@@ -113,7 +113,7 @@ def map_to_interval_cell(x, cell_nodes):
 
 batched_mapping = jax.vmap(map_to_interval_cell, in_axes=(None, 0))
 batched_jacobian = jax.vmap(
-    jax.ji(jax.jacfwd(map_to_interval_cell)), in_axes=(None, 0)
+    jax.jit(jax.jacfwd(map_to_interval_cell)), in_axes=(None, 0)
 )
 
 
