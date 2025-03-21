@@ -1,0 +1,66 @@
+font.family : sans-serif
+font.weight : normal
+font.sans-serif : "DejaVu Sans"
+#font.stretch : condensed
+font.size : 10
+
+mathtext.fontset     : cm # Should be 'cm' (Computer Modern), 'stix', # 'stixsans' or 'custom'
+
+text.usetex           :  True
+text.latex.preamble   :  \usepackage{sansmath}\sansmath
+
+### LINES
+lines.linewidth        : 1.0   # line width in points
+lines.antialiased      : True  # render lines in antialised (no jaggies)
+lines.markeredgecolor  : white #555555     # the line width around the marker symbol
+lines.markeredgewidth  : 0.25  # the line width around the marker symbol
+lines.markersize       : 4     # markersize, in points
+
+### TICKS
+# see http://matplotlib.sourceforge.net/api/axis_api.html#matplotlib.axis.Tick
+xtick.major.width    : 0.4
+xtick.minor.width    : 0.25
+xtick.major.pad      : 3      # distance to major tick label in points
+xtick.minor.pad      : 3      # distance to the minor tick label in points
+xtick.color          : black  #555555      # color of the tick labels
+xtick.labelsize      : 9      #medium # fontsize of the tick labels
+xtick.direction      : out    # direction: in or out
+
+
+ytick.major.width    : 0.4
+ytick.minor.width    : 0.25
+ytick.major.pad      : 3      # distance to major tick label in points
+ytick.minor.pad      : 3      # distance to the minor tick label in points
+ytick.color          : black  #555555      # color of the tick labels
+ytick.labelsize      : 9      #medium # fontsize of the tick labels
+ytick.direction      : out    # direction: in or out
+
+
+### AXES
+axes.prop_cycle             : cycler('color', ['009AF9', 'E26F46', '3DA44D', 'C271D2', 'AC8D18', '00A9AD', 'ED5D92'])
+axes.linewidth              : 0.4
+axes.labelcolor             : black #555555
+axes.labelsize              : 10
+axes.formatter.use_mathtext : False
+
+### GRID
+grid.color       :   grey   # grid color
+grid.linestyle   :   solid  # dotted
+grid.linewidth   :   0.25   # in points
+grid.alpha       : 0.2
+
+
+### Legend
+legend.numpoints     : 2      # the number of points in the legend line
+legend.fontsize      : 9
+legend.borderpad     : 0.5    # border whitspace in fontsize units
+legend.markerscale   : 0.75    # the relative size of legend markers vs. original
+
+figure.dpi : 150
+
+### Saving figure
+savefig.format : 'svg'
+savefig.dpi : 1000
+savefig.transparent : True
+
+
