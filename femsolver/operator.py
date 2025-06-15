@@ -6,7 +6,17 @@ import jax.numpy as jnp
 
 import equinox as eqx
 from typing import Callable
-from femsolver.jax_utils import auto_vmap
+from femsolver.jax_utils import auto_vmap, vmap
+
+
+def gather_fields(
+    u_flat: jnp.ndarray, connectivity: jnp.ndarray, dof_per_node: int
+) -> jnp.ndarray:
+    """
+    Gathers the fields from the flat array to the full array.
+    """
+    u_full = u_flat.reshape(-1, dof_per_node)
+    return u_full[connectivity]
 
 
 class FemOperator(eqx.Module):
@@ -97,7 +107,7 @@ class FemOperator(eqx.Module):
         return self.gradient(x, nodal_values, nodes)
 
     # --- Element-level energy ---
-    @auto_vmap(nodal_values=2, nodes=2)
+    @vmap(in_axes=(None, 0, 0))
     def integrate(
         self,
         nodal_values: jnp.ndarray,
@@ -116,3 +126,13 @@ class FemOperator(eqx.Module):
             return wi * energy * jnp.linalg.det(J)
 
         return jnp.sum(jax.vmap(integrand)(qp, w))
+
+    def total_energy(
+        self, u_flat: jnp.ndarray, coords: jnp.ndarray, connectivity: jnp.ndarray
+    ) -> jnp.ndarray:
+        """
+        Computes the total energy of the system.
+        """
+        u_cells = gather_fields(u_flat, connectivity, dof_per_node=coords.shape[1])
+        X_cells = coords[connectivity]
+        return jnp.sum(self.integrate(u_cells, X_cells))

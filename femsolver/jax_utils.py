@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def vmap(use_vmap=True, *vmap_args, **vmap_kwargs):
+def vmap(*vmap_args, **vmap_kwargs):
     """
     Decorator to optionally apply jax.vmap to a function.
 
@@ -22,11 +22,8 @@ def vmap(use_vmap=True, *vmap_args, **vmap_kwargs):
     def decorator(func):
         @wraps(func)
         def wrapped(*args, **kwargs):
-            if use_vmap:
-                vmapped_func = jax.jit(jax.vmap(func, *vmap_args, **vmap_kwargs))
-                return vmapped_func(*args, **kwargs)
-            else:
-                return func(*args, **kwargs)
+            vmapped_func = jax.vmap(func, *vmap_args, **vmap_kwargs)
+            return vmapped_func(*args, **kwargs)
 
         return wrapped
 

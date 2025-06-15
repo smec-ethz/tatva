@@ -1,93 +1,174 @@
 # femsolver
+Functional programming and differentiable framework for finite element method (FEM) simulations.
 
 
+## Overview
 
-## Getting started
+femsolver is a Python library for finite element method (FEM) simulations. It is built on top of JAX and Equinox, making it easy to use FEM in a differentiable way.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Features
 
-## Add your files
+- Functional programming interface for FEM simulations
+- Differentiable operations using JAX
+- Support for linear, nonlinear, and mixed FEM simulations
+- Easy integration with machine learning frameworks
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://gitlab.ethz.ch/compmechmat/research/mohit-pundir/femsolver.git
-git branch -M main
-git push -uf origin main
-```
-
-## Integrate with your tools
-
-- [ ] [Set up project integrations](https://gitlab.ethz.ch/compmechmat/research/mohit-pundir/femsolver/-/settings/integrations)
-
-## Collaborate with your team
-
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
 
 ## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+
+```bash
+pip install -e .
+```
 
 ## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+```python
+jax.config.update("jax_enable_x64", True)  # use double-precision
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update("jax_platforms", "cpu")
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+from femsolver.quadrature import quad_tri3, shape_fn_tri3
+from femsolver.operator import FemOperator
+import matplotlib.pyplot as plt
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+# --- Material model (linear elasticity: plane strain) ---
+def compute_strain(grad_u):
+    return 0.5 * (grad_u + grad_u.T)
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+def compute_stress(eps, mu=1.0, lmbda=1.0):
+    I = jnp.eye(2)
+    return 2 * mu * eps + lmbda * jnp.trace(eps) * I
 
-## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+def linear_elasticity_energy(grad_u, mu=1.0, lmbda=1.0):
+    eps = compute_strain(grad_u)
+    sigma = compute_stress(eps, mu, lmbda)
+    return 0.5 * jnp.sum(sigma * eps)
+
+
+def von_mises_stress(stress):
+    s_xx, s_yy = stress[0, 0], stress[1, 1]
+    s_xy = stress[0, 1]
+    return jnp.sqrt(s_xx**2 - s_xx * s_yy + s_yy**2 + 3 * s_xy**2)
+
+
+# --- Mesh generation ---
+def generate_unit_square_mesh_tri(nx, ny):
+    x = jnp.linspace(0, 1, nx + 1)
+    y = jnp.linspace(0, 1, ny + 1)
+    xv, yv = jnp.meshgrid(x, y, indexing="ij")
+    coords = jnp.stack([xv.ravel(), yv.ravel()], axis=-1)
+
+    def node_id(i, j):
+        return i * (ny + 1) + j
+
+    elements = []
+    for i in range(nx):
+        for j in range(ny):
+            n0 = node_id(i, j)
+            n1 = node_id(i + 1, j)
+            n2 = node_id(i, j + 1)
+            n3 = node_id(i + 1, j + 1)
+            elements.append([n0, n1, n3])
+            elements.append([n0, n3, n2])
+    return coords, jnp.array(elements)
+
+
+# --- Solver ---
+def solve_fem():
+    # --- Mesh ---
+    coords, elements = generate_unit_square_mesh_tri(4, 2)
+    n_nodes = coords.shape[0]
+    n_dofs = 2 * n_nodes
+    u = jnp.zeros(n_dofs)
+
+    fem = FemOperator(
+        compute_quads=quad_tri3,
+        compute_shape_fn=shape_fn_tri3,
+        compute_energy=linear_elasticity_energy,
+    )
+
+
+    # --- Total energy ---
+    def total_energy(u_flat, coords, elements, fem):
+        u = u_flat.reshape(-1, 2)
+        u_cell = u[elements]
+        x_cell = coords[elements]
+        return jnp.sum(fem.integrate(u_cell, x_cell))
+
+    grad_E = jax.grad(total_energy)
+    hess_E = jax.jacfwd(jax.grad(total_energy))
+    K = hess_E(u, coords, elements, fem)
+    f_int = grad_E(u, coords, elements, fem)
+
+    # Apply Dirichlet BCs
+    left_nodes = jnp.where(jnp.isclose(coords[:, 0], 0.0))[0]
+    right_nodes = jnp.where(jnp.isclose(coords[:, 0], 1.0))[0]
+    fixed_dofs = jnp.concatenate(
+        [
+            2 * left_nodes,
+            2 * left_nodes + 1,
+            2 * right_nodes,
+        ]
+    )
+    prescribed_values = jnp.zeros(n_dofs).at[2 * right_nodes].set(0.1)
+    free_dofs = jnp.setdiff1d(jnp.arange(n_dofs), fixed_dofs)
+
+    f_ext = -f_int - K @ prescribed_values
+    f_reduced = f_ext[free_dofs]
+    K_reduced = K[jnp.ix_(free_dofs, free_dofs)]
+    u_free = jnp.linalg.solve(K_reduced, f_reduced)
+    u_full = prescribed_values.at[free_dofs].set(u_free)
+
+    return coords, u_full.reshape(-1, 2), elements
+
+
+# --- Compute von Mises stress per element ---
+def compute_element_stress(coords, u, elements, fem):
+    u_cells = u.reshape(-1, 2)[elements]
+    coords_cells = coords[elements]
+
+    def element_von_mises(u_e, x_e):
+        qp, _ = quad_tri3()
+        xi = qp[0]  # just take one point per element
+        grad_u = fem.gradient(xi, u_e, x_e)
+        eps = compute_strain(grad_u)
+        sigma = compute_stress(eps)
+        return von_mises_stress(sigma)
+
+    return jax.vmap(element_von_mises)(u_cells, coords_cells)
+
+
+# --- Visualization ---
+def plot_displacement_and_stress(coords, u, elements, stress, scale=1.0):
+    displaced = coords + scale * u
+    tri_elements = elements
+
+    plt.figure(figsize=(10, 5))
+    plt.tripcolor(
+        displaced[:, 0],
+        displaced[:, 1],
+        tri_elements,
+        facecolors=stress,
+        shading="flat",
+        cmap="viridis",
+    )
+    plt.colorbar(label="Von Mises Stress")
+    plt.title("Von Mises Stress on Deformed Mesh")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.axis("equal")
+    plt.grid(True)
+    plt.show()
+
+
+coords, u, elements = solve_fem()
+fem = FemOperator(quad_tri3, shape_fn_tri3, linear_elasticity_energy)
+
+stress_vm = compute_element_stress(coords, u, elements, fem)
+plot_displacement_and_stress(coords, u, elements, stress_vm)
+
+```
