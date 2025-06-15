@@ -8,11 +8,10 @@ setup(
     description="Functional programming and differentiable framework for finite element methods",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/femsolver",  # optional
+    url="https://gitlab.ethz.ch/compmechmat/research/mohit-pundir/femsolver",  # optional
     packages=find_packages(where="."),  # finds femsolver/
     install_requires=[
         "jax==0.4.30",
-        "equinox==0.12.1",
         "numpy",
     ],
     classifiers=[

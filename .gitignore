@@ -16,3 +16,5 @@ arguments-*
 *.out
 *_venv*
 *jax-cache*
+*egg-info*
+*build*

@@ -4,33 +4,105 @@ jax.config.update("jax_enable_x64", True)  # use double-precision
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 import jax.numpy as jnp
 
-import equinox as eqx
-from femsolver.jax_utils import auto_vmap
+
+# --- Shape functions and quadrature ---
+def quad_quad4() -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Quadrature points and weights for a quadrilateral element.
+
+    Returns
+    -------
+    quad_points : jnp.ndarray
+        The quadrature points.
+        The shape of the array is (nb_quads, nb_axes_in reference space).
+    weights : jnp.ndarray
+        The quadrature weights.
+        The shape of the array is (nb_quads, nb_axes_in reference space).
+    """
+    xi = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
+    w = jnp.array([1.0, 1.0])
+    quad_points = jnp.stack(jnp.meshgrid(xi, xi), axis=-1).reshape(-1, 2)
+    weights = jnp.kron(w, w)
+    return quad_points, weights
 
 
-class ShapeFunctions(eqx.Module):
-    N: jax.Array
-    dNdξ: jax.Array
-    d2Ndξ2: jax.Array
-    wts: jax.Array
-    quad_pts: jax.Array
+def shape_fn_quad4(xi: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Shape functions and derivatives for a quadrilateral element.
 
-    def __init__(self, nb_quads, nb_nodes_per_element):
-        self.N = jnp.zeros((nb_quads, nb_nodes_per_element))
-        self.dNdξ = jnp.zeros((nb_quads, nb_nodes_per_element))
-        self.d2Ndξ2 = jnp.zeros((nb_quads, nb_nodes_per_element))
-        self.wts = jnp.zeros(nb_quads)
-        self.quad_pts = jnp.zeros(nb_quads)
+    Parameters
+    ----------
+    xi : jnp.ndarray
+        The local coordinates of the quadrature points.
 
-    def interpolate(self,x, dofs):
-        return self.N(x) @ dofs
-    
-    def gradient(self, x, dofs):
-        return self.dNdξ(x) @ dofs
+    Returns
+    -------
+    N : jnp.ndarray
+        The shape functions.
+        The shape of the array is (nb_nodes_per_element,).
+    dNdr : jnp.ndarray
+        The derivatives of the shape functions with respect to the local coordinates. 
+        The shape of the array is (nb_axes_in_reference_space, nb_nodes_per_element).
+    """
+    r, s = xi
+    N = 0.25 * jnp.array(
+        [(1 - r) * (1 - s), (1 + r) * (1 - s), (1 + r) * (1 + s), (1 - r) * (1 + s)]
+    )
+    dNdr = (
+        0.25
+        * jnp.array(
+            [
+                [-(1 - s), -(1 - r)],
+                [(1 - s), -(1 + r)],
+                [(1 + s), (1 + r)],
+                [-(1 + s), (1 - r)],
+            ]
+        ).T
+    )
+    return N, dNdr
 
-    def hessian(self, x, dofs): 
-        return self.d2Ndξ2(x) @ dofs
 
+def quad_tri3() -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Quadrature points and weights for a triangular element.
+
+    Returns
+    -------
+    quad_points : jnp.ndarray
+        The quadrature points.
+        The shape of the array is (nb_quads, nb_axes_in reference space).
+    weights : jnp.ndarray
+        The quadrature weights.
+        The shape of the array is (nb_quads, nb_axes_in reference space).
+    """
+    qp = jnp.array([[1 / 3, 1 / 3]])
+    w = jnp.array([0.5])
+    return qp, w
+
+
+def shape_fn_tri3(xi: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Shape functions and derivatives for a triangular element.
+
+    Parameters
+    ----------
+    xi : jnp.ndarray
+        The local coordinates of the quadrature points.
+
+    Returns
+    -------
+    N : jnp.ndarray
+        The shape functions.
+        The shape of the array is (nb_nodes_per_element,).
+    dNdr : jnp.ndarray
+        The derivatives of the shape functions with respect to the local coordinates.
+        The shape of the array is (nb_axes_in_reference_space, nb_nodes_per_element).
+    """
+    xi1, xi2 = xi
+    xi3 = 1.0 - xi1 - xi2
+    N = jnp.array([xi3, xi1, xi2])
+    dNdxi = jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]]).T
+    return N, dNdxi
 
 
 @jax.tree_util.register_pytree_node_class
@@ -74,18 +146,3 @@ class Basis:
         instance.wts = ω
         instance.quad_pts = quad_pts
         return instance
-
-
-@auto_vmap(x=0)
-def interpolate(x, dofs, basis):
-    return jnp.einsum("ij,j...->i..", basis.N, dofs, optimize="optimal")
-
-
-@auto_vmap(x=0)
-def gradient(x, dofs, basis):
-    return jnp.einsum("ij,j...->i..", basis.dNdξ, dofs, optimize="optimal")
-
-
-@auto_vmap(x=0)
-def hessian(x, dofs, basis):
-    return jnp.einsum("ij,j...->i..", basis.d2Ndξ2, dofs, optimize="optimal")
