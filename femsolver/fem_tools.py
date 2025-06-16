@@ -58,6 +58,13 @@ class Basis:
         instance.wts = ω
         instance.quad_pts = quad_pts
         return instance
+    
+
+    def __repr__(self):
+        """
+        Returns a string representation of the Basis object.
+        """
+        return f"Basis(N={self.N}, dNdξ={self.dNdξ}, wts={self.wts}, quad_pts={self.quad_pts})"
 
 
 def create_finite_element(cell, element_type, degree, variant):
@@ -256,7 +263,7 @@ def integrate_over_cell(value_at_quad, detJ, wts):
     return integral_value
 
 
-'''@jax.jit
+"""@jax.jit
 def integrate_per_cell(carry, iiter):
     value_at_quads, detJs, wts = carry
     integral_values = jnp.vecdot(value_at_quads[iiter], wts)*detJs[iiter]
@@ -275,4 +282,4 @@ def scanned_integration(value_at_quads, wts, detJs):
         iterations,
     )
 
-    return integral_values_cell'''
+    return integral_values_cell"""
