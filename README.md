@@ -32,6 +32,7 @@ jax.config.update("jax_platforms", "cpu")
 from femsolver.quadrature import quad_tri3, shape_fn_tri3
 from femsolver.operator import FemOperator
 import matplotlib.pyplot as plt
+import cmcrameri.cm as cmc
 ```
 
 We define a function to generate mesh (coords and cells). Here we will use a square plate with triangular finite elements.
@@ -230,7 +231,14 @@ def plot_displacement_and_stress(coords, u, elements, stress, scale=1.0):
     plt.show()
 
 
+# --- Compute the stress ---    
+u = u_full.reshape(-1, n_dofs_per_node)
+
 stress_vm = compute_element_stress(coords, u, elements, fem)
+
+# --- Plot the displacement and stress ---
 plot_displacement_and_stress(coords, u, elements, stress_vm)
 
 ```
+
+![Von Mises Stress on Deformed Mesh](examples/notebooks/linear_elasticity.png)
