@@ -11,7 +11,7 @@ setup(
     url="https://gitlab.ethz.ch/compmechmat/research/mohit-pundir/femsolver",  # optional
     packages=find_packages(where="."),  # finds femsolver/
     install_requires=[
-        "jax==0.4.30",
+        "jax==0.6.1",
         "numpy",
     ],
     classifiers=[
