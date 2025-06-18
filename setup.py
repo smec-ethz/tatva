@@ -12,7 +12,10 @@ setup(
     packages=find_packages(where="."),  # finds femsolver/
     install_requires=[
         "jax==0.6.1",
+        "equinox",
         "numpy",
+        "matplotlib",
+        "cmcrameri",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

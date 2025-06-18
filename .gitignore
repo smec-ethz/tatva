@@ -15,6 +15,7 @@ arguments-*
 *.err 
 *.out
 *_venv*
+*venv*
 *jax-cache*
 *egg-info*
 *build*
