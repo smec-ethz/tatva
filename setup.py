@@ -16,6 +16,7 @@ setup(
         "numpy",
         "scipy",
         "mpi4py",
+        "sparsejac",
         "petsc",
         "petsc4py",
         "matplotlib",
