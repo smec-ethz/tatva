@@ -242,3 +242,15 @@ plot_displacement_and_stress(coords, u, elements, stress_vm)
 ```
 
 ![Von Mises Stress on Deformed Mesh](examples/notebooks/linear_elasticity.png)
+
+
+## Profiling
+
+### Memory usage profiling
+
+We use pprof to profile the memory usage. Please follow the instruction on JAX's documentation on profiling  ![Link to documentation](https://docs.jax.dev/en/latest/device_memory_profiling.html). Using `go` and `pprof`.
+
+For 20000 degrees of freedom and a sparse linear elastic framework (`benchmarking/profiling_memory_usage.py`), a total of `15 MB` memory is used on `CPU`. The distribution of memory usage is as follows:
+
+![](benchmarking/profile001.svg)
+
