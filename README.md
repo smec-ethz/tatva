@@ -1,10 +1,5 @@
 # femsolver
-Functional programming and differentiable framework for finite element method (FEM) simulations.
-
-
-## Overview
-
-femsolver is a Python library for finite element method (FEM) simulations. It is built on top of JAX and Equinox, making it easy to use FEM in a differentiable way.
+Functional programming and differentiable framework for finite element method (FEM) simulations. `femsolver` is a Python library for finite element method (FEM) simulations. It is built on top of JAX and Equinox, making it easy to use FEM in a differentiable way.
 
 
 ## Features
@@ -12,16 +7,19 @@ femsolver is a Python library for finite element method (FEM) simulations. It is
 - Functional programming interface for FEM simulations
 - Differentiable operations using JAX
 - Support for linear, nonlinear, and mixed FEM simulations
-- Easy integration with machine learning frameworks
 
 
 ## Installation
+
+We recommend to create a python virtual environment and then install the library.
 
 ```bash
 pip install -e .
 ```
 
 ## Usage
+
+The basic usage of the library is shown below for a linear elastic case. 
 
 ```python
 import jax
@@ -243,6 +241,14 @@ plot_displacement_and_stress(coords, u, elements, stress_vm)
 
 ![Von Mises Stress on Deformed Mesh](examples/notebooks/linear_elasticity.png)
 
+
+## Dense vs Sparse 
+
+The example shown above creates a dense stiffness matrix which for understanding is great but is memory intensive. A sparse framework for the same example is provided in `examples/notebooks/sparse_linear_elasticity.ipynb`. For sparse representation of the stiffness matrix or the hessian of the total energy, we use the library `sparsejac` that allows automatic differentiation of a functional based on a sparsity pattern. This significantly reduces the memory consumption. For more details on how the automatic differentiation can be done using sparsity pattern, please check the link below:
+
+![Paper](https://arxiv.org/html/2501.17737v1)
+![Sparsejac github](https://github.com/mfschubert/sparsejac)
+![Sparsediffax, python interface for the paper](https://github.com/gdalle/sparsediffax)
 
 ## Profiling
 
