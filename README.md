@@ -246,9 +246,9 @@ plot_displacement_and_stress(coords, u, elements, stress_vm)
 
 The example shown above creates a dense stiffness matrix which for understanding is great but is memory intensive. A sparse framework for the same example is provided in `examples/notebooks/sparse_linear_elasticity.ipynb`. For sparse representation of the stiffness matrix or the hessian of the total energy, we use the library `sparsejac` that allows automatic differentiation of a functional based on a sparsity pattern. This significantly reduces the memory consumption. For more details on how the automatic differentiation can be done using sparsity pattern, please check the link below:
 
-![Paper](https://arxiv.org/html/2501.17737v1)
-![Sparsejac github](https://github.com/mfschubert/sparsejac)
-![Sparsediffax, python interface for the paper](https://github.com/gdalle/sparsediffax)
+![Paper](https://arxiv.org/html/2501.17737v1)</br>
+![Github: sparsejac](https://github.com/mfschubert/sparsejac)</br>
+![Github: Sparsediffax, python interface for the paper](https://github.com/gdalle/sparsediffax)</br>
 
 ## Profiling
 
