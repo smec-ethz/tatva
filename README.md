@@ -252,6 +252,17 @@ The example shown above creates a dense stiffness matrix which for understanding
 
 ## Profiling
 
+### Time usage profiling
+
+Below we provide the computational time for the assembly of the sparse stiffness matrix for linear elasticity problem. The code is available in `benchmarking/profiling_time.py`.
+
+
+![Assembly Time](benchmarking/assembly_time_cpu.png)
+
+The time above doesnot account for the compilation time  of the functions. In JAX, the first time a function is called, it is compiled and repeated calls are faster. This compilation time is not included in the time above. The time above is for a single core of a CPU. 
+
+
+
 ### Memory usage profiling
 
 We use pprof to profile the memory usage. Please follow the instruction on JAX's documentation on profiling  ![Link to documentation](https://docs.jax.dev/en/latest/device_memory_profiling.html). Using `go` and `pprof`.
