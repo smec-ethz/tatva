@@ -4,6 +4,110 @@ jax.config.update("jax_enable_x64", True)  # use double-precision
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 import jax.numpy as jnp
 
+# file: elements_eqx.py
+
+import equinox as eqx
+from typing import Tuple
+
+
+# --- Base Module (defines the common interface) ---
+class Element(eqx.Module):
+    """Base Module for all finite elements, compatible with JAX."""
+
+    # In Equinox, we don't use @abstractmethod. We can either leave this
+    # class empty or raise NotImplementedError to enforce the interface.
+    def get_quadrature(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Returns the element's quadrature points and weights."""
+        raise NotImplementedError
+
+    def get_shape_functions(self, xi: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Returns the shape functions and their derivatives at a point."""
+        raise NotImplementedError
+
+
+# --- Concrete Element Implementations ---
+
+
+class Line2(Element):
+    """A 2-node linear interval element."""
+
+    def get_quadrature(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        qp = jnp.array([[0.0]])
+        w = jnp.array([2.0])
+        return qp, w
+
+    def get_shape_functions(self, xi: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        xi_val = xi[0]
+        N = jnp.array([0.5 * (1.0 - xi_val), 0.5 * (1.0 + xi_val)])
+        dNdxi = jnp.array([[-0.5, 0.5]])
+        return N, dNdxi
+
+
+class Tri3(Element):
+    """A 3-node linear triangular element."""
+
+    def get_quadrature(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        qp = jnp.array([[1 / 3, 1 / 3]])
+        w = jnp.array([0.5])
+        return qp, w
+
+    def get_shape_functions(self, xi: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        xi1, xi2 = xi
+        N = jnp.array([1.0 - xi1 - xi2, xi1, xi2])
+        dNdxi = jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]]).T
+        return N, dNdxi
+
+
+class Quad4(Element):
+    """A 4-node bilinear quadrilateral element."""
+
+    def get_quadrature(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
+        w_vals = jnp.array([1.0, 1.0])
+        quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals), axis=-1).reshape(-1, 2)
+        weights = jnp.kron(w_vals, w_vals)
+        return quad_points, weights
+
+    def get_shape_functions(self, xi: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        r, s = xi
+        N = 0.25 * jnp.array(
+            [(1 - r) * (1 - s), (1 + r) * (1 - s), (1 + r) * (1 + s), (1 - r) * (1 + s)]
+        )
+        dNdr = (
+            0.25
+            * jnp.array(
+                [
+                    [-(1 - s), -(1 - r)],
+                    [(1 - s), -(1 + r)],
+                    [(1 + s), (1 + r)],
+                    [-(1 + s), (1 - r)],
+                ]
+            ).T
+        )
+        return N, dNdr
+    
+# Dictionary mapping keywords to element classes
+_element_map = {
+    "line2": Line2,
+    "tri3": Tri3,
+    "quad4": Quad4,
+}
+
+def get_element(name: str) -> Element:
+    """
+    Factory to get an element object by its keyword.
+
+    Args:
+        name: The keyword for the element ('line2', 'tri3', 'quad4').
+
+    Returns:
+        An instance of the corresponding Equinox element module.
+    """
+    element_class = _element_map.get(name.lower())
+    if element_class is None:
+        raise ValueError(f"Unknown element type: '{name}'. Available: {list(_element_map.keys())}")
+    return element_class()
+
 
 # --- Shape functions and quadrature ---
 def quad_quad4() -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -41,7 +145,7 @@ def shape_fn_quad4(xi: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         The shape functions.
         The shape of the array is (nb_nodes_per_element,).
     dNdr : jnp.ndarray
-        The derivatives of the shape functions with respect to the local coordinates. 
+        The derivatives of the shape functions with respect to the local coordinates.
         The shape of the array is (nb_axes_in_reference_space, nb_nodes_per_element).
     """
     r, s = xi
@@ -102,6 +206,50 @@ def shape_fn_tri3(xi: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     xi3 = 1.0 - xi1 - xi2
     N = jnp.array([xi3, xi1, xi2])
     dNdxi = jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]]).T
+    return N, dNdxi
+
+
+def quad_line2() -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Quadrature point and weight for a 2-node linear interval element.
+
+    Uses a 1-point Gauss quadrature rule, which is exact for integrating
+    linear polynomials over the reference interval [-1, 1].
+
+    Returns:
+        tuple[jnp.ndarray, jnp.ndarray]: A tuple containing:
+            - quad_points (jnp.ndarray): Quadrature point(s), shape (1, 1).
+            - weights (jnp.ndarray): Quadrature weight(s), shape (1,).
+    """
+    # 1-point Gauss quadrature rule
+    qp = jnp.array([[0.0]])
+    w = jnp.array([2.0])
+    return qp, w
+
+
+def shape_fn_line2(xi: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Shape functions and derivatives for a 2-node linear interval element.
+
+    The reference element is defined on the interval xi in [-1, 1].
+
+    Parameters:
+        xi (jnp.ndarray): The local coordinate of a point, shape (1,).
+
+    Returns:
+        tuple[jnp.ndarray, jnp.ndarray]: A tuple containing:
+            - N (jnp.ndarray): Shape functions evaluated at xi, shape (2,).
+            - dNdxi (jnp.ndarray): Shape function derivatives, shape (1, 2).
+    """
+    # The input xi is a 1-element array, e.g., jnp.array([0.0])
+    xi_val = xi[0]
+
+    # Shape functions: N1 = (1 - xi) / 2,  N2 = (1 + xi) / 2
+    N = jnp.array([0.5 * (1.0 - xi_val), 0.5 * (1.0 + xi_val)])
+
+    # Derivatives: dN1/dxi = -0.5,  dN2/dxi = 0.5
+    dNdxi = jnp.array([[-0.5, 0.5]])
+
     return N, dNdxi
 
 
