@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import equinox as eqx
 from typing import Callable
 from femsolver.jax_utils import auto_vmap, vmap
-
+from femsolver.quadrature import Element
 
 def gather_fields(
     u_flat: jnp.ndarray, connectivity: jnp.ndarray, dof_per_node: int
@@ -17,6 +17,54 @@ def gather_fields(
     """
     u_full = u_flat.reshape(-1, dof_per_node)
     return u_full[connectivity]
+
+
+class IntegrateOperator(eqx.Module):
+    """
+    A class used to represent a IntegrateOperator for finite element method (FEM) simulations.
+    """
+    element: Element    
+    integrand: Callable
+
+    def __init__(self, element: Element, integrand: Callable):
+        self.element = element
+        self.integrand = integrand
+
+    
+    @auto_vmap(x=1, nodal_values=None)
+    def interpolate(
+        self,
+        x: jnp.ndarray,
+        nodal_values: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        Interpolates the nodal values at the given points.
+        """
+        N, dNdr = self.element.get_shape_functions(x)
+        return N @ nodal_values
+
+
+    # --- Element-level energy ---
+    @vmap(in_axes=(None, 0, 0))
+    def integrate(
+        self,
+        nodal_values: jnp.ndarray,
+        nodes: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        Integrates the energy over the cells.
+        """
+        qp, w = self.element.get_quadrature()
+
+        def integrand(xi, wi):
+            N, dNdr = self.element.get_shape_functions(xi)
+            J = dNdr @ nodes
+            u_quad = self.interpolate(xi, nodal_values)
+            value = self.integrand(u_quad)
+            return wi * value * jnp.linalg.det(J)
+
+        return jnp.sum(jax.vmap(integrand)(qp, w))
+
 
 
 class FemOperator(eqx.Module):
