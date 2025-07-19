@@ -40,17 +40,38 @@ class Operator(eqx.Module):
         self.element = element
         self.integrand = integrand
 
-    @auto_vmap(x=1, nodal_values=None)
+    @vmap(in_axes=(None, 0))
     def interpolate(
         self,
-        x: jnp.ndarray,
         nodal_values: jnp.ndarray,
     ) -> jnp.ndarray:
         """
         Interpolates the nodal values at the given points.
         """
-        N, dNdr = self.element.get_shape_functions(x)
-        return N @ nodal_values
+        qp, w = self.element.get_quadrature()
+
+        def _interpolate(xi):
+            return self.element.interpolate(xi, nodal_values)
+
+        return jax.vmap(_interpolate)(qp)
+    
+
+    @vmap(in_axes=(None, 0, 0))
+    def gradient(
+        self,
+        nodal_values: jnp.ndarray,
+        nodes: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        Computes the gradient of the nodal values at the given points.
+        """
+        qp, w = self.element.get_quadrature()
+
+        def _gradient(xi):
+            u_grad = self.element.gradient(xi, nodal_values, nodes)
+            return u_grad
+
+        return jax.vmap(_gradient)(qp)
 
     # --- Element-level energy ---
     @vmap(in_axes=(None, 0, 0))
@@ -65,11 +86,11 @@ class Operator(eqx.Module):
         qp, w = self.element.get_quadrature()
 
         def integrand(xi, wi):
-            N, dNdr = self.element.get_shape_functions(xi)
-            J = dNdr @ nodes
-            u_quad = self.interpolate(xi, nodal_values)
+            u_quad, u_grad, detJ = self.element.get_local_values(
+                xi, nodal_values, nodes
+            )
             value = self.integrand(u_quad)
-            return wi * value * jnp.linalg.det(J)
+            return wi * value * detJ
 
         return jnp.sum(jax.vmap(integrand)(qp, w))
 

@@ -24,8 +24,32 @@ class Element(eqx.Module):
         """Returns the shape functions and their derivatives at a point."""
         raise NotImplementedError
 
+    def get_jacobian(self, xi: jnp.ndarray, nodes: jnp.ndarray) -> jnp.ndarray:
+        N, dNdr = self.get_shape_functions(xi)
+        J = dNdr @ nodes
+        return J, jnp.linalg.det(J)
 
-# --- Concrete Element Implementations ---
+    def interpolate(self, xi: jnp.ndarray, nodal_values: jnp.ndarray) -> jnp.ndarray:
+        N, _ = self.get_shape_functions(xi)
+        return N @ nodal_values
+    
+    def gradient(
+        self, xi: jnp.ndarray, nodal_values: jnp.ndarray, nodes: jnp.ndarray
+    ) -> jnp.ndarray:
+        N, dNdr = self.get_shape_functions(xi)
+        J, detJ = self.get_jacobian(xi, nodes)
+        dNdX = jnp.linalg.inv(J) @ dNdr
+        return dNdX @ nodal_values
+    
+    def get_local_values(
+        self, xi: jnp.ndarray, nodal_values: jnp.ndarray, nodes: jnp.ndarray
+    ) -> jnp.ndarray:
+        N, dNdr = self.get_shape_functions(xi)
+        J, detJ = self.get_jacobian(xi, nodes)
+        dNdX = jnp.linalg.inv(J) @ dNdr
+        return N @ nodal_values, dNdX @ nodal_values, detJ
+
+
 
 
 class Line2(Element):
@@ -39,8 +63,31 @@ class Line2(Element):
     def get_shape_functions(self, xi: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         xi_val = xi[0]
         N = jnp.array([0.5 * (1.0 - xi_val), 0.5 * (1.0 + xi_val)])
-        dNdxi = jnp.array([[-0.5, 0.5]])
+        dNdxi = jnp.array([-0.5, 0.5])
         return N, dNdxi
+
+    def get_jacobian(self, xi: jnp.ndarray, nodes: jnp.ndarray) -> jnp.ndarray:
+        N, dNdr = self.get_shape_functions(xi)
+        J = dNdr @ nodes
+        t = jnp.asarray([J[0], J[1]]) / jnp.linalg.norm(J)
+        return jnp.dot(J, t), jnp.dot(J, t)
+
+
+    def gradient(
+        self, xi: jnp.ndarray, nodal_values: jnp.ndarray, nodes: jnp.ndarray
+    ) -> jnp.ndarray:
+        N, dNdr = self.get_shape_functions(xi)
+        J, _ = self.get_jacobian(xi, nodes)
+        dNdX = dNdr / J
+        return dNdX @ nodal_values
+
+    def get_local_values(
+        self, xi: jnp.ndarray, nodal_values: jnp.ndarray, nodes: jnp.ndarray
+    ) -> jnp.ndarray:
+        N, dNdr = self.get_shape_functions(xi)
+        J, detJ = self.get_jacobian(xi, nodes)
+        dNdX = dNdr / J
+        return N @ nodal_values, dNdX @ nodal_values, detJ
 
 
 class Tri3(Element):
@@ -85,13 +132,14 @@ class Quad4(Element):
             ).T
         )
         return N, dNdr
-    
+
 # Dictionary mapping keywords to element classes
 _element_map = {
     "line2": Line2,
     "tri3": Tri3,
     "quad4": Quad4,
 }
+
 
 def get_element(name: str) -> Element:
     """
@@ -105,7 +153,9 @@ def get_element(name: str) -> Element:
     """
     element_class = _element_map.get(name.lower())
     if element_class is None:
-        raise ValueError(f"Unknown element type: '{name}'. Available: {list(_element_map.keys())}")
+        raise ValueError(
+            f"Unknown element type: '{name}'. Available: {list(_element_map.keys())}"
+        )
     return element_class()
 
 
