@@ -9,6 +9,7 @@ from typing import Callable
 from femsolver.jax_utils import auto_vmap, vmap
 from femsolver.quadrature import Element
 
+
 def gather_fields(
     u_flat: jnp.ndarray, connectivity: jnp.ndarray, dof_per_node: int
 ) -> jnp.ndarray:
@@ -19,18 +20,26 @@ def gather_fields(
     return u_full[connectivity]
 
 
-class IntegrateOperator(eqx.Module):
+class Operator(eqx.Module):
     """
-    A class used to represent a IntegrateOperator for finite element method (FEM) simulations.
+    A class used to represent a Operator for finite element method (FEM) simulations.
+
+    Attributes:
+        element: The element to use for the integration.
+        integrand: The integrand to use for the integration.
+
+    Methods:
+        interpolate: Interpolates the nodal values at the given points.
+        integrate: Integrates the integrand over the cells.
     """
-    element: Element    
+
+    element: Element
     integrand: Callable
 
     def __init__(self, element: Element, integrand: Callable):
         self.element = element
         self.integrand = integrand
 
-    
     @auto_vmap(x=1, nodal_values=None)
     def interpolate(
         self,
@@ -42,7 +51,6 @@ class IntegrateOperator(eqx.Module):
         """
         N, dNdr = self.element.get_shape_functions(x)
         return N @ nodal_values
-
 
     # --- Element-level energy ---
     @vmap(in_axes=(None, 0, 0))
@@ -64,7 +72,6 @@ class IntegrateOperator(eqx.Module):
             return wi * value * jnp.linalg.det(J)
 
         return jnp.sum(jax.vmap(integrand)(qp, w))
-
 
 
 class FemOperator(eqx.Module):
@@ -174,13 +181,3 @@ class FemOperator(eqx.Module):
             return wi * energy * jnp.linalg.det(J)
 
         return jnp.sum(jax.vmap(integrand)(qp, w))
-
-    def total_energy(
-        self, u_flat: jnp.ndarray, coords: jnp.ndarray, connectivity: jnp.ndarray
-    ) -> jnp.ndarray:
-        """
-        Computes the total energy of the system.
-        """
-        u_cells = gather_fields(u_flat, connectivity, dof_per_node=coords.shape[1])
-        X_cells = coords[connectivity]
-        return jnp.sum(self.integrate(u_cells, X_cells))
