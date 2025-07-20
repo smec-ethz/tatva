@@ -8,6 +8,7 @@ import equinox as eqx
 from typing import Callable
 from femsolver.jax_utils import auto_vmap, vmap
 from femsolver.quadrature import Element
+import abc
 
 
 def gather_fields(
@@ -34,13 +35,11 @@ class Operator(eqx.Module):
     """
 
     element: Element
-    integrand: Callable
 
-    def __init__(self, element: Element, integrand: Callable):
+    def __init__(self, element: Element):
         self.element = element
-        self.integrand = integrand
 
-    @vmap(in_axes=(None, 0))
+    @eqx.filter_vmap(in_axes=(None, 0))
     def interpolate(
         self,
         nodal_values: jnp.ndarray,
@@ -54,9 +53,8 @@ class Operator(eqx.Module):
             return self.element.interpolate(xi, nodal_values)
 
         return jax.vmap(_interpolate)(qp)
-    
 
-    @vmap(in_axes=(None, 0, 0))
+    @eqx.filter_vmap(in_axes=(None, 0, 0))
     def gradient(
         self,
         nodal_values: jnp.ndarray,
@@ -73,8 +71,13 @@ class Operator(eqx.Module):
 
         return jax.vmap(_gradient)(qp)
 
-    # --- Element-level energy ---
-    @vmap(in_axes=(None, 0, 0))
+    @eqx.filter_vmap(
+        in_axes=(
+            None,
+            0,
+            0,
+        )
+    )
     def integrate(
         self,
         nodal_values: jnp.ndarray,
@@ -83,16 +86,12 @@ class Operator(eqx.Module):
         """
         Integrates the energy over the cells.
         """
-        qp, w = self.element.get_quadrature()
+        xi, w = self.element.get_quadrature()
+        return jnp.sum(self.integrand(xi, w, nodal_values, nodes))
 
-        def integrand(xi, wi):
-            u_quad, u_grad, detJ = self.element.get_local_values(
-                xi, nodal_values, nodes
-            )
-            value = self.integrand(u_quad)
-            return wi * value * detJ
-
-        return jnp.sum(jax.vmap(integrand)(qp, w))
+    @abc.abstractmethod
+    def integrand(self, xi, wi, nodal_values, nodes):
+        raise NotImplementedError
 
 
 class FemOperator(eqx.Module):
