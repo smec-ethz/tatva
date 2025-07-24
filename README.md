@@ -17,6 +17,21 @@ We recommend to create a python virtual environment and then install the library
 pip install -e .
 ```
 
+## Roadmap
+
+- [x] Add example for linear elasticity (**Mohit**)
+- [x] Add example for nonlinear elasticity (**Mohit**)
+- [ ] Add example for Dirichlet BCs as constraints (**Mohit**)
+- [ ] Add example for matrix-free solvers (with Dirichlet BCs) (**Mohit**)
+- [x] Add example for contact problems with penalty method (**Mohit**)
+- [ ] Add example for contact problems with Lagrange multipliers (**Flavio**)
+- [ ] Add example for contact problems with augmented Lagrangian method (**Flavio**)
+- [x] Add example for cohesive fracture problems (**Mohit**)
+- [ ] Add example for cohesive fracture problems in dynamics (**Mohit**)
+- [ ] Add example for thermal-mechanical coupled problems (**Mohit**)
+- [ ] Add example for phase-field fracture coupled problems (**Mohit**)
+
+
 ## Usage
 
 The basic usage of the library is shown below for a linear elastic case. 
@@ -27,8 +42,12 @@ jax.config.update("jax_enable_x64", True)  # use double-precision
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_platforms", "cpu")
 
-from femsolver.quadrature import quad_tri3, shape_fn_tri3
-from femsolver.operator import FemOperator
+from femsolver.quadrature import get_element, Element
+from femsolver.operator import Operator
+from femsolver.jax_utils import auto_vmap 
+import jax.numpy as jnp
+import equinox as eqx
+
 import matplotlib.pyplot as plt
 import cmcrameri.cm as cmc
 ```
@@ -76,62 +95,85 @@ $$
 \epsilon = \frac{1}{2} (\nabla u + \nabla u^T)
 $$
 
+To ease the handling of the material paramters and later on ease the integration of the material parameters for computing energy density, we define a class `Material` that can be used to define the material parameters.
+
+```python
+class Material(eqx.Module):
+    mu: eqx.AbstractVar[float] 
+    lmbda: eqx.AbstractVar[float]
+```
+Now we can define the python functions to compute the strain, stress and energy density.
+
 ```python
 # --- Material model (linear elasticity: plane strain) ---
+@auto_vmap(grad_u=2)
 def compute_strain(grad_u):
     return 0.5 * (grad_u + grad_u.T)
 
-
-def compute_stress(eps, mu=1.0, lmbda=1.0):
+@auto_vmap(eps=2, mu=0, lmbda=0)
+def compute_stress(eps, mu, lmbda):
     I = jnp.eye(2)
     return 2 * mu * eps + lmbda * jnp.trace(eps) * I
 
-
-def linear_elasticity_energy(grad_u, mu=1.0, lmbda=1.0):
+@auto_vmap(grad_u=2, mu=0, lmbda=0)
+def linear_elasticity_energy(grad_u, mu, lmbda):
     eps = compute_strain(grad_u)
     sigma = compute_stress(eps, mu, lmbda)
     return 0.5 * jnp.sum(sigma * eps)
+
 ```
+The femsolver provides a generic class `Operator` that can be used to solve FEM problems. This operator is the core of the library as it provide functions that can automatically integrate the energy density function defined above over the range of elements.
 
-The femsolver provides a generic class `FemOperator` that can be used to solve FEM problems. This operator is the core of the library as it provide functions that can automatically integrate the energy density function defined above over the range of elements.
-
-It takes three arguments:
-
-- `compute_quads`: a function that returns the quadrature points and weights for the elements
-- `compute_shape_fn`: a function that returns the shape functions for the elements
-- `compute_energy`: a function that returns the energy density for the elements
+Below, we define a class `ElasticityOperator` that inherits from `Operator` and `Material`.
 
 ```python
-fem = FemOperator(quad_tri3, shape_fn_tri3, linear_elasticity_energy)
+class ElasticityOperator(Operator, Material):
+    element: Element
+    mu: float
+    lmbda: float
+
+    @auto_vmap(xi=1, wi=1, nodal_values=None, nodes=None)
+    def integrand(self, xi, wi, nodal_values, nodes):
+        u_quad, u_grad, detJ = self.element.get_local_values(
+            xi, nodal_values, nodes
+        )
+        value = linear_elasticity_energy(u_grad, self.mu, self.lmbda)
+        return wi * value * detJ
 ```
 
-In the above definition of the ``FemOperator`` class, we have used the ``quad_tri3`` and ``shape_fn_tri3`` functions to compute the quadrature points and shape functions for the triangular elements.
+The `integrand` function is the key function that is used to integrate the energy density over the range of elements. It is a function that takes the quadrature points, weights, nodal values and nodes as input and returns the energy density.
 
-One can simply replace these two functions with any other quadrature and shape function. Just look at the ``quad_tri3`` and ``shape_fn_tri3`` functions in ``femsolver/quadrature.py`` to see how to define your own.
+The `Operator` class relies on the `Element` type. The `Element` class is a generic class that can be used to define the element type. The `Element` class knows what quadrature rule to apply and what shape functions to use.  It provides a `get_local_values` function that can be used to compute the local values of the displacement field (and its gradient) at the quadrature points.
 
-For more complex problems, one can define their own implementation of the `FemOperator` class. One just have to inherit from the `FemOperator` class and override the functions that are needed.
+To see in detail the functionalities of `Element` class or define a new `Element` type, please refer to the file `femsolver/quadrature.py`.
 
-For example, if we want to solve a problem with a history dependent material model, we can define a new class that inherits from the `FemOperator` class and overrides the integration functions.
+For this example, we are using the `tri3` element. The `tri3` element is a triangular element with 3 nodes. The `tri3` element is defined in the file `femsolver/quadrature.py`.
 
 ```python
-class HistoryDependentElasticityOperator(FemOperator):
-    def integrate(self, nodal_values, nodes, history_variables):
-        qp, w  = self.funcs["quads"]()
+tri3 = get_element("tri3")
+```
 
-        def integrand(xi, wi, history):
-            N, dNdr = self.funcs["shape_fn"](xi)
-            J = dNdr @ nodes
-            u_grad = self.gradient(xi, nodal_values, nodes)
-            energy = self.funcs["energy"](u_grad, history)  
-            return wi * energy * jnp.linalg.det(J)
+One can simply replace this element with any other element. Just look at the `tri3` element in `femsolver/quadrature.py` to see how to define your own.
 
-        return jnp.sum(jax.vmap(integrand)(qp, w, history_variables))
+For more complex problems, one can define their own implementation of the `Operator` class. One just have to inherit from the `Operator` class and override the functions that are needed.
+
+For example, if we want to solve a problem with a history dependent material model, we can define a new class that inherits from the `Operator` class and overrides the integration functions.
+
+```python
+class HistoryDependentOperator(Operator):
+    element: Element
+    @auto_vmap(xi=1, wi=1, nodal_values=None, nodes=None, history_variables=1)
+    def integrate(self, xi, wi, nodal_values, nodes, history_variables):
+        u_quad, u_grad, detJ = self.element.get_local_values(
+            xi, nodal_values, nodes
+        )
+        value = self.integrand(u_grad, history_variables)
+        return wi * value * detJ
 ```
 
 For full implementation of such complex examples, please refere to the `examples/` directory.
 
-
-
+Now we can define the mesh and the operator.
 
 ```python
 # --- Mesh ---
@@ -184,59 +226,63 @@ u_full = prescribed_values.at[free_dofs].set(u_free)
 For visualization, we can now compute the von Mises stress on the deformed mesh.
 
 ```python
+@auto_vmap(stress=2)
 def von_mises_stress(stress):
     s_xx, s_yy = stress[0, 0], stress[1, 1]
     s_xy = stress[0, 1]
     return jnp.sqrt(s_xx**2 - s_xx * s_yy + s_yy**2 + 3 * s_xy**2)
+```
+
+We can now call the functions defined above to compute the strains and stresses for each element at its quadrature points.
+
+```python
+grad_us = fem.gradient(u_full.reshape(-1, n_dofs_per_node)[elements], coords[elements])
+strains = compute_strain(grad_us)
+stresses = compute_stress(strains, fem.mu, fem.lmbda)
+stress_vm = von_mises_stress(stresses)
+```
+
+In the above example, we have used the `gradient` function to compute the gradient of the displacement field at the quadrature points. The `gradient` function is a function that takes nodal values (per cell) and nodes (per cell) as input and returns the gradient of the displacement field (per cell per quadrature point).
+
+Thus, the shape of the `grad_us` is `(n_elements, n_quadrature_points, n_dofs_per_node, n_dofs_per_node)`.
 
 
-# --- Compute von Mises stress per element ---
-def compute_element_stress(coords, u, elements, fem):
-    u_cells = u.reshape(-1, 2)[elements]
-    coords_cells = coords[elements]
-
-    def element_von_mises(u_e, x_e):
-        qp, _ = quad_tri3()
-        xi = qp[0]  # just take one point per element
-        grad_u = fem.gradient(xi, u_e, x_e)
-        eps = compute_strain(grad_u)
-        sigma = compute_stress(eps)
-        return von_mises_stress(sigma)
-
-    return jax.vmap(element_von_mises)(u_cells, coords_cells)
-
-
+```python
 # --- Visualization ---
+from femsolver.plotting import STYLE_PATH
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
 def plot_displacement_and_stress(coords, u, elements, stress, scale=1.0):
     displaced = coords + scale * u
     tri_elements = elements
-
-    plt.figure(figsize=(10, 5))
-    plt.tripcolor(
+    
+    plt.style.use(STYLE_PATH)
+    fig =plt.figure(figsize=(5, 4))
+    ax = plt.axes()
+    cb =ax.tripcolor(
         displaced[:, 0],
         displaced[:, 1],
         tri_elements,
         facecolors=stress,
         shading="flat",
-        cmap="viridis",
+        cmap=cmc.managua_r,
+        edgecolors="black",
     )
-    plt.colorbar(label="Von Mises Stress")
-    plt.title("Von Mises Stress on Deformed Mesh")
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.axis("equal")
-    plt.grid(True)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal")
+    ax.set_title("Von Mises Stress on Deformed Mesh")
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.05)
+    fig.colorbar(cb, cax=cax)
     plt.show()
-
 
 # --- Compute the stress ---    
 u = u_full.reshape(-1, n_dofs_per_node)
 
-stress_vm = compute_element_stress(coords, u, elements, fem)
 
 # --- Plot the displacement and stress ---
-plot_displacement_and_stress(coords, u, elements, stress_vm)
-
+plot_displacement_and_stress(coords, u, elements, stress_vm.flatten())
 ```
 
 ![Von Mises Stress on Deformed Mesh](examples/notebooks/linear_elasticity.png)
