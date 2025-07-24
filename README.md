@@ -151,6 +151,7 @@ For this example, we are using the `tri3` element. The `tri3` element is a trian
 
 ```python
 tri3 = get_element("tri3")
+fem = ElasticityOperator(tri3, mu=1.0, lmbda=1.0)
 ```
 
 One can simply replace this element with any other element. Just look at the `tri3` element in `femsolver/quadrature.py` to see how to define your own.
