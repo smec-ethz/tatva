@@ -34,10 +34,8 @@ class Operator(eqx.Module):
         integrate: Integrates the integrand over the cells.
     """
 
-    element: Element
+    element: eqx.AbstractVar[Element]
 
-    def __init__(self, element: Element):
-        self.element = element
 
     @eqx.filter_vmap(in_axes=(None, 0))
     def interpolate(
