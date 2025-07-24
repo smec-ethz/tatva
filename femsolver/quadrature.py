@@ -159,6 +159,7 @@ def get_element(name: str) -> Element:
     return element_class()
 
 
+''''
 # --- Shape functions and quadrature ---
 def quad_quad4() -> tuple[jnp.ndarray, jnp.ndarray]:
     """
@@ -344,3 +345,4 @@ class Basis:
         instance.wts = ω
         instance.quad_pts = quad_pts
         return instance
+'''

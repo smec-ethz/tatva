@@ -11,14 +11,6 @@ from femsolver.quadrature import Element
 import abc
 
 
-def gather_fields(
-    u_flat: jnp.ndarray, connectivity: jnp.ndarray, dof_per_node: int
-) -> jnp.ndarray:
-    """
-    Gathers the fields from the flat array to the full array.
-    """
-    u_full = u_flat.reshape(-1, dof_per_node)
-    return u_full[connectivity]
 
 
 class Operator(eqx.Module):
@@ -60,6 +52,7 @@ class Operator(eqx.Module):
     ) -> jnp.ndarray:
         """
         Computes the gradient of the nodal values at the given points.
+        TODO: add the option to provide a function instead of nodal values
         """
         qp, w = self.element.get_quadrature()
 
@@ -90,6 +83,16 @@ class Operator(eqx.Module):
     @abc.abstractmethod
     def integrand(self, xi, wi, nodal_values, nodes):
         raise NotImplementedError
+
+'''
+def gather_fields(
+    u_flat: jnp.ndarray, connectivity: jnp.ndarray, dof_per_node: int
+) -> jnp.ndarray:
+    """
+    Gathers the fields from the flat array to the full array.
+    """
+    u_full = u_flat.reshape(-1, dof_per_node)
+    return u_full[connectivity]
 
 
 class FemOperator(eqx.Module):
@@ -199,3 +202,4 @@ class FemOperator(eqx.Module):
             return wi * energy * jnp.linalg.det(J)
 
         return jnp.sum(jax.vmap(integrand)(qp, w))
+'''
