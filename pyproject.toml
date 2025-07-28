@@ -1,0 +1,37 @@
+[project]
+name = "femsolver"
+version = "0.1.0"
+description = "Functional programming and differentiable framework for finite element methods"
+authors = [
+    { name = "Mohit Pundir", email = "mpundir@ethz.ch" },
+    { name = "Flavio Lorez", email = "florez@ethz.ch" },
+]
+license = "MIT"
+license-files = ["LICENSE.md",]
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "jax==0.6.1",
+    "equinox",
+    "numpy",
+    "sparsejac",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+examples = [
+    "petsc",
+    "petsc4py",
+    "cmcrameri",
+]
+
+[build-system]
+requires = [ "hatchling", ]
+build-backend = "hatchling.build"
+
+[project.urls]
+repository = "https://gitlab.ethz.ch/compmechmat/research/mohit-pundir/femsolver"
