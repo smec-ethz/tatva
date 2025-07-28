@@ -15,7 +15,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "jax==0.6.1",
+    "jax<=0.6.1",
     "equinox",
     "numpy",
     "sparsejac",
