@@ -19,3 +19,4 @@ arguments-*
 *jax-cache*
 *egg-info*
 *build*
+uv.lock

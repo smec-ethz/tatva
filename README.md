@@ -11,11 +11,20 @@ Functional programming and differentiable framework for finite element method (F
 
 ## Installation
 
-We recommend to create a python virtual environment and then install the library.
-
+Clone the repository and install the package with pip:
 ```bash
-pip install -e .
+pip install path/to/femsolver
 ```
+
+You can also use pip to install directly from the GitLab repository. Make sure
+you have access to the repository and have set up SSH keys for authentication.
+```bash
+pip install git+ssh://git@gitlab.ethz.ch/compmechmat/research/mohit-pundir/femsolver.git
+```
+
+> [!note]
+> We strongly recommend to always use a virtual environment. We further
+> recommend using [uv](https://docs.astral.sh/uv/).
 
 ## Roadmap
 
