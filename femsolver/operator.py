@@ -96,7 +96,7 @@ class Operator(eqx.Module):
 
         return _integrate
 
-    def interpolate_function(self, func: Integrand) -> IntegrateFunction:
+    def eval_at_quad(self, func: Integrand) -> IntegrateFunction:
         """Decorator to interpolate a local function at the mesh elements quad points.
 
         Returns a function that takes nodal values and additional values at quadrature
@@ -140,12 +140,12 @@ class Operator(eqx.Module):
 
         return _interpolate
 
-    def interpolate(
+    def at_quad(
         self,
         nodal_values: jax.Array,
         *_additional_values_at_quad: jax.Array,
     ) -> jax.Array:
-        """Interpolates the given function at the mesh nodes.
+        """Interpolates the given function at the quad points.
 
         Args:
             nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
@@ -172,12 +172,12 @@ class Operator(eqx.Module):
             nodal_values[self.mesh.elements], self.mesh.nodes[self.mesh.elements]
         )
 
-    def gradient(
+    def grad(
         self,
         nodal_values: jax.Array,
         *_additional_values_at_quad: jax.Array,
     ) -> jax.Array:
-        """Computes the gradient of the nodal values at the mesh nodes.
+        """Computes the gradient of the nodal values at the quad points.
 
         Args:
             nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
