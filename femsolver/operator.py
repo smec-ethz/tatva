@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable, Protocol
+from typing import Callable, Protocol, overload
 
 import equinox as eqx
 import jax
@@ -96,7 +96,26 @@ class Operator(eqx.Module):
 
         return _integrate
 
-    def eval_at_quad(self, func: Integrand) -> IntegrateFunction:
+    @overload
+    def eval(self, arg: Integrand) -> IntegrateFunction: ...
+    @overload
+    def eval(
+        self, arg: jax.Array, *additional_values_at_quad: jax.Array
+    ) -> jax.Array: ...
+    def eval(self, arg, *additional_values_at_quad) -> IntegrateFunction | jax.Array:
+        """Decorator to evaluate a local function at the mesh elements quad points.
+
+        Returns a function that takes nodal values and additional values at quadrature
+        points and returns the evaluated values at the quadrature points.
+        *(shape: (n_elements, n_quad_points, n_values))*
+        """
+
+        if isinstance(arg, Callable):
+            return self._eval_functor_at_quad_points(arg)
+
+        return self._eval_nodals_at_quad_points(arg, *additional_values_at_quad)
+
+    def _eval_functor_at_quad_points(self, func: Integrand) -> IntegrateFunction:
         """Decorator to interpolate a local function at the mesh elements quad points.
 
         Returns a function that takes nodal values and additional values at quadrature
@@ -108,23 +127,9 @@ class Operator(eqx.Module):
             nodal_values: jax.Array,
             *_additional_values_at_quad: jax.Array,
         ) -> jax.Array:
-            """Interpolates the given function at the mesh nodes.
-
-            Args:
-                nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
-                *_additional_values_at_quad: Additional values at the quadrature points (optional)
-            """
-
             def _interpolate_each_element(
                 nodal_values: jax.Array, nodal_coords: jax.Array
             ) -> jax.Array:
-                """Interpolates the function over a single element.
-
-                Args:
-                    nodal_values: The nodal values at the element's nodes (shape: (n_nodes_el, n_values))
-                    nodes: The coordinates of the nodes of the element (shape: (n_nodes_el, 2))
-                """
-
                 def _interpolate_quad(xi: jax.Array) -> jax.Array:
                     """Calls the function (interpolator) on a quad point."""
                     u, u_grad, _detJ = self.element.get_local_values(
@@ -140,7 +145,7 @@ class Operator(eqx.Module):
 
         return _interpolate
 
-    def at_quad(
+    def _eval_nodals_at_quad_points(
         self,
         nodal_values: jax.Array,
         *_additional_values_at_quad: jax.Array,
@@ -155,13 +160,6 @@ class Operator(eqx.Module):
         def _interpolate_each_element(
             nodal_values: jax.Array, nodal_coords: jax.Array
         ) -> jax.Array:
-            """Interpolates the function over a single element.
-
-            Args:
-                nodal_values: The nodal values at the element's nodes (shape: (n_nodes_el, n_values))
-                nodes: The coordinates of the nodes of the element (shape: (n_nodes_el, 2))
-            """
-
             def _interpolate_quad(xi: jax.Array) -> jax.Array:
                 """Calls the function (interpolator) on a quad point."""
                 return self.element.interpolate(xi, nodal_values)
