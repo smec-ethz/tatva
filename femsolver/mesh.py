@@ -14,7 +14,7 @@ class Mesh(NamedTuple):
         elements: The connectivity of the mesh elements.
     """
 
-    nodes: jax.Array  # Shape (n_nodes, n_dim)
+    coords: jax.Array  # Shape (n_nodes, n_dim)
     elements: jax.Array  # Shape (n_elements, n_nodes_per_element)
 
     @classmethod

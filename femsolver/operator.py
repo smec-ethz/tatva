@@ -101,7 +101,7 @@ class Operator(eqx.Module):
         return jax.vmap(
             _at_each_element,
             in_axes=(0, 0),
-        )(nodal_values[self.mesh.elements], self.mesh.nodes[self.mesh.elements])
+        )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
 
     def integrate(self, func: Form) -> FormCallable:
         """Decorator to integrate a function over the mesh.
@@ -332,5 +332,5 @@ class OperatorTotalLagrangian(Operator):
             in_axes=(0, 0),
         )(
             nodal_values[self.mesh.elements],
-            (self.mesh.nodes + nodal_values)[self.mesh.elements],
+            (self.mesh.coords + nodal_values)[self.mesh.elements],
         )
