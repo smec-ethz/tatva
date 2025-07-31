@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Any, Callable, Protocol, overload
+from typing import Any, Callable, Concatenate, ParamSpec, Protocol, TypeAlias, overload
 
 import equinox as eqx
 import jax
@@ -13,28 +13,19 @@ from femsolver.utils import auto_vmap
 
 # TODO: naming of these types
 
+P = ParamSpec("P")
 
-class FormCallable(Protocol):
+
+Form: TypeAlias = Callable[Concatenate[jax.Array, jax.Array, P], jax.Array]
+
+
+class FormCallable(Protocol[P]):
     @staticmethod
     def __call__(
         nodal_values: jax.Array,
-        *args: Any,
+        *args: P.args,
+        **kwargs: P.kwargs,
     ) -> jax.Array: ...
-
-
-Form = Callable[
-    [jax.Array, jax.Array, *tuple[Any, ...]], jax.Array
-]  # values, gradients, *additional args -> result
-
-# # TODO: This will give better type checking (will show the actual expected arguments)
-# # but it will report an error if the function arguments are named differently :(
-# class Form(Protocol):
-#     @staticmethod
-#     def __call__(
-#         values: jax.Array,
-#         gradients: jax.Array,
-#         *additionals: Any,
-#     ) -> jax.Array: ...
 
 
 class _VmapOverElementsCallable(Protocol):
@@ -114,7 +105,55 @@ class Operator(eqx.Module):
             additional_values_at_quad,
         )
 
-    def integrate(self, func: Form) -> FormCallable:
+    @overload
+    def integrate(self, arg: Form[P]) -> FormCallable[P]: ...
+    @overload
+    def integrate(self, arg: jax.Array) -> jax.Array: ...
+    def integrate(self, arg):
+        """Integrate a function/nodal_array/quad_array over the mesh.
+
+        If a function is provided, it returns a function that integrates the function given the nodal values.
+        If nodal values or quad values are given, it returns the integral.
+
+        Returns:
+            A function that integrates the given function over the mesh, or the integral
+            (**scalar**) of the nodal values or quadrature values over the mesh.
+        """
+        if isinstance(arg, Callable):
+            return self._integrate_functor(arg, sum=True)
+
+        if arg.shape[0] == self.mesh.elements.shape[0]:  # element field
+            res = self._integrate_quad_array(arg)
+        else:  # nodal field
+            res = self._integrate_nodal_array(arg)
+
+        return jnp.sum(res, axis=(0, 1))  # Sum over elements and quadrature points
+
+    @overload
+    def integrate_per_element(self, arg: Form[P]) -> FormCallable[P]: ...
+    @overload
+    def integrate_per_element(self, arg: jax.Array) -> jax.Array: ...
+    def integrate_per_element(self, arg):
+        """Integrate a function/nodal_array/quad_array over the mesh, returning the result per element.
+
+        If a function is provided, it returns a function that integrates the function given the nodal values.
+        If nodal values or quad values are given, it returns the integral per element.
+
+        Returns:
+            A function that integrates the given function over the mesh, or the integral
+            of the nodal values or quadrature values over each element.
+        """
+        if isinstance(arg, Callable):
+            return self._integrate_functor(arg, sum=False)
+
+        if arg.shape[0] == self.mesh.elements.shape[0]:
+            return self._integrate_quad_array(arg)
+        else:
+            return self._integrate_nodal_array(arg)
+
+    def _integrate_functor(
+        self, func: Form[P], *, sum: bool = False
+    ) -> FormCallable[P]:
         """Decorator to integrate a function over the mesh.
 
         Returns a function that takes nodal values and additional values at quadrature
@@ -124,7 +163,8 @@ class Operator(eqx.Module):
         @eqx.filter_jit
         def _integrate(
             nodal_values: jax.Array,
-            *args: Any,
+            *args: P.args,
+            **kwargs: P.kwargs,
         ) -> jax.Array:
             """Integrates the given local function over the mesh.
 
@@ -145,22 +185,23 @@ class Operator(eqx.Module):
                 u, u_grad, detJ = self.element.get_local_values(
                     xi, el_nodal_values, el_nodal_coords
                 )
-                return func(u, u_grad, *args) * detJ
+                return func(u, u_grad, *args, **kwargs) * detJ
 
-            return jnp.sum(
-                jnp.einsum(
-                    "eq...,q...->eq...",
-                    self._vmap_over_elements_and_quads(
-                        nodal_values, _integrate_quads, _additional_values_at_quad
-                    ),
-                    self.element.quad_weights,
-                ),
-                axis=(0, 1),  # Sum over elements and quadrature points
+            res = jnp.einsum(
+                "eq...,q...->eq...",
+                self._vmap_over_elements_and_quads(nodal_values, _integrate_quads),
+                self.element.quad_weights,
             )
+            if sum:
+                return jnp.sum(
+                    res, axis=(0, 1)
+                )  # Sum over elements and quadrature points
+            else:
+                return res
 
         return _integrate
 
-    def integrate_quad_array(self, quad_values: jax.Array) -> jax.Array:
+    def _integrate_quad_array(self, quad_values: jax.Array) -> jax.Array:
         """Integrates a given array of values at quadrature points over the mesh.
 
         Args:
@@ -181,8 +222,19 @@ class Operator(eqx.Module):
             jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights),
         )
 
+    def _integrate_nodal_array(self, nodal_values: jax.Array) -> jax.Array:
+        """Integrates a given array of nodal values over the mesh.
+
+        Args:
+            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+
+        Returns:
+            A jax.Array where each element contains the integral of the nodal values in the element
+        """
+        return self._integrate_quad_array(self.eval(nodal_values))
+
     @overload
-    def eval(self, arg: Form) -> FormCallable: ...
+    def eval(self, arg: Form[P]) -> FormCallable[P]: ...
     @overload
     def eval(self, arg: jax.Array, *args: tuple[Any, ...]) -> jax.Array: ...
     def eval(self, arg, *args):
@@ -197,7 +249,7 @@ class Operator(eqx.Module):
         else:
             return self._eval_direct(arg)
 
-    def _eval_functor(self, func: Form) -> FormCallable:
+    def _eval_functor(self, func: Form[P]) -> FormCallable[P]:
         """Decorator to interpolate a local function at the mesh elements quad points.
 
         Returns a function that takes nodal values and additional values at quadrature
@@ -207,7 +259,8 @@ class Operator(eqx.Module):
 
         def _eval(
             nodal_values: jax.Array,
-            *args: Any,
+            *args: P.args,
+            **kwargs: P.kwargs,
         ) -> jax.Array:
             """Interpolates the given function at the mesh nodes.
 
@@ -226,7 +279,7 @@ class Operator(eqx.Module):
                 u, u_grad, _detJ = self.element.get_local_values(
                     xi, el_nodal_values, el_nodal_coords
                 )
-                return func(u, u_grad, *args)
+                return func(u, u_grad, *args, **kwargs)
 
             return self._vmap_over_elements_and_quads(
                 nodal_values, _eval_quad, _additional_values_at_quad
@@ -258,7 +311,7 @@ class Operator(eqx.Module):
         )
 
     @overload
-    def grad(self, arg: Form) -> FormCallable: ...
+    def grad(self, arg: Form[P]) -> FormCallable[P]: ...
     @overload
     def grad(self, arg: jax.Array, *args: tuple[Any, ...]) -> jax.Array: ...
     def grad(self, arg, *args):
@@ -294,7 +347,7 @@ class Operator(eqx.Module):
             nodal_values, _gradient_quad, _additional_values_at_quad
         )
 
-    def _grad_functor(self, func: Form, *args: tuple[Any, ...]) -> FormCallable:
+    def _grad_functor(self, func: Form[P]) -> FormCallable[P]:
         """Decorator to compute the gradient of a local function at the mesh elements quad
         points.
 
