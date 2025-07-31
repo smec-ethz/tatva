@@ -280,3 +280,56 @@ class Operator(eqx.Module):
         """
         # TODO: Not sure this is useful
         ...
+
+
+class OperatorTotalLagrangian(Operator):
+    """A class that provides an Operator for finite element method (FEM) assembly.
+
+    Other than the base `Operator`, this class is specifically designed for total Lagrangian
+    formalism. Meaning, integration is done over the deformed configuration of the mesh.
+    Nodal values are expected to be the displacements of the nodes, not an arbitrary field.
+    Ensure your model is set up accordingly.
+
+    Args:
+        mesh: The mesh containing the elements and nodes.
+        element: The element type used for the finite element method.
+
+    Provides several operators for evaluating and integrating functions over the mesh,
+    such as `integrate`, `eval`, and `grad`. These operators can be used to compute
+    integrals, evaluate functions at quadrature points, and compute gradients of
+    functions at quadrature points.
+    """
+
+    def _vmap_over_elements_and_quads(
+        self, nodal_values: jax.Array, func: _VmapOverElementsCallable
+    ) -> jax.Array:
+        """Helper function. Maps a function over the elements and quadrature points of the
+        mesh.
+
+        Args:
+            nodal_values: The nodal **displacement** at the element's nodes (shape: (n_nodes, n_dim))
+            func: The function to map over the elements and quadrature points.
+
+        Returns:
+            A jax.Array with the results of the function applied at each quadrature point
+            of each element (shape: (n_elements, n_quad_points, n_values)).
+        """
+
+        def _at_each_element(
+            el_nodal_values: jax.Array, el_nodal_coords: jax.Array
+        ) -> jax.Array:
+            return jax.vmap(
+                partial(
+                    func,
+                    el_nodal_values=el_nodal_values,
+                    el_nodal_coords=el_nodal_coords,
+                )
+            )(self.element.quad_points)
+
+        return jax.vmap(
+            _at_each_element,
+            in_axes=(0, 0),
+        )(
+            nodal_values[self.mesh.elements],
+            (self.mesh.nodes + nodal_values)[self.mesh.elements],
+        )
