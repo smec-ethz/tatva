@@ -283,7 +283,7 @@ class Operator(eqx.Module):
         ...
 
 
-class OperatorTotalLagrangian(Operator):
+class OperatorUpdatedLagrangian(Operator):
     """A class that provides an Operator for finite element method (FEM) assembly.
 
     Other than the base `Operator`, this class is specifically designed for total Lagrangian
