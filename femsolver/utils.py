@@ -1,9 +1,9 @@
 from __future__ import annotations
+
 import inspect
 from functools import partial, wraps
 from inspect import signature
 from typing import Any, Callable, Optional, Union
-
 
 import jax
 import jax.numpy as jnp
