@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable, Protocol, overload
+from typing import Any, Callable, Protocol, overload
 
 import equinox as eqx
 import jax
@@ -18,13 +18,13 @@ class FormCallable(Protocol):
     @staticmethod
     def __call__(
         nodal_values: jax.Array,
-        *additional_values_at_quad: jax.Array,
+        *args: Any,
     ) -> jax.Array: ...
 
 
 Form = Callable[
-    [jax.Array, jax.Array, *tuple[jax.Array, ...]], jax.Array
-]  # values, gradients, *additionals -> result
+    [jax.Array, jax.Array, *tuple[Any, ...]], jax.Array
+]  # values, gradients, *additional args -> result
 
 # # TODO: This will give better type checking (will show the actual expected arguments)
 # # but it will report an error if the function arguments are named differently :(
@@ -33,7 +33,7 @@ Form = Callable[
 #     def __call__(
 #         values: jax.Array,
 #         gradients: jax.Array,
-#         *additionals: jax.Array,
+#         *additionals: Any,
 #     ) -> jax.Array: ...
 
 
@@ -124,13 +124,13 @@ class Operator(eqx.Module):
         @eqx.filter_jit
         def _integrate(
             nodal_values: jax.Array,
-            _additional_values_at_quad: jax.Array = None,
+            *args: Any,
         ) -> jax.Array:
             """Integrates the given local function over the mesh.
 
             Args:
                 nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
-                *_additional_values_at_quad: Additional values at the quadrature points (optional)
+                *args: Additional arguments to pass to the function (optional)
             """
 
             def _integrate_quads(
@@ -145,7 +145,7 @@ class Operator(eqx.Module):
                 u, u_grad, detJ = self.element.get_local_values(
                     xi, el_nodal_values, el_nodal_coords
                 )
-                return func(u, u_grad, additional_values_at_quad) * detJ
+                return func(u, u_grad, *args) * detJ
 
             return jnp.sum(
                 jnp.einsum(
@@ -184,8 +184,8 @@ class Operator(eqx.Module):
     @overload
     def eval(self, arg: Form) -> FormCallable: ...
     @overload
-    def eval(self, arg: jax.Array, *additional_values_at_quad) -> jax.Array: ...
-    def eval(self, arg, *additional_values_at_quad):
+    def eval(self, arg: jax.Array, *args: tuple[Any, ...]) -> jax.Array: ...
+    def eval(self, arg, *args):
         """Evaluates the function at the quadrature points.
 
         If a function is provided, it returns a function that interpolates the nodal values
@@ -193,9 +193,9 @@ class Operator(eqx.Module):
         values at the quadrature points.
         """
         if isinstance(arg, Callable):
-            return self._eval_functor(arg)
+            return self._eval_functor(arg, *args)
         else:
-            return self._eval_direct(arg, *additional_values_at_quad)
+            return self._eval_direct(arg)
 
     def _eval_functor(self, func: Form) -> FormCallable:
         """Decorator to interpolate a local function at the mesh elements quad points.
@@ -207,13 +207,13 @@ class Operator(eqx.Module):
 
         def _eval(
             nodal_values: jax.Array,
-            _additional_values_at_quad: jax.Array = None,
+            *args: Any,
         ) -> jax.Array:
             """Interpolates the given function at the mesh nodes.
 
             Args:
                 nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
-                *_additional_values_at_quad: Additional values at the quadrature points (optional)
+                *args: Additional arguments to pass to the function (optional)
             """
 
             def _eval_quad(
@@ -226,7 +226,7 @@ class Operator(eqx.Module):
                 u, u_grad, _detJ = self.element.get_local_values(
                     xi, el_nodal_values, el_nodal_coords
                 )
-                return func(u, u_grad, additional_values_at_quad)
+                return func(u, u_grad, *args)
 
             return self._vmap_over_elements_and_quads(
                 nodal_values, _eval_quad, _additional_values_at_quad
@@ -237,13 +237,11 @@ class Operator(eqx.Module):
     def _eval_direct(
         self,
         nodal_values: jax.Array,
-        _additional_values_at_quad: jax.Array = None,
     ) -> jax.Array:
         """Interpolates the given function at the quad points.
 
         Args:
             nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
-            *_additional_values_at_quad: Additional values at the quadrature points (optional)
         """
 
         def _eval_quad(
@@ -262,10 +260,8 @@ class Operator(eqx.Module):
     @overload
     def grad(self, arg: Form) -> FormCallable: ...
     @overload
-    def grad(
-        self, arg: jax.Array, *additional_values_at_quad: jax.Array
-    ) -> jax.Array: ...
-    def grad(self, arg, *additional_values_at_quad):
+    def grad(self, arg: jax.Array, *args: tuple[Any, ...]) -> jax.Array: ...
+    def grad(self, arg, *args):
         """Evaluates the gradient of the function at the quadrature points.
 
         If a function is provided, it returns a function that computes the gradient of the
@@ -273,20 +269,15 @@ class Operator(eqx.Module):
         gradient of the nodal values at the quadrature points.
         """
         if isinstance(arg, Callable):
-            return self._grad_functor(arg)
+            return self._grad_functor(arg, *args)
         else:
-            return self._grad_direct(arg, *additional_values_at_quad)
+            return self._grad_direct(arg)
 
-    def _grad_direct(
-        self,
-        nodal_values: jax.Array,
-        _additional_values_at_quad: jax.Array = None,
-    ) -> jax.Array:
+    def _grad_direct(self, nodal_values: jax.Array) -> jax.Array:
         """Computes the gradient of the nodal values at the quad points.
 
         Args:
             nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
-            *_additional_values_at_quad: Additional values at the quadrature points (optional)
         """
 
         def _gradient_quad(
@@ -303,7 +294,7 @@ class Operator(eqx.Module):
             nodal_values, _gradient_quad, _additional_values_at_quad
         )
 
-    def _grad_functor(self, func: Form) -> FormCallable:
+    def _grad_functor(self, func: Form, *args: tuple[Any, ...]) -> FormCallable:
         """Decorator to compute the gradient of a local function at the mesh elements quad
         points.
 
