@@ -24,9 +24,10 @@ dependencies = [
 
 [project.optional-dependencies]
 examples = [
-    "petsc",
-    "petsc4py",
+    # "petsc",
+    # "petsc4py",
     "cmcrameri",
+    "ipykernel>=6.30.0",
 ]
 
 [build-system]
