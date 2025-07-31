@@ -137,7 +137,8 @@ class Operator(eqx.Module):
                     "eq...,q...->eq...",
                     self._vmap_over_elements_and_quads(nodal_values, _integrate_quads),
                     self.element.quad_weights,
-                )
+                ),
+                axis=(0, 1),  # Sum over elements and quadrature points
             )
 
         return _integrate
