@@ -5,6 +5,8 @@ STYLE_PATH = os.path.join(
     os.path.dirname(__file__), "latex_sans_serif.mplstyle"
 )
 
+# Colors
+
 blue = '#009AF9'
 red =  '#E26F46'
 green = '#3DA44D'
