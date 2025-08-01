@@ -1,7 +1,8 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
-
+from jax.experimental import sparse as jax_sparse
+ 
 
 def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
     """
@@ -53,7 +54,7 @@ def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
     indices = np.unique(np.vstack((row_idx, col_idx)).T, axis=0)
 
     data = np.ones(indices.shape[0], dtype=jnp.int32)
-    sparsity_pattern = jax.experimental.sparse.BCOO(
+    sparsity_pattern = jax_sparse.BCOO(
         (data, indices.astype(np.int32)), shape=K_shape
     )
     return sparsity_pattern
@@ -94,7 +95,7 @@ def create_sparsity_pattern(
         K_shape: Shape of the matrix K
         constraint_elements: (num_constraint_elements, nodes_per_constraint_element)
     Returns:
-        sparsity_pattern: jax.experimental.sparse.BCOO
+        sparsity_pattern: jax_sparse.BCOO
     """
     sparsity_pattern = _create_sparse_structure(elements, n_dofs_per_node, K_shape)
     if constraint_elements is not None:
@@ -108,7 +109,7 @@ def create_sparsity_pattern(
         combined_indices = np.concatenate(
             [sparsity_pattern.indices, sparsity_pattern_constraint.indices]
         )
-        sparsity_pattern = jax.experimental.sparse.BCOO(
+        sparsity_pattern = jax_sparse.BCOO(
             (combined_data, combined_indices), shape=K_shape
         )
 
