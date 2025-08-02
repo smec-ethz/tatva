@@ -195,6 +195,7 @@ class Operator(eqx.Module):
         else:
             return self._eval_direct(arg, *additional_values_at_quad)
 
+
     def _eval_functor(self, func: Form) -> FormCallable:
         """Decorator to interpolate a local function at the mesh elements quad points.
 
