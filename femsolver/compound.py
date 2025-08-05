@@ -38,60 +38,41 @@ class Compound:
 
     """
 
-    _fields: tuple[tuple[str, field], ...] = ()
-    _splits_flattened_array: tuple[int, ...]
+    _fields: tuple[tuple[str, field, int], ...] = ()
+    _splits_flattened_array: tuple[int, ...] = ()
+    _data: Array
+
+    size: int = 0
 
     def __init_subclass__(cls, **kwargs) -> None:
         """Initialize the subclass and register its fields."""
         super().__init_subclass__(**kwargs)
 
-        splits = ()
-        offset = 0
-        for _, field in cls._fields:
-            size = int(jnp.prod(jnp.array(field.shape)))
-            offset += size
-            splits += (offset,)
-
-        cls._splits_flattened_array = splits
-
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, arr: Array | None = None) -> None:
         """Initialize the state with given keyword arguments."""
-        for name, field in self._fields:
-            if name in kwargs:
-                value = kwargs[name]
-                if isinstance(value, Array):
-                    setattr(self, name, value)
-                else:
-                    setattr(self, name, jnp.full(field.shape, value))
-            else:
-                # Use default factory if provided
-                if field.default_factory is not None:
-                    setattr(self, name, field.default_factory())
-                else:
-                    setattr(self, name, jnp.zeros(field.shape, dtype=float))
+        if arr is not None:
+            assert arr.size == self.size, (
+                f"Array size {arr.size} does not match expected size {self.size}."
+            )
+            self._data = arr
+        else:
+            self._data = jnp.zeros(self.size, dtype=float)
 
     def __len__(self) -> int:
         return len(self._fields)
 
     def __iter__(self) -> Generator[Array, None, None]:
-        for name, _ in self._fields:
+        for name, _, _ in self._fields:
             yield getattr(self, name)
 
     def pack(self) -> Array:
         """Pack the state into a single array. Flattened and concatenated."""
-        return jnp.concatenate(
-            [getattr(self, field).reshape(-1) for field, _ in self._fields]
-        )
+        return self._data
 
     @classmethod
-    def unpack(cls, packed) -> Self:
+    def unpack(cls, packed: Array) -> Self:
         """Unpack the state from a single flattened packed array."""
-        splits = jnp.split(packed, cls._splits_flattened_array[:-1])
-        kwargs = {
-            name: value.reshape(field.shape)
-            for (name, field), value in zip(cls._fields, splits)
-        }
-        return cls(**kwargs)
+        return cls(packed)
 
 
 class field:
@@ -108,21 +89,20 @@ class field:
         self.public_name = name
         self.private_name = f"_{name}"
 
-        owner._fields += ((name, self),)
+        previous_end_idx = owner._fields[-1][2] if owner._fields else 0
+        size = int(jnp.prod(jnp.array(self.shape)))
 
-    def __get__(self, instance, owner):
-        return getattr(instance, self.private_name, None)
+        owner._fields += ((name, self, previous_end_idx + size),)
+        owner.size += size
 
-    def __set__(self, instance, value):
-        if isinstance(value, Array):
-            assert value.shape == self.shape, (
-                f"Value shape {value.shape} does not match field shape {self.shape}."
-            )
-            setattr(instance, self.private_name, value)
-        else:
-            setattr(
-                instance, self.private_name, jnp.full(self.shape, value, dtype=float)
-            )
+        self.slice = slice(previous_end_idx, previous_end_idx + size)
+
+    def __get__(self, instance: Compound, owner):
+        return instance._data[self.slice].reshape(self.shape) if instance else self
+
+    def __set__(self, instance: Compound, value: Array | float | int) -> None:
+        value = jnp.asarray(value)
+        instance._data = instance._data.at[self.slice].set(value)
 
     def __delete__(self, instance):
         raise AttributeError(
