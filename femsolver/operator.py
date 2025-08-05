@@ -127,7 +127,7 @@ class Operator(eqx.Module):
         else:  # nodal field
             res = self._integrate_nodal_array(arg)
 
-        return jnp.sum(res, axis=(0, 1))  # Sum over elements and quadrature points
+        return jnp.sum(res, axis=(0,))  # Sum over elements and quadrature points
 
     @overload
     def integrate_per_element(self, arg: Form[P]) -> FormCallable[P]: ...
