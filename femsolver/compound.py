@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Generator, Self
+from typing import Callable, Generator, Self, overload
 
 import jax.numpy as jnp
 from jax import Array
@@ -65,6 +65,13 @@ class Compound:
         for name, _, _ in self._fields:
             yield getattr(self, name)
 
+    def __repr__(self) -> str:
+        # print shape of each field in the class
+        field_reprs = [
+            f"{name}={getattr(type(self), name).shape}" for name, _, _ in self._fields
+        ]
+        return f"{self.__class__.__name__}({', '.join(field_reprs)})"
+
     def pack(self) -> Array:
         """Pack the state into a single array. Flattened and concatenated."""
         return self._data
@@ -97,8 +104,17 @@ class field:
 
         self.slice = slice(previous_end_idx, previous_end_idx + size)
 
-    def __get__(self, instance: Compound, owner):
-        return instance._data[self.slice].reshape(self.shape) if instance else self
+    @overload
+    def __get__(self, instance: None, owner) -> field: ...
+    @overload
+    def __get__(self, instance: Compound, owner) -> Array: ...
+    def __get__(self, instance, owner):
+        # If instance is None, we are accessing the class attribute, not an instance
+        # attribute. Hence, return the descriptor itself.
+        if instance is None:
+            return self  # pyright: ignore[reportUnreachable]
+
+        return instance._data[self.slice].reshape(self.shape)
 
     def __set__(self, instance: Compound, value: Array | float | int) -> None:
         value = jnp.asarray(value)
