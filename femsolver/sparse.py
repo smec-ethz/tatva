@@ -70,16 +70,18 @@ def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
     return sparsity_pattern
 
 
-def get_bc_indices(indices, fixed_dofs):
+def get_bc_indices(sparsity_pattern: jax_sparse.BCOO, fixed_dofs: Array):
     """
     Get the indices of the fixed degrees of freedom.
     Args:
-        indices: (num_nonzero_elements, 2)
+        sparsity_pattern: jax.experimental.sparse.BCOO
         fixed_dofs: (num_fixed_dofs,)
     Returns:
         zero_indices: (num_zero_indices,)
         one_indices: (num_one_indices,)
     """
+
+    indices = sparsity_pattern.indices
     zero_indices = []
     one_indices = []
 
