@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Callable, Generator, Self, overload
+from typing import Any, Callable, Generator, Self, overload
 
 import jax.numpy as jnp
 from jax import Array
+from jax.tree_util import register_pytree_node_class
 
 
 class Compound:
@@ -44,9 +45,17 @@ class Compound:
 
     size: int = 0
 
+    def tree_flatten(self) -> tuple[tuple[Array], Any]:
+        return (self._data,), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data: Any, children: tuple[Array]) -> Self:
+        return cls(*children)
+
     def __init_subclass__(cls, **kwargs) -> None:
         """Initialize the subclass and register its fields."""
         super().__init_subclass__(**kwargs)
+        register_pytree_node_class(cls)
 
     def __init__(self, arr: Array | None = None) -> None:
         """Initialize the state with given keyword arguments."""
@@ -85,42 +94,77 @@ class Compound:
 class field:
     """A descriptor to define fields in the State class."""
 
+    shape: tuple[int, ...]
+    default_factory: Callable | None
+    idx: _CompoundIdx
+
     def __init__(
         self, shape: tuple[int, ...], default_factory: Callable | None = None
     ) -> None:
         self.shape = shape
         self.default_factory = default_factory
+        self.idx = None  # pyright: ignore
 
     def __set_name__(self, owner: Compound, name: str) -> None:
-        # runs at class creation time to register the field
-        self.public_name = name
-        self.private_name = f"_{name}"
+        # compute slice indices
+        start = owner._fields[-1][2] if owner._fields else 0
+        size = int(jnp.prod(jnp.asarray(self.shape)))
+        end = start + size
 
-        previous_end_idx = owner._fields[-1][2] if owner._fields else 0
-        size = int(jnp.prod(jnp.array(self.shape)))
-
-        owner._fields += ((name, self, previous_end_idx + size),)
+        owner._fields += ((name, self, end),)
         owner.size += size
 
-        self.slice = slice(previous_end_idx, previous_end_idx + size)
+        self.slice = slice(start, end)
+        self.idx = _CompoundIdx(start, self.shape)
 
     @overload
     def __get__(self, instance: None, owner) -> field: ...
     @overload
     def __get__(self, instance: Compound, owner) -> Array: ...
-    def __get__(self, instance, owner):
-        # If instance is None, we are accessing the class attribute, not an instance
-        # attribute. Hence, return the descriptor itself.
+    def __get__(self, instance, owner=None):
         if instance is None:
-            return self  # pyright: ignore[reportUnreachable]
-
+            return self
+        # get slice
         return instance._data[self.slice].reshape(self.shape)
 
     def __set__(self, instance: Compound, value: Array | float | int) -> None:
-        value = jnp.asarray(value)
-        instance._data = instance._data.at[self.slice].set(value)
+        arr = jnp.asarray(value)
+        instance._data = instance._data.at[self.slice].set(arr)
 
     def __delete__(self, instance):
         raise AttributeError(
             f"Cannot delete field ... from {instance.__class__.__name__}."
         )
+
+
+class _CompoundIdx:
+    """A helper for flat indexing into the compound array."""
+
+    def __init__(self, slice_start: int, shape: tuple[int, ...]) -> None:
+        self.slice_start = slice_start
+        self.shape = shape
+
+    def __getitem__(self, arg) -> Array:
+        # Normalize to tuple
+        if not isinstance(arg, tuple):
+            arg = (arg,)
+        # extend with full slices
+        if len(arg) < len(self.shape):
+            arg = arg + (slice(None),) * (len(self.shape) - len(arg))
+        # build index arrays
+        idxs = []
+        for dim, sub in enumerate(arg):
+            if isinstance(sub, slice):
+                start, stop, step = sub.indices(self.shape[dim])
+                idxs.append(jnp.arange(start, stop, step))
+            elif isinstance(sub, (int, jnp.integer)):
+                idxs.append(jnp.array([sub]))
+            else:
+                idxs.append(jnp.asarray(sub))
+        # meshgrid
+        mesh = jnp.meshgrid(*idxs, indexing="ij")
+        # flatten
+        multi_idx = [m.flatten() for m in mesh]
+        flat_local = jnp.ravel_multi_index(multi_idx, dims=self.shape)
+        # shift and return
+        return jnp.array(flat_local + self.slice_start)
