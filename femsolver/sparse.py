@@ -2,7 +2,19 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.experimental import sparse as jax_sparse
- 
+import sparsejac
+from femsolver import Mesh
+from typing import Optional
+from jax import Array
+
+
+def jacfwd(func, sparsity_pattern):
+    return sparsejac.jacfwd(func, sparsity=sparsity_pattern)
+
+
+def jacrev(func, sparsity_pattern):
+    return sparsejac.jacrev(func, sparsity=sparsity_pattern)
+
 
 def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
     """
@@ -54,9 +66,7 @@ def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
     indices = np.unique(np.vstack((row_idx, col_idx)).T, axis=0)
 
     data = np.ones(indices.shape[0], dtype=jnp.int32)
-    sparsity_pattern = jax_sparse.BCOO(
-        (data, indices.astype(np.int32)), shape=K_shape
-    )
+    sparsity_pattern = jax_sparse.BCOO((data, indices.astype(np.int32)), shape=K_shape)
     return sparsity_pattern
 
 
@@ -85,18 +95,25 @@ def get_bc_indices(indices, fixed_dofs):
 
 
 def create_sparsity_pattern(
-    elements, n_dofs_per_node, K_shape, constraint_elements=None
+    mesh: Mesh, n_dofs_per_node: int, constraint_elements: Optional[Array] = None
 ):
     """
     Create a sparsity pattern for a given set of elements and constraints.
     Args:
-        elements: (num_elements, nodes_per_element)
+        mesh: Mesh object
         n_dofs_per_node: Number of degrees of freedom per node
-        K_shape: Shape of the matrix K
-        constraint_elements: (num_constraint_elements, nodes_per_constraint_element)
+        constraint_elements: Optional array of constraint elements. If provided, the sparsity pattern will be created for the constraint elements.
     Returns:
-        sparsity_pattern: jax_sparse.BCOO
+        sparsity_pattern: jax.experimental.sparse.BCOO
     """
+
+    elements = mesh.elements
+
+    K_shape = (
+        n_dofs_per_node * mesh.coords.shape[0],
+        n_dofs_per_node * mesh.coords.shape[0],
+    )
+
     sparsity_pattern = _create_sparse_structure(elements, n_dofs_per_node, K_shape)
     if constraint_elements is not None:
         sparsity_pattern_constraint = _create_sparse_structure(
