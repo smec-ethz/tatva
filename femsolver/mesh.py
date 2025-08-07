@@ -20,10 +20,16 @@ class Mesh(NamedTuple):
     @classmethod
     def unit_square(cls, n_x: int, n_y: int) -> Mesh:
         """Generate a unit square mesh with n_x and n_y nodes in the x and y directions."""
+        return cls.rectangle((0.0, 1.0), (0.0, 1.0), n_x, n_y)
 
-        x = jnp.linspace(0, 1, n_x + 1)
-        y = jnp.linspace(0, 1, n_y + 1)
-        xv, yv = jnp.meshgrid(x, y, indexing="ij")
+    @classmethod
+    def rectangle(
+        cls, x: tuple[float, float], y: tuple[float, float], n_x: int, n_y: int
+    ) -> Mesh:
+        """Generate a rectangular mesh with specified x and y ranges and number of nodes."""
+        x_vals = jnp.linspace(x[0], x[1], n_x + 1)
+        y_vals = jnp.linspace(y[0], y[1], n_y + 1)
+        xv, yv = jnp.meshgrid(x_vals, y_vals, indexing="ij")
         coords = jnp.stack([xv.ravel(), yv.ravel()], axis=-1)
 
         def node_id(i, j):
