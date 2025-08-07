@@ -120,6 +120,7 @@ class Operator(eqx.Module):
         points and returns the integrated value over the mesh.
         """
 
+        @eqx.filter_jit
         def _integrate(
             nodal_values: jax.Array,
             _additional_values_at_quad: jax.Array = None,
