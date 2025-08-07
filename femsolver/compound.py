@@ -41,12 +41,12 @@ class Compound:
 
     _fields: tuple[tuple[str, field, int], ...] = ()
     _splits_flattened_array: tuple[int, ...] = ()
-    _data: Array
+    arr: Array
 
     size: int = 0
 
     def tree_flatten(self) -> tuple[tuple[Array], Any]:
-        return (self._data,), None
+        return (self.arr,), None
 
     @classmethod
     def tree_unflatten(cls, aux_data: Any, children: tuple[Array]) -> Self:
@@ -63,9 +63,9 @@ class Compound:
             assert arr.size == self.size, (
                 f"Array size {arr.size} does not match expected size {self.size}."
             )
-            self._data = arr
+            self.arr = arr
         else:
-            self._data = jnp.zeros(self.size, dtype=float)
+            self.arr = jnp.zeros(self.size, dtype=float)
 
     def __len__(self) -> int:
         return len(self._fields)
@@ -81,9 +81,12 @@ class Compound:
         ]
         return f"{self.__class__.__name__}({', '.join(field_reprs)})"
 
+    def __add__(self, other: Self) -> Self:
+        return self.__class__(self.arr + other.arr)
+
     def pack(self) -> Array:
         """Pack the state into a single array. Flattened and concatenated."""
-        return self._data
+        return self.arr
 
     @classmethod
     def unpack(cls, packed: Array) -> Self:
@@ -125,11 +128,11 @@ class field:
         if instance is None:
             return self
         # get slice
-        return instance._data[self.slice].reshape(self.shape)
+        return instance.arr[self.slice].reshape(self.shape)
 
     def __set__(self, instance: Compound, value: Array | float | int) -> None:
         arr = jnp.asarray(value)
-        instance._data = instance._data.at[self.slice].set(arr)
+        instance.arr = instance.arr.at[self.slice].set(arr)
 
     def __delete__(self, instance):
         raise AttributeError(
