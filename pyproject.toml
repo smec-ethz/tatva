@@ -20,6 +20,7 @@ dependencies = [
     "numpy",
     "sparsejac",
     "matplotlib",
+    "scipy"
 ]
 
 [project.optional-dependencies]
