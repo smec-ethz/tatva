@@ -1,9 +1,7 @@
 import os
 
 # Path to custom style
-STYLE_PATH = os.path.join(
-    os.path.dirname(__file__), "latex_sans_serif.mplstyle"
-)
+STYLE_PATH = os.path.join(os.path.dirname(__file__), "latex_sans_serif.mplstyle")
 
 
 import matplotlib.pyplot as plt
@@ -11,12 +9,37 @@ import cmcrameri.cm as cmc
 
 import matplotlib as mpl
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from jax import Array
+from femsolver import Mesh
+from typing import Optional
 
 
 def plot_element_values(
-    u, mesh, values, ax=None, scale=1.0, label=None, cmap=cmc.managua_r
+    mesh: Mesh,
+    values: Array,
+    u: Optional[Array] = None,
+    ax: Optional[mpl.axes.Axes] = None,
+    scale: float = 1.0,
+    label: Optional[str] = None,
+    cmap=cmc.managua_r,
 ):
-    displaced = mesh.coords + scale * u
+    """
+    Plot the element values of a field on a mesh.
+
+    Args:
+        u : The displacement field.
+        mesh : The mesh.
+        values : The element values to plot.
+        ax : The axes to plot on.
+        scale : The scale of the displacement field.
+        label : The label of the colorbar.
+        cmap : The colormap to use.
+    """
+
+    if u is not None:
+        displaced = mesh.coords + scale * u
+    else:
+        displaced = mesh.coords
     tri_elements = mesh.elements
     vertices = displaced[tri_elements]
 
@@ -40,9 +63,31 @@ def plot_element_values(
 
 
 def plot_nodal_values(
-    u, mesh, nodal_values, ax=None, scale=1.0, label=None, cmap=cmc.managua_r
+    mesh: Mesh,
+    nodal_values: Array,
+    u: Optional[Array] = None,
+    ax: Optional[mpl.axes.Axes] = None,
+    scale: float = 1.0,
+    label: Optional[str] = None,
+    cmap=cmc.managua_r,
 ):
-    displaced = mesh.coords + scale * u
+    """
+    Plot the nodal values of a field on a mesh.
+
+    Args:
+        u : The displacement field.
+        mesh : The mesh.
+        nodal_values : The nodal values to plot.
+        ax : The axes to plot on.
+        scale : The scale of the displacement field.
+        label : The label of the colorbar.
+        cmap : The colormap to use.
+    """
+
+    if u is not None:
+        displaced = mesh.coords + scale * u
+    else:
+        displaced = mesh.coords
     tri_elements = mesh.elements
 
     plt.style.use(STYLE_PATH)
@@ -60,11 +105,11 @@ def plot_nodal_values(
         edgecolors="black",
     )
 
-    #divider = make_axes_locatable(ax)
-    #cax = divider.append_axes("right", size="15%", pad=0.05)
+    # divider = make_axes_locatable(ax)
+    # cax = divider.append_axes("right", size="15%", pad=0.05)
 
-    #fig = ax.get_figure()
-    #fig.colorbar(cb, cax=cax, label=label)
+    # fig = ax.get_figure()
+    # fig.colorbar(cb, cax=cax, label=label)
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("top", size="10%", pad=0.2)
 
