@@ -136,6 +136,15 @@ def create_sparsity_pattern(
 
 
 def create_sparsity_pattern_KKT(mesh: Mesh, n_dofs_per_node: int, B: Array):
+    """
+    Create a sparsity pattern for the KKT system.
+    Args:
+        mesh: Mesh object
+        n_dofs_per_node: Number of degrees of freedom per node
+        B: Constraint matrix (nb_cons, n_dofs)
+    Returns:
+        sparsity_pattern_KKT: jax.experimental.sparse.BCOO
+    """
 
     nb_cons = B.shape[0]
 
