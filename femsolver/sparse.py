@@ -133,3 +133,27 @@ def create_sparsity_pattern(
         )
 
     return sparsity_pattern
+
+
+def create_sparsity_pattern_KKT(mesh: Mesh, n_dofs_per_node: int, B: Array):
+
+    nb_cons = B.shape[0]
+
+    K_sparsity_pattern = create_sparsity_pattern(mesh, n_dofs_per_node=n_dofs_per_node)
+    B_sparsity_pattern = jax_sparse.BCOO.fromdense(B)
+
+    sparsity_pattern_left = jax_sparse.bcoo_concatenate(
+        [K_sparsity_pattern, B_sparsity_pattern], dimension=0
+    )
+
+    BT_sparsity_pattern = jax_sparse.BCOO.fromdense(B.T)
+    C = jax_sparse.BCOO.fromdense(jnp.zeros((nb_cons, nb_cons), dtype=jnp.int32))
+    sparsity_pattern_right = jax_sparse.bcoo_concatenate(
+        [BT_sparsity_pattern, C], dimension=0
+    )
+
+    sparsity_pattern_KKT = jax_sparse.bcoo_concatenate(
+        [sparsity_pattern_left, sparsity_pattern_right], dimension=1
+    )
+
+    return sparsity_pattern_KKT
