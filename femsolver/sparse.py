@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from jax.experimental import sparse as jax_sparse
 import sparsejac
 from femsolver import Mesh
-from typing import Optional
+from typing import Optional, Tuple
 from jax import Array
 
 
@@ -97,7 +97,10 @@ def get_bc_indices(sparsity_pattern: jax_sparse.BCOO, fixed_dofs: Array):
 
 
 def create_sparsity_pattern(
-    mesh: Mesh, n_dofs_per_node: int, constraint_elements: Optional[Array] = None
+    mesh: Mesh,
+    n_dofs_per_node: int,
+    K_shape: Optional[Tuple[int, int]] = None,
+    constraint_elements: Optional[Array] = None,
 ):
     """
     Create a sparsity pattern for a given set of elements and constraints.
@@ -111,10 +114,11 @@ def create_sparsity_pattern(
 
     elements = mesh.elements
 
-    K_shape = (
-        n_dofs_per_node * mesh.coords.shape[0],
-        n_dofs_per_node * mesh.coords.shape[0],
-    )
+    if K_shape is None:
+        K_shape = (
+            n_dofs_per_node * mesh.coords.shape[0],
+            n_dofs_per_node * mesh.coords.shape[0],
+        )   
 
     sparsity_pattern = _create_sparse_structure(elements, n_dofs_per_node, K_shape)
     if constraint_elements is not None:
