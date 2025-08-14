@@ -70,6 +70,7 @@ def plot_nodal_values(
     scale: float = 1.0,
     label: Optional[str] = None,
     cmap=cmc.managua_r,
+    edgecolors: Optional[str] = "none",
 ):
     """
     Plot the nodal values of a field on a mesh.
@@ -100,16 +101,11 @@ def plot_nodal_values(
         displaced[:, 1],
         tri_elements,
         nodal_values,
-        shading="flat",
+        shading="gouraud",
         cmap=cmap,
-        edgecolors="black",
+        edgecolors=edgecolors,
     )
 
-    # divider = make_axes_locatable(ax)
-    # cax = divider.append_axes("right", size="15%", pad=0.05)
-
-    # fig = ax.get_figure()
-    # fig.colorbar(cb, cax=cax, label=label)
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("top", size="10%", pad=0.2)
 
