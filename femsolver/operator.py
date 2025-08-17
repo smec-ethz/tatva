@@ -298,10 +298,7 @@ class Operator(eqx.Module):
         """
 
         def _eval_quad(
-            xi: jax.Array,
-            el_nodal_values: jax.Array,
-            el_nodal_coords: jax.Array,
-            additional_values_at_quad: jax.Array = None,
+            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             """Calls the function (interpolator) on a quad point."""
             return self.element.interpolate(xi, el_nodal_values)
