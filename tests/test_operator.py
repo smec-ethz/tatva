@@ -94,6 +94,18 @@ def test_gradient(operator: Operator):
             assert np.isclose(grad_value[i, 1], float(dy), atol=1e-12)
 
 
+# --- Test interpolation ---
+@pytest.mark.parametrize("operator", [op_tri, op_quad], ids=["tri", "quad"])
+def test_interpolation(operator: Operator):
+    points = jnp.array([[0.5, 0.25], [0.5, 0.75]])
+    interpolated_values = operator.interpolate(nodes, points)
+
+    assert np.isclose(interpolated_values[0, 0], 0.5, atol=1e-12)
+    assert np.isclose(interpolated_values[0, 1], 0.25, atol=1e-12)
+    assert np.isclose(interpolated_values[1, 0], 0.5, atol=1e-12)
+    assert np.isclose(interpolated_values[1, 1], 0.75, atol=1e-12)
+
+
 # --- Test stiffness matrix ---
 
 
