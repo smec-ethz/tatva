@@ -71,6 +71,7 @@ def plot_nodal_values(
     label: Optional[str] = None,
     cmap=cmc.managua_r,
     edgecolors: Optional[str] = "none",
+    shading: Optional[str] = "gouraud",
 ):
     """
     Plot the nodal values of a field on a mesh.
@@ -101,7 +102,7 @@ def plot_nodal_values(
         displaced[:, 1],
         tri_elements,
         nodal_values,
-        shading="gouraud",
+        shading=shading,
         cmap=cmap,
         edgecolors=edgecolors,
     )
