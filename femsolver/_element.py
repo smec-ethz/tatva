@@ -64,6 +64,7 @@ class Element(eqx.Module):
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = jnp.linalg.inv(J) @ dNdr
         return N @ nodal_values, dNdX @ nodal_values, detJ
+    
 
 
 class Line2(Element):
