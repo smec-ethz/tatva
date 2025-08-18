@@ -4,15 +4,20 @@ import os
 STYLE_PATH = os.path.join(os.path.dirname(__file__), "latex_sans_serif.mplstyle")
 
 
-import matplotlib.pyplot as plt
-import cmcrameri.cm as cmc
-import pyvista as pv
-import numpy as np
-import matplotlib as mpl
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-from jax import Array
-from femsolver import Mesh
 from typing import Optional
+
+import cmcrameri.cm as cmc
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from jax import Array
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+from femsolver import Mesh
+
+try:
+    from ._pyvista import get_pyvista_grid
+except ImportError:
+    get_pyvista_grid = None
 
 
 def plot_element_values(
@@ -117,33 +122,3 @@ def plot_nodal_values(
     if ax is None:
         plt.show()
 
-
-
-def get_pyvista_grid(mesh, cell_type="quad"):
-    pv_points = np.hstack((mesh.coords, np.zeros(shape=(mesh.coords.shape[0], 1))))
-
-    cell_type_dict = {
-        "quad": 4,
-        "triangle": 3,
-    }
-
-    pv_cells = np.hstack(
-        (
-            np.full(
-                fill_value=cell_type_dict[cell_type], shape=(mesh.elements.shape[0], 1)
-            ),
-            mesh.elements,
-        )
-    )
-
-    pv_cell_type_dict = {
-        "quad": pv.CellType.QUAD,
-        "triangle": pv.CellType.TRIANGLE,
-    }
-    cell_types = np.full(
-        fill_value=pv_cell_type_dict[cell_type], shape=(mesh.elements.shape[0],)
-    )
-
-    grid = pv.UnstructuredGrid(pv_cells, cell_types, pv_points)
-
-    return grid
