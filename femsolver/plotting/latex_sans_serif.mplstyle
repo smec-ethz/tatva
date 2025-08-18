@@ -56,6 +56,9 @@ legend.fontsize      : 9
 legend.borderpad     : 0.5    # border whitspace in fontsize units
 legend.markerscale   : 0.75    # the relative size of legend markers vs. original
 
+### Images
+image.cmap: managua
+
 figure.dpi : 150
 
 ### Saving figure

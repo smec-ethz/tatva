@@ -3,7 +3,8 @@ from typing import TYPE_CHECKING
 
 import equinox as eqx
 import jax.numpy as jnp
-from jax import Array
+
+from jaxtyping import Float, Array, jaxtyped
 
 if TYPE_CHECKING:
     from typing import ClassVar as AbstractClassVar
@@ -63,6 +64,7 @@ class Element(eqx.Module):
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = jnp.linalg.inv(J) @ dNdr
         return N @ nodal_values, dNdX @ nodal_values, detJ
+    
 
 
 class Line2(Element):
@@ -103,8 +105,8 @@ class Line2(Element):
 class Tri3(Element):
     """A 3-node linear triangular element."""
 
-    quad_points = jnp.array([[1 / 3, 1 / 3]])
-    quad_weights = jnp.array([0.5])
+    quad_points = jnp.array([[1.0 / 3, 1.0 / 3]])
+    quad_weights = jnp.array([1.0 / 2])
 
     def shape_function(self, xi: Array) -> Array:
         """Returns the shape functions evaluated at the local coordinates (xi, eta)."""
