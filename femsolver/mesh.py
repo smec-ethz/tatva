@@ -50,9 +50,9 @@ class Mesh(NamedTuple):
 
 @jax.jit
 def find_containing_polygons(
-    points: Array,
-    polygons: Array,
-) -> Array:
+    points: jax.Array,
+    polygons: jax.Array,
+) -> jax.Array:
     """
     Finds the index of the containing polygon for each point.
 
@@ -61,13 +61,13 @@ def find_containing_polygons(
 
     Args:
         points (Array): An array of points to test, shape (num_points, 2).
-        polygons (Array): A 3D array of polygons, where each polygon is a
-                                list of vertices. Shape (num_polygons, num_vertices, 2).
+        polygons (Array): A 3D array of polygons, where each polygon is a list of
+            vertices. Shape (num_polygons, num_vertices, 2).
 
     Returns:
-        Array: An array of shape (num_points,) where each element is the
-                     index of the polygon containing the corresponding point.
-                     Returns -1 if a point is not in any polygon.
+        Array: An array of shape (num_points,) where each element is the index of the
+            polygon containing the corresponding point. Returns -1 if a point is not in
+            any polygon.
     """
 
     # --- Core function for a single point and a single polygon ---

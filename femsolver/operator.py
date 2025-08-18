@@ -303,9 +303,7 @@ class Operator(eqx.Module):
             """Calls the function (interpolator) on a quad point."""
             return self.element.interpolate(xi, el_nodal_values)
 
-        return self._vmap_over_elements_and_quads(
-            nodal_values, _eval_quad, _additional_values_at_quad
-        )
+        return self._vmap_over_elements_and_quads(nodal_values, _eval_quad)
 
     @overload
     def grad(self, arg: Form[P]) -> FormCallable[P]: ...
@@ -356,12 +354,10 @@ class Operator(eqx.Module):
         ...
 
     @overload
-    def interpolate(self, arg: Form, points: jax.Array) -> FormCallable: ...
+    def interpolate(self, arg: Form[P], points: jax.Array) -> FormCallable[P]: ...
     @overload
-    def interpolate(
-        self, arg: jax.Array, points: jax.Array, *additional_values_at_quad: jax.Array
-    ) -> jax.Array: ...
-    def interpolate(self, arg, points, *additional_values_at_quad):
+    def interpolate(self, arg: jax.Array, points: jax.Array) -> jax.Array: ...
+    def interpolate(self, arg, points):
         """Interpolates a function or nodal values to a set of points in the physical space.
 
         If a function is provided, it returns a function that interpolates the function at the
@@ -371,7 +367,6 @@ class Operator(eqx.Module):
         Args:
             arg: The function to interpolate or the nodal values to interpolate.
             points: The points to interpolate the function or nodal values to.
-            *_additional_values_at_quad: Additional values at the quadrature points (optional)
         """
 
         @jax.jit
@@ -394,7 +389,7 @@ class Operator(eqx.Module):
             delta_xi = jnp.linalg.solve(lhs, -rhs)
             return self.element.quad_points[0] + delta_xi
 
-        def map_physical_to_reference(points: jax.Array) -> jax.Array:
+        def map_physical_to_reference(points: jax.Array) -> tuple[jax.Array, jax.Array]:
             element_indices = find_containing_polygons(
                 points, self.mesh.coords[self.mesh.elements]
             )
@@ -417,15 +412,10 @@ class Operator(eqx.Module):
         if isinstance(arg, Callable):
             return self._interpolate_functor(arg, valid_quad_points, valid_elements)
         else:
-            return self._interpolate_direct(
-                arg,
-                valid_quad_points,
-                valid_elements,
-                *additional_values_at_quad,
-            )
+            return self._interpolate_direct(arg, valid_quad_points, valid_elements)
 
     def _interpolate_functor(
-        self, func: Form, valid_quad_points: jax.Array, valid_elements: jax.Array
+        self, func: Form[P], valid_quad_points: jax.Array, valid_elements: jax.Array
     ) -> FormCallable:
         """Decorator to interpolate a local function at the mesh elements quad points.
 
@@ -436,7 +426,8 @@ class Operator(eqx.Module):
 
         def _interpolate(
             nodal_values: jax.Array,
-            _additional_values_at_quad: jax.Array = None,
+            *args: P.args,
+            **kwargs: P.kwargs,
         ) -> jax.Array:
             """Interpolates the given function at the mesh nodes.
 
@@ -449,13 +440,12 @@ class Operator(eqx.Module):
                 xi: jax.Array,
                 el_nodal_values: jax.Array,
                 el_nodal_coords: jax.Array,
-                additional_values_at_quad: jax.Array = None,
             ) -> jax.Array:
                 """Calls the function (interpolator) on a quad point."""
                 u, u_grad, _detJ = self.element.get_local_values(
                     xi, el_nodal_values, el_nodal_coords
                 )
-                return func(u, u_grad, additional_values_at_quad)
+                return func(u, u_grad, *args, **kwargs)
 
             return eqx.filter_vmap(
                 _interpolate_quad,
@@ -464,7 +454,6 @@ class Operator(eqx.Module):
                 valid_quad_points,
                 nodal_values[valid_elements],
                 self.mesh.coords[valid_elements],
-                _additional_values_at_quad,
             )
 
         return _interpolate
@@ -474,15 +463,11 @@ class Operator(eqx.Module):
         nodal_values: jax.Array,
         valid_quad_points: jax.Array,
         valid_elements: jax.Array,
-        _additional_values_at_quad: jax.Array = None,
     ) -> jax.Array:
         """Interpolates the given nodal values at the quad points."""
 
         def _interpolate_quad(
-            xi: jax.Array,
-            el_nodal_values: jax.Array,
-            el_nodal_coords: jax.Array,
-            additional_values_at_quad: jax.Array = None,
+            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             """Calls the function (interpolator) on a quad point."""
             return self.element.interpolate(xi, el_nodal_values)
@@ -494,7 +479,6 @@ class Operator(eqx.Module):
             valid_quad_points,
             nodal_values[valid_elements],
             self.mesh.coords[valid_elements],
-            _additional_values_at_quad,
         )
 
 
