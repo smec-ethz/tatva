@@ -65,10 +65,7 @@ class Operator(eqx.Module):
     element: Element
 
     def _vmap_over_elements_and_quads(
-        self,
-        nodal_values: jax.Array,
-        func: _VmapOverElementsCallable,
-        additional_values_at_quad: jax.Array = None,
+        self, nodal_values: jax.Array, func: _VmapOverElementsCallable
     ) -> jax.Array:
         """Helper function. Maps a function over the elements and quadrature points of the
         mesh.
@@ -83,27 +80,20 @@ class Operator(eqx.Module):
         """
 
         def _at_each_element(
-            el_nodal_values: jax.Array,
-            el_nodal_coords: jax.Array,
-            additional_values_at_quad: jax.Array = None,
+            el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             return eqx.filter_vmap(
                 partial(
                     func,
                     el_nodal_values=el_nodal_values,
                     el_nodal_coords=el_nodal_coords,
-                    additional_values_at_quad=additional_values_at_quad,
                 )
             )(self.element.quad_points)
 
         return eqx.filter_vmap(
             _at_each_element,
-            in_axes=(0, 0, eqx.if_array(0)),
-        )(
-            nodal_values[self.mesh.elements],
-            self.mesh.coords[self.mesh.elements],
-            additional_values_at_quad,
-        )
+            in_axes=(0, 0),
+        )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
 
     @overload
     def integrate(self, arg: Form[P]) -> FormCallable[P]: ...
@@ -177,7 +167,6 @@ class Operator(eqx.Module):
                 xi: jax.Array,
                 el_nodal_values: jax.Array,
                 el_nodal_coords: jax.Array,
-                additional_values_at_quad: jax.Array = None,
             ) -> jax.Array:
                 """Calls the function (integrand) on a quad point. Multiplying by the
                 determinant of the Jacobian.
@@ -270,10 +259,7 @@ class Operator(eqx.Module):
             """
 
             def _eval_quad(
-                xi: jax.Array,
-                el_nodal_values: jax.Array,
-                el_nodal_coords: jax.Array,
-                additional_values_at_quad: jax.Array = None,
+                xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
             ) -> jax.Array:
                 """Calls the function (interpolator) on a quad point."""
                 u, u_grad, _detJ = self.element.get_local_values(
@@ -281,9 +267,7 @@ class Operator(eqx.Module):
                 )
                 return func(u, u_grad, *args, **kwargs)
 
-            return self._vmap_over_elements_and_quads(
-                nodal_values, _eval_quad, _additional_values_at_quad
-            )
+            return self._vmap_over_elements_and_quads(nodal_values, _eval_quad)
 
         return _eval
 
@@ -329,18 +313,13 @@ class Operator(eqx.Module):
         """
 
         def _gradient_quad(
-            xi: jax.Array,
-            el_nodal_values: jax.Array,
-            el_nodal_coords: jax.Array,
-            additional_values_at_quad: jax.Array = None,
+            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             """Calls the function (gradient) on a quad point."""
             u_grad = self.element.gradient(xi, el_nodal_values, el_nodal_coords)
             return u_grad
 
-        return self._vmap_over_elements_and_quads(
-            nodal_values, _gradient_quad, _additional_values_at_quad
-        )
+        return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
 
     def _grad_functor(self, func: Form[P]) -> FormCallable[P]:
         """Decorator to compute the gradient of a local function at the mesh elements quad
