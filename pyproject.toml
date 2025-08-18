@@ -20,6 +20,9 @@ dependencies = [
     "numpy",
     "sparsejac",
     "matplotlib",
+    "scipy",
+    "gmsh",
+    "meshio",
 ]
 
 [project.optional-dependencies]
