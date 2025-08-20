@@ -118,7 +118,7 @@ def create_sparsity_pattern(
         K_shape = (
             n_dofs_per_node * mesh.coords.shape[0],
             n_dofs_per_node * mesh.coords.shape[0],
-        )   
+        )
 
     sparsity_pattern = _create_sparse_structure(elements, n_dofs_per_node, K_shape)
     if constraint_elements is not None:
@@ -153,14 +153,14 @@ def create_sparsity_pattern_KKT(mesh: Mesh, n_dofs_per_node: int, B: Array):
     nb_cons = B.shape[0]
 
     K_sparsity_pattern = create_sparsity_pattern(mesh, n_dofs_per_node=n_dofs_per_node)
-    B_sparsity_pattern = jax_sparse.BCOO.fromdense(B)
+    B_sparsity_pattern = jax_sparse.BCOO.fromdense(B).astype(jnp.int32)
 
     sparsity_pattern_left = jax_sparse.bcoo_concatenate(
         [K_sparsity_pattern, B_sparsity_pattern], dimension=0
     )
 
-    BT_sparsity_pattern = jax_sparse.BCOO.fromdense(B.T)
-    C = jax_sparse.BCOO.fromdense(jnp.zeros((nb_cons, nb_cons), dtype=jnp.int32))
+    BT_sparsity_pattern = jax_sparse.BCOO.fromdense(B.T).astype(jnp.int32)
+    C = jax_sparse.BCOO.fromdense(jnp.eye(nb_cons, nb_cons, dtype=jnp.int32))
     sparsity_pattern_right = jax_sparse.bcoo_concatenate(
         [BT_sparsity_pattern, C], dimension=0
     )
