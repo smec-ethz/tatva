@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
+from numbers import Number
 from typing import Any, Callable, Concatenate, ParamSpec, Protocol, TypeAlias, overload
 
 import equinox as eqx
@@ -16,7 +17,8 @@ from femsolver.utils import auto_vmap
 P = ParamSpec("P")
 
 
-Form: TypeAlias = Callable[Concatenate[jax.Array, jax.Array, P], jax.Array]
+Numeric: TypeAlias = float | int | jnp.number
+Form: TypeAlias = Callable[Concatenate[jax.Array, jax.Array, P], jax.Array | float]
 
 
 class FormCallable(Protocol[P]):
@@ -37,7 +39,7 @@ class _VmapOverElementsCallable(Protocol):
         xi: jax.Array,
         el_nodal_values: jax.Array,
         el_nodal_coords: jax.Array,
-    ) -> jax.Array: ...
+    ) -> jax.Array | float: ...
 
 
 class Operator(eqx.Module):
@@ -98,7 +100,7 @@ class Operator(eqx.Module):
     @overload
     def integrate(self, arg: Form[P]) -> FormCallable[P]: ...
     @overload
-    def integrate(self, arg: jax.Array) -> jax.Array: ...
+    def integrate(self, arg: jax.Array | Numeric) -> jax.Array: ...
     def integrate(self, arg):
         """Integrate a function/nodal_array/quad_array over the mesh.
 
@@ -112,7 +114,9 @@ class Operator(eqx.Module):
         if isinstance(arg, Callable):
             return self._integrate_functor(arg, sum=True)
 
-        if arg.shape[0] == self.mesh.elements.shape[0]:  # element field
+        if isinstance(arg, Number):
+            res = self._integrate_nodal_array(jnp.array([arg]))
+        elif arg.shape[0] == self.mesh.elements.shape[0]:  # element field
             res = self._integrate_quad_array(arg)
         else:  # nodal field
             res = self._integrate_nodal_array(arg)
@@ -260,7 +264,7 @@ class Operator(eqx.Module):
 
             def _eval_quad(
                 xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
-            ) -> jax.Array:
+            ) -> jax.Array | float:
                 """Calls the function (interpolator) on a quad point."""
                 u, u_grad, _detJ = self.element.get_local_values(
                     xi, el_nodal_values, el_nodal_coords
@@ -419,7 +423,7 @@ class Operator(eqx.Module):
                 xi: jax.Array,
                 el_nodal_values: jax.Array,
                 el_nodal_coords: jax.Array,
-            ) -> jax.Array:
+            ) -> jax.Array | float:
                 """Calls the function (interpolator) on a quad point."""
                 u, u_grad, _detJ = self.element.get_local_values(
                     xi, el_nodal_values, el_nodal_coords
