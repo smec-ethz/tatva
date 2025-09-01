@@ -50,7 +50,7 @@ Some of the examples are available in the `examples/notebooks` directory.
 
 ## Dense vs Sparse 
 
-The example shown above creates a dense stiffness matrix which for understanding is great but is memory intensive. A sparse framework for the same example is provided in `examples/notebooks/sparse_linear_elasticity.ipynb`. For sparse representation of the stiffness matrix or the hessian of the total energy, we use the library `sparsejac` that allows automatic differentiation of a functional based on a sparsity pattern. This significantly reduces the memory consumption. For more details on how the automatic differentiation can be done using sparsity pattern, please check the link below:
+A unique aspect of `femsolver` is that it can handle both dense and sparse matrices. This is achieved by using the library `sparsejac` that allows automatic differentiation of a functional based on a sparsity pattern. This significantly reduces the memory consumption. For more details on how the automatic differentiation can be done using sparsity pattern, please check the link below:
 
 ![Paper](https://arxiv.org/html/2501.17737v1)</br>
 ![Github: sparsejac](https://github.com/mfschubert/sparsejac)</br>
