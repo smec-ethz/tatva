@@ -20,10 +20,16 @@ class Mesh(NamedTuple):
     @classmethod
     def unit_square(cls, n_x: int, n_y: int) -> Mesh:
         """Generate a unit square mesh with n_x and n_y nodes in the x and y directions."""
+        return cls.rectangle((0.0, 1.0), (0.0, 1.0), n_x, n_y)
 
-        x = jnp.linspace(0, 1, n_x + 1)
-        y = jnp.linspace(0, 1, n_y + 1)
-        xv, yv = jnp.meshgrid(x, y, indexing="ij")
+    @classmethod
+    def rectangle(
+        cls, x: tuple[float, float], y: tuple[float, float], n_x: int, n_y: int
+    ) -> Mesh:
+        """Generate a rectangular mesh with specified x and y ranges and number of nodes."""
+        x_vals = jnp.linspace(x[0], x[1], n_x + 1)
+        y_vals = jnp.linspace(y[0], y[1], n_y + 1)
+        xv, yv = jnp.meshgrid(x_vals, y_vals, indexing="ij")
         coords = jnp.stack([xv.ravel(), yv.ravel()], axis=-1)
 
         def node_id(i, j):
@@ -44,9 +50,9 @@ class Mesh(NamedTuple):
 
 @jax.jit
 def find_containing_polygons(
-    points: Array,
-    polygons: Array,
-) -> Array:
+    points: jax.Array,
+    polygons: jax.Array,
+) -> jax.Array:
     """
     Finds the index of the containing polygon for each point.
 
@@ -55,13 +61,13 @@ def find_containing_polygons(
 
     Args:
         points (Array): An array of points to test, shape (num_points, 2).
-        polygons (Array): A 3D array of polygons, where each polygon is a
-                                list of vertices. Shape (num_polygons, num_vertices, 2).
+        polygons (Array): A 3D array of polygons, where each polygon is a list of
+            vertices. Shape (num_polygons, num_vertices, 2).
 
     Returns:
-        Array: An array of shape (num_points,) where each element is the
-                     index of the polygon containing the corresponding point.
-                     Returns -1 if a point is not in any polygon.
+        Array: An array of shape (num_points,) where each element is the index of the
+            polygon containing the corresponding point. Returns -1 if a point is not in
+            any polygon.
     """
 
     # --- Core function for a single point and a single polygon ---
