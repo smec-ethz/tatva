@@ -26,19 +26,6 @@ pip install git+ssh://git@gitlab.ethz.ch/compmechmat/research/mohit-pundir/femso
 > We strongly recommend to always use a virtual environment. We further
 > recommend using [uv](https://docs.astral.sh/uv/).
 
-## Roadmap
-
-- [x] Add example for linear elasticity (**Mohit**)
-- [x] Add example for nonlinear elasticity (**Mohit**)
-- [x] Add example for Dirichlet BCs as constraints (**Mohit**)
-- [x] Add example for matrix-free solvers (with Dirichlet BCs) (**Mohit**)
-- [x] Add example for contact problems with penalty method (**Mohit**)
-- [x] Add example for contact problems with Lagrange multipliers (**Flavio**)
-- [ ] Add example for contact problems with augmented Lagrangian method (**Flavio**)
-- [x] Add example for cohesive fracture problems (**Mohit**)
-- [x] Add example for cohesive fracture problems in dynamics (**Mohit**)
-- [x] Add example for thermal-mechanical coupled problems (**Mohit**)
-- [ ] Add example for phase-field fracture coupled problems (**Mohit**)
 
 
 ## Usage
@@ -47,6 +34,30 @@ pip install git+ssh://git@gitlab.ethz.ch/compmechmat/research/mohit-pundir/femso
 A complete guide on how to use `femsolver` is available in the [course notes](https://gitlab.ethz.ch/compmechmat/teaching/stcm/course-notes).
 
 Some of the examples are available in the `examples/notebooks` directory.
+
+## Roadmap
+
+The roadmap for `femsolver` is to be updated as we progress with the development. Currently, the roadmap is as follows:
+
+- [ ] Add support for Hermite elements for beam analysis (**Mohit**)
+- [ ] Add support for shell elements for plate analysis (**Flavio**)
+
+Currently, the roadmap for different applications/examples/use-cases of `femsolver` is as follows:
+
+- [x] Add example for linear elasticity (**Mohit**)
+- [x] Add example for nonlinear elasticity (**Mohit**)
+- [x] Add example for Dirichlet BCs as constraints (**Mohit**)
+- [x] Add example for matrix-free solvers (with Dirichlet BCs) (**Mohit**)
+- [x] Add example for contact problems with penalty method (**Mohit**)
+- [x] Add example for contact problems with Lagrange multipliers (**Flavio**)
+- [ ] Add example for contact problems with augmented Lagrangian method (**Flavio**)
+- [ ] Add example for contact problems with Nitsche method (**Flavio**)
+- [x] Add example for cohesive fracture problems (**Mohit**)
+- [x] Add example for cohesive fracture problems under quasi-static loading (**Mohit**)
+- [x] Add example for cohesive fracture problems in dynamics (**Mohit**)
+- [x] Add example for thermal-mechanical coupled problems (**Mohit**)
+- [ ] Add example for phase-field fracture coupled problems (**Mohit**)
+
 
 ## Dense vs Sparse 
 
