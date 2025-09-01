@@ -73,7 +73,7 @@ class _VmapOverElementsCallable(Protocol):
     ) -> jax.Array | float: ...
 
 
-class MappableOverElements(Protocol[P, RT]):
+class MappableOverElementsAndQuads(Protocol[P, RT]):
     """Internal protocol for functions that are mapped over elements using
     `Operator.map`."""
 
@@ -83,6 +83,9 @@ class MappableOverElements(Protocol[P, RT]):
         *el_values: P.args,
         **el_kwargs: P.kwargs,
     ) -> RT: ...
+
+
+MappableOverElements: TypeAlias = Callable[P, RT]
 
 
 class MappedCallable(Protocol[P, RT]):
@@ -148,7 +151,7 @@ class Operator(Generic[ElementT], eqx.Module):
             in_axes=(0, 0),
         )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
 
-    def map(self, func: MappableOverElements[P, RT]) -> MappedCallable[P, RT]:
+    def map(self, func: MappableOverElementsAndQuads[P, RT]) -> MappedCallable[P, RT]:
         """Maps a function over the elements and quad points of the mesh.
 
         Returns a function that takes values at nodal points (globally) and returns the
@@ -166,6 +169,32 @@ class Operator(Generic[ElementT], eqx.Module):
                 return eqx.filter_vmap(
                     lambda xi: func(xi, *el_values, **kwargs),
                 )(self.element.quad_points)
+
+            return eqx.filter_vmap(
+                _at_each_element,
+                in_axes=(0,) * len(values),
+            )(*(v[self.mesh.elements] for v in _values))
+
+        return _mapped
+
+    def map_over_elements(
+        self, func: MappableOverElements[P, RT]
+    ) -> MappedCallable[P, RT]:
+        """Maps a function over the elements of the mesh.
+
+        Returns a function that takes values at nodal points (globally) and returns the
+        vmapped result over the elements.
+
+        Args:
+            func: The function to map over the elements.
+        """
+
+        def _mapped(*values: P.args, **kwargs: P.kwargs) -> RT:
+            # values should be arrays!
+            _values = cast(tuple[jax.Array, ...], values)
+
+            def _at_each_element(*el_values) -> RT:
+                return func(*el_values, **kwargs)
 
             return eqx.filter_vmap(
                 _at_each_element,
