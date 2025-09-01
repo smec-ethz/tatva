@@ -54,6 +54,10 @@ class Shell4(Element):
             ]
         ).T
 
+    def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
+        J, _, detJ = self.surface_tangents(xi, nodal_coords)
+        return J, detJ
+
     @staticmethod
     def _orthonormal_frame(A: Array) -> Array:
         """Build local orthonormal frame R=[e1, e2, e3] from A=[a1, a2].
