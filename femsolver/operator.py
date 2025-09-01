@@ -432,7 +432,7 @@ class Operator(eqx.Module):
 
             return eqx.filter_vmap(
                 _interpolate_quad,
-                in_axes=(0, 0, 0, eqx.if_array(0)),
+                in_axes=(0, 0, 0),
             )(
                 valid_quad_points,
                 nodal_values[valid_elements],
@@ -457,7 +457,7 @@ class Operator(eqx.Module):
 
         return eqx.filter_vmap(
             _interpolate_quad,
-            in_axes=(0, 0, 0, eqx.if_array(0)),
+            in_axes=(0, 0, 0),
         )(
             valid_quad_points,
             nodal_values[valid_elements],
