@@ -1,4 +1,4 @@
-![](assets/logo-small.png)
+![](assets/logo-small.png =x200)
 
 Functional programming and differentiable framework for finite element method (FEM) simulations. `femsolver` is a Python library for finite element method (FEM) simulations. It is built on top of JAX and Equinox, making it easy to use FEM in a differentiable way.
 
