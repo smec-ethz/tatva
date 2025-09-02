@@ -141,7 +141,10 @@
        x="-7.2714911"
        y="55.68047"
        clip-path="url(#clipPath24)"
-       transform="matrix(0.95788722,0,0,0.82600429,31.558287,-28.147673)" /><text
+       transform="matrix(0.95788722,0,0,0.82600429,31.558287,-28.147673)"
+       inkscape:export-filename="logo-small.svg"
+       inkscape:export-xdpi="100"
+       inkscape:export-ydpi="100" /><text
        xml:space="preserve"
        style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:14.1111px;line-height:0;font-family:Honk;-inkscape-font-specification:'Honk, @MORF=7.8,SHLN=35';font-variant-ligatures:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-east-asian:normal;font-variation-settings:'MORF' 7.8, 'SHLN' 35;text-align:justify;letter-spacing:0.0079375px;word-spacing:0.0105833px;fill:#ffff00;stroke-width:0.627944;stroke-linecap:square;stroke-miterlimit:0;stroke-dasharray:1.88383, 0.627944"
        x="71.404305"
