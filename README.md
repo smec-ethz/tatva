@@ -1,14 +1,14 @@
 
 <img src="assets/logo-small.png" alt="drawing" width="400"/>
 
-Functional programming and differentiable framework for finite element method (FEM) simulations. `femsolver` is a Python library for finite element method (FEM) simulations. It is built on top of JAX and Equinox, making it easy to use FEM in a differentiable way.
+`tatva` (टत्तव which means principle or elements of truth) is a Functional programming and differentiable framework for finite element method (FEM) simulations. `tatva` is a Python library for finite element method (FEM) simulations. It is built on top of JAX and Equinox, making it easy to use FEM in a differentiable way.
 
 ## License
 
 Copyright © 2025 ETH Zurich (Mohit Pundir)
-`femsolver` is free software: you can redistribute it and/or modify it under the terms of the GNU Lesser General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
-`femsolver` is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for more details.
-You should have received a copy of the GNU Lesser General Public License along with `femsolver`.  If not, see https://www.gnu.org/licenses/.
+`tatva` is free software: you can redistribute it and/or modify it under the terms of the GNU Lesser General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+`tatva` is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for more details.
+You should have received a copy of the GNU Lesser General Public License along with `tatva`.  If not, see https://www.gnu.org/licenses/.
 
 
 ## Features
