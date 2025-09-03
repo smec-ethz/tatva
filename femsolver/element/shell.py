@@ -1,7 +1,7 @@
+from typing import override
+
 import jax.numpy as jnp
 from jax import Array, vmap
-
-from femsolver.operator import MappableOverElements
 
 from ._element import Element
 
@@ -105,7 +105,8 @@ class Shell4(Element):
             dN_dX: (3, 4) column i is ∇_s N_i
         """
         dN_dxi = self.shape_function_derivative(xi)  # (2, 4)
-        A, G, _ = self.surface_tangents(xi, nodal_coords)
+        A = nodal_coords.T @ dN_dxi.T  # (3, 4) @ (4, 2) -> (3, 2)
+        G = A.T @ A  # (2, 2) first fundamental form
         Y = jnp.linalg.solve(G, dN_dxi)  # (2, 4), solves G Y = dN_dxi
         dN_dX = A @ Y  # (3, 2) @ (2, 4) -> (3, 4)
         return dN_dX
@@ -116,7 +117,8 @@ class Shell4(Element):
         Returns:
             R: (3, 3) world->local rotation is R^T; local->world is R
         """
-        A, *_ = self.surface_tangents(xi, nodal_coords)
+        dN_dxi = self.shape_function_derivative(xi)  # (2, 4)
+        A = nodal_coords.T @ dN_dxi.T  # (3, 4) @ (4, 2) -> (3, 2)
         return self._orthonormal_frame(A)
 
     def shape_function_local_grads(self, xi: Array, nodal_coords: Array) -> Array:
@@ -135,6 +137,7 @@ class Shell4(Element):
         dN_dloc = R.T @ dN_dX  # (3, 3) @ (3, 4) -> (3, 4)
         return dN_dloc
 
+    @override
     def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         """Returns the gradient of the nodal values at the given local coordinates (xi, eta).
 
@@ -243,7 +246,7 @@ class Shell4(Element):
         Ks = kappa_s * G * t * jnp.eye(2)  # transverse shear (2x2)
         return A, D, Ks
 
-    def get_local_values(
+    def get_local_kinematics(
         self, xi: Array, nodal_coords: Array, U: Array, theta: Array
     ) -> tuple[Array, Array, Array, Array, Array]:
         """Get local displacements, tangential displacement derivatives,
