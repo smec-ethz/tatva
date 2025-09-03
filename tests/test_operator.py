@@ -7,8 +7,8 @@ jax.config.update("jax_enable_x64", True)  # use double-precision
 import jax.numpy as jnp
 from jax import Array
 
-from femsolver import Mesh, Operator, element
-from femsolver.utils import auto_vmap
+from tatva import Mesh, Operator, element
+from tatva.utils import auto_vmap
 
 
 import sympy as sp
