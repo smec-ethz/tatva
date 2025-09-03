@@ -1,19 +1,19 @@
 # Copyright (C) 2025 ETH Zurich (Mohit Pundir)
 #
-# This file is part of femsolver.
+# This file is part of tatva.
 #
-# femsolver is free software: you can redistribute it and/or modify
+# tatva is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# femsolver is distributed in the hope that it will be useful,
+# tatva is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Lesser General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with femsolver.  If not, see <https://www.gnu.org/licenses/>.
+# along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
 from __future__ import annotations
@@ -26,9 +26,9 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from femsolver._element import Element
-from femsolver.mesh import Mesh, find_containing_polygons
-from femsolver.utils import auto_vmap
+from tatva._element import Element
+from tatva.mesh import Mesh, find_containing_polygons
+from tatva.utils import auto_vmap
 
 # TODO: naming of these types
 
@@ -73,7 +73,7 @@ class Operator(eqx.Module):
     functions at quadrature points.
 
     Example:
-        >>> from femsolver import Mesh, Tri3, Operator
+        >>> from tatva import Mesh, Tri3, Operator
         >>> mesh = Mesh.unit_square(10, 10)  # Create a mesh
         >>> element = Tri3()  # Define an element type
         >>> operator = Operator(mesh, element)

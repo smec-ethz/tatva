@@ -1,5 +1,4 @@
-
-<img src="assets/logo-small.png" alt="drawing" width="400"/>
+<img src="assets/logo-small.png" alt="drawing" width="400" align="center"/>
 
 `tatva` (टत्तव which means principle or elements of truth) is a Functional programming and differentiable framework for finite element method (FEM) simulations. `tatva` is a Python library for finite element method (FEM) simulations. It is built on top of JAX and Equinox, making it easy to use FEM in a differentiable way.
 

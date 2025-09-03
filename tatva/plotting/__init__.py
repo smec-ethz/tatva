@@ -1,19 +1,19 @@
 # Copyright (C) 2025 ETH Zurich (Mohit Pundir)
 #
-# This file is part of femsolver.
+# This file is part of tatva.
 #
-# femsolver is free software: you can redistribute it and/or modify
+# tatva is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# femsolver is distributed in the hope that it will be useful,
+# tatva is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Lesser General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with femsolver.  If not, see <https://www.gnu.org/licenses/>.
+# along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
 import os
@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 from jax import Array
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from femsolver import Mesh
+from tatva import Mesh
 
 try:
     from ._pyvista import get_pyvista_grid
