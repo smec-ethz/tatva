@@ -25,16 +25,18 @@ You should have received a copy of the GNU Lesser General Public License along w
 
 ## Installation
 
-Clone the repository and install the package with pip:
-```bash
-pip install path/to/femsolver
-```
-
 You can also use pip to install directly from the GitLab repository. Make sure
 you have access to the repository and have set up SSH keys for authentication.
 ```bash
-pip install git+ssh://git@gitlab.ethz.ch/compmechmat/research/mohit-pundir/femsolver.git
+pip install git+ssh://git@gitlab.ethz.ch/smec/software/tatva.git
 ```
+
+
+Clone the repository and install the package with pip:
+```bash
+pip install path/to/tatva
+```
+
 
 > [!note]
 > We strongly recommend to always use a virtual environment. We further
@@ -45,18 +47,18 @@ pip install git+ssh://git@gitlab.ethz.ch/compmechmat/research/mohit-pundir/femso
 ## Usage
 
 
-A complete guide on how to use `femsolver` is available in the [course notes](https://gitlab.ethz.ch/compmechmat/teaching/stcm/course-notes).
+A complete guide on how to use `tatva` is available in the [course notes](https://gitlab.ethz.ch/smec/teaching/stcm/course).
 
 Some of the examples are available in the `examples/notebooks` directory.
 
 ## Roadmap
 
-The roadmap for `femsolver` is to be updated as we progress with the development. Currently, the roadmap is as follows:
+The roadmap for `tatva` is to be updated as we progress with the development. Currently, the roadmap is as follows:
 
 - [ ] Add support for Hermite elements for beam analysis (**Mohit**)
 - [ ] Add support for shell elements for plate analysis (**Flavio**)
 
-Currently, the roadmap for different applications/examples/use-cases of `femsolver` is as follows:
+Currently, the roadmap for different applications/examples/use-cases of `tatva` is as follows:
 
 - [x] Add example for linear elasticity (**Mohit**)
 - [x] Add example for nonlinear elasticity (**Mohit**)
@@ -65,7 +67,7 @@ Currently, the roadmap for different applications/examples/use-cases of `femsolv
 - [x] Add example for contact problems with penalty method (**Mohit**)
 - [x] Add example for contact problems with Lagrange multipliers (**Flavio**)
 - [ ] Add example for contact problems with augmented Lagrangian method (**Flavio**)
-- [ ] Add example for contact problems with Nitsche method (**Flavio**)
+- [ ] Add example for contact problems with Nitsche method (**Mohit**)
 - [x] Add example for cohesive fracture problems (**Mohit**)
 - [x] Add example for cohesive fracture problems under quasi-static loading (**Mohit**)
 - [x] Add example for cohesive fracture problems in dynamics (**Mohit**)
@@ -75,7 +77,7 @@ Currently, the roadmap for different applications/examples/use-cases of `femsolv
 
 ## Dense vs Sparse 
 
-A unique aspect of `femsolver` is that it can handle both dense and sparse matrices. This is achieved by using the library `sparsejac` that allows automatic differentiation of a functional based on a sparsity pattern. This significantly reduces the memory consumption. For more details on how the automatic differentiation can be done using sparsity pattern, please check the link below:
+A unique aspect of `tatva` is that it can handle both dense and sparse matrices. This is achieved by using the library `sparsejac` that allows automatic differentiation of a functional based on a sparsity pattern. This significantly reduces the memory consumption. For more details on how the automatic differentiation can be done using sparsity pattern, please check the link below:
 
 - ![Paper](https://arxiv.org/html/2501.17737v1)</br>
 - ![Github: sparsejac](https://github.com/mfschubert/sparsejac)</br>
