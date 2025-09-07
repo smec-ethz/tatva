@@ -75,7 +75,7 @@ class Shell4(Element):
         ]
     )
     quad_weights = jnp.array([1.0, 1.0, 1.0, 1.0])
-    shear_tying_points = jnp.array(
+    _shear_tying_points = jnp.array(
         [
             [0.0, -1.0],
             [0.0, 1.0],
@@ -83,6 +83,7 @@ class Shell4(Element):
             [1.0, 0.0],
         ]
     )
+    _edges = jnp.array([[0, 1], [1, 2], [2, 3], [3, 0]])
 
     def shape_function(self, xi: Array) -> Array:
         """Returns the shape functions evaluated at the local coordinates (xi, eta)."""
@@ -124,6 +125,14 @@ class Shell4(Element):
         detJ = jnp.linalg.det(J @ J.T) ** 0.5
         return J, detJ
 
+    def _1d_shape_function(self, s: Array | float) -> Array:
+        """Returns the 1D shape functions evaluated at the local coordinate xi."""
+        return jnp.array([0.5 * (1.0 - s), 0.5 * (1.0 + s)])
+
+    def _1d_shape_function_derivative(self, s: Array | float) -> Array:
+        """Returns the derivative of the 1D shape functions with respect to the local coordinate xi."""
+        return jnp.array([-0.5, 0.5])
+
     def get_triad(self, xi: Array, nodal_coords: Array) -> Array:
         """Calculate the triad (local coordinate system) at the given local coordinates (xi, eta).
 
@@ -163,9 +172,9 @@ class Shell4(Element):
         # stack for times dn0
         dn0 = jnp.tile(dn0, (4, 1))  # (4, 3)
 
-        theta_gp = N @ TH  # (2,) interpolated rotation at gp
-        omega_local = jnp.array([theta_gp[0], theta_gp[1], 0.0])
-        omega = triad @ omega_local  # (3,) rotation vector at gp in global coords
+        # omega_local = jnp.array([theta_gp[0], theta_gp[1], 0.0])
+        omega_local = jnp.hstack((TH, jnp.zeros((4, 1))))  # (4, 3)
+        omega = vmap(lambda w: triad @ w)(omega_local)  # (4, 3)
         Rn = vmap(rodrigues, 0)(omega)  # (4, 3, 3)
         dn = vmap(lambda R, d0: normalize(R @ d0))(Rn, dn0)  # (4, 3)
 
@@ -233,13 +242,13 @@ class Shell4(Element):
         # TODO: check if this is correct
         N_tie = jnp.array(
             [
-                0.5 * (1.0 - s),
-                0.5 * (1.0 + s),
-                0.5 * (1.0 - r),
-                0.5 * (1.0 + r),
+                [0.0, 0.5 * (1.0 - r)],
+                [0.5 * (1.0 + s), 0.0],
+                [0.0, 0.5 * (1.0 + r)],
+                [0.5 * (1.0 - s), 0.0],
             ]
         )
-        return N_tie @ gamma_tying
+        return N_tie.T @ gamma_tying  # (2,4) @ (4,) = (2,)
 
     def _mitc4_shear_at_tying_points(
         self, nodal_coords: Array, U: Array, TH: Array
@@ -254,13 +263,27 @@ class Shell4(Element):
         Returns:
             gamma_mitc: Shear strains at the shear tying points, shape (4, 2).
         """
+        triad = self.get_triad(jnp.array([0, 0]), nodal_coords)  # (3, 3)
+        dn0 = triad[:, 2]  # (3,) initial director at gp
+        dn0 = jnp.tile(dn0, (4, 1))  # (4, 3)
+        omega_local = jnp.hstack((TH, jnp.zeros((4, 1))))  # (4, 3)
+        omega = vmap(lambda w: triad @ w)(omega_local)  # (4, 3)
+        Rn = vmap(rodrigues, 0)(omega)  # (4, 3, 3)
+        dn = vmap(lambda R, d0: normalize(R @ d0))(Rn, dn0)  # (4, 3)
 
-        def gamma_at_gp(xi_tie: Array) -> Array:
-            val = self._interpolate(xi_tie, nodal_coords, U, TH)
-            gamma = val.a @ val.d - val.A @ val.D0  # (2,)
-            return gamma
+        def shear_at_edge(edge: Array) -> Array:
+            x_e = nodal_coords[edge] + U[edge]  # (2, 3)
+            N1d = self._1d_shape_function(0)  # (2,)
+            dN1d = self._1d_shape_function_derivative(0)  # (2,)
+            t_e = dN1d @ x_e  # (3,)
 
-        return vmap(gamma_at_gp)(self.shear_tying_points)  # (4, 2)
+            d = dn[edge]  # (2, 3)
+            d = N1d @ d  # (3,)
+            g3 = normalize(d)
+            return jnp.dot(t_e, g3)  # scalar shear along edge
+
+        gamma = vmap(shear_at_edge)(self._edges)  # (4,)
+        return gamma
 
     def drill_penalty(
         self,
