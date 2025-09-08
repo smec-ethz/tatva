@@ -6,7 +6,7 @@ Tatva (टत्तव) : Lego-like building blocks for FEM
 </p>
 
 </br>
-`tatva` (is a Sanskrit word which means principle or elements of reality). True to its name, `tatva` provide fundamental Lego-like building blocks (elements) which can be used to construct complex finite element method (FEM) simulations. `tatva` is purely written in Python library for FEM simulations and is built on top of JAX and Equinox, making it easy to use FEM in a differentiable way.
+`tatva` (is a Sanskrit word which means principle or elements of reality). True to its name, `tatva` provide fundamental Lego-like building blocks (elements) which can be used to construct complex finite element method (FEM) simulations. `tatva` is purely written in Python library for FEM simulations and is built on top of JAX, Equinox and sparsejac, making it easy to use FEM in a differentiable way.
 
 ## License
 
@@ -19,7 +19,8 @@ You should have received a copy of the GNU Lesser General Public License along w
 ## Features
 
 - Functional programming interface for FEM simulations
-- Differentiable operations using JAX
+- Differentiable operations using `JAX`
+- Support for sparse matrices using `sparsejac`
 - Support for linear, nonlinear, and mixed FEM simulations
 
 
