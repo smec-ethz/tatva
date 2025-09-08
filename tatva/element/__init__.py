@@ -15,8 +15,6 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
-
-# pyright: reportUnusedImport=false
-
 from ._element import Element as Element
-from ._element import Line2, Quad4, Tri3
+from ._element import Line2, Tri3, Quad4
+from .beam import BeamElement, HermiteElement, CorotationalHermiteElement, LinearElement

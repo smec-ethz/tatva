@@ -26,7 +26,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from tatva._element import Element
+from tatva.element import Element
 from tatva.mesh import Mesh, find_containing_polygons
 from tatva.utils import auto_vmap
 
