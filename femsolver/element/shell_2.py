@@ -217,20 +217,31 @@ class Shell4(Element):
             kappa: Bending curvatures at the given local coordinates, shape (3,).
         """
         val = self._interpolate(xi, nodal_coords, U, TH)
-        B0 = -val.dD0_dxi @ val.A.T  # (2, 2)
-        b = -val.dd_dxi @ val.a.T  # (2, 2)
-        kappa = b - B0  # (2, 2)
-        # kappa = 0.5 * (kappa + kappa.T)  # make symmetric
+        a = val.a  # (2, 3)
+        g = a @ a.T  # (2, 2) metric tensor
+        g_inv = jnp.linalg.inv(g)  # (2, 2)
+        a_contra = g_inv @ a  # (2, 3) contravariant basis
 
-        # transform to cartesian basis
-        # g_inv = jnp.linalg.inv(val.a @ val.a.T)  # (2,2) metric tensor
-        # a_contra = g_inv @ val.a  # (2,3) contravariant basis
-        # kappa_cart = a_contra.T @ kappa @ a_contra  # (3,3)
+        B0 = -val.dD0_dxi @ val.A.T  # (2, 2)
+        b = -val.dd_dxi @ a.T  # (2, 2)
+        kappa = b - B0  # (2, 2)
+
+        # transform covariant curvature to local orthonormal basis (lamina frame)
+        d = val.d  # (3,)
+        t1 = a[0]  # (3,)
+        e1_bar = t1 - d * (t1 @ d)  # remove component along d
+        e1_bar = normalize(e1_bar)
+        e2_bar = jnp.cross(d, e1_bar)
+        Q = jnp.stack([e1_bar, e2_bar], axis=1)  # (3,2)
+
+        S = a_contra @ Q  # (2,2)
+        kappa_lamina = S.T @ kappa @ S  # (2,2) curvature in lamina frame
+
         return jnp.array(
             [
-                kappa[0, 0],
-                kappa[1, 1],
-                kappa[0, 1] + kappa[1, 0],
+                kappa_lamina[0, 0],
+                kappa_lamina[1, 1],
+                kappa_lamina[0, 1] + kappa_lamina[1, 0],
             ]
         )  # (3,) Voigt notation
 
