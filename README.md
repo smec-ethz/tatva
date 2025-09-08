@@ -1,5 +1,5 @@
 <p align="center">
-<img src="assets/logo-small.png" alt="drawing" width="400"/>
+<img src="docs/assets/logo-small.png" alt="drawing" width="400"/>
 </p>
 <p align="center">
 Tatva (टत्तव) : Lego-like building blocks for FEM
