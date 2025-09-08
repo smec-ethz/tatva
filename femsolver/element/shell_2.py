@@ -52,7 +52,8 @@ def normalize(v: Array) -> Array:
 
 def normalize_interp_and_grad(N, dN_dxi, nodal_vecs, eps=1e-12):
     s = N @ nodal_vecs  # (3,)
-    s_a = jnp.tensordot(dN_dxi, nodal_vecs, axes=((1,), (0,)))  # (2,3)
+    # s_a = jnp.tensordot(dN_dxi, nodal_vecs, axes=((1,), (0,)))  # (2,3)
+    s_a = dN_dxi @ nodal_vecs  # (2,3)
     nrm = jnp.linalg.norm(s)
     d = s / jnp.where(nrm > eps, nrm, 1.0)
     P = jnp.eye(3) - jnp.outer(d, d)
@@ -78,9 +79,9 @@ class Shell4(Element):
     _shear_tying_points = jnp.array(
         [
             [0.0, -1.0],
+            [1.0, 0.0],
             [0.0, 1.0],
             [-1.0, 0.0],
-            [1.0, 0.0],
         ]
     )
     _edges = jnp.array([[0, 1], [1, 2], [2, 3], [3, 0]])
@@ -122,7 +123,7 @@ class Shell4(Element):
         """
         dN_dxi = self.shape_function_derivative(xi)
         J = dN_dxi @ nodal_coords  # (2, 3)
-        detJ = jnp.linalg.det(J @ J.T) ** 0.5
+        detJ = jnp.sqrt(jnp.linalg.det(J @ J.T))
         return J, detJ
 
     def _1d_shape_function(self, s: Array | float) -> Array:
@@ -172,7 +173,6 @@ class Shell4(Element):
         # stack for times dn0
         dn0 = jnp.tile(dn0, (4, 1))  # (4, 3)
 
-        # omega_local = jnp.array([theta_gp[0], theta_gp[1], 0.0])
         omega_local = jnp.hstack((TH, jnp.zeros((4, 1))))  # (4, 3)
         omega = vmap(lambda w: triad @ w)(omega_local)  # (4, 3)
         Rn = vmap(rodrigues, 0)(omega)  # (4, 3, 3)
@@ -220,9 +220,18 @@ class Shell4(Element):
         B0 = -val.dD0_dxi @ val.A.T  # (2, 2)
         b = -val.dd_dxi @ val.a.T  # (2, 2)
         kappa = b - B0  # (2, 2)
-        kappa = 0.5 * (kappa + kappa.T)  # make symmetric
+        # kappa = 0.5 * (kappa + kappa.T)  # make symmetric
+
+        # transform to cartesian basis
+        # g_inv = jnp.linalg.inv(val.a @ val.a.T)  # (2,2) metric tensor
+        # a_contra = g_inv @ val.a  # (2,3) contravariant basis
+        # kappa_cart = a_contra.T @ kappa @ a_contra  # (3,3)
         return jnp.array(
-            [kappa[0, 0], kappa[1, 1], 2.0 * kappa[0, 1]]
+            [
+                kappa[0, 0],
+                kappa[1, 1],
+                kappa[0, 1] + kappa[1, 0],
+            ]
         )  # (3,) Voigt notation
 
     def mitc4_shear(self, xi: Array, nodal_coords: Array, U: Array, TH: Array) -> Array:
