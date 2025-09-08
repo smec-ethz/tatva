@@ -1,10 +1,8 @@
-from typing import NamedTuple, override
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax import Array, vmap
-
-from femsolver.utils import auto_vmap
 
 from ._element import Element
 
@@ -44,6 +42,14 @@ def rodrigues(omega, eps=1e-12):
     return jax.lax.cond(theta2 < eps, small, large, operand=None)
 
 
+def rodrigues_series2(omega: Array, eps=1e-12) -> Array:
+    """Rodrigues series quadratic approximation for small angles."""
+    I = jnp.eye(3, dtype=omega.dtype)
+    K = skew(omega)
+    K2 = K @ K
+    return I + K + 0.5 * K2
+
+
 def normalize(v: Array) -> Array:
     """Returns the normalized vector."""
     norm = jnp.linalg.norm(v)
@@ -76,12 +82,15 @@ class Shell4(Element):
         ]
     )
     quad_weights = jnp.array([1.0, 1.0, 1.0, 1.0])
+    _nodes_isoparametric = jnp.array(
+        [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]]
+    )
     _shear_tying_points = jnp.array(
         [
-            [0.0, -1.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [-1.0, 0.0],
+            [0.0, -1.0],  # bottom edge
+            [1.0, 0.0],  # right edge
+            [0.0, 1.0],  # top edge
+            [-1.0, 0.0],  # left edge
         ]
     )
     _edges = jnp.array([[0, 1], [1, 2], [2, 3], [3, 0]])
@@ -126,63 +135,43 @@ class Shell4(Element):
         detJ = jnp.sqrt(jnp.linalg.det(J @ J.T))
         return J, detJ
 
-    def _1d_shape_function(self, s: Array | float) -> Array:
-        """Returns the 1D shape functions evaluated at the local coordinate xi."""
-        return jnp.array([0.5 * (1.0 - s), 0.5 * (1.0 + s)])
+    def get_orthonormal_strains(
+        self, nodal_coords: Array, U: Array, TH: Array
+    ) -> tuple[Array, Array, Array]:
+        """Calculate all strain components in the orthonormal lamina frame for the element.
 
-    def _1d_shape_function_derivative(self, s: Array | float) -> Array:
-        """Returns the derivative of the 1D shape functions with respect to the local coordinate xi."""
-        return jnp.array([-0.5, 0.5])
-
-    def get_triad(self, xi: Array, nodal_coords: Array) -> Array:
-        """Calculate the triad (local coordinate system) at the given local coordinates (xi, eta).
+        This combines membrane, bending, and shear strains. Returns values at all
+        quadrature points. Mappable over elements.
 
         Args:
-            xi: Local coordinates (r, s).
             nodal_coords: Nodal coordinates of the element, shape (4, 3).
-
-        Returns:
-            triad: Triad at the given local coordinates, shape (3, 3).
+            u: Nodal displacements of the element, shape (4, 3).
+            theta: Nodal rotations of the element, shape (4, 2).
         """
-        dN_dxi = self.shape_function_derivative(xi)
-        A = dN_dxi @ nodal_coords  # (2, 3)
-        e3 = normalize(jnp.cross(A[0], A[1]))
-        e1 = normalize(A[0])
-        e2 = normalize(jnp.cross(e3, e1))
-        return jnp.stack([e1, e2, e3], axis=1)
+        dn0, dn = self._get_current_directors(nodal_coords, TH)
 
-    def _interpolate(self, xi: Array, X: Array, U: Array, TH: Array):
-        N = self.shape_function(xi)  # (4,)
-        dN_dxi = self.shape_function_derivative(xi)  # (2, 4)
+        # compute shear at tying points
+        gamma_tying = self._mitc4_shear_at_tying_points(nodal_coords, U, dn)  # (4,)
 
-        # initial and current nodal positions
-        Xn = X  # (4, 3)
-        xn = X + U  # (4, 3)
+        def _at_gp(xi: Array):
+            val = self._interpolate(xi, nodal_coords, U, dn0, dn)
 
-        # interpolate fields
-        R0 = N @ Xn  # (3,)
-        r = N @ xn  # (3,)
+            # membrane strain
+            E = 0.5 * (val.a @ val.a.T - val.A @ val.A.T)  # (2, 2)
+            membrane_strain = jnp.array(
+                [E[0, 0], E[1, 1], 2.0 * E[0, 1]]
+            )  # (3,) Voigt notation
 
-        # covariant tangent bases (parametric derivatives)
-        A = dN_dxi @ Xn  # (2, 3)
-        a = dN_dxi @ xn  # (2, 3)
+            # bending curvature
+            curvature = self._compute_curvature_in_lamina_frame(val)  # (3,)
 
-        # rotated directors at nodes (large rotation)
-        triad = self.get_triad(xi, Xn)  # (3, 3)
-        dn0 = triad[:, 2]  # (3,) initial director at gp
-        # stack for times dn0
-        dn0 = jnp.tile(dn0, (4, 1))  # (4, 3)
+            # shear strain
+            shear_shape = self._tying_shape_function(xi).T  # (2,4)
+            shear_strain = shear_shape @ gamma_tying  # (2,)
 
-        omega_local = jnp.hstack((TH, jnp.zeros((4, 1))))  # (4, 3)
-        omega = vmap(lambda w: triad @ w)(omega_local)  # (4, 3)
-        Rn = vmap(rodrigues, 0)(omega)  # (4, 3, 3)
-        dn = vmap(lambda R, d0: normalize(R @ d0))(Rn, dn0)  # (4, 3)
+            return membrane_strain, curvature, shear_strain
 
-        # director derivatives (needed for curvature)
-        d, dd_dxi = normalize_interp_and_grad(N, dN_dxi, dn)  # (3,), (2, 3)
-        D0, dD0_dxi = normalize_interp_and_grad(N, dN_dxi, dn0)  # = (0,0,1), zero grads
-
-        return _InterpolateResult(N, dN_dxi, R0, r, A, a, D0, d, dD0_dxi, dd_dxi)
+        return vmap(_at_gp)(self.quad_points)  # (ngp, 8)
 
     def membrane_strain(
         self, xi: Array, nodal_coords: Array, U: Array, TH: Array
@@ -198,7 +187,8 @@ class Shell4(Element):
         Returns:
             epsilon: Membrane strains at the given local coordinates, shape (3,).
         """
-        val = self._interpolate(xi, nodal_coords, U, TH)
+        dn0, dn = self._get_current_directors(nodal_coords, TH)
+        val = self._interpolate(xi, nodal_coords, U, dn0, dn)
         E = 0.5 * (val.a @ val.a.T - val.A @ val.A.T)  # (2, 2)
         return jnp.array([E[0, 0], E[1, 1], 2.0 * E[0, 1]])  # (3,) Voigt notation
 
@@ -216,7 +206,106 @@ class Shell4(Element):
         Returns:
             kappa: Bending curvatures at the given local coordinates, shape (3,).
         """
-        val = self._interpolate(xi, nodal_coords, U, TH)
+        dn0, dn = self._get_current_directors(nodal_coords, TH)
+        val = self._interpolate(xi, nodal_coords, U, dn0, dn)
+        return self._compute_curvature_in_lamina_frame(val)
+
+    def mitc4_shear(self, xi: Array, nodal_coords: Array, U: Array, TH: Array) -> Array:
+        """Calculate the MITC4 shear strains at the given local coordinates (xi, eta).
+
+        Args:
+            xi: Local coordinates (r, s).
+            nodal_coords: Nodal coordinates of the element, shape (4, 3).
+            u: Nodal displacements of the element, shape (4, 3).
+            theta: Nodal rotations of the element, shape (4, 2).
+
+        Returns:
+            gamma_mitc: Shear strains at the given local coordinates, shape (2,).
+        """
+        _, dn = self._get_current_directors(nodal_coords, TH)
+        gamma_tying = self._mitc4_shear_at_tying_points(nodal_coords, U, dn)
+        return self._tying_shape_function(xi).T @ gamma_tying  # (2,4) @ (4,) = (2,)
+
+    # -----------------------------------
+    # Custom shape functions for MITC4
+    # -----------------------------------
+
+    def _1d_shape_function(self, s: Array | float) -> Array:
+        """Returns the 1D shape functions evaluated at the local coordinate xi."""
+        return jnp.array([0.5 * (1.0 - s), 0.5 * (1.0 + s)])
+
+    def _1d_shape_function_derivative(self, s: Array | float) -> Array:
+        """Returns the derivative of the 1D shape functions with respect to the local
+        coordinate xi.
+        """
+        return jnp.array([-0.5, 0.5])
+
+    def _tying_shape_function(self, xi: Array) -> Array:
+        """Returns the MITC4 shear tying shape functions evaluated at the local
+        coordinates (xi, eta).
+        """
+        r, s = xi
+        return jnp.array(
+            [
+                [0.0, 0.5 * (1.0 - r)],  # edge bottom (0, 1)
+                [0.5 * (1.0 + s), 0.0],  # edge right (1, 2)
+                [0.0, 0.5 * (1.0 + r)],  # edge top (2, 3)
+                [0.5 * (1.0 - s), 0.0],  # edge left (3, 0)
+            ]
+        )
+
+    # -----------------------------------
+    # Internal helper methods
+    # -----------------------------------
+
+    def _get_triad(self, xi: Array, nodal_coords: Array) -> Array:
+        """Calculate the triad (local coordinate system) at the given local coordinates (xi, eta).
+
+        Args:
+            xi: Local coordinates (r, s).
+            nodal_coords: Nodal coordinates of the element, shape (4, 3).
+
+        Returns:
+            triad: Triad at the given local coordinates, shape (3, 3).
+        """
+        dN_dxi = self.shape_function_derivative(xi)
+        A = dN_dxi @ nodal_coords  # (2, 3)
+        e3 = normalize(jnp.cross(A[0], A[1]))
+        e1 = normalize(A[0])
+        e2 = normalize(jnp.cross(e3, e1))
+        return jnp.stack([e1, e2, e3], axis=1)
+
+    class _InterpolateResult(NamedTuple):
+        N: Array  # (4,) shape functions at xi
+        dN_dxi: Array  # (2, 4) shape function derivatives at xi
+        A: Array  # (2, 3) initial covariant basis
+        a: Array  # (2, 3) current covariant basis
+        D0: Array  # (3,) initial director at xi
+        d: Array  # (3,) current directors at xi
+        dD0_dxi: Array  # (2, 3) initial director derivatives at xi
+        dd_dxi: Array  # (2, 3) current director derivatives at xi
+
+    def _interpolate(
+        self, xi: Array, X: Array, U: Array, dn0: Array, dn: Array
+    ) -> _InterpolateResult:
+        N = self.shape_function(xi)
+        dN_dxi = self.shape_function_derivative(xi)
+
+        # initial and current nodal positions
+        Xn = X  # (4, 3)
+        xn = X + U  # (4, 3)
+
+        # covariant tangent bases (parametric derivatives)
+        A = dN_dxi @ Xn  # (2, 3)
+        a = dN_dxi @ xn  # (2, 3)
+
+        # director derivatives (needed for curvature)
+        d, dd_dxi = normalize_interp_and_grad(N, dN_dxi, dn)  # (3,), (2, 3)
+        D0, dD0_dxi = normalize_interp_and_grad(N, dN_dxi, dn0)  # = (0,0,1), zero grads
+
+        return Shell4._InterpolateResult(N, dN_dxi, A, a, D0, d, dD0_dxi, dd_dxi)
+
+    def _compute_curvature_in_lamina_frame(self, val: "_InterpolateResult") -> Array:
         a = val.a  # (2, 3)
         g = a @ a.T  # (2, 2) metric tensor
         g_inv = jnp.linalg.inv(g)  # (2, 2)
@@ -245,51 +334,19 @@ class Shell4(Element):
             ]
         )  # (3,) Voigt notation
 
-    def mitc4_shear(self, xi: Array, nodal_coords: Array, U: Array, TH: Array) -> Array:
-        """Calculate the MITC4 shear strains at the given local coordinates (xi, eta).
-
-        Args:
-            xi: Local coordinates (r, s).
-            nodal_coords: Nodal coordinates of the element, shape (4, 3).
-            u: Nodal displacements of the element, shape (4, 3).
-            theta: Nodal rotations of the element, shape (4, 2).
-
-        Returns:
-            gamma_mitc: Shear strains at the given local coordinates, shape (2,).
-        """
-        gamma_tying = self._mitc4_shear_at_tying_points(nodal_coords, U, TH)
-        r, s = xi
-        # TODO: check if this is correct
-        N_tie = jnp.array(
-            [
-                [0.0, 0.5 * (1.0 - r)],
-                [0.5 * (1.0 + s), 0.0],
-                [0.0, 0.5 * (1.0 + r)],
-                [0.5 * (1.0 - s), 0.0],
-            ]
-        )
-        return N_tie.T @ gamma_tying  # (2,4) @ (4,) = (2,)
-
     def _mitc4_shear_at_tying_points(
-        self, nodal_coords: Array, U: Array, TH: Array
+        self, nodal_coords: Array, U: Array, dn: Array
     ) -> Array:
         """Calculate the MITC4 shear strains at the shear tying points.
 
         Args:
             nodal_coords: Nodal coordinates of the element, shape (4, 3).
             u: Nodal displacements of the element, shape (4, 3).
-            theta: Nodal rotations of the element, shape (4, 2).
+            dn: Current directors at the nodes, shape (4, 3).
 
         Returns:
             gamma_mitc: Shear strains at the shear tying points, shape (4, 2).
         """
-        triad = self.get_triad(jnp.array([0, 0]), nodal_coords)  # (3, 3)
-        dn0 = triad[:, 2]  # (3,) initial director at gp
-        dn0 = jnp.tile(dn0, (4, 1))  # (4, 3)
-        omega_local = jnp.hstack((TH, jnp.zeros((4, 1))))  # (4, 3)
-        omega = vmap(lambda w: triad @ w)(omega_local)  # (4, 3)
-        Rn = vmap(rodrigues, 0)(omega)  # (4, 3, 3)
-        dn = vmap(lambda R, d0: normalize(R @ d0))(Rn, dn0)  # (4, 3)
 
         def shear_at_edge(edge: Array) -> Array:
             x_e = nodal_coords[edge] + U[edge]  # (2, 3)
@@ -305,50 +362,24 @@ class Shell4(Element):
         gamma = vmap(shear_at_edge)(self._edges)  # (4,)
         return gamma
 
-    def drill_penalty(
-        self,
-        xi: Array,
-        nodal_coords: Array,
-        U: Array,
-        TH: Array,
-        *,
-        E: float = 1.0,
-        t: float = 1.0,
-        beta=1e-3,
-    ) -> Array:
-        """Calculate the drilling penalty at the given local coordinates (xi, eta).
+    def _get_current_directors(
+        self, nodal_coords: Array, TH: Array
+    ) -> tuple[Array, Array]:
+        """Calculate the initial and current directors at the nodes.
 
         Args:
-            xi: Local coordinates (r, s).
             nodal_coords: Nodal coordinates of the element, shape (4, 3).
-            u: Nodal displacements of the element, shape (4, 3).
-            theta: Nodal rotations of the element, shape (4, 2).
-
-        Returns:
-            penalty: Drilling penalty at the given local coordinates, shape ().
+            TH: Nodal rotations of the element, shape (4, 2).
         """
-        val = self._interpolate(xi, nodal_coords, U, TH)
-        a1 = normalize(val.a[0])
-        a2 = normalize(jnp.cross(val.d, a1))
-        theta_gp = val.N @ TH
-        R_gp = rodrigues(theta_gp)
-        e1 = jnp.array([1.0, 0.0, 0.0])
-        e2 = jnp.array([0.0, 1.0, 0.0])
-        m1 = R_gp @ e1
-        m2 = R_gp @ e2
+        # compute directors and triads at nodes
+        triads = vmap(self._get_triad, in_axes=(0, None))(
+            self._nodes_isoparametric, nodal_coords
+        )
+        dn0 = triads[:, :, 2]  # (4, 3) initial director at nodes
 
-        mis = jnp.sum((a1 - m1) ** 2) + jnp.sum((a2 - m2) ** 2)
-        return beta * E * t * mis
-
-
-class _InterpolateResult(NamedTuple):
-    N: Array  # (4,) shape functions at xi
-    dN_dxi: Array  # (2, 4) shape function derivatives at xi
-    R0: Array  # (3,) initial position at xi
-    r: Array  # (3,) current position at xi
-    A: Array  # (2, 3) initial covariant basis
-    a: Array  # (2, 3) current covariant basis
-    D0: Array  # (3,) initial director at xi
-    d: Array  # (3,) current directors at xi
-    dD0_dxi: Array  # (2, 3) initial director derivatives at xi
-    dd_dxi: Array  # (2, 3) current director derivatives at xi
+        omega_local = jnp.hstack((TH, jnp.zeros((4, 1))))  # (4, 3)
+        Rn = vmap(rodrigues, 0)(omega_local)  # (4, 3, 3)
+        dn = vmap(lambda R, d0: normalize(R @ d0))(
+            Rn, dn0
+        )  # (4, 3) current director at nodes
+        return dn0, dn
