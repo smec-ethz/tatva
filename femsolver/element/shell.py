@@ -67,6 +67,39 @@ def normalize_interp_and_grad(N, dN_dxi, nodal_vecs, eps=1e-12):
     return d, dd
 
 
+def build_nodal_frame(
+    normals: Array,
+    *,
+    global_axis=jnp.array([1.0, 0.0, 0.0]),
+    global_axis_backup=jnp.array([0.0, 1.0, 0.0]),
+) -> Array:
+    """Build a local orthonormal frame given the normal vector.
+
+    Args:
+        normals: Normal vectors, shape (nnodes, 3).
+        global_axis: A global axis to help define the local frame, shape (3,).
+        global_axis_backup: A backup global axis if the first is parallel to the normal, shape (3,).
+
+    Returns:
+        frames: Local orthonormal frames, shape (nnodes, 3, 3).
+    """
+    return vmap(_build_frame, (0, None, None))(
+        normals, global_axis, global_axis_backup
+    )  # (..., 3, 3)
+
+
+def _build_frame(n: Array, global_axis: Array, global_axis_backup: Array) -> Array:
+    # ensure n is normalized
+    n = normalize(n)
+    projected = global_axis @ n
+    global_axis_used = jnp.where(
+        projected**2 < 1.0 - 1e-3, global_axis, global_axis_backup
+    )
+    t1 = normalize(global_axis_used - (global_axis_used @ n) * n)
+    t2 = jnp.cross(n, t1)
+    return jnp.stack([t1, t2, n], axis=1)  # (3, 3)
+
+
 class Shell4(Element):
     """A 4-node bilinear shell element."""
 
@@ -136,7 +169,7 @@ class Shell4(Element):
         return J, detJ
 
     def get_orthonormal_strains(
-        self, nodal_coords: Array, U: Array, TH: Array
+        self, nodal_coords: Array, nodal_frames: Array, U: Array, TH: Array
     ) -> tuple[Array, Array, Array]:
         """Calculate all strain components in the orthonormal lamina frame for the element.
 
@@ -145,13 +178,18 @@ class Shell4(Element):
 
         Args:
             nodal_coords: Nodal coordinates of the element, shape (4, 3).
+            nodal_frames: Nodal orthonormal frames of the element, shape (4, 3, 3).
             u: Nodal displacements of the element, shape (4, 3).
             theta: Nodal rotations of the element, shape (4, 2).
         """
-        dn0, dn = self._get_current_directors(nodal_coords, TH)
+        dn0, dn = self._get_current_directors(nodal_coords, nodal_frames, TH)
 
         # compute shear at tying points
-        gamma_tying = self._mitc4_shear_at_tying_points(nodal_coords, U, dn)  # (4,)
+        gamma_tying = self._mitc4_shear_at_tying_points(
+            nodal_coords, U, dn, dn0
+        )  # (4,)
+
+        # transform shear in isoparametric space to lamina frame
 
         def _at_gp(xi: Array):
             val = self._interpolate(xi, nodal_coords, U, dn0, dn)
@@ -187,43 +225,51 @@ class Shell4(Element):
         Returns:
             epsilon: Membrane strains at the given local coordinates, shape (3,).
         """
-        dn0, dn = self._get_current_directors(nodal_coords, TH)
-        val = self._interpolate(xi, nodal_coords, U, dn0, dn)
-        E = 0.5 * (val.a @ val.a.T - val.A @ val.A.T)  # (2, 2)
+        Xn = nodal_coords  # (4, 3)
+        xn = nodal_coords + U  # (4, 3)
+
+        A = self.shape_function_derivative(xi) @ Xn  # (2, 3)
+        a = self.shape_function_derivative(xi) @ xn  # (2, 3)
+
+        E = 0.5 * (a @ a.T - A @ A.T)  # (2, 2)
         return jnp.array([E[0, 0], E[1, 1], 2.0 * E[0, 1]])  # (3,) Voigt notation
 
     def bending_curvature(
-        self, xi: Array, nodal_coords: Array, U: Array, TH: Array
+        self, xi: Array, nodal_coords: Array, nodal_frames: Array, U: Array, TH: Array
     ) -> Array:
         """Calculate the bending curvatures at the given local coordinates (xi, eta).
 
         Args:
             xi: Local coordinates (r, s).
             nodal_coords: Nodal coordinates of the element, shape (4, 3).
+            nodal_frames: Nodal orthonormal frames of the element, shape (4, 3, 3).
             u: Nodal displacements of the element, shape (4, 3).
             theta: Nodal rotations of the element, shape (4, 2).
 
         Returns:
             kappa: Bending curvatures at the given local coordinates, shape (3,).
         """
-        dn0, dn = self._get_current_directors(nodal_coords, TH)
+        dn0, dn = self._get_current_directors(nodal_coords, nodal_frames, TH)
         val = self._interpolate(xi, nodal_coords, U, dn0, dn)
         return self._compute_curvature_in_lamina_frame(val)
 
-    def mitc4_shear(self, xi: Array, nodal_coords: Array, U: Array, TH: Array) -> Array:
+    def mitc4_shear(
+        self, xi: Array, nodal_coords: Array, nodal_frames: Array, U: Array, TH: Array
+    ) -> Array:
         """Calculate the MITC4 shear strains at the given local coordinates (xi, eta).
 
         Args:
             xi: Local coordinates (r, s).
             nodal_coords: Nodal coordinates of the element, shape (4, 3).
+            nodal_frames: Nodal orthonormal frames of the element, shape (4, 3, 3).
             u: Nodal displacements of the element, shape (4, 3).
             theta: Nodal rotations of the element, shape (4, 2).
 
         Returns:
             gamma_mitc: Shear strains at the given local coordinates, shape (2,).
         """
-        _, dn = self._get_current_directors(nodal_coords, TH)
-        gamma_tying = self._mitc4_shear_at_tying_points(nodal_coords, U, dn)
+        dn0, dn = self._get_current_directors(nodal_coords, nodal_frames, TH)
+        gamma_tying = self._mitc4_shear_at_tying_points(nodal_coords, U, dn, dn0)
         return self._tying_shape_function(xi).T @ gamma_tying  # (2,4) @ (4,) = (2,)
 
     # -----------------------------------
@@ -335,7 +381,7 @@ class Shell4(Element):
         )  # (3,) Voigt notation
 
     def _mitc4_shear_at_tying_points(
-        self, nodal_coords: Array, U: Array, dn: Array
+        self, nodal_coords: Array, U: Array, dn: Array, dn0: Array
     ) -> Array:
         """Calculate the MITC4 shear strains at the shear tying points.
 
@@ -349,36 +395,41 @@ class Shell4(Element):
         """
 
         def shear_at_edge(edge: Array) -> Array:
+            X_e = nodal_coords[edge]  # (2, 3)
             x_e = nodal_coords[edge] + U[edge]  # (2, 3)
             N1d = self._1d_shape_function(0)  # (2,)
             dN1d = self._1d_shape_function_derivative(0)  # (2,)
+            T_e = dN1d @ X_e  # (3,)
             t_e = dN1d @ x_e  # (3,)
 
             d = dn[edge]  # (2, 3)
             d = N1d @ d  # (3,)
+            D = N1d @ dn0[edge]  # (3,)
             g3 = normalize(d)
-            return jnp.dot(t_e, g3)  # scalar shear along edge
+            return jnp.dot(t_e, g3) - jnp.dot(T_e, D)  # scalar shear along edge
 
         gamma = vmap(shear_at_edge)(self._edges)  # (4,)
         return gamma
 
     def _get_current_directors(
-        self, nodal_coords: Array, TH: Array
+        self, nodal_coords: Array, nodal_frames: Array, TH: Array
     ) -> tuple[Array, Array]:
         """Calculate the initial and current directors at the nodes.
 
         Args:
             nodal_coords: Nodal coordinates of the element, shape (4, 3).
+            nodal_frames: Nodal orthonormal frames of the element, shape (4, 3, 3).
             TH: Nodal rotations of the element, shape (4, 2).
         """
-        # compute directors and triads at nodes
-        triads = vmap(self._get_triad, in_axes=(0, None))(
-            self._nodes_isoparametric, nodal_coords
-        )
-        dn0 = triads[:, :, 2]  # (4, 3) initial director at nodes
+        dn0 = nodal_frames[:, :, 2]  # (4, 3) initial director at nodes
 
-        omega_local = jnp.hstack((TH, jnp.zeros((4, 1))))  # (4, 3)
-        Rn = vmap(rodrigues, 0)(omega_local)  # (4, 3, 3)
+        # the rotational dofs are in the nodal frame (in plane rotations)
+        omega = jnp.hstack((TH, jnp.zeros((4, 1))))  # (4, 3)
+
+        # transform rotation to global frame (xyz)
+        omega = vmap(lambda R, th: R @ th)(nodal_frames, omega)  # (4, 3)
+
+        Rn = vmap(rodrigues, 0)(omega)  # (4, 3, 3)
         dn = vmap(lambda R, d0: normalize(R @ d0))(
             Rn, dn0
         )  # (4, 3) current director at nodes
