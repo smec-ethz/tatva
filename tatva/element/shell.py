@@ -217,15 +217,17 @@ class Shell4(Element):
             val = self._interpolate(xi, nodal_coords, U, dn0, dn)
 
             # compute contravariant basis
-            a_contra = self._contravariant_basis(val.a)  # (2,3)
-            Q_ref = self._lamina_basis(val.d, val.a)  # (3,2)
             # a_contra = self._contravariant_basis(val.a)  # (2,3)
-            # Q_ref = self._lamina_basis_ref(val.A)[:, :2]  # (3,2)
-            S = a_contra @ Q_ref  # (2,2) transformation matrix
+            # Q_ref = self._lamina_basis(val.d, val.a)  # (3,2)
+            a_contra = self._contravariant_basis(val.A)  # (2,3)
+            Q_ref = self._lamina_basis_ref(val.A)[:, :2]  # (3,2)
+            # S = a_contra @ Q_ref  # (2,2) transformation matrix
+            S = Q_ref.T @ a_contra.T
+            # S_ = val.a @ Q_ref  # (2,2) transformation matrix
 
             # membrane strain in covariant basis
             E_hat = 0.5 * (val.a @ val.a.T - val.A @ val.A.T)  # (2, 2)
-            E = S.T @ E_hat @ S
+            E = S @ E_hat @ S.T  # (2,2) strain in lamina frame
             membrane_strain = jnp.array(
                 [E[0, 0], E[1, 1], 2.0 * E[0, 1]]
             )  # (3,) Voigt notation
@@ -235,7 +237,7 @@ class Shell4(Element):
             b = -val.dd_dxi @ val.a.T  # (2, 2)
             kappa_hat = b - B0  # (2, 2)
 
-            kappa = S.T @ kappa_hat @ S  # (2,2) curvature in lamina frame
+            kappa = S @ kappa_hat @ S.T  # (2,2) curvature in lamina frame
 
             curvature = jnp.array(
                 [
@@ -250,7 +252,7 @@ class Shell4(Element):
             gamma_mitc = shear_shape_func @ gamma_tying  # (2,4) @ (4,) = (2,)
             gamma_mitc = jnp.diag(gamma_mitc)
             # shear_strain = (val.a @ Q_ref).T @ gamma_mitc  # (2,)
-            shear_strain = S.T @ gamma_mitc  # (2,)
+            shear_strain = S @ gamma_mitc  # (2,)
 
             return membrane_strain, curvature, shear_strain
 
