@@ -100,6 +100,30 @@ def _build_frame(n: Array, global_axis: Array, global_axis_backup: Array) -> Arr
     return jnp.stack([t1, t2, n], axis=1)  # (3, 3)
 
 
+def get_constitutive_mats(E: float, nu: float, t: float, kappa_s: float = 5 / 6):
+    """Return (A, D, Ks). Voigt order [xx, yy, xy], with γ_xy = 2 ε_xy.
+
+    Args:
+        E: Young's modulus.
+        nu: Poisson's ratio.
+        t: Thickness of the shell.
+        kappa_s: Shear correction factor, default is 5/6.
+    """
+    c = E / (1.0 - nu**2)
+    M = jnp.array(
+        [
+            [1.0, nu, 0.0],
+            [nu, 1.0, 0.0],
+            [0.0, 0.0, (1.0 - nu) / 2.0],
+        ]
+    )
+    A = c * t * M  # membrane
+    D = c * (t**3) / 12.0 * M  # bending
+    G = E / (2.0 * (1.0 + nu))
+    Ks = kappa_s * G * t * jnp.eye(2)  # transverse shear (2x2)
+    return A, D, Ks
+
+
 class Shell4(Element):
     """A 4-node bilinear shell element."""
 
@@ -187,25 +211,46 @@ class Shell4(Element):
         # compute shear at tying points
         gamma_tying = self._mitc4_shear_at_tying_points(
             nodal_coords, U, dn, dn0
-        )  # (4,)
-
-        # transform shear in isoparametric space to lamina frame
+        )  # (4,2)
 
         def _at_gp(xi: Array):
             val = self._interpolate(xi, nodal_coords, U, dn0, dn)
 
-            # membrane strain
-            E = 0.5 * (val.a @ val.a.T - val.A @ val.A.T)  # (2, 2)
+            # compute contravariant basis
+            a_contra = self._contravariant_basis(val.a)  # (2,3)
+            Q_ref = self._lamina_basis(val.d, val.a)  # (3,2)
+            # a_contra = self._contravariant_basis(val.a)  # (2,3)
+            # Q_ref = self._lamina_basis_ref(val.A)[:, :2]  # (3,2)
+            S = a_contra @ Q_ref  # (2,2) transformation matrix
+
+            # membrane strain in covariant basis
+            E_hat = 0.5 * (val.a @ val.a.T - val.A @ val.A.T)  # (2, 2)
+            E = S.T @ E_hat @ S
             membrane_strain = jnp.array(
                 [E[0, 0], E[1, 1], 2.0 * E[0, 1]]
             )  # (3,) Voigt notation
 
-            # bending curvature
-            curvature = self._compute_curvature_in_lamina_frame(val)  # (3,)
+            # bending curvature in covariant basis
+            B0 = -val.dD0_dxi @ val.A.T  # (2, 2)
+            b = -val.dd_dxi @ val.a.T  # (2, 2)
+            kappa_hat = b - B0  # (2, 2)
+
+            kappa = S.T @ kappa_hat @ S  # (2,2) curvature in lamina frame
+
+            curvature = jnp.array(
+                [
+                    kappa[0, 0],
+                    kappa[1, 1],
+                    kappa[0, 1] + kappa[1, 0],
+                ]
+            )  # (3,) Voigt notation
 
             # shear strain
-            shear_shape = self._tying_shape_function(xi).T  # (2,4)
-            shear_strain = shear_shape @ gamma_tying  # (2,)
+            shear_shape_func = self._tying_shape_function(xi)  # (2,4)
+            gamma_mitc = shear_shape_func @ gamma_tying  # (2,4) @ (4,) = (2,)
+            gamma_mitc = jnp.diag(gamma_mitc)
+            # shear_strain = (val.a @ Q_ref).T @ gamma_mitc  # (2,)
+            shear_strain = S.T @ gamma_mitc  # (2,)
 
             return membrane_strain, curvature, shear_strain
 
@@ -270,7 +315,7 @@ class Shell4(Element):
         """
         dn0, dn = self._get_current_directors(nodal_coords, nodal_frames, TH)
         gamma_tying = self._mitc4_shear_at_tying_points(nodal_coords, U, dn, dn0)
-        return self._tying_shape_function(xi).T @ gamma_tying  # (2,4) @ (4,) = (2,)
+        return self._tying_shape_function(xi) @ gamma_tying  # (2,4) @ (4,) = (2,)
 
     # -----------------------------------
     # Custom shape functions for MITC4
@@ -293,12 +338,12 @@ class Shell4(Element):
         r, s = xi
         return jnp.array(
             [
-                [0.0, 0.5 * (1.0 - r)],  # edge bottom (0, 1)
-                [0.5 * (1.0 + s), 0.0],  # edge right (1, 2)
-                [0.0, 0.5 * (1.0 + r)],  # edge top (2, 3)
-                [0.5 * (1.0 - s), 0.0],  # edge left (3, 0)
+                [0.5 * (1.0 - r), 0.0],  # edge bottom (0, 1)
+                [0.0, 0.5 * (1.0 + s)],  # edge right (1, 2)
+                [0.5 * (1.0 + r), 0.0],  # edge top (2, 3)
+                [0.0, 0.5 * (1.0 - s)],  # edge left (3, 0)
             ]
-        )
+        ).T
 
     # -----------------------------------
     # Internal helper methods
@@ -314,12 +359,17 @@ class Shell4(Element):
         Returns:
             triad: Triad at the given local coordinates, shape (3, 3).
         """
-        dN_dxi = self.shape_function_derivative(xi)
-        A = dN_dxi @ nodal_coords  # (2, 3)
-        e3 = normalize(jnp.cross(A[0], A[1]))
-        e1 = normalize(A[0])
-        e2 = normalize(jnp.cross(e3, e1))
-        return jnp.stack([e1, e2, e3], axis=1)
+        # transform covariant curvature to local orthonormal basis (lamina frame)
+        A1, A2 = self.shape_function_derivative(xi) @ nodal_coords
+        # normal (ref director)
+        e3 = jnp.cross(A1, A2)
+        e3 = e3 / jnp.linalg.norm(e3)
+        # pick first tangent axis
+        e1 = A1 - jnp.dot(A1, e3) * e3
+        e1 = e1 / jnp.linalg.norm(e1)
+        # second tangent axis
+        e2 = jnp.cross(e3, e1)
+        return jnp.stack([e1, e2, e3], axis=1)  # (3,3)
 
     class _InterpolateResult(NamedTuple):
         N: Array  # (4,) shape functions at xi
@@ -346,20 +396,58 @@ class Shell4(Element):
         a = dN_dxi @ xn  # (2, 3)
 
         # director derivatives (needed for curvature)
-        d, dd_dxi = normalize_interp_and_grad(N, dN_dxi, dn)  # (3,), (2, 3)
-        D0, dD0_dxi = normalize_interp_and_grad(N, dN_dxi, dn0)  # = (0,0,1), zero grads
+        # d, dd_dxi = normalize_interp_and_grad(N, dN_dxi, dn)  # (3,), (2, 3)
+        # D0, dD0_dxi = normalize_interp_and_grad(N, dN_dxi, dn0)  # = (0,0,1), zero grads
+        d = N @ dn  # (3,)
+        D0 = N @ dn0
+        dD0_dxi = dN_dxi @ dn0  # (2, 3)
+        dd_dxi = dN_dxi @ dn  # (2, 3)
 
         return Shell4._InterpolateResult(N, dN_dxi, A, a, D0, d, dD0_dxi, dd_dxi)
+
+    def _contravariant_basis(self, a: Array) -> Array:
+        g = a @ a.T  # (2, 2) metric tensor
+        g_inv = jnp.linalg.inv(g)  # (2, 2)
+        # in physical meaning, a_contra is the gradient of the parametric coords
+        # in the cartesian space (?)
+        a_contra = g_inv @ a  # (2, 3) contravariant basis
+        return a_contra
+
+    def _lamina_basis(self, d: Array, a: Array) -> Array:
+        # transform covariant curvature to local orthonormal basis (lamina frame)
+        t1 = a[0]  # (3,)
+        e1_bar = t1 - d * (t1 @ d)  # remove component along d
+        e1_bar = normalize(e1_bar)
+        e2_bar = jnp.cross(d, e1_bar)
+        Q = jnp.stack([e1_bar, e2_bar], axis=1)  # (3,2)
+        return Q
+
+    @staticmethod
+    def _lamina_basis_ref(A: Array) -> Array:
+        # transform covariant curvature to local orthonormal basis (lamina frame)
+        A1, A2 = A
+        # normal (ref director)
+        e3 = jnp.cross(A1, A2)
+        e3 = e3 / jnp.linalg.norm(e3)
+        # pick first tangent axis
+        e1 = A1 - jnp.dot(A1, e3) * e3
+        e1 = e1 / jnp.linalg.norm(e1)
+        # second tangent axis
+        e2 = jnp.cross(e3, e1)
+        return jnp.stack([e1, e2, e3], axis=1)  # (3,3)
+
+    def _transformation_matrix(self, a: Array, d: Array) -> Array:
+        """Calculate the transformation matrix from the parametric basis to the lamina frame."""
+        # S is a rotation matrix (orthogonal) mapping from parametric to lamina frame
+        a_contra = self._contravariant_basis(a)  # (2,3)
+        Q = self._lamina_basis(d, a)  # (3,2)
+        return a_contra @ Q  # (2,2)
 
     def _compute_curvature_in_lamina_frame(self, val: "_InterpolateResult") -> Array:
         a = val.a  # (2, 3)
         g = a @ a.T  # (2, 2) metric tensor
         g_inv = jnp.linalg.inv(g)  # (2, 2)
         a_contra = g_inv @ a  # (2, 3) contravariant basis
-
-        B0 = -val.dD0_dxi @ val.A.T  # (2, 2)
-        b = -val.dd_dxi @ a.T  # (2, 2)
-        kappa = b - B0  # (2, 2)
 
         # transform covariant curvature to local orthonormal basis (lamina frame)
         d = val.d  # (3,)
@@ -368,8 +456,12 @@ class Shell4(Element):
         e1_bar = normalize(e1_bar)
         e2_bar = jnp.cross(d, e1_bar)
         Q = jnp.stack([e1_bar, e2_bar], axis=1)  # (3,2)
-
         S = a_contra @ Q  # (2,2)
+
+        B0 = -val.dD0_dxi @ val.A.T  # (2, 2)
+        b = -val.dd_dxi @ a.T  # (2, 2)
+        kappa = b - B0  # (2, 2)
+
         kappa_lamina = S.T @ kappa @ S  # (2,2) curvature in lamina frame
 
         return jnp.array(
@@ -389,27 +481,59 @@ class Shell4(Element):
             nodal_coords: Nodal coordinates of the element, shape (4, 3).
             u: Nodal displacements of the element, shape (4, 3).
             dn: Current directors at the nodes, shape (4, 3).
+            dn0: Initial directors at the nodes, shape (4, 3).
 
         Returns:
-            gamma_mitc: Shear strains at the shear tying points, shape (4, 2).
+            gamma_mitc: Shear strain at the shear tying points per edge, shape (4,).
         """
 
-        def shear_at_edge(edge: Array) -> Array:
-            X_e = nodal_coords[edge]  # (2, 3)
-            x_e = nodal_coords[edge] + U[edge]  # (2, 3)
-            N1d = self._1d_shape_function(0)  # (2,)
-            dN1d = self._1d_shape_function_derivative(0)  # (2,)
-            T_e = dN1d @ X_e  # (3,)
-            t_e = dN1d @ x_e  # (3,)
+        def shear_at_tying_point(xi: Array) -> Array:
+            dN_dxi = self.shape_function_derivative(xi)  # (2,4)
+            N = self.shape_function(xi)  # (4,)
+            A = dN_dxi @ nodal_coords  # (2, 3)
+            a = dN_dxi @ (nodal_coords + U)  # (2, 3)
+            D0 = normalize(jnp.cross(A[0], A[1]))  # (3,)
+            g3 = normalize(N @ dn)  # (3,)
 
-            d = dn[edge]  # (2, 3)
-            d = N1d @ d  # (3,)
-            D = N1d @ dn0[edge]  # (3,)
-            g3 = normalize(d)
-            return jnp.dot(t_e, g3) - jnp.dot(T_e, D)  # scalar shear along edge
+            gamma1 = jnp.dot(a[0], g3) - jnp.dot(A[0], D0)  # shear along xi
+            gamma2 = jnp.dot(a[1], g3) - jnp.dot(A[1], D0)  # shear along eta
 
-        gamma = vmap(shear_at_edge)(self._edges)  # (4,)
+            # return jnp.where(component == 0, gamma1, gamma2)
+            return jnp.stack([gamma1, gamma2], axis=0)
+
+        gamma = vmap(shear_at_tying_point)(self._shear_tying_points)  # (4,)
         return gamma
+
+    # def _mitc4_shear_at_tying_points(
+    #     self, nodal_coords: Array, U: Array, dn: Array, dn0: Array
+    # ) -> Array:
+    #     """Calculate the MITC4 shear strains at the shear tying points.
+    #
+    #     Args:
+    #         nodal_coords: Nodal coordinates of the element, shape (4, 3).
+    #         u: Nodal displacements of the element, shape (4, 3).
+    #         dn: Current directors at the nodes, shape (4, 3).
+    #
+    #     Returns:
+    #         gamma_mitc: Shear strain at the shear tying points per edge, shape (4,).
+    #     """
+    #
+    #     def shear_at_edge(edge: Array) -> Array:
+    #         X_e = nodal_coords[edge]  # (2, 3)
+    #         x_e = nodal_coords[edge] + U[edge]  # (2, 3)
+    #         N1d = self._1d_shape_function(0)  # (2,)
+    #         dN1d = self._1d_shape_function_derivative(0)  # (2,)
+    #         T_e = dN1d @ X_e  # (3,)
+    #         t_e = dN1d @ x_e  # (3,)
+    #
+    #         d = normalize(N1d @ dn[edge])  # (3,)
+    #         D = normalize(N1d @ dn0[edge])  # (3,)
+    #         # the shear scalar wrt the edge tangent
+    #         # but the frame doesnt matter since we only use the shear magnitude(?)
+    #         return jnp.dot(t_e, d) - jnp.dot(T_e, D)  # scalar shear along edge
+    #
+    #     gamma = vmap(shear_at_edge)(self._edges)  # (4,)
+    #     return gamma
 
     def _get_current_directors(
         self, nodal_coords: Array, nodal_frames: Array, TH: Array
