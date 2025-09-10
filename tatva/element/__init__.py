@@ -15,8 +15,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
-
 # pyright: reportUnusedImport=false
-
 from .base import Element as Element
 from .base import Hexahedron8, Line2, Quad4, Tetrahedron4, Tri3
+from .shell import Shell4
