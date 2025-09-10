@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -47,10 +47,17 @@ class Mesh(NamedTuple):
 
     @classmethod
     def unit_square(
-        cls, n_x: int, n_y: int, *, type: ElementType = ElementType.TRIANGLE
+        cls,
+        n_x: int,
+        n_y: int,
+        *,
+        type: ElementType | Literal["triangle", "quad"] = ElementType.TRIANGLE,
+        dim: Literal[2, 3] = 2,
     ) -> Mesh:
         """Generate a unit square mesh with n_x and n_y nodes in the x and y directions."""
-        return cls.rectangle((0.0, 1.0), (0.0, 1.0), n_x, n_y, type=type)
+        return cls.rectangle(
+            (0.0, 1.0), (0.0, 1.0), n_x, n_y, type=ElementType(type), dim=dim
+        )
 
     @classmethod
     def rectangle(
@@ -61,13 +68,14 @@ class Mesh(NamedTuple):
         n_y: int,
         *,
         type: ElementType = ElementType.TRIANGLE,
+        dim: Literal[2, 3] = 2,
     ) -> Mesh:
         """Generate a rectangular mesh with specified x and y ranges and number of nodes."""
         match type:
             case ElementType.TRIANGLE:
-                coords, elements = cls._rectangle_triangular(x, y, n_x, n_y)
+                coords, elements = cls._rectangle_triangular(x, y, n_x, n_y, dim)
             case ElementType.QUAD:
-                coords, elements = cls._rectangle_quadrilateral(x, y, n_x, n_y)
+                coords, elements = cls._rectangle_quadrilateral(x, y, n_x, n_y, dim)
             case _:
                 raise NotImplementedError(f"Element type {type} not implemented.")
 
@@ -75,7 +83,7 @@ class Mesh(NamedTuple):
 
     @staticmethod
     def _rectangle_triangular(
-        x: tuple[float, float], y: tuple[float, float], n_x: int, n_y: int
+        x: tuple[float, float], y: tuple[float, float], n_x: int, n_y: int, dim: int = 2
     ) -> tuple[jax.Array, jax.Array]:
         x_vals = jnp.linspace(x[0], x[1], n_x + 1)
         y_vals = jnp.linspace(y[0], y[1], n_y + 1)
@@ -95,11 +103,14 @@ class Mesh(NamedTuple):
                 elements.append([n0, n1, n3])
                 elements.append([n0, n3, n2])
 
+        if dim == 3:
+            coords = jnp.hstack([coords, jnp.zeros((coords.shape[0], 1))])
+
         return coords, jnp.array(elements, dtype=jnp.int32)
 
     @staticmethod
     def _rectangle_quadrilateral(
-        x: tuple[float, float], y: tuple[float, float], n_x: int, n_y: int
+        x: tuple[float, float], y: tuple[float, float], n_x: int, n_y: int, dim: int = 2
     ) -> tuple[jax.Array, jax.Array]:
         x_vals = jnp.linspace(x[0], x[1], n_x + 1)
         y_vals = jnp.linspace(y[0], y[1], n_y + 1)
@@ -117,6 +128,9 @@ class Mesh(NamedTuple):
                 n2 = node_id(i + 1, j + 1)
                 n3 = node_id(i, j + 1)
                 elements.append([n0, n1, n2, n3])
+
+        if dim == 3:
+            coords = jnp.hstack([coords, jnp.zeros((coords.shape[0], 1))])
 
         return coords, jnp.array(elements, dtype=jnp.int32)
 
