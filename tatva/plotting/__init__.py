@@ -24,7 +24,6 @@ STYLE_PATH = os.path.join(os.path.dirname(__file__), "latex_sans_serif.mplstyle"
 
 from typing import Optional
 
-import cmcrameri.cm as cmc
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from jax import Array
@@ -45,7 +44,7 @@ def plot_element_values(
     ax: Optional[mpl.axes.Axes] = None,
     scale: float = 1.0,
     label: Optional[str] = None,
-    cmap=cmc.managua_r,
+    cmap="managua_r",
 ):
     """
     Plot the element values of a field on a mesh.
@@ -93,7 +92,7 @@ def plot_nodal_values(
     ax: Optional[mpl.axes.Axes] = None,
     scale: float = 1.0,
     label: Optional[str] = None,
-    cmap=cmc.managua_r,
+    cmap="managua_r",
     edgecolors: Optional[str] = "none",
     shading: Optional[str] = "gouraud",
 ):
