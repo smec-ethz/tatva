@@ -1,6 +1,6 @@
 [project]
 name = "tatva"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lego-like building blocks for finite element analysis"
 authors = [
     { name = "Mohit Pundir", email = "mpundir@ethz.ch" },
@@ -48,3 +48,4 @@ version_scheme = "pep440"
 version_provider = "pep621"
 update_changelog_on_bump = true
 major_version_zero = true
+template = ".changelog.tpl"
