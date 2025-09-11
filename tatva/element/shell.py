@@ -4,6 +4,8 @@ import jax
 import jax.numpy as jnp
 from jax import Array, vmap
 
+from tatva.mesh import Mesh
+
 from ._element import Element
 
 
@@ -56,20 +58,38 @@ def normalize(v: Array) -> Array:
     return v / jnp.where(norm < 1e-12, 1.0, norm)
 
 
-def normalize_interp_and_grad(N, dN_dxi, nodal_vecs, eps=1e-12):
+def normalize_interp_and_grad(N, dN_dxi, nodal_vecs, eps=1e-12) -> tuple[Array, Array]:
+    """Interpolate and normalize a vector field, and compute its gradient.
+
+    Args:
+        N: Shape functions at a point, shape (nnodes,).
+        dN_dxi: Shape function derivatives at a point, shape (2, nnodes).
+        nodal_vecs: Nodal vectors to interpolate and normalize, shape (nnodes, 3).
+        eps: Small value to avoid division by zero.
+
+    Returns:
+        d: Normalized interpolated vector, shape (3,).
+        dd: Gradient of the normalized vector with respect to local coords, shape (2, 3).
+    """
+    # interpolate vector and derivatives before normalization
     s = N @ nodal_vecs  # (3,)
-    # s_a = jnp.tensordot(dN_dxi, nodal_vecs, axes=((1,), (0,)))  # (2,3)
     s_a = dN_dxi @ nodal_vecs  # (2,3)
+
+    # normalize director (unit vector)
     nrm = jnp.linalg.norm(s)
-    d = s / jnp.where(nrm > eps, nrm, 1.0)
+    d = s / jnp.where(nrm > eps, nrm, 1.0)  # (3,)
+
+    # project derivative onto tangent plane of d and normalize
     P = jnp.eye(3) - jnp.outer(d, d)
     dd = (s_a @ P.T) / jnp.where(nrm > eps, nrm, 1.0)  # (2,3)
+
     return d, dd
 
 
 def build_nodal_frame(
-    normals: Array,
+    normals: Array | None = None,
     *,
+    mesh: Mesh | None = None,
     global_axis=jnp.array([1.0, 0.0, 0.0]),
     global_axis_backup=jnp.array([0.0, 1.0, 0.0]),
 ) -> Array:
@@ -83,6 +103,14 @@ def build_nodal_frame(
     Returns:
         frames: Local orthonormal frames, shape (nnodes, 3, 3).
     """
+    assert (normals is not None) != (mesh is not None), (
+        "Provide either normals or mesh."
+    )
+
+    # compute normals from mesh if not provided
+    if normals is None:
+        normals = _compute_normals_from_mesh(mesh)  # type: ignore (mesh is not None)
+
     return vmap(_build_frame, (0, None, None))(
         normals, global_axis, global_axis_backup
     )  # (..., 3, 3)
@@ -98,6 +126,42 @@ def _build_frame(n: Array, global_axis: Array, global_axis_backup: Array) -> Arr
     t1 = normalize(global_axis_used - (global_axis_used @ n) * n)
     t2 = jnp.cross(n, t1)
     return jnp.stack([t1, t2, n], axis=1)  # (3, 3)
+
+
+def _compute_normals_from_mesh(mesh: Mesh) -> Array:
+    """Compute nodal normals as area-weighted average of adjacent face normals.
+
+    Args:
+        mesh: A Mesh object.
+
+    Returns:
+        normals: Nodal normals, shape (nnodes, 3).
+    """
+    # initialize normals to zero
+    n_nodes = mesh.coords.shape[0]
+    normals = jnp.zeros((n_nodes, 3))
+
+    def add_element_normal(normals, element):
+        v0, v1, v2, v3 = mesh.coords[element]
+        # two triangles per quad
+        face_normal1 = jnp.cross(v1 - v0, v3 - v0)
+        face_normal2 = jnp.cross(v2 - v1, v0 - v1)
+        area1 = jnp.linalg.norm(face_normal1) / 2.0
+        area2 = jnp.linalg.norm(face_normal2) / 2.0
+        face_normal = normalize(face_normal1 + face_normal2) * (area1 + area2)
+        for node in element:
+            normals = normals.at[node].add(face_normal)
+        return normals
+
+    normals = jax.lax.fori_loop(
+        0,
+        mesh.elements.shape[0],
+        lambda i, n: add_element_normal(n, mesh.elements[i]),
+        normals,
+    )
+    # normalize the accumulated normals
+    normals = vmap(normalize)(normals)
+    return normals
 
 
 def get_constitutive_mats(E: float, nu: float, t: float, kappa_s: float = 5 / 6):
@@ -124,11 +188,42 @@ def get_constitutive_mats(E: float, nu: float, t: float, kappa_s: float = 5 / 6)
     return A, D, Ks
 
 
-class Shell4(Element):
-    """A 4-node bilinear shell element."""
+class Mitc4(Element):
+    """A 4-node bilinear shell element with MITC4 shear locking alleviation.
 
-    # nodal coords: (nnodes, 3)
-    # nodal values: (nnodes, nvalues)
+    This element follows the Reissner–Mindlin kinematic assumption with
+    independent interpolation of the transverse shear strains at the tying
+    points. The kinematics are described by 5 DOF per node: 3 displacements
+    and 2 in-plane rotation vectors, which are mapped to 3D using the nodal
+    frames.
+
+    Use the method `get_orthonormal_strains` to compute membrane, bending,
+    and shear strains in the orthonormal lamina frame at quadrature points.
+    This method is mappable over elements. To compute strains for an entire
+    mesh, use `Operator.map_over_elements`.
+
+    Examples::
+
+        A, D, Ks = shell.get_constitutive_mats(E, nu, t)
+        mesh = Mesh.rectangle((0, L), (0, w), n, n2,
+                              type=ElementType.QUAD, dim=3)
+        el = Mitc4()
+        op = Operator(mesh, el)
+        nodal_frames = shell.build_nodal_frame(mesh=mesh)
+
+        @jax.jit
+        def total_energy(arr: Array) -> Array:
+            u, th = Solution(arr)  # see `tatva.compound`
+            eps, kappa, gamma = op.map_over_elements(
+                el.get_orthonormal_strains
+            )(mesh.coords, nodal_frames, u, th)
+
+            U_mem = 0.5 * jnp.einsum("...i,ij,...j->...", eps, A, eps)
+            U_bend = 0.5 * jnp.einsum("...i,ij,...j->...", kappa, D, kappa)
+            U_shear = 0.5 * jnp.einsum("...i,ij,...j->...", gamma, Ks, gamma)
+
+            return op.integrate(U_mem + U_bend + U_shear)
+    """
 
     quad_points = jnp.array(
         [
@@ -150,7 +245,14 @@ class Shell4(Element):
             [-1.0, 0.0],  # left edge
         ]
     )
-    _edges = jnp.array([[0, 1], [1, 2], [2, 3], [3, 0]])
+    _edges = jnp.array(
+        [
+            [0, 1],  # bottom edge
+            [1, 2],  # right edge
+            [2, 3],  # top edge
+            [3, 0],  # left edge
+        ]
+    )
 
     def shape_function(self, xi: Array) -> Array:
         """Returns the shape functions evaluated at the local coordinates (xi, eta)."""
@@ -165,7 +267,9 @@ class Shell4(Element):
         )
 
     def shape_function_derivative(self, xi: Array) -> Array:
-        """Returns the derivative of the shape functions with respect to the local coordinates (xi, eta)."""
+        """Returns the derivative of the shape functions with respect to the local
+        coordinates (xi, eta).
+        """
         r, s = xi
         return jnp.array(
             [
@@ -177,7 +281,8 @@ class Shell4(Element):
         ).T
 
     def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
-        """Calculate the Jacobian matrix and its determinant at the given local coordinates (xi, eta).
+        """Calculate the Jacobian matrix and its determinant at the given local
+        coordinates (xi, eta).
 
         Args:
             xi: Local coordinates (r, s).
@@ -205,6 +310,12 @@ class Shell4(Element):
             nodal_frames: Nodal orthonormal frames of the element, shape (4, 3, 3).
             u: Nodal displacements of the element, shape (4, 3).
             theta: Nodal rotations of the element, shape (4, 2).
+
+        Returns:
+            A tuple of three arrays being in plane strain measures:
+            - membrane_strain: Membrane strains at all quadrature points, shape (ngp, 3).
+            - curvature: Bending curvatures at all quadrature points, shape (ngp, 3).
+            - shear_strain: Shear strains at all quadrature points, shape (ngp, 2).
         """
         dn0, dn = self._get_current_directors(nodal_coords, nodal_frames, TH)
 
@@ -216,14 +327,10 @@ class Shell4(Element):
         def _at_gp(xi: Array):
             val = self._interpolate(xi, nodal_coords, U, dn0, dn)
 
-            # compute contravariant basis
-            # a_contra = self._contravariant_basis(val.a)  # (2,3)
-            # Q_ref = self._lamina_basis(val.d, val.a)  # (3,2)
+            # compute contravariant basis in reference lamina frame
             a_contra = self._contravariant_basis(val.A)  # (2,3)
             Q_ref = self._lamina_basis_ref(val.A)[:, :2]  # (3,2)
-            # S = a_contra @ Q_ref  # (2,2) transformation matrix
             S = Q_ref.T @ a_contra.T
-            # S_ = val.a @ Q_ref  # (2,2) transformation matrix
 
             # membrane strain in covariant basis
             E_hat = 0.5 * (val.a @ val.a.T - val.A @ val.A.T)  # (2, 2)
@@ -398,14 +505,10 @@ class Shell4(Element):
         a = dN_dxi @ xn  # (2, 3)
 
         # director derivatives (needed for curvature)
-        # d, dd_dxi = normalize_interp_and_grad(N, dN_dxi, dn)  # (3,), (2, 3)
-        # D0, dD0_dxi = normalize_interp_and_grad(N, dN_dxi, dn0)  # = (0,0,1), zero grads
-        d = N @ dn  # (3,)
-        D0 = N @ dn0
-        dD0_dxi = dN_dxi @ dn0  # (2, 3)
-        dd_dxi = dN_dxi @ dn  # (2, 3)
+        d, dd_dxi = normalize_interp_and_grad(N, dN_dxi, dn)  # (3,), (2, 3)
+        D0, dD0_dxi = normalize_interp_and_grad(N, dN_dxi, dn0)  # = (0,0,1), zero grads
 
-        return Shell4._InterpolateResult(N, dN_dxi, A, a, D0, d, dD0_dxi, dd_dxi)
+        return Mitc4._InterpolateResult(N, dN_dxi, A, a, D0, d, dD0_dxi, dd_dxi)
 
     def _contravariant_basis(self, a: Array) -> Array:
         g = a @ a.T  # (2, 2) metric tensor
@@ -416,7 +519,7 @@ class Shell4(Element):
         return a_contra
 
     def _lamina_basis(self, d: Array, a: Array) -> Array:
-        # transform covariant curvature to local orthonormal basis (lamina frame)
+        """Orthonormal basis vectors starting from the director."""
         t1 = a[0]  # (3,)
         e1_bar = t1 - d * (t1 @ d)  # remove component along d
         e1_bar = normalize(e1_bar)
@@ -426,7 +529,7 @@ class Shell4(Element):
 
     @staticmethod
     def _lamina_basis_ref(A: Array) -> Array:
-        # transform covariant curvature to local orthonormal basis (lamina frame)
+        """Orthonormal basis vectors starting from the inplane covariant basis."""
         A1, A2 = A
         # normal (ref director)
         e3 = jnp.cross(A1, A2)
@@ -494,48 +597,17 @@ class Shell4(Element):
             N = self.shape_function(xi)  # (4,)
             A = dN_dxi @ nodal_coords  # (2, 3)
             a = dN_dxi @ (nodal_coords + U)  # (2, 3)
+            # TODO: I believe D0 should be interpolated from dn0
             D0 = normalize(jnp.cross(A[0], A[1]))  # (3,)
             g3 = normalize(N @ dn)  # (3,)
 
             gamma1 = jnp.dot(a[0], g3) - jnp.dot(A[0], D0)  # shear along xi
             gamma2 = jnp.dot(a[1], g3) - jnp.dot(A[1], D0)  # shear along eta
 
-            # return jnp.where(component == 0, gamma1, gamma2)
             return jnp.stack([gamma1, gamma2], axis=0)
 
         gamma = vmap(shear_at_tying_point)(self._shear_tying_points)  # (4,)
         return gamma
-
-    # def _mitc4_shear_at_tying_points(
-    #     self, nodal_coords: Array, U: Array, dn: Array, dn0: Array
-    # ) -> Array:
-    #     """Calculate the MITC4 shear strains at the shear tying points.
-    #
-    #     Args:
-    #         nodal_coords: Nodal coordinates of the element, shape (4, 3).
-    #         u: Nodal displacements of the element, shape (4, 3).
-    #         dn: Current directors at the nodes, shape (4, 3).
-    #
-    #     Returns:
-    #         gamma_mitc: Shear strain at the shear tying points per edge, shape (4,).
-    #     """
-    #
-    #     def shear_at_edge(edge: Array) -> Array:
-    #         X_e = nodal_coords[edge]  # (2, 3)
-    #         x_e = nodal_coords[edge] + U[edge]  # (2, 3)
-    #         N1d = self._1d_shape_function(0)  # (2,)
-    #         dN1d = self._1d_shape_function_derivative(0)  # (2,)
-    #         T_e = dN1d @ X_e  # (3,)
-    #         t_e = dN1d @ x_e  # (3,)
-    #
-    #         d = normalize(N1d @ dn[edge])  # (3,)
-    #         D = normalize(N1d @ dn0[edge])  # (3,)
-    #         # the shear scalar wrt the edge tangent
-    #         # but the frame doesnt matter since we only use the shear magnitude(?)
-    #         return jnp.dot(t_e, d) - jnp.dot(T_e, D)  # scalar shear along edge
-    #
-    #     gamma = vmap(shear_at_edge)(self._edges)  # (4,)
-    #     return gamma
 
     def _get_current_directors(
         self, nodal_coords: Array, nodal_frames: Array, TH: Array
