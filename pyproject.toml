@@ -23,6 +23,7 @@ dependencies = [
     "scipy",
     "gmsh",
     "meshio",
+    "jax-autovmap>=0.3.0",
 ]
 
 [project.optional-dependencies]
