@@ -30,6 +30,9 @@ examples = [
     "cmcrameri",
     "ipykernel>=6.30.0",
 ]
+dev = [
+    "commitizen>=4.9.1",
+]
 
 [build-system]
 requires = [ "hatchling", ]
@@ -37,3 +40,11 @@ build-backend = "hatchling.build"
 
 [project.urls]
 repository = "https://gitlab.ethz.ch/smec/software/tatva"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+version_scheme = "pep440"
+version_provider = "pep621"
+update_changelog_on_bump = true
+major_version_zero = true
