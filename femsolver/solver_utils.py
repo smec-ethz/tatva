@@ -1,6 +1,7 @@
 from typing import Callable, Concatenate, ParamSpec, Protocol, overload
 
 import equinox
+from jax.experimental.sparse import BCOO
 import jax.numpy as jnp
 from jax import Array
 
@@ -68,7 +69,7 @@ class Lifter(equinox.Module):
         """Reduce full displacement vector to free dofs."""
         return u_full[self.free_dofs]
 
-    def lifted_energy_function(
+    def reduce_energy_function(
         self,
         energy_fn: Callable[Concatenate[Array, P], Array],
     ) -> LiftedEnergyFunction[P]:
@@ -81,3 +82,21 @@ class Lifter(equinox.Module):
             return energy_fn(u_full, *args, **kwargs)
 
         return new_energy_fn
+
+    def reduce_sparsity_pattern(self, pattern: BCOO) -> BCOO:
+        """Reduce a sparse matrix pattern to free dofs.
+
+        Args:
+            pattern (BCOO): Sparse matrix pattern in BCOO format.
+
+        Returns:
+            BCOO: Reduced sparse matrix pattern in BCOO format.
+        """
+        mask = jnp.isin(pattern.indices, self.free_dofs).all(axis=1)
+        reduced_indices = pattern.indices[mask]
+        index_map = jnp.zeros(self.size, dtype=int) - 1
+        index_map = index_map.at[self.free_dofs].set(jnp.arange(len(self.free_dofs)))
+        reduced_indices = index_map[reduced_indices]
+        reduced_data = pattern.data[mask]
+        shape = (len(self.free_dofs), len(self.free_dofs))
+        return BCOO((reduced_data, reduced_indices), shape=shape)
