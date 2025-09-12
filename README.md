@@ -85,12 +85,12 @@ A unique aspect of `femsolver` is that it can handle both dense and sparse matri
 
 ### Time usage profiling
 
-Below we provide the computational time for the assembly of the sparse stiffness matrix for linear elasticity problem. The code is available in `benchmarking/profiling_time.py`.
+Below we provide the computational time for the assembly of the sparse stiffness matrix for linear elasticity problem. The code is available in `benchmarking/profiling_gpus.py`.
 
 
-![Assembly Time](benchmarking/assembly_time_cpu.png)
+![Assembly Time](benchmarking/assembly_time.png)
 
-The time above doesnot account for the compilation time  of the functions. In JAX, the first time a function is called, it is compiled and repeated calls are faster. This compilation time is not included in the time above. The time above is for a single core of a CPU. 
+The time above doesnot account for the compilation time  of the functions. In JAX, the first time a function is called, it is compiled and repeated calls are faster. This compilation time is not included in the time above. The time above is for a single core of a CPU and NVIDIA GeForce RTX 4090.
 
 
 
