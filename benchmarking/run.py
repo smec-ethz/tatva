@@ -1,6 +1,8 @@
 import os
 import subprocess
 
+os.environ["JAX_PLATFORM"] = "gpu"
+
 # file to execute
 job_folder = "/cluster/home/mpundir/dev/femsolver/benchmarking"
 
