@@ -22,8 +22,8 @@ def create_sbatch_script(file_to_run, job_folder, gpu_model):
     script = f"""#!/bin/bash
 #SBATCH --ntasks=8
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node={gpu_model}:1
-#SBATCH --gres=gpumem:20g
+#SBATCH --gpus-per-node={gpu_model}:2
+#SBATCH --gres=gpumem:24g
 #SBATCH --time=01:00:00
 #SBATCH --job-name=benchmarking
 #SBATCH --output={job_folder}/{gpu_model}.out
@@ -31,7 +31,7 @@ def create_sbatch_script(file_to_run, job_folder, gpu_model):
 
 source /cluster/project/cmbm/local-stacks/load-scripts/load_gpu.sh 
 source /cluster/home/mpundir/python-venv/test/bin/activate
-export JAX_CACHE_DIR="$SCRATCH/jax-cache"
+export JAX_CACHE_DIR="$SCRATCH/jax-cache-gpu"
 python {file_to_run}
 
 """

@@ -82,7 +82,7 @@ stiffness_execution_time = []
 # solve_compilation_time = []
 # solve_execution_time = []
 
-for nx in [10, 50, 100, 150, 200, 500]:
+for nx in [10, 50, 100, 150, 200, 500, 700, 1000]:
     print(f"======= {nx} x {nx} ==============")
     coords, elements = generate_unit_square_mesh_tri_fast(nx, nx)
     mesh = Mesh(coords, elements)
@@ -185,4 +185,4 @@ result = subprocess.run(
 gpu_make = result.replace(" ", "_")
 if os.environ["JAX_PLATFORM"] == "cpu":
     gpu_make = "cpu"
-df.to_csv(f"""benchmark-{gpu_make}.csv""")
+df.to_csv(f"""benchmark-chunked_vmap_{gpu_make}.csv""")

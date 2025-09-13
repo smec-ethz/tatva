@@ -25,15 +25,31 @@ You should have received a copy of the GNU Lesser General Public License along w
 
 ## Installation
 
+**On CPU**
+
 Clone the repository and install the package with pip:
 ```bash
-pip install path/to/femsolver
+pip install path/to/tatva "jax==0.6.0"
 ```
 
 You can also use pip to install directly from the GitLab repository. Make sure
 you have access to the repository and have set up SSH keys for authentication.
 ```bash
-pip install git+ssh://git@gitlab.ethz.ch/compmechmat/research/mohit-pundir/femsolver.git
+pip install git+ssh://git@gitlab.ethz.ch/smec/softwares/tatva.git "jax==0.6.0"
+```
+
+
+**On GPU**
+
+Clone the repository and install the package with pip:
+```bash
+pip install path/to/tatva "jax[cuda12]==0.6.0"
+```
+
+You can also use pip to install directly from the GitLab repository. Make sure
+you have access to the repository and have set up SSH keys for authentication.
+```bash
+pip install git+ssh://git@gitlab.ethz.ch/smec/softwares/tatva.git "jax[cuda12]==0.6.0"
 ```
 
 > [!note]

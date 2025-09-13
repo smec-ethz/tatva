@@ -1,10 +1,13 @@
 import matplotlib.pyplot as plt
 import pandas as pd
 
+# "benchmark-NVIDIA_GeForce_RTX_4090.csv"
+
 plt.figure(figsize=(5, 4), layout="constrained")
-colors = ["#009AF9", "#E26F46"]
+colors = ["#009AF9", "#E26F46", "#3DA44D"]
 for file, color in zip(
-    ["benchmark-cpu.csv", "benchmark-NVIDIA_GeForce_RTX_4090.csv"], colors
+    ["benchmark-cpu.csv", "benchmark-chunked_vmap_cpu.csv", "benchmark-NVIDIA_GeForce_RTX_4090.csv"],
+    colors,
 ):
     results = pd.read_csv(file)
     plt.loglog(

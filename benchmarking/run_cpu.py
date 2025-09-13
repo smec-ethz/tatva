@@ -22,14 +22,16 @@ def create_sbatch_script(file_to_run, job_folder, gpu_model):
     script = f"""#!/bin/bash
 #SBATCH --ntasks=8
 #SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=8096
 #SBATCH --time=01:00:00
 #SBATCH --job-name=benchmarking
 #SBATCH --output={job_folder}/{gpu_model}.out
 #SBATCH --error={job_folder}/{gpu_model}.err
 
 source /cluster/project/cmbm/local-stacks/load-scripts/load_fenicsx.sh 
-source /cluster/home/mpundir/python-venv/test/bin/activate
-export JAX_CACHE_DIR="$SCRATCH/jax-cache"
+source /cluster/home/mpundir/python-venv/cpu_python/bin/activate
+export JAX_CACHE_DIR="$SCRATCH/jax-cache-cpu"
 python {file_to_run}
 
 """
