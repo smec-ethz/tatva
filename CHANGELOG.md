@@ -6,6 +6,13 @@ All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
 
+## v0.1.2 (2025-09-16)
+
+### Fix
+
+- update version of jax to >=0.4.1 (1dae07b)
+- remove autovmap and replacing it with dependency of the original project (b8b8b60)
+
 ## v0.1.1 (2025-09-11)
 
 ### Fix
