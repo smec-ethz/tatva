@@ -185,7 +185,7 @@ class Compound(metaclass=_CompoundMeta):
     flat array for the solver.
 
     Args:
-        **kwargs (Optional): Keyword arguments to initialize the fields of the state.
+        arr: The flat data array. If None, initializes to zeros.
 
     Examples:
 
@@ -197,15 +197,12 @@ class Compound(metaclass=_CompoundMeta):
 
         state = MyState()
 
-    Use `state.pack()` to flatten the state into a single array, and
-    `state.unpack(packed_array)` to restore the state from a packed array::
-
-        u_flat = state.pack()
-        packed_state = MyState.unpack(u_flat)
+    Use `state.arr` to access the flat array, and `state.u`, `state.phi` to access the
+    individual fields.
 
     You can use iterator unpacking to directly unpack the fields from the state::
 
-        u, phi = MyState.unpack(u_flat)
+        u, phi = MyState(arr)
 
     """
 
