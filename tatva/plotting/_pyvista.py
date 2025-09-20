@@ -21,11 +21,15 @@ import pyvista as pv
 
 
 def get_pyvista_grid(mesh, cell_type="quad"):
-    pv_points = np.hstack((mesh.coords, np.zeros(shape=(mesh.coords.shape[0], 1))))
+    if mesh.coords.shape[1] == 2:
+        pv_points = np.hstack((mesh.coords, np.zeros(shape=(mesh.coords.shape[0], 1))))
+    else:
+        pv_points = mesh.coords
 
     cell_type_dict = {
         "quad": 4,
         "triangle": 3,
+        "tetra": 4,
     }
 
     pv_cells = np.hstack(
@@ -40,6 +44,7 @@ def get_pyvista_grid(mesh, cell_type="quad"):
     pv_cell_type_dict = {
         "quad": pv.CellType.QUAD,
         "triangle": pv.CellType.TRIANGLE,
+        "tetra": pv.CellType.TETRA,
     }
     cell_types = np.full(
         fill_value=pv_cell_type_dict[cell_type], shape=(mesh.elements.shape[0],)
