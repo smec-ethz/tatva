@@ -1,8 +1,6 @@
 import os
 import subprocess
 
-os.environ["JAX_PLATFORM"] = "rocm-gpu"
-
 
 # file to execute
 job_folder = "/cluster/home/mpundir/dev/femsolver/benchmarking"
@@ -64,8 +62,10 @@ module load rocthrust/6.3.2
 module load roctracer-dev/6.3.2
 module load roctracer-dev-api/6.3.2
 
+
 source /cluster/home/mpundir/python-venv/rocm632_python/bin/activate
 export JAX_CACHE_DIR="$SCRATCH/jax-cache-rocm"
+export JAX_PLATFORM="rocm-gpu"
 python {file_to_run}
 
 """

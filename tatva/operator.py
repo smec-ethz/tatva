@@ -109,7 +109,7 @@ class Operator(eqx.Module):
             of each element (shape: (n_elements, n_quad_points, n_values)).
         """
 
-        '''
+        
         def _at_each_element(
             el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
@@ -124,9 +124,9 @@ class Operator(eqx.Module):
         return eqx.filter_vmap(
             _at_each_element,
             in_axes=(0, 0),
-        )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])'''
+        )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
 
-        def _at_each_element(args: Tuple[Array, Array]) -> Array:
+        '''def _at_each_element(args: Tuple[Array, Array]) -> Array:
             el_nodal_values, el_nodal_coords = args
             return eqx.filter_vmap(
                 partial(
@@ -140,7 +140,7 @@ class Operator(eqx.Module):
             _at_each_element,
             xs=(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements]),
             batch_size=10000,
-        )
+        )'''
 
     @overload
     def integrate(self, arg: Form[P]) -> FormCallable[P]: ...
@@ -248,12 +248,17 @@ class Operator(eqx.Module):
         Returns:
             A jax.Array where each element contains the integral of the values in the element
         """
+        # Calculating detJ is the cause of the constant-folding issue. JAX sees that calculating the Jacobian determinants depends only on the mesh coordinates, 
+        # not the function input u_flat. It decides to pre-compute (constant-fold) the value of det_J_elements for the entire mesh and bake the result into the compiled code
+        # Its a trade-off between compilation time and execution time. So the compliation time will be longer, but the execution time will be shorter.
+
         det_J_elements = self._vmap_over_elements_and_quads(
             jnp.zeros(1),  # Dummy nodal values
             lambda xi, el_nodal_values, el_nodal_coords: self.element.get_jacobian(
                 xi, el_nodal_coords
             )[1],
         )
+
         return jnp.einsum(
             "eq...,eq->e...",
             quad_values,

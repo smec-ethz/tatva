@@ -1,8 +1,6 @@
 import os
 import subprocess
 
-os.environ["JAX_PLATFORM"] = "cpu"
-
 # file to execute
 job_folder = "/cluster/home/mpundir/dev/femsolver/benchmarking"
 
@@ -32,6 +30,7 @@ def create_sbatch_script(file_to_run, job_folder, gpu_model):
 source /cluster/project/cmbm/local-stacks/load-scripts/load_fenicsx.sh 
 source /cluster/home/mpundir/python-venv/cpu_python/bin/activate
 export JAX_CACHE_DIR="$SCRATCH/jax-cache-cpu"
+export JAX_PLATFORM="cpu"
 python {file_to_run}
 
 """

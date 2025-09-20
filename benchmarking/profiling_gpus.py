@@ -18,6 +18,67 @@ from tatva import sparse
 from typing import NamedTuple
 import timeit
 
+import gmsh
+import numpy as np
+import meshio
+
+def generate_mesh_with_gmsh(nx, ny):
+    """
+    Generates a structured triangular mesh of a unit square using the Gmsh Python API.
+
+    This function replicates the output of the JAX-based meshing function,
+    creating a grid with nx * ny cells, where each cell is split into two
+    triangles with a consistent diagonal.
+
+    Args:
+        nx (int): The number of elements along the x-axis.
+        ny (int): The number of elements along the y-axis.
+        show_gui (bool): If True, opens the Gmsh GUI to visualize the mesh.
+
+    Returns:
+        tuple: A tuple containing:
+            - coords (numpy.ndarray): Array of node coordinates, shape (N, 2).
+            - elements (numpy.ndarray): Array of element connectivity, shape (M, 3),
+                                       using 0-based indexing.
+    """
+    gmsh.initialize()
+    gmsh.model.add("unit_square")
+    ## 1. Define Geometry
+    # Create the four corner points of the unit square
+    p1 = gmsh.model.geo.addPoint(0, 0, 0)
+    p2 = gmsh.model.geo.addPoint(1, 0, 0)
+    p3 = gmsh.model.geo.addPoint(1, 1, 0)
+    p4 = gmsh.model.geo.addPoint(0, 1, 0)
+    # Create the four boundary lines
+    l_bottom = gmsh.model.geo.addLine(p1, p2)
+    l_right = gmsh.model.geo.addLine(p2, p3)
+    l_top = gmsh.model.geo.addLine(p3, p4)
+    l_left = gmsh.model.geo.addLine(p4, p1)
+    # Create a surface from the boundary lines
+    cl = gmsh.model.geo.addCurveLoop([l_bottom, l_right, l_top, l_left])
+    surface = gmsh.model.geo.addPlaneSurface([cl])
+    gmsh.model.geo.synchronize()
+    ## 2. Define Meshing Parameters
+    # Use the "Transfinite" algorithm for a structured grid.
+    # This requires specifying the number of nodes on each boundary curve.
+    gmsh.model.mesh.setTransfiniteCurve(l_bottom, nx + 1)
+    gmsh.model.mesh.setTransfiniteCurve(l_top, nx + 1)
+    gmsh.model.mesh.setTransfiniteCurve(l_right, ny + 1)
+    gmsh.model.mesh.setTransfiniteCurve(l_left, ny + 1)
+    gmsh.model.mesh.setTransfiniteSurface(surface, "Left")
+
+    gmsh.model.mesh.generate(2)  # Generate the 2D mesh
+
+    gmsh.write("mesh.msh")
+    print(f"Mesh successfully generated and saved to 'mesh.msh'")
+    gmsh.finalize()
+    _mesh = meshio.read("mesh.msh")
+    mesh = Mesh(
+        coords=_mesh.points[:, :2],
+        elements=_mesh.cells_dict["triangle"],
+    )
+
+    return mesh
 
 def generate_unit_square_mesh_tri_fast(nx, ny):
     # --- Coordinate generation is already efficient ---
@@ -44,7 +105,8 @@ def generate_unit_square_mesh_tri_fast(nx, ny):
     # 4. Concatenate the two sets of triangles into one array
     elements = jnp.concatenate([tri1, tri2], axis=0)
     
-    return coords, elements
+    return  Mesh(coords, elements)
+  
 
 @autovmap(grad_u=2)
 def compute_strain(grad_u: Array) -> Array:
@@ -82,11 +144,9 @@ stiffness_execution_time = []
 # solve_compilation_time = []
 # solve_execution_time = []
 
-for nx in [10, 50, 100, 150, 200, 500, 700]:
+for nx in [10, 50, 100, 150, 200, 500, 700, 1000]:
     print(f"======= {nx} x {nx} ==============")
-    coords, elements = generate_unit_square_mesh_tri_fast(nx, nx)
-    mesh = Mesh(coords, elements)
-    #mesh = Mesh.unit_square(nx, nx)
+    mesh = generate_mesh_with_gmsh(nx, nx)
 
     n_nodes = mesh.coords.shape[0]
     n_dofs_per_node = 2
@@ -189,4 +249,4 @@ if os.environ["JAX_PLATFORM"] == "cpu":
 if os.environ["JAX_PLATFORM"] == "rocm-gpu":
     gpu_make = "mi300a"
 
-df.to_csv(f"""benchmark-chunked_vmap_{gpu_make}.csv""")
+df.to_csv(f"""benchmark-vmap_{gpu_make}.csv""")
