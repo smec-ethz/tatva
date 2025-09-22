@@ -1,9 +1,10 @@
 from typing import Callable, Concatenate, ParamSpec, Protocol, overload
 
 import equinox
-from jax.experimental.sparse import BCOO
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
+from jax.experimental.sparse import BCOO
 
 P = ParamSpec("P")
 
@@ -19,6 +20,7 @@ class Lifter(equinox.Module):
     free_dofs: Array
     constrained_dofs: Array
     size: int
+    ndof_reduced: int
 
     def __init__(
         self, size: int, free: Array | None = None, constrained: Array | None = None
@@ -60,6 +62,7 @@ class Lifter(equinox.Module):
             else jnp.setdiff1d(jnp.arange(size), free)
         )
         self.size = size
+        self.ndof_reduced = self.free_dofs.size
 
     def lift(self, u_reduced: Array, u_full: Array) -> Array:
         """Lift reduced displacement vector to full size."""
@@ -83,20 +86,60 @@ class Lifter(equinox.Module):
 
         return new_energy_fn
 
+    # def reduce_sparsity_pattern(self, pattern: BCOO) -> BCOO:
+    #     """Reduce a sparse matrix pattern to free dofs.
+
+    #     Args:
+    #         pattern (BCOO): Sparse matrix pattern in BCOO format.
+
+    #     Returns:
+    #         BCOO: Reduced sparse matrix pattern in BCOO format.
+    #     """
+    #     mask = jnp.isin(pattern.indices, self.free_dofs).all(axis=1)
+    #     reduced_indices = pattern.indices[mask]
+    #     index_map = jnp.zeros(self.size, dtype=int) - 1
+    #     index_map = index_map.at[self.free_dofs].set(jnp.arange(len(self.free_dofs)))
+    #     reduced_indices = index_map[reduced_indices]
+    #     reduced_data = pattern.data[mask]
+    #     shape = (len(self.free_dofs), len(self.free_dofs))
+    #     return BCOO((reduced_data, reduced_indices), shape=shape)
+
     def reduce_sparsity_pattern(self, pattern: BCOO) -> BCOO:
-        """Reduce a sparse matrix pattern to free dofs.
+        """Reduce a sparse matrix pattern to free dofs."""
+        # Pull to host (avoid device OOM for big masks)
+        I = np.asarray(pattern.indices[:, 0])
+        J = np.asarray(pattern.indices[:, 1])
+        D = np.asarray(pattern.data)
 
-        Args:
-            pattern (BCOO): Sparse matrix pattern in BCOO format.
+        n_full = int(self.size)
+        free = np.asarray(self.free_dofs, dtype=np.int64)
 
-        Returns:
-            BCOO: Reduced sparse matrix pattern in BCOO format.
-        """
-        mask = jnp.isin(pattern.indices, self.free_dofs).all(axis=1)
-        reduced_indices = pattern.indices[mask]
-        index_map = jnp.zeros(self.size, dtype=int) - 1
-        index_map = index_map.at[self.free_dofs].set(jnp.arange(len(self.free_dofs)))
-        reduced_indices = index_map[reduced_indices]
-        reduced_data = pattern.data[mask]
-        shape = (len(self.free_dofs), len(self.free_dofs))
-        return BCOO((reduced_data, reduced_indices), shape=shape)
+        # Membership mask: O(n_full) setup, O(nnz) index
+        is_free = np.zeros(n_full, dtype=bool)
+        is_free[free] = True
+        mask = is_free[I] & is_free[J]
+
+        I = I[mask]
+        J = J[mask]
+        D = D[mask]
+
+        # Full -> reduced reindex
+        index_map = -np.ones(n_full, dtype=np.int64)
+        index_map[free] = np.arange(free.size, dtype=np.int64)
+        I_red = index_map[I]
+        J_red = index_map[J]
+
+        # Deduplicate (sum data; for pure pattern set to 1)
+        keys = I_red * free.size + J_red
+        uniq, inv = np.unique(keys, return_inverse=True)
+        # accumulate
+        D_red = np.bincount(inv, weights=D, minlength=uniq.size)
+        I_red = (uniq // free.size).astype(np.int32)
+        J_red = (uniq % free.size).astype(np.int32)
+
+        # Back to JAX
+        indices_red = jnp.stack([jnp.asarray(I_red), jnp.asarray(J_red)], axis=1)
+        data_red = jnp.asarray(D_red)
+        shape = (free.size, free.size)
+
+        return BCOO((data_red, indices_red), shape=shape)
