@@ -18,9 +18,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import partial
 from numbers import Number
-from typing import Any, Callable, Concatenate, ParamSpec, Protocol, TypeAlias, overload
+from typing import (
+    Any,
+    Callable,
+    Concatenate,
+    Generic,
+    ParamSpec,
+    Protocol,
+    TypeAlias,
+    TypeVar,
+    cast,
+    overload,
+)
 
 import equinox as eqx
 import jax
@@ -33,8 +45,8 @@ from tatva.mesh import Mesh, find_containing_polygons
 # TODO: naming of these types
 
 P = ParamSpec("P")
-
-
+RT = TypeVar("RT", bound=jax.Array | tuple, covariant=True)
+ElementT = TypeVar("ElementT", bound=Element)
 Numeric: TypeAlias = float | int | jnp.number
 Form: TypeAlias = Callable[Concatenate[jax.Array, jax.Array, P], jax.Array | float]
 
@@ -48,19 +60,30 @@ class FormCallable(Protocol[P]):
     ) -> jax.Array: ...
 
 
-class _VmapOverElementsCallable(Protocol):
-    """Internal protocol for functions that are mapped over elements and quadrature points
-    using `Operator._vmap_over_elements_and_quads`."""
+class MappableOverElementsAndQuads(Protocol[P, RT]):
+    """Internal protocol for functions that are mapped over elements using
+    `Operator.map`."""
 
     @staticmethod
     def __call__(
         xi: jax.Array,
-        el_nodal_values: jax.Array,
-        el_nodal_coords: jax.Array,
-    ) -> jax.Array | float: ...
+        *el_values: P.args,
+        **el_kwargs: P.kwargs,
+    ) -> RT: ...
 
 
-class Operator(eqx.Module):
+MappableOverElements: TypeAlias = Callable[P, RT]
+
+
+class MappedCallable(Protocol[P, RT]):
+    @staticmethod
+    def __call__(
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> RT: ...
+
+
+class Operator(Generic[ElementT], eqx.Module):
     """A class that provides an Operator for finite element method (FEM) assembly.
 
     Args:
@@ -82,10 +105,10 @@ class Operator(eqx.Module):
     """
 
     mesh: Mesh
-    element: Element
+    element: ElementT
 
     def _vmap_over_elements_and_quads(
-        self, nodal_values: jax.Array, func: _VmapOverElementsCallable
+        self, nodal_values: jax.Array, func: MappableOverElementsAndQuads
     ) -> jax.Array:
         """Helper function. Maps a function over the elements and quadrature points of the
         mesh.
@@ -114,6 +137,82 @@ class Operator(eqx.Module):
             _at_each_element,
             in_axes=(0, 0),
         )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
+
+    def map(
+        self,
+        func: MappableOverElementsAndQuads[P, RT],
+        *,
+        element_quantity: Sequence[int] = (),
+    ) -> MappedCallable[P, RT]:
+        """Maps a function over the elements and quad points of the mesh.
+
+        Returns a function that takes values at nodal points (globally) and returns the
+        vmapped result over the elements and quad points.
+
+        Args:
+            func: The function to map over the elements and quadrature points.
+            element_quantity: Indices of the arguments of `func` that are quantities
+                defined per element. The rest of the arguments are assumed to be defined
+                at nodal points.
+        """
+
+        def _mapped(*values: P.args, **kwargs: P.kwargs) -> RT:
+            # values should be arrays!
+            _values = cast(tuple[jax.Array, ...], values)
+
+            def _at_each_element(*el_values) -> jax.Array:
+                return eqx.filter_vmap(
+                    lambda xi: func(xi, *el_values, **kwargs),
+                )(self.element.quad_points)
+
+            return eqx.filter_vmap(
+                _at_each_element,
+                in_axes=(0,) * len(values),
+            )(
+                *(
+                    v[self.mesh.elements] if i not in element_quantity else v
+                    for i, v in enumerate(_values)
+                )
+            )
+
+        return _mapped
+
+    def map_over_elements(
+        self,
+        func: MappableOverElements[P, RT],
+        *,
+        element_quantity: Sequence[int] = (),
+    ) -> MappedCallable[P, RT]:
+        """Maps a function over the elements of the mesh.
+
+        Returns a function that takes values at nodal points (globally) and returns the
+        vmapped result over the elements.
+
+        Args:
+            func: The function to map over the elements.
+            element_quantity: Indices of the arguments of `func` that are quantities
+                defined per element. The rest of the arguments are assumed to be defined
+                at nodal points.
+        """
+
+        def _mapped(*values: P.args, **kwargs: P.kwargs) -> RT:
+            # values should be arrays!
+            _values = cast(tuple[jax.Array, ...], values)
+
+            def _at_each_element(*el_values) -> RT:
+                return func(*el_values, **kwargs)
+
+            return eqx.filter_vmap(
+                _at_each_element,
+                in_axes=(0,) * len(values),
+            )(
+                *(
+                    v[self.mesh.elements] if i not in element_quantity else v
+                    for i, v in enumerate(_values)
+                )
+            )
+
+        return _mapped
 
     @overload
     def integrate(self, arg: Form[P]) -> FormCallable[P]: ...
@@ -480,57 +579,4 @@ class Operator(eqx.Module):
             valid_quad_points,
             nodal_values[valid_elements],
             self.mesh.coords[valid_elements],
-        )
-
-
-class OperatorUpdatedLagrangian(Operator):
-    """A class that provides an Operator for finite element method (FEM) assembly.
-
-    Other than the base `Operator`, this class is specifically designed for total Lagrangian
-    formalism. Meaning, integration is done over the deformed configuration of the mesh.
-    Nodal values are expected to be the displacements of the nodes, not an arbitrary field.
-    Ensure your model is set up accordingly.
-
-    Args:
-        mesh: The mesh containing the elements and nodes.
-        element: The element type used for the finite element method.
-
-    Provides several operators for evaluating and integrating functions over the mesh,
-    such as `integrate`, `eval`, and `grad`. These operators can be used to compute
-    integrals, evaluate functions at quadrature points, and compute gradients of
-    functions at quadrature points.
-    """
-
-    def _vmap_over_elements_and_quads(
-        self, nodal_values: jax.Array, func: _VmapOverElementsCallable
-    ) -> jax.Array:
-        """Helper function. Maps a function over the elements and quadrature points of the
-        mesh.
-
-        Args:
-            nodal_values: The nodal **displacement** at the element's nodes (shape: (n_nodes, n_dim))
-            func: The function to map over the elements and quadrature points.
-
-        Returns:
-            A jax.Array with the results of the function applied at each quadrature point
-            of each element (shape: (n_elements, n_quad_points, n_values)).
-        """
-
-        def _at_each_element(
-            el_nodal_values: jax.Array, el_nodal_coords: jax.Array
-        ) -> jax.Array:
-            return jax.vmap(
-                partial(
-                    func,
-                    el_nodal_values=el_nodal_values,
-                    el_nodal_coords=el_nodal_coords,
-                )
-            )(self.element.quad_points)
-
-        return jax.vmap(
-            _at_each_element,
-            in_axes=(0, 0),
-        )(
-            nodal_values[self.mesh.elements],
-            (self.mesh.coords + nodal_values)[self.mesh.elements],
         )
