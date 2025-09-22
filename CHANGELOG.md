@@ -6,6 +6,21 @@ All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
 
+## v0.2.0 (2025-09-22)
+
+### Feat
+
+- **operator**: add to map an argument "element_quantity" to specify arguments which are not nodal but elemental values (5f0e3d6)
+- **operator**: add map_over_element which maps a generic function over all elements but not gauss points !9 (1ffd67c)
+- **operator**: map method to map over any function (provided by the element) given a certain signature !9 (62deb78)
+- **element**: add tetrahedron and hexahedron elements !10 (d92b934)
+- **compound**: add functionality to reorder the array by stacking fields (make hessian diagonal -> easy sparsity pattern) (6ce6f49)
+
+### Refactor
+
+- **operator**: add generic element type to operator for clearer static typing (29adaf9)
+- **compound**: update compound class (fba347e)
+
 ## v0.1.2 (2025-09-16)
 
 ### Fix
