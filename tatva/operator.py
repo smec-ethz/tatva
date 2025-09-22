@@ -25,10 +25,10 @@ from typing import Any, Callable, Concatenate, ParamSpec, Protocol, TypeAlias, o
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jax_autovmap import autovmap
 
 from tatva.element import Element
 from tatva.mesh import Mesh, find_containing_polygons
-from tatva.utils import auto_vmap
 
 # TODO: naming of these types
 
@@ -381,7 +381,7 @@ class Operator(eqx.Module):
             dfdxi = jax.jacrev(self.element.get_local_values)
             return dfdxi(self.element.quad_points[0], nodal_coords, nodal_coords)[0]
 
-        @auto_vmap(point=1, nodal_coords=2)
+        @autovmap(point=1, nodal_coords=2)
         def _map_physical_to_reference(
             point: jax.Array, nodal_coords: jax.Array
         ) -> jax.Array:
