@@ -24,6 +24,7 @@ dependencies = [
     "gmsh",
     "meshio",
     "jax-autovmap>=0.3.0",
+    "beartype"
 ]
 
 [project.optional-dependencies]
