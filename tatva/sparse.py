@@ -16,14 +16,16 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
-import numpy as np
+from typing import Optional, Tuple
+
 import jax
 import jax.numpy as jnp
-from jax.experimental import sparse as jax_sparse
+import numpy as np
 import sparsejac
-from tatva import Mesh
-from typing import Optional, Tuple
 from jax import Array
+from jax.experimental import sparse as jax_sparse
+
+from tatva import Mesh
 
 
 def jacfwd(func, sparsity_pattern):
@@ -84,7 +86,7 @@ def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
     indices = np.unique(np.vstack((row_idx, col_idx)).T, axis=0)
 
     data = np.ones(indices.shape[0], dtype=jnp.int32)
-    sparsity_pattern = jax_sparse.BCOO((data, indices.astype(np.int32)), shape=K_shape)
+    sparsity_pattern = jax_sparse.BCOO((data, indices.astype(np.int32)), shape=K_shape)  # type: ignore
     return sparsity_pattern
 
 
@@ -151,7 +153,8 @@ def create_sparsity_pattern(
             [sparsity_pattern.indices, sparsity_pattern_constraint.indices]
         )
         sparsity_pattern = jax_sparse.BCOO(
-            (combined_data, combined_indices), shape=K_shape
+            (combined_data, combined_indices),  # type: ignore
+            shape=K_shape,
         )
 
     return sparsity_pattern

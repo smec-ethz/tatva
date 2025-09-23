@@ -1,199 +1,213 @@
-import os
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 
-import jax
+from tatva.element import Tri3
+from tatva.mesh import Mesh
+from tatva.operator import Operator
 
-jax.config.update("jax_enable_x64", True)  # use double-precision
-import jax.numpy as jnp
-from jax import Array
+jax.config.update("jax_enable_x64", True)
 
-from tatva import Mesh, Operator, element
-from tatva.utils import auto_vmap
+NODES = jnp.array(
+    [
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+    ],
+    dtype=jnp.float64,
+)
 
+ELEMENTS = jnp.array(
+    [
+        [0, 1, 2],
+        [0, 2, 3],
+    ],
+    dtype=jnp.int32,
+)
 
-import sympy as sp
-from sympy.vector import CoordSys3D, gradient, ParametricRegion, vector_integrate
-from sympy.abc import x, y
-import numpy as np
-
-
-nodes = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
-tri_cells = np.array([[0, 1, 2], [0, 2, 3]])
-quad_cells = np.array([[0, 1, 2, 3]])
-
-n_nodes = nodes.shape[0]
-n_dofs_per_node = 1
-n_dofs = n_nodes * n_dofs_per_node
-
-tri = element.Tri3()
-tri_mesh = Mesh(nodes, tri_cells)
-op_tri = Operator(tri_mesh, tri)
-
-quad = element.Quad4()
-quad_mesh = Mesh(nodes, quad_cells)
-op_quad = Operator(quad_mesh, quad)
+EXPECTED_ELEMENT_AREAS = np.array([0.5, 0.5], dtype=np.float64)
 
 
-x_min = np.min(nodes[:, 0])
-x_max = np.max(nodes[:, 0])
-y_min = np.min(nodes[:, 1])
-y_max = np.max(nodes[:, 1])
-sp_region = ParametricRegion((x, y), (x, x_min, x_max), (y, y_min, y_max))
-R = CoordSys3D("R")
-
-
-# --- Test integration ---
-def scalar_function(
-    u: Array,
-) -> Array:
-    jax.debug.print("u: {}", u)
-    return u
-
-
-def total_area(u: Array, u_grad: Array, *_) -> Array:
-    """Compute the total area of the system."""
-    return scalar_function(u)
-
-
-@pytest.mark.parametrize("operator", [op_tri, op_quad], ids=["tri", "quad"])
-def test_integration(operator: Operator):
-    val = 1.0
-    u = jnp.full(fill_value=val, shape=(n_dofs,))
-    integrate_func = operator.integrate(total_area)
-    integral_value = integrate_func(u)
-    print(integral_value)
-
-    assert np.isclose(
-        integral_value, float(vector_integrate(val, sp_region)), atol=1e-12
-    ), f"Incorrect integration value is {integral_value}"
-
-
-# --- Test gradient ---
-@pytest.mark.parametrize("operator", [op_tri, op_quad], ids=["tri", "quad"])
-def test_gradient(operator: Operator):
-    f = nodes[:, 0] + nodes[:, 1]
-    s1 = R.x + R.y
-
-    quad_points = operator.eval(nodes)
-    grad_values = operator.grad(f)
-
-    for quad_point, grad_value in zip(quad_points, grad_values):
-        for i in range(quad_point.shape[0]):
-            dx = (
-                gradient(s1)
-                .evalf(subs={R.x: quad_point[i, 0], R.y: quad_point[i, 1]})
-                .dot(R.i)
-            )
-            dy = (
-                gradient(s1)
-                .evalf(subs={R.x: quad_point[i, 0], R.y: quad_point[i, 1]})
-                .dot(R.j)
-            )
-
-            assert np.isclose(grad_value[i, 0], float(dx), atol=1e-12)
-            assert np.isclose(grad_value[i, 1], float(dy), atol=1e-12)
-
-
-# --- Test interpolation ---
-@pytest.mark.parametrize("operator", [op_tri, op_quad], ids=["tri", "quad"])
-def test_interpolation(operator: Operator):
-    points = jnp.array([[0.5, 0.25], [0.5, 0.75]])
-    interpolated_values = operator.interpolate(nodes, points)
-
-    assert np.isclose(interpolated_values[0, 0], 0.5, atol=1e-12)
-    assert np.isclose(interpolated_values[0, 1], 0.25, atol=1e-12)
-    assert np.isclose(interpolated_values[1, 0], 0.5, atol=1e-12)
-    assert np.isclose(interpolated_values[1, 1], 0.75, atol=1e-12)
-
-
-# --- Test stiffness matrix ---
-
-
-# Define the vertived and triangles of the mesh
-"""vertices = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
-triangles = [[0, 1, 2], [0, 2, 3]]
-
-# Create a matrix of zeros with the correct shape
-matrix = [[0 for i in range(4)] for j in range(4)]
-
-# Create a Lagrange element
-element = symfem.create_element("triangle", "Lagrange", 1)
-
-for triangle in triangles:
-    # Get the vertices of the triangle
-    vs = tuple(vertices[i] for i in triangle)
-    # Create a reference cell with these vertices: this will be used
-    # to compute the integral over the triangle
-    ref = symfem.create_reference("triangle", vertices=vs)
-    # Map the basis functions to the cell
-    basis = element.map_to_cell(vs)
-
-    for test_i, test_f in zip(triangle, basis):
-        for trial_i, trial_f in zip(triangle, basis):
-            # Compute the integral of grad(u)-dot-grad(v) for each pair of basis
-            # functions u and v. The second input (x) into `ref.integral` tells
-            # symfem which variables to use in the integral.
-            integrand = test_f.grad(2).dot(trial_f.grad(2))
-            matrix[test_i][trial_i] += integrand.integral(ref, x)
-
-print(np.array(matrix))"""
-
-'''
-def strain_energy(u: Array, u_grad: Array) -> Array:
-    return u_grad @ u_grad.T
-
-
-def total_energy(u: Array, u_grad: Array, *_) -> Array:
-    """Compute the total energy of the system."""
-    return strain_energy(u, u_grad)
-
-
-@pytest.mark.parametrize("operator", [op_tri, op_quad])
-def test_stiffness_matrix(operator: Operator):
-
-    half = sp.Rational(1, 2)
-    actual_matrix = np.array(
+def test_operator_raises_for_dimension_mismatch():
+    coords = jnp.array(
         [
-            [1, -half, -half, 0],
-            [-half, 1, 0, -half],
-            [-half, 0, 1, -half],
-            [0, -half, -half, 1],
-        ]
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=jnp.float64,
     )
-    u = jnp.full(fill_value=2.0, shape=(n_dofs,))
-    K = jax.jacfwd(jax.jacrev(operator.integrate(total_energy)))(u)
-    print(K)
-    assert np.isclose(
-        K, actual_matrix, atol=1e-12
-    ), f"Incorrect stiffness matrix is {K}"
-'''
+    elements = jnp.array([[0, 1, 2]], dtype=jnp.int32)
+    mesh = Mesh(coords=coords, elements=elements)
 
-# Create a matrix of zeros with the correct shape
-"""quadrilateral = [[0, 1, 2, 3]]
-matrix = [[0 for i in range(4)] for j in range(4)]
-
-# Create a Lagrange element
-element = symfem.create_element("quadrilateral", "Lagrange", 1)
-
-for quad in quadrilateral:
-    # Get the vertices of the quadrilateral
-    vs = tuple(vertices[i] for i in quad)
-    # Create a reference cell with these vertices: this will be used
-    # to compute the integral over the quadrilateral
-    ref = symfem.create_reference("quadrilateral", vertices=vs)
-    # Map the basis functions to the cell
-    basis = element.map_to_cell(vs)
-
-    for test_i, test_f in zip(quad, basis):
-        for trial_i, trial_f in zip(quad, basis):
-            # Compute the integral of grad(u)-dot-grad(v) for each pair of basis
-            # functions u and v. The second input (x) into `ref.integral` tells
-            # symfem which variables to use in the integral.
-            integrand = test_f.grad(2).dot(trial_f.grad(2))
-            matrix[test_i][trial_i] += integrand.integral(ref, x)
-
-print(np.array(matrix))"""
+    with pytest.raises(ValueError, match="expects 2D coordinates"):
+        Operator(mesh, Tri3())
 
 
-if __name__ == "__main__":
-    pytest.main()
+def test_operator_raises_for_node_count_mismatch():
+    coords = jnp.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+        ],
+        dtype=jnp.float64,
+    )
+    elements = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
+    mesh = Mesh(coords=coords, elements=elements)
+
+    with pytest.raises(ValueError, match="lists 4 nodes per element"):
+        Operator(mesh, Tri3())
+
+
+def test_operator_raises_for_invalid_connectivity():
+    coords = jnp.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=jnp.float64,
+    )
+    elements = jnp.array([[0, 1, 3]], dtype=jnp.int32)
+    mesh = Mesh(coords=coords, elements=elements)
+
+    with pytest.raises(ValueError, match="outside the mesh coordinates"):
+        Operator(mesh, Tri3())
+
+
+@pytest.fixture(scope="module")
+def tri_operator() -> Operator:
+    mesh = Mesh(coords=NODES, elements=ELEMENTS)
+    return Operator(mesh, Tri3())
+
+
+def _manual_map_results(func, nodal_values: jnp.ndarray) -> np.ndarray:
+    results = []
+    for element in np.array(ELEMENTS):
+        element_values = np.array(nodal_values)[element]
+        element_results = [
+            np.array(func(xi, element_values)) for xi in np.array(Tri3().quad_points)
+        ]
+        results.append(np.asarray(element_results))
+    return np.asarray(results)
+
+
+def test_map_applies_function_per_element_and_quad(tri_operator: Operator):
+    """Test that the map method applies the function to each element and quadrature point
+    correctly."""
+    nodal_values = jnp.arange(NODES.shape[0], dtype=jnp.float64)
+
+    def func(xi, el_values):
+        return jnp.sum(el_values) + jnp.sum(xi)
+
+    mapped = tri_operator.map(func)
+    result = mapped(nodal_values)
+
+    expected = _manual_map_results(
+        lambda xi, el_vals: np.sum(el_vals) + np.sum(np.array(xi)),
+        nodal_values,
+    )
+    np.testing.assert_allclose(result, expected)
+
+
+def test_map_respects_element_quantity(tri_operator: Operator):
+    """Test that the element_quantity argument correctly passes additional per-element
+    data to the mapped function."""
+    nodal_values = jnp.arange(NODES.shape[0], dtype=jnp.float64)
+    element_bias = jnp.array([10.0, 20.0], dtype=jnp.float64)
+
+    def func(xi, el_values, bias):
+        return jnp.sum(el_values) + bias + xi[0]
+
+    mapped = tri_operator.map(func, element_quantity=(1,))
+    result = mapped(nodal_values, element_bias)
+
+    def manual(xi, el_vals, bias):
+        return np.sum(el_vals) + bias + np.array(xi)[0]
+
+    expected = []
+    for idx, element in enumerate(np.array(ELEMENTS)):
+        element_values = np.array(nodal_values)[element]
+        element_results = [
+            manual(xi, element_values, float(element_bias[idx]))
+            for xi in np.array(Tri3().quad_points)
+        ]
+        expected.append(np.asarray(element_results))
+
+    np.testing.assert_allclose(result, np.asarray(expected))
+
+
+def test_map_over_elements_matches_manual(tri_operator: Operator):
+    """Test that map_over_elements applies the function to each element correctly."""
+    nodal_values = jnp.arange(NODES.shape[0], dtype=jnp.float64)
+
+    def func(el_values):
+        return jnp.sum(el_values)
+
+    mapped = tri_operator.map_over_elements(func)
+    result = mapped(nodal_values)
+
+    expected = np.array(
+        [np.sum(np.array(nodal_values)[element]) for element in np.array(ELEMENTS)]
+    )
+    np.testing.assert_allclose(result, expected)
+
+
+def test_eval_returns_weighted_average(tri_operator: Operator):
+    nodal_values = jnp.array([0.0, 1.0, 2.0, 3.0], dtype=jnp.float64)
+    result = tri_operator.eval(nodal_values)
+    expected = np.array([[1.0], [5.0 / 3.0]], dtype=np.float64)
+    np.testing.assert_allclose(result, expected)
+
+
+def test_grad_of_linear_field_is_constant(tri_operator: Operator):
+    coeffs = jnp.array([2.0, 3.0])
+    nodal_values = NODES @ coeffs
+    grad = tri_operator.grad(nodal_values)
+    expected = np.array([[[2.0, 3.0]], [[2.0, 3.0]]], dtype=np.float64)
+    np.testing.assert_allclose(grad, expected)
+
+
+def test_integrate_nodal_field_matches_area(tri_operator: Operator):
+    nodal_values = jnp.ones(NODES.shape[0], dtype=jnp.float64)
+    per_element = tri_operator.integrate_per_element(nodal_values)
+    total = tri_operator.integrate(nodal_values)
+
+    np.testing.assert_allclose(per_element, EXPECTED_ELEMENT_AREAS)
+    np.testing.assert_allclose(total, np.sum(EXPECTED_ELEMENT_AREAS))
+
+
+def test_integrate_quad_values_matches_manual(tri_operator: Operator):
+    quad_values = jnp.full(
+        (ELEMENTS.shape[0], Tri3().quad_points.shape[0]), 4.0, dtype=jnp.float64
+    )
+    per_element = tri_operator.integrate_per_element(quad_values)
+    expected = EXPECTED_ELEMENT_AREAS * 4.0
+    np.testing.assert_allclose(per_element, expected)
+
+
+def test_interpolate_recovers_linear_function(tri_operator: Operator):
+    nodal_values = jnp.sum(NODES, axis=1)
+    points = jnp.array(
+        [
+            [0.25, 0.25],
+            [0.75, 0.25],
+            [0.25, 0.75],
+            [0.5, 0.5],
+        ],
+        dtype=jnp.float64,
+    )
+    interpolated = tri_operator.interpolate(nodal_values, points)
+    expected = np.sum(np.array(points), axis=1)
+    np.testing.assert_allclose(interpolated, expected)
+
+
+def test_interpolate_raises_for_points_outside_mesh(tri_operator: Operator):
+    nodal_values = jnp.ones(NODES.shape[0], dtype=jnp.float64)
+    points = jnp.array([[1.5, 0.5]], dtype=jnp.float64)
+    with pytest.raises(RuntimeError):
+        tri_operator.interpolate(nodal_values, points)

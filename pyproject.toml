@@ -6,8 +6,11 @@ authors = [
     { name = "Mohit Pundir", email = "mpundir@ethz.ch" },
     { name = "Flavio Lorez", email = "florez@ethz.ch" },
 ]
-license = "MIT"
-license-files = ["LICENSE.md",]
+license = "LGPL-3.0"
+license-files = [
+    "COPYING",
+    "COPYING.LESSER",
+]
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 classifiers = [
@@ -19,20 +22,16 @@ dependencies = [
     "equinox",
     "numpy",
     "sparsejac",
-    "matplotlib",
-    "scipy",
-    "gmsh",
-    "meshio",
     "jax-autovmap>=0.3.0",
 ]
 
 [project.optional-dependencies]
-examples = [
-    "cmcrameri",
-    "ipykernel>=6.30.0",
+plotting = [
+    "matplotlib",
 ]
 dev = [
     "commitizen>=4.9.1",
+    "pytest>=8.4.2",
 ]
 
 [build-system]

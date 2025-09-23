@@ -21,8 +21,7 @@ from typing import TYPE_CHECKING
 
 import equinox as eqx
 import jax.numpy as jnp
-
-from jaxtyping import Float, Array, jaxtyped
+from jaxtyping import Array
 
 if TYPE_CHECKING:
     from typing import ClassVar as AbstractClassVar
@@ -37,7 +36,7 @@ class Element(eqx.Module):
     quad_weights: AbstractClassVar[Array]
 
     @abstractmethod
-    def shape_function(self, xi: Array) -> tuple[Array, Array]:
+    def shape_function(self, xi: Array) -> Array:
         """Returns the shape functions and their derivatives at a point."""
         raise NotImplementedError
 
@@ -98,23 +97,23 @@ class Line2(Element):
         """Returns the derivative of the shape functions with respect to the local coordinates."""
         return jnp.array([-0.5, 0.5])
 
-    def get_jacobian(self, xi: Array, nodes: Array) -> tuple[Array, Array]:
+    def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
         _N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
-        J = dNdr @ nodes
+        J = dNdr @ nodal_coords
         t = jnp.asarray([J[0], J[1]]) / jnp.linalg.norm(J)
         return jnp.dot(J, t), jnp.dot(J, t)
 
-    def gradient(self, xi: Array, nodal_values: Array, nodes: Array) -> Array:
+    def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         _N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
-        J, _ = self.get_jacobian(xi, nodes)
+        J, _ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
         return dNdX @ nodal_values
 
     def get_local_values(
-        self, xi: Array, nodal_values: Array, nodes: Array
+        self, xi: Array, nodal_values: Array, nodal_coords: Array
     ) -> tuple[Array, Array, Array]:
         N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
-        J, detJ = self.get_jacobian(xi, nodes)
+        J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
         return N @ nodal_values, dNdX @ nodal_values, detJ
 
@@ -175,7 +174,6 @@ class Quad4(Element):
         )
 
 
-
 class Tetrahedron4(Element):
     """A 4-node linear tetrahedral element."""
 
@@ -197,7 +195,9 @@ class Tetrahedron4(Element):
 
 def _get_hex8_quadrature() -> tuple[Array, Array]:
     xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
-    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals, xi_vals), axis=-1).reshape(-1, 3)
+    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals, xi_vals), axis=-1).reshape(
+        -1, 3
+    )
     weights = jnp.full(quad_points.shape[0], fill_value=1.0)
     return quad_points, weights
 
@@ -233,13 +233,18 @@ class Hexahedron8(Element):
         xi, eta, zeta = xi
         return (1 / 8) * jnp.array(
             [
-                [-(1 - eta) * (1 - zeta), -(1 - xi) * (1 - zeta), -(1 - xi) * (1 - eta) ],
-                [ (1 - eta) * (1 - zeta), -(1 + xi) * (1 - zeta), -(1 + xi) * (1 - eta) ],
-                [ (1 + eta) * (1 - zeta),  (1 + xi) * (1 - zeta), -(1 + xi) * (1 + eta) ],
-                [-(1 + eta) * (1 - zeta),  (1 - xi) * (1 - zeta), -(1 - xi) * (1 + eta) ],
-                [-(1 - eta) * (1 + zeta), -(1 - xi) * (1 + zeta),  (1 - xi) * (1 - eta) ],
-                [ (1 - eta) * (1 + zeta), -(1 + xi) * (1 + zeta),  (1 + xi) * (1 - eta) ],
-                [ (1 + eta) * (1 + zeta),  (1 + xi) * (1 + zeta),  (1 + xi) * (1 + eta) ],
-                [-(1 + eta) * (1 + zeta),  (1 - xi) * (1 + zeta),  (1 - xi) * (1 + eta) ],
+                [
+                    -(1 - eta) * (1 - zeta),
+                    -(1 - xi) * (1 - zeta),
+                    -(1 - xi) * (1 - eta),
+                ],
+                [(1 - eta) * (1 - zeta), -(1 + xi) * (1 - zeta), -(1 + xi) * (1 - eta)],
+                [(1 + eta) * (1 - zeta), (1 + xi) * (1 - zeta), -(1 + xi) * (1 + eta)],
+                [-(1 + eta) * (1 - zeta), (1 - xi) * (1 - zeta), -(1 - xi) * (1 + eta)],
+                [-(1 - eta) * (1 + zeta), -(1 - xi) * (1 + zeta), (1 - xi) * (1 - eta)],
+                [(1 - eta) * (1 + zeta), -(1 + xi) * (1 + zeta), (1 + xi) * (1 - eta)],
+                [(1 + eta) * (1 + zeta), (1 + xi) * (1 + zeta), (1 + xi) * (1 + eta)],
+                [-(1 + eta) * (1 + zeta), (1 - xi) * (1 + zeta), (1 - xi) * (1 + eta)],
             ]
         )
+
