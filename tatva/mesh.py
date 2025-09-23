@@ -55,9 +55,7 @@ class Mesh(NamedTuple):
         dim: Literal[2, 3] = 2,
     ) -> Mesh:
         """Generate a unit square mesh with n_x and n_y nodes in the x and y directions."""
-        return cls.rectangle(
-            (0.0, 1.0), (0.0, 1.0), n_x, n_y, type=ElementType(type), dim=dim
-        )
+        return cls.rectangle((0.0, 1.0), (0.0, 1.0), n_x, n_y, type=type, dim=dim)
 
     @classmethod
     def rectangle(
@@ -67,11 +65,11 @@ class Mesh(NamedTuple):
         n_x: int,
         n_y: int,
         *,
-        type: ElementType = ElementType.TRIANGLE,
+        type: ElementType | Literal["triangle", "quad"] = ElementType.TRIANGLE,
         dim: Literal[2, 3] = 2,
     ) -> Mesh:
         """Generate a rectangular mesh with specified x and y ranges and number of nodes."""
-        match type:
+        match ElementType(type):
             case ElementType.TRIANGLE:
                 coords, elements = cls._rectangle_triangular(x, y, n_x, n_y, dim)
             case ElementType.QUAD:
