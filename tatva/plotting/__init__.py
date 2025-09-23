@@ -16,17 +16,15 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
-import os
-
-# Path to custom style
-STYLE_PATH = os.path.join(os.path.dirname(__file__), "latex_sans_serif.mplstyle")
-
-
-from typing import Optional
+from typing import Literal, Optional, cast
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import numpy as np
 from jax import Array
+from matplotlib.axes import Axes
+from matplotlib.collections import PolyCollection
+from matplotlib.tri import Triangulation
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from tatva import Mesh
@@ -38,104 +36,116 @@ except ImportError:
 
 
 def plot_element_values(
-    mesh: Mesh,
+    coords: Array,
+    elements: Array,
     values: Array,
+    *,
     u: Optional[Array] = None,
-    ax: Optional[mpl.axes.Axes] = None,
+    ax: Optional[Axes] = None,
     scale: float = 1.0,
     label: Optional[str] = None,
     cmap="managua_r",
+    **kwargs,
 ):
     """
     Plot the element values of a field on a mesh.
 
     Args:
-        u : The displacement field.
-        mesh : The mesh.
-        values : The element values to plot.
-        ax : The axes to plot on.
-        scale : The scale of the displacement field.
-        label : The label of the colorbar.
-        cmap : The colormap to use.
+        coords: The coordinates of the mesh nodes.
+        elements: The connectivity of the mesh elements.
+        values: The element values to plot.
+        u: The displacement field.
+        ax: The axes to plot on.
+        scale: The scale of the displacement field.
+        label: The label of the colorbar.
+        cmap: The colormap to use.
+        **kwargs : Additional keyword arguments to pass to PolyCollection.
     """
 
     if u is not None:
-        displaced = mesh.coords + scale * u
-    else:
-        displaced = mesh.coords
-    tri_elements = mesh.elements
-    vertices = displaced[tri_elements]
+        coords = coords + scale * u
 
-    plt.style.use(STYLE_PATH)
+    vertices = coords[elements]
+
     if ax is None:
         fig = plt.figure(figsize=(5, 4))
-        ax = plt.axes()
+        ax = fig.add_subplot(111)
 
-    poly = mpl.collections.PolyCollection(vertices, cmap=cmap)
+    poly = PolyCollection(vertices, cmap=cmap, linewidths=0.3, **kwargs)  # pyright: ignore[reportArgumentType]
     poly.set_array(values.flatten())
     poly.set_edgecolor("face")
-    poly.set_lw(0.3)
     ax.add_collection(poly)
+
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("top", size="10%", pad=0.2)
-
-    fig = ax.get_figure()
-    fig.colorbar(poly, cax=cax, label=label, orientation="horizontal", location="top")
-    if ax is None:
-        plt.show()
+    plt.colorbar(poly, cax=cax, label=label, orientation="horizontal", location="top")
 
 
 def plot_nodal_values(
-    mesh: Mesh,
-    nodal_values: Array,
+    coords: Array,
+    elements: Array,
+    values: Array,
+    *,
     u: Optional[Array] = None,
-    ax: Optional[mpl.axes.Axes] = None,
+    ax: Optional[Axes] = None,
     scale: float = 1.0,
     label: Optional[str] = None,
     cmap="managua_r",
-    edgecolors: Optional[str] = "none",
-    shading: Optional[str] = "gouraud",
+    edgecolors: str = "none",
+    shading: Literal["flat", "gouraud"] = "gouraud",
+    **kwargs,
 ):
     """
     Plot the nodal values of a field on a mesh.
 
     Args:
-        u : The displacement field.
-        mesh : The mesh.
-        nodal_values : The nodal values to plot.
-        ax : The axes to plot on.
-        scale : The scale of the displacement field.
-        label : The label of the colorbar.
-        cmap : The colormap to use.
+        coords: The coordinates of the mesh nodes.
+        elements: The connectivity of the mesh elements.
+        values: The element values to plot.
+        u: The displacement field.
+        ax: The axes to plot on.
+        scale: The scale of the displacement field.
+        label: The label of the colorbar.
+        cmap: The colormap to use.
+        edgecolors: The edge colors of the triangles.
+        shading: The shading of the triangles.
+        **kwargs: Additional keyword arguments to pass to tripcolor.
     """
 
+    coords_np = np.asarray(coords)
     if u is not None:
-        displaced = mesh.coords + scale * u
-    else:
-        displaced = mesh.coords
-    tri_elements = mesh.elements
+        coords_np = coords_np + scale * np.asarray(u)
 
-    plt.style.use(STYLE_PATH)
     if ax is None:
         fig = plt.figure(figsize=(5, 4))
-        ax = plt.axes()
+        ax = fig.add_subplot(111)
+
+    elements_np = np.asarray(elements)
+
+    if elements_np.shape[1] == 3:
+        triangles = elements_np
+    elif elements_np.shape[1] == 4:
+        # Split each quad into two triangles along the (0, 2) diagonal.
+        first_half = elements_np[:, [0, 1, 2]]
+        second_half = elements_np[:, [0, 2, 3]]
+        triangles = np.concatenate((first_half, second_half), axis=0)
+    else:
+        raise ValueError(
+            "Only triangular or quadrilateral elements are supported for nodal values."
+        )
+
+    triangles = np.asarray(triangles, dtype=int)
+    tri = Triangulation(coords_np[:, 0], coords_np[:, 1], triangles)
 
     cb = ax.tripcolor(
-        displaced[:, 0],
-        displaced[:, 1],
-        tri_elements,
-        nodal_values,
+        tri,
+        np.asarray(values),
         shading=shading,
         cmap=cmap,
         edgecolors=edgecolors,
+        **kwargs,
     )
 
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("top", size="10%", pad=0.2)
-
-    fig = ax.get_figure()
-    fig.colorbar(cb, cax=cax, label=label, orientation="horizontal", location="top")
-
-    if ax is None:
-        plt.show()
-
+    plt.colorbar(cb, cax=cax, label=label, orientation="horizontal", location="top")
