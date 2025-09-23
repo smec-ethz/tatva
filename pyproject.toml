@@ -19,17 +19,12 @@ dependencies = [
     "equinox",
     "numpy",
     "sparsejac",
-    "matplotlib",
-    "scipy",
-    "gmsh",
-    "meshio",
     "jax-autovmap>=0.3.0",
 ]
 
 [project.optional-dependencies]
-examples = [
-    "cmcrameri",
-    "ipykernel>=6.30.0",
+plotting = [
+    "matplotlib",
 ]
 dev = [
     "commitizen>=4.9.1",
