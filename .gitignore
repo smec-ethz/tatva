@@ -20,3 +20,4 @@ arguments-*
 *egg-info*
 *build*
 uv.lock
+docs/examples/*.ipynb

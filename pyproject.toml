@@ -34,6 +34,10 @@ dev = [
     "pytest>=8.4.2",
 ]
 
+docs = [
+    "jupytext",
+]
+
 [build-system]
 requires = [ "hatchling", ]
 build-backend = "hatchling.build"
