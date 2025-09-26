@@ -6,18 +6,52 @@ All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
 
+## v0.3.0 (2025-09-23)
+
+### Feat
+
+- **operator**: mesh and element validation in __post_init__ (0978269)
+- **mesh**: add dimension arg (f730de8)
+- **mesh**: add generation of quad mesh in 2d (d09036a)
+
+### Fix
+
+- **mesh**: add correctly the element type and dim arguments also to rectangle() (42d8951)
+- **plotting**: add import check and verbose error if optional package matplotlib is missing (035ea71)
+- **plotting**: remove personal config + bring simple plot methods up to date (064cda9)
+
+### Refactor
+
+- **operator**: simplify api by removing decorator functionality for integrate, eval, grad (4609bae)
+- **element**: move elements to submodule (a89c875)
+
+## v0.2.0 (2025-09-22)
+
+### Feat
+
+- **operator**: add to map an argument "element_quantity" to specify arguments which are not nodal but elemental values (5f0e3d6)
+- **operator**: add map_over_element which maps a generic function over all elements but not gauss points !9 (1ffd67c)
+- **operator**: map method to map over any function (provided by the element) given a certain signature !9 (62deb78)
+- **element**: add tetrahedron and hexahedron elements !10 (d92b934)
+- **compound**: add functionality to reorder the array by stacking fields (make hessian diagonal -> easy sparsity pattern) (6ce6f49)
+
+### Refactor
+
+- **operator**: add generic element type to operator for clearer static typing (29adaf9)
+- **compound**: update compound class (fba347e)
+
 ## v0.1.2 (2025-09-16)
 
 ### Fix
 
-- update version of jax to >=0.4.1 (1dae07b)
-- remove autovmap and replacing it with dependency of the original project (b8b8b60)
+- update version of jax to >=0.4.1 (fc6a34d)
+- remove autovmap and replacing it with dependency of the original project (1cb17aa)
 
 ## v0.1.1 (2025-09-11)
 
 ### Fix
 
-- **plotting**: removes imports of cmcrameri (7bcfc3c)
+- **plotting**: removes imports of cmcrameri (32694c1)
 
 ## v0.1.0 (2025-09-03)
 
