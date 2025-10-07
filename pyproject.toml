@@ -19,7 +19,8 @@ classifiers = [
 ]
 dependencies = [
     "jax>=0.4.1",
-    "equinox",
+    "equinox<=0.13.0",
+    "jaxtyping==0.3.2",
     "numpy",
     "sparsejac",
     "jax-autovmap>=0.3.0",
