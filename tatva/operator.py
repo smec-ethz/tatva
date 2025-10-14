@@ -99,69 +99,6 @@ class Operator(Generic[ElementT], eqx.Module):
             "eq,q->eq", det_J_elements, self.element.quad_weights
         )
 
-    def __check_init__(self) -> None:
-        """Validates the mesh and element compatibility. Does a series of checks to ensure
-        that the mesh and element are useable together.
-
-        Raises:
-            ValueError: If the mesh or element are not compatible.
-            TypeError: If the mesh element connectivity is not of integer type.
-        """
-        coords = self.mesh.coords
-        elements = self.mesh.elements
-        quad_points = self.element.quad_points
-
-        if coords.ndim != 2:
-            raise ValueError(
-                "Mesh coordinates must be a 2D array shaped (n_nodes, n_dim)."
-            )
-        if coords.shape[0] == 0:
-            raise ValueError("Mesh must contain at least one node.")
-
-        if elements.ndim != 2:
-            raise ValueError(
-                "Mesh elements must be a 2D array shaped (n_elements, n_nodes_per_element)."
-            )
-        if elements.shape[0] == 0:
-            raise ValueError("Mesh must contain at least one element.")
-        if not jnp.issubdtype(elements.dtype, jnp.integer):
-            raise TypeError("Mesh element connectivity must contain integer indices.")
-
-        if quad_points.ndim != 2 or quad_points.shape[0] == 0:
-            raise ValueError(
-                "Element must define at least one quadrature point in an (n_q, n_dim) array."
-            )
-
-        local_dim = quad_points.shape[1]
-        global_dim = coords.shape[1]
-        if local_dim > 1 and local_dim != global_dim:
-            raise ValueError(
-                f"Element {self.element.__class__.__name__} expects {local_dim}D coordinates but mesh provides {global_dim}D nodes."
-            )
-        if local_dim == 0:
-            raise ValueError("Element must have a positive number of local dimensions.")
-
-        n_nodes_per_element = elements.shape[1]
-        shape_fn = np.asarray(self.element.shape_function(self.element.quad_points[0]))
-        if shape_fn.ndim != 1:
-            raise ValueError(
-                "Element shape function must return a 1D array of nodal weights."
-            )
-        if shape_fn.shape[0] != n_nodes_per_element:
-            raise ValueError(
-                f"Mesh connectivity lists {n_nodes_per_element} nodes per element but {self.element.__class__.__name__} expects {shape_fn.shape[0]}."
-            )
-
-        flat_elements = elements.ravel()
-        if flat_elements.min() < 0:
-            raise ValueError(
-                "Mesh element connectivity contains negative node indices."
-            )
-        if flat_elements.max() >= coords.shape[0]:
-            raise ValueError(
-                "Mesh element connectivity references nodes outside the mesh coordinates array."
-            )
-
     def _vmap_over_elements_and_quads(
         self, nodal_values: jax.Array, func: MappableOverElementsAndQuads
     ) -> jax.Array:
