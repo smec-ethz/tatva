@@ -16,7 +16,7 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
-from typing import Dict, Mapping, Optional, Tuple, Union
+from typing import Mapping, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp

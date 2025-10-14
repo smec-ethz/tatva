@@ -25,8 +25,8 @@ from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, c
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jax import Array
 import numpy as np
+from jax import Array
 from jax_autovmap import autovmap
 
 from tatva.element import Element
@@ -86,7 +86,7 @@ class Operator(Generic[ElementT], eqx.Module):
     element: ElementT
     det_J_elements_weights: Array
 
-    def __init__(self, mesh: Mesh, element: Element):
+    def __init__(self, mesh: Mesh, element: ElementT):
         self.mesh = mesh
         self.element = element
 

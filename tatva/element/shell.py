@@ -55,7 +55,7 @@ def rodrigues_series2(omega: Array, eps=1e-12) -> Array:
 def normalize(v: Array) -> Array:
     """Returns the normalized vector."""
     norm = jnp.linalg.norm(v)
-    return v / jnp.where(norm < 1e-12, 1.0, norm)
+    return v / jnp.where(norm < 1e-12, 1.0, norm)  # type: ignore
 
 
 def normalize_interp_and_grad(N, dN_dxi, nodal_vecs, eps=1e-12) -> tuple[Array, Array]:
