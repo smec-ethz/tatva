@@ -6,6 +6,13 @@ All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
 
+## v0.3.1 (2025-10-14)
+
+### Fix
+
+- **operator**: computes detJ with quad weights at initialization (e40b699)
+- **operator**: moving detJ and detJ weight calculation to initalization (dc0b03d)
+
 ## v0.3.0 (2025-09-23)
 
 ### Feat
