@@ -1,66 +1,101 @@
+# Copyright (C) 2025 ETH Zurich (Mohit Pundir)
+#
+# This file is part of tatva.
+#
+# tatva is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# tatva is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with tatva.  If not, see <https://www.gnu.org/licenses/>.
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from functools import partial
+from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, cast
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float, Int
 
 from tatva.mesh import Mesh
 from tatva.element import BeamElement
-import equinox as eqx
-from typing import Callable, Protocol, overload, ParamSpec, Concatenate, TypeAlias, Any
-import abc
 
 
 P = ParamSpec("P")
+RT = TypeVar("RT", bound=jax.Array | tuple, covariant=True)
+BeamElementT = TypeVar("BeamElementT", bound=BeamElement)
 Numeric: TypeAlias = float | int | jnp.number
-Form: TypeAlias = Callable[Concatenate[Array, Array, P], Array | float]
 
 
-class FormCallable(Protocol[P]):
+class MappableOverElementsAndQuads(Protocol[P, RT]):
+    """Internal protocol for functions that are mapped over elements using
+    `Operator.map`."""
+
     @staticmethod
     def __call__(
-        nodal_values: Array,
+        xi: jax.Array,
+        *el_values: P.args,
+        **el_kwargs: P.kwargs,
+    ) -> RT: ...
+
+MappableOverElements: TypeAlias = Callable[P, RT]
+
+class MappedCallable(Protocol[P, RT]):
+    @staticmethod
+    def __call__(
         *args: P.args,
         **kwargs: P.kwargs,
-    ) -> Array: ...
+    ) -> RT: ...
 
 
-class _VmapOverElementsCallable(Protocol):
-    """Internal protocol for functions that are mapped over elements and quadrature points."""
-
-    @staticmethod
-    def __call__(
-        xi: Array,
-        el_nodal_values: Array,
-        el_nodes_coords: Array,
-    ) -> Array | Float: ...
-
-
-class BeamOperator(eqx.Module):
-    """A class that provides an Operator for finite element method (FEM) assembly.
+class BeamOperator(Generic[BeamElementT], eqx.Module):
+    """A class that provides an Operator for finite element method (FEM) assembly for beam elements.
 
     Args:
         mesh: The mesh containing the elements and nodes.
-        element: The element type used for the finite element method.
-
+        element: The beam element type used for the finite element method.
+       
     Provides several operators for evaluating and integrating functions over the mesh,
     such as `integrate`, `eval`, and `grad`. These operators can be used to compute
     integrals, evaluate functions at quadrature points, and compute gradients of
     functions at quadrature points.
 
     Example:
-        >>> from femsolver import Mesh, Tri3, Operator
-        >>> mesh = Mesh.unit_square(10, 10)  # Create a mesh
-        >>> element = Tri3()  # Define an element type
-        >>> operator = Operator(mesh, element)
+        >>> from tatva import Mesh, LinearElement, BeamOperator
+        >>> element = LinearElement()  # Define an element type
+        >>> operator = BeamOperator(mesh, element)
         >>> nodal_values = jnp.array(...)  # Nodal values at the mesh nodes
         >>> energy = operator.integrate(energy_density)(nodal_values)
     """
 
     mesh: Mesh
-    element: BeamElement
+    element: BeamElementT
+    det_J_elements_weights: Array
+
+    def __init__(self, mesh: Mesh, element: BeamElement):
+        self.mesh = mesh
+        self.element = element
+
+        def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
+            """Calls the function element.get_jacobian and returns the second output."""
+            return self.element.get_jacobian(xi, el_nodal_coords)[1]
+
+        det_J_elements = self.map(_get_det_J)(self.mesh.coords)
+        self.det_J_elements_weights = jnp.einsum(
+            "eq,q->eq", det_J_elements, self.element.quad_weights
+        )
 
     def _vmap_over_elements_and_quads(
-        self, nodal_values: jax.Array, func: _VmapOverElementsCallable
+        self, nodal_values: jax.Array, func: MappableOverElementsAndQuads
     ) -> jax.Array:
         """Helper function. Maps a function over the elements and quadrature points of the
         mesh.
@@ -88,145 +123,85 @@ class BeamOperator(eqx.Module):
             in_axes=(0, 0),
         )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
 
-    @overload
-    def grad(self, arg: Form[P]) -> FormCallable[P]: ...
-    @overload
-    def grad(self, arg: jax.Array, *args: tuple[Any, ...]) -> jax.Array: ...
-    def grad(self, arg, *args):
-        """Evaluates the gradient of the function at the quadrature points.
 
-        If a function is provided, it returns a function that computes the gradient of the
-        nodal values at the quadrature points. If nodal values are provided, it returns the
-        gradient of the nodal values at the quadrature points.
-        """
-        if isinstance(arg, Callable):
-            return self._grad_functor(arg, *args)
-        else:
-            return self._grad_direct(arg)
 
-    def _grad_direct(self, nodal_values: jax.Array) -> jax.Array:
-        """Computes the gradient of the nodal values at the quad points.
+    def map(
+        self,
+        func: MappableOverElementsAndQuads[P, RT],
+        *,
+        element_quantity: Sequence[int] = (),
+    ) -> MappedCallable[P, RT]:
+        """Maps a function over the elements and quad points of the mesh.
+
+        Returns a function that takes values at nodal points (globally) and returns the
+        vmapped result over the elements and quad points.
 
         Args:
-            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+            func: The function to map over the elements and quadrature points.
+            element_quantity: Indices of the arguments of `func` that are quantities
+                defined per element. The rest of the arguments are assumed to be defined
+                at nodal points.
         """
 
-        def _gradient_quad(
-            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
-        ) -> jax.Array:
-            """Calls the function (gradient) on a quad point."""
-            u_grad = self.element.gradient(xi, el_nodal_values, el_nodal_coords)
-            return u_grad
+        def _mapped(*values: P.args, **kwargs: P.kwargs) -> RT:
+            # values should be arrays!
+            _values = cast(tuple[jax.Array, ...], values)
 
-        return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
+            def _at_each_element(*el_values) -> jax.Array:
+                return eqx.filter_vmap(
+                    lambda xi: func(xi, *el_values, **kwargs),
+                )(self.element.quad_points)
 
-    def _grad_functor(self, func: Form[P]) -> FormCallable[P]:
-        """Decorator to compute the gradient of a local function at the mesh elements quad
-        points.
+            return eqx.filter_vmap(
+                _at_each_element,
+                in_axes=(0,) * len(values),
+            )(
+                *(
+                    v[self.mesh.elements] if i not in element_quantity else v
+                    for i, v in enumerate(_values)
+                )
+            )
 
-        Returns a function that takes nodal values and additional values at nodal
-        points and returns the gradient of the evaluated function at the quadrature points.
-        *(shape: (n_elements, n_quad_points, n_values))*
-        """
-        # TODO: Not sure this is useful
-        ...
+        return _mapped
 
-    @overload
-    def integrate(self, arg: Form[P]) -> FormCallable[P]: ...
-    @overload
-    def integrate(self, arg: Array | Numeric) -> Array: ...
-    def integrate(self, arg):
-        """Integrate a function/nodal_array/quad_array over the mesh.
 
-        If a function is provided, it returns a function that integrates the function given the nodal values.
-        If nodal values or quad values are given, it returns the integral.
+    def integrate(self, arg: jax.Array | Numeric) -> jax.Array:
+        """Integrate a nodal_array, quad_array, or numeric value over the mesh.
+
+        Args:
+            arg: An array of nodal values (shape: (n_nodes, n_values)), an array of
+                quadrature values (shape: (n_elements, n_quad_points, n_values)), or a
+                numeric value (float or int).
 
         Returns:
-            A function that integrates the given function over the mesh, or the integral
-            (**scalar**) of the nodal values or quadrature values over the mesh.
+            The integral of the nodal values or quadrature values over the mesh.
         """
-        if isinstance(arg, Callable):
-            return self._integrate_functor(arg, sum=True)
+        res = self.integrate_per_element(arg)
+        return jnp.sum(res, axis=(0,))  # Sum over elements and quadrature points
 
+    def integrate_per_element(self, arg: jax.Array | Numeric) -> jax.Array:
+        """Integrate a nodal_array, quad_array, or numeric value over the mesh. Returning the
+        integral per element.
+
+        Args:
+            arg: An array of nodal values (shape: (n_nodes, n_values)), an array of
+                quadrature values (shape: (n_elements, n_quad_points, n_values)), or a
+                numeric value (float or int).
+
+        Returns:
+            A `jax.Array` where each element contains the integral of the values in the
+            element (shape: (n_elements, n_values)).
+        """
         if isinstance(arg, Numeric):
-            res = self._integrate_nodal_array(jnp.array([arg]))
+            res = self._integrate_quad_array(self.eval(jnp.array([arg])))
         elif arg.shape[0] == self.mesh.elements.shape[0]:  # element field
             res = self._integrate_quad_array(arg)
         else:  # nodal field
-            res = self._integrate_nodal_array(arg)
+            field_at_quads = self.eval(arg)
+            res = self._integrate_quad_array(field_at_quads)
 
-        return jnp.sum(res, axis=(0,))  # Sum over elements and quadrature points
+        return res
 
-    @overload
-    def integrate_per_element(self, arg: Form[P]) -> FormCallable[P]: ...
-    @overload
-    def integrate_per_element(self, arg: Array) -> Array: ...
-    def integrate_per_element(self, arg):
-        """Integrate a function/nodal_array/quad_array over the mesh, returning the result per element.
-
-        If a function is provided, it returns a function that integrates the function given the nodal values.
-        If nodal values or quad values are given, it returns the integral per element.
-
-        Returns:
-            A function that integrates the given function over the mesh, or the integral
-            of the nodal values or quadrature values over each element.
-        """
-        if isinstance(arg, Callable):
-            return self._integrate_functor(arg, sum=False)
-
-        if arg.shape[0] == self.mesh.elements.shape[0]:
-            return self._integrate_quad_array(arg)
-        else:
-            return self._integrate_nodal_array(arg)
-
-    def _integrate_functor(
-        self, func: Form[P], *, sum: bool = False
-    ) -> FormCallable[P]:
-        """Decorator to integrate a function over the mesh.
-
-        Returns a function that takes nodal values and additional values at quadrature
-        points and returns the integrated value over the mesh.
-        """
-
-        @eqx.filter_jit
-        def _integrate(
-            nodal_values: jax.Array,
-            *args: P.args,
-            **kwargs: P.kwargs,
-        ) -> jax.Array:
-            """Integrates the given local function over the mesh.
-
-            Args:
-                nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
-                *args: Additional arguments to pass to the function (optional)
-            """
-
-            def _integrate_quads(
-                xi: jax.Array,
-                el_nodal_values: jax.Array,
-                el_nodal_coords: jax.Array,
-            ) -> jax.Array:
-                """Calls the function (integrand) on a quad point. Multiplying by the
-                determinant of the Jacobian.
-                """
-                u, w, theta, du_dx, dw_dx, d2w_dx2, detJ = (
-                    self.element.get_local_values(xi, el_nodal_values, el_nodal_coords)
-                )
-                return func(u, w, theta, du_dx, dw_dx, d2w_dx2, *args, **kwargs) * detJ
-
-            res = jnp.einsum(
-                "eq...,q...->eq...",
-                self._vmap_over_elements_and_quads(nodal_values, _integrate_quads),
-                self.element.quad_weights,
-            )
-            if sum:
-                return jnp.sum(
-                    res, axis=(0, 1)
-                )  # Sum over elements and quadrature points
-            else:
-                return res
-
-        return _integrate
 
     def _integrate_quad_array(self, quad_values: Array) -> Array:
         """Integrates a given array of values at quadrature points over the mesh.
@@ -237,92 +212,56 @@ class BeamOperator(eqx.Module):
         Returns:
             A jax.Array where each element contains the integral of the values in the element
         """
-        det_J_elements = self._vmap_over_elements_and_quads(
-            jnp.zeros(1),  # Dummy nodal values
-            lambda xi, el_nodal_values, el_nodal_coords: self.element.get_jacobian(
-                xi, el_nodal_coords
-            )[1],
-        )
+        #det_J_elements = self._vmap_over_elements_and_quads(
+        #    jnp.zeros(1),  # Dummy nodal values
+        #    lambda xi, el_nodal_values, el_nodal_coords: self.element.get_jacobian(
+        #        xi, el_nodal_coords
+        #    )[1],
+        #)
         return jnp.einsum(
             "eq...,eq->e...",
             quad_values,
-            jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights),
+            self.det_J_elements_weights,
         )
 
-    def _integrate_nodal_array(self, nodal_values: Array) -> Array:
-        """Integrates a given array of nodal values over the mesh.
+
+    def eval(self, nodal_values: jax.Array) -> jax.Array:
+        """Evaluates the nodal values at the quadrature points.
 
         Args:
             nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
 
         Returns:
-            A jax.Array where each element contains the integral of the nodal values in the element
-        """
-        return self._integrate_quad_array(self.eval(nodal_values))
-
-    @overload
-    def eval(self, arg: Form[P]) -> FormCallable[P]: ...
-    @overload
-    def eval(self, arg: Array, *args: tuple[Any, ...]) -> Array: ...
-    def eval(self, arg, *args):
-        """Evaluates the function at the quadrature points.
-
-        If a function is provided, it returns a function that interpolates the nodal values
-        at the quadrature points. If nodal values are provided, it returns the interpolated
-        values at the quadrature points.
-        """
-        if isinstance(arg, Callable):
-            return self._eval_functor(arg, *args)
-        else:
-            return self._eval_direct(arg)
-
-    def _eval_functor(self, func: Form[P]) -> FormCallable[P]:
-        """Decorator to interpolate a local function at the mesh elements quad points.
-
-        Returns a function that takes nodal values and additional values at quadrature
-        points and returns the interpolated values at the quadrature points.
-        *(shape: (n_elements, n_quad_points, n_values))*
-        """
-
-        def _eval(
-            nodal_values: jax.Array,
-            *args: P.args,
-            **kwargs: P.kwargs,
-        ) -> jax.Array:
-            """Interpolates the given function at the mesh nodes.
-
-            Args:
-                nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
-                *args: Additional arguments to pass to the function (optional)
-            """
-
-            def _eval_quad(
-                xi: Array, el_nodal_values: Array, el_nodal_coords: Array
-            ) -> Array | float:
-                """Calls the function (interpolator) on a quad point."""
-                u, w, theta, du_dx, dw_dx, d2w_dx2, _detJ = (
-                    self.element.get_local_values(xi, el_nodal_values, el_nodal_coords)
-                )
-                return func(u, w, theta, du_dx, dw_dx, d2w_dx2, *args, **kwargs)
-
-            return self._vmap_over_elements_and_quads(nodal_values, _eval_quad)
-
-        return _eval
-
-    def _eval_direct(
-        self,
-        nodal_values: Array,
-    ) -> Array:
-        """Interpolates the given function at the quad points.
-
-        Args:
-            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+            A `jax.Array` with the values of the nodal values at each quadrature point of
+            each element (shape: (n_elements, n_quad_points, n_values)).
         """
 
         def _eval_quad(
-            xi: Array, el_nodal_values: Array, el_nodal_coords: Array
-        ) -> Array:
+            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
+        ) -> jax.Array:
             """Calls the function (interpolator) on a quad point."""
             return self.element.interpolate(xi, el_nodal_values, el_nodal_coords)
 
         return self._vmap_over_elements_and_quads(nodal_values, _eval_quad)
+
+
+    
+    def grad(self, nodal_values: jax.Array) -> jax.Array:
+        """Computes the gradient of the nodal values at the quad points.
+
+        Args:
+            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+
+        Returns:
+            A `jax.Array` with the gradient of the nodal values at each quadrature point
+            of each element (shape: (n_elements, n_quad_points, n_values, n_dim)).
+        """
+
+        def _gradient_quad(
+            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
+        ) -> jax.Array:
+            """Calls the function (gradient) on a quad point."""
+            u_grad = self.element.gradient(xi, el_nodal_values, el_nodal_coords)
+            return u_grad
+
+        return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
