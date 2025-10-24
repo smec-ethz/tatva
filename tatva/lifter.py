@@ -1,4 +1,4 @@
-from typing import Callable, Concatenate, ParamSpec, Protocol, overload
+from typing import Callable, Concatenate, ParamSpec, Protocol
 
 import equinox
 import jax.numpy as jnp
@@ -28,9 +28,9 @@ class Lifter(equinox.Module):
         """Class to handle lifting and reducing displacement vectors.
 
         Args:
-            size (int): Size of the full displacement vector.
-            free (Array | None): Indices of free dofs. If None, all dofs are free.
-            constrained (Array | None): Indices of constrained dofs. If None, inferred from free dofs.
+            size: Size of the full displacement vector.
+            free: Indices of free dofs. If None, all dofs are free.
+            constrained: Indices of constrained dofs. If None, inferred from free dofs.
         """
         assert free is not None or constrained is not None, (
             "Either free or constrained dofs must be provided."
@@ -86,26 +86,15 @@ class Lifter(equinox.Module):
 
         return new_energy_fn
 
-    # def reduce_sparsity_pattern(self, pattern: BCOO) -> BCOO:
-    #     """Reduce a sparse matrix pattern to free dofs.
-
-    #     Args:
-    #         pattern (BCOO): Sparse matrix pattern in BCOO format.
-
-    #     Returns:
-    #         BCOO: Reduced sparse matrix pattern in BCOO format.
-    #     """
-    #     mask = jnp.isin(pattern.indices, self.free_dofs).all(axis=1)
-    #     reduced_indices = pattern.indices[mask]
-    #     index_map = jnp.zeros(self.size, dtype=int) - 1
-    #     index_map = index_map.at[self.free_dofs].set(jnp.arange(len(self.free_dofs)))
-    #     reduced_indices = index_map[reduced_indices]
-    #     reduced_data = pattern.data[mask]
-    #     shape = (len(self.free_dofs), len(self.free_dofs))
-    #     return BCOO((reduced_data, reduced_indices), shape=shape)
-
     def reduce_sparsity_pattern(self, pattern: BCOO) -> BCOO:
-        """Reduce a sparse matrix pattern to free dofs."""
+        """Reduce a sparse matrix pattern to the free dofs.
+
+        Args:
+            pattern: Sparse matrix pattern in BCOO format.
+
+        Returns:
+            BCOO: Reduced sparse matrix pattern in BCOO format.
+        """
         # Pull to host (avoid device OOM for big masks)
         I = np.asarray(pattern.indices[:, 0])
         J = np.asarray(pattern.indices[:, 1])
