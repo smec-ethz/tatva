@@ -1,4 +1,8 @@
-from typing import Callable, Concatenate, ParamSpec, Protocol
+from __future__ import annotations
+
+from collections.abc import Hashable
+from dataclasses import dataclass
+from typing import Self
 
 import equinox
 import jax.numpy as jnp
@@ -6,91 +10,100 @@ import numpy as np
 from jax import Array
 from jax.experimental.sparse import BCOO
 
-P = ParamSpec("P")
+
+class Constraint(Hashable):
+    """Abstract base class for conditions applied during lifting."""
+
+    dofs: Array
+    """The constrained dofs"""
+
+    def apply_lift(self, u_full: Array) -> Array:  # override in subclasses
+        return u_full
 
 
-class LiftedEnergyFunction(Protocol[P]):
-    @staticmethod
-    def __call__(
-        u_reduced: Array, u_full: Array, *args: P.args, **kwargs: P.kwargs
-    ) -> Array: ...
+@dataclass
+class PeriodicMap(Constraint):
+    dofs: Array
+    master_dofs: Array
+
+    def apply_lift(self, u_full: Array) -> Array:
+        return u_full.at[self.dofs].set(u_full[self.master_dofs])
+
+
+@dataclass
+class DirichletBC(Constraint):
+    dofs: Array
+    values: Array
+
+    def apply_lift(self, u_full: Array) -> Array:
+        return u_full.at[self.dofs].set(self.values)
 
 
 class Lifter(equinox.Module):
     free_dofs: Array
     constrained_dofs: Array
     size: int
-    ndof_reduced: int
+    size_reduced: int
+    constraints: tuple[Constraint, ...] = ()
 
     def __init__(
-        self, size: int, free: Array | None = None, constrained: Array | None = None
+        self,
+        size: int,
+        dirichlet_dofs: Array,
+        *additional_constraints: Constraint,
+        **kwargs,
     ):
-        """Class to handle lifting and reducing displacement vectors.
+        self.size = size
+        self.constraints = additional_constraints
 
-        Args:
-            size: Size of the full displacement vector.
-            free: Indices of free dofs. If None, all dofs are free.
-            constrained: Indices of constrained dofs. If None, inferred from free dofs.
-        """
-        assert free is not None or constrained is not None, (
-            "Either free or constrained dofs must be provided."
+        self._compute_sizes(dirichlet_dofs)
+
+    def __hash__(self):
+        return hash(self.constraints)
+
+    def _compute_sizes(self, dirichlet_dofs: Array):
+        all_dofs = jnp.arange(self.size)
+        constrained = jnp.concatenate(
+            [dirichlet_dofs] + [cond.dofs for cond in self.constraints]
         )
-        if free is None:
-            free = jnp.setdiff1d(jnp.arange(size), constrained)  # type: ignore
-        else:
-            assert jnp.all(free < size) and jnp.all(free >= 0), (
-                "Free dof indices out of bounds."
-            )
-            assert len(jnp.unique(free)) == len(free), (
-                "Free dof indices must be unique."
-            )
-
-        if constrained is None:
-            constrained = jnp.setdiff1d(jnp.arange(size), free)
-        else:
-            assert jnp.all(constrained < size) and jnp.all(constrained >= 0), (
-                "Constrained dof indices out of bounds."
-            )
-            assert len(jnp.unique(constrained)) == len(constrained), (
-                "Constrained dof indices must be unique."
-            )
+        constrained = jnp.unique(constrained)
+        free = jnp.setdiff1d(all_dofs, constrained, assume_unique=True)
 
         self.free_dofs = free
-        self.constrained_dofs = (
-            constrained
-            if constrained is not None
-            else jnp.setdiff1d(jnp.arange(size), free)
+        self.constrained_dofs = constrained
+        self.size_reduced = free.size
+
+    def add(self, condition: Constraint) -> Self:
+        """Add a condition to the lifter."""
+        return equinox.tree_at(
+            lambda lf: lf.constraints, self, self.constraints + (condition,)
         )
-        self.size = size
-        self.ndof_reduced = self.free_dofs.size
 
     def lift(self, u_reduced: Array, u_full: Array) -> Array:
         """Lift reduced displacement vector to full size."""
-        return u_full.at[self.free_dofs].set(u_reduced)
+        assert u_reduced.shape[0] == self.size_reduced, (
+            f"Reduced displacement vector has incorrect size: "
+            f"expected {self.size_reduced}, got {u_reduced.shape[0]}"
+        )
+        u_full = u_full.at[self.free_dofs].set(u_reduced)
+        for condition in self.constraints:
+            u_full = condition.apply_lift(u_full)
+        return u_full
+
+    def lift_from_null(self, u_reduced: Array) -> Array:
+        """Lift reduced displacement vector to full size from zero."""
+        u_full = jnp.zeros(self.size, dtype=u_reduced.dtype)
+        return self.lift(u_reduced, u_full)
 
     def reduce(self, u_full: Array) -> Array:
         """Reduce full displacement vector to free dofs."""
         return u_full[self.free_dofs]
 
-    def reduce_energy_function(
-        self,
-        energy_fn: Callable[Concatenate[Array, P], Array],
-    ) -> LiftedEnergyFunction[P]:
-        """Compute energy given reduced displacement vector."""
-
-        def new_energy_fn(
-            u_reduced: Array, u_full: Array, *args: P.args, **kwargs: P.kwargs
-        ) -> Array:
-            u_full = self.lift(u_reduced, u_full)
-            return energy_fn(u_full, *args, **kwargs)
-
-        return new_energy_fn
-
     def reduce_sparsity_pattern(self, pattern: BCOO) -> BCOO:
-        """Reduce a sparse matrix pattern to the free dofs.
+        """Reduce a sparse matrix pattern to free dofs.
 
         Args:
-            pattern: Sparse matrix pattern in BCOO format.
+            pattern (BCOO): Sparse matrix pattern in BCOO format.
 
         Returns:
             BCOO: Reduced sparse matrix pattern in BCOO format.
