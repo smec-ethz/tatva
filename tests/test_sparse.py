@@ -45,7 +45,7 @@ def strain_energy(grad_u: Array, mu: float, lmbda: float) -> Array:
     return 0.5 * jnp.einsum("ij,ij->", sig, eps)
 
 
-mesh = Mesh.unit_square(5, 5)
+mesh = Mesh.unit_square(8, 8)
 tri = element.Tri3()
 op = Operator(mesh, tri)
 

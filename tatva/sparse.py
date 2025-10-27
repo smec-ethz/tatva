@@ -27,6 +27,7 @@ from jax.experimental import sparse as jax_sparse
 
 from tatva import Mesh
 import scipy.sparse as sps
+import math
 
 
 def jacfwd(func, sparsity_pattern):
@@ -93,49 +94,62 @@ def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
 
 def _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape):
     """
-    Creates the sparse structure with maximum performance by offloading the
-    most expensive step (handling duplicate indices) to SciPy.
+    Creates the sparse structure with maximum performance and guaranteed correctness.
+
+    - Uses SciPy for the fastest possible reduction of duplicate coordinates.
+    - Uses NumPy's `unique` on a linearized index to perfectly replicate the
+      sorting order of the original JAX code at high speed.
 
     Args:
-        elements: (num_elements, nodes_per_element) - Can be JAX or NumPy array
+        elements: (num_elements, nodes_per_element)
         n_dofs_per_node: Number of degrees of freedom per node
         K_shape: Shape of the global stiffness matrix K
 
     Returns:
-        A jax_sparse.BCOO object representing the sparsity pattern.
+        A jax_sparse.BCOO object with canonically sorted indices.
     """
     
-    # Ensure elements is a NumPy array for fast CPU-based index generation.
-    elements_np = np.asarray(elements)
+    # Use 64-bit integers throughout the CPU-based setup to prevent any overflow.
+    elements_np = np.asarray(elements, dtype=np.int64)
     num_elements, nodes_per_element = elements_np.shape
     num_dofs_per_element = nodes_per_element * n_dofs_per_node
 
-    # Get all global DOF indices for each element using NumPy.
     dofs = (
         elements_np[..., None] * n_dofs_per_node
-        + np.arange(n_dofs_per_node, dtype=np.int32)
+        + np.arange(n_dofs_per_node, dtype=np.int64)
     )
     element_dofs = dofs.reshape(num_elements, -1)
 
-    # Create the list of all potential row and column indices (with duplicates).
-    # These are standard NumPy operations and are very fast.
     row_indices = np.repeat(element_dofs, num_dofs_per_element, axis=1).flatten()
     col_indices = np.tile(element_dofs, (1, num_dofs_per_element)).flatten()
-    
-    # It automatically and efficiently handles the duplicate coordinates.
-    # We provide a dummy data array of ones.
-    data = np.ones_like(row_indices, dtype=np.int32)
-    
-    # This single line replaces the entire expensive `unique` operation.
+
+    # Use SciPy to efficiently get the unique (but unsorted) coordinate pairs.
+    data = np.ones(row_indices.shape[0], dtype=np.int8)
     coo_matrix = sps.coo_matrix((data, (row_indices, col_indices)), shape=K_shape)
+    unique_rows = coo_matrix.row
+    unique_cols = coo_matrix.col
 
-    # Extract the now-unique indices from the SciPy object and build the
-    # final JAX BCOO sparse object.
-    unique_indices = jnp.vstack((coo_matrix.row, coo_matrix.col)).T
-    final_data = jnp.ones(unique_indices.shape[0], dtype=jnp.int32)
-    
-    return jax_sparse.BCOO((final_data, unique_indices), shape=K_shape)
 
+    # Linearize the indices. This is the key to matching the original sorting logic.
+    num_cols = K_shape[1]
+    linear_indices = unique_rows.astype(np.int64) * num_cols + unique_cols.astype(np.int64)
+
+    #The critical step: Use NumPy's fast, C-based `unique` function.
+    # This sorts the linearized indices, perfectly replicating the slow JAX
+    # version's logic but orders of magnitude faster.
+    sorted_linear_indices = np.unique(linear_indices)
+
+    # Delinearize the now-sorted indices.
+    sorted_rows = sorted_linear_indices // num_cols
+    sorted_cols = sorted_linear_indices % num_cols
+
+    # === Part 3: Final Assembly (JAX) ===
+
+    # The result is now correct, sorted, and ready to be passed to JAX.
+    final_indices = jnp.asarray(np.vstack((sorted_rows, sorted_cols)).T, dtype=jnp.int32)
+    final_data = jnp.ones(final_indices.shape[0], dtype=jnp.int32)
+
+    return jax_sparse.BCOO((final_data, final_indices), shape=K_shape)
 
 def get_bc_indices(sparsity_pattern: jax_sparse.BCOO, fixed_dofs: Array):
     """
@@ -187,9 +201,9 @@ def create_sparsity_pattern(
             n_dofs_per_node * mesh.coords.shape[0],
         )
 
-    sparsity_pattern = _create_sparse_structure(elements, n_dofs_per_node, K_shape)
+    sparsity_pattern = _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape)
     if constraint_elements is not None:
-        sparsity_pattern_constraint = _create_sparse_structure(
+        sparsity_pattern_constraint = _create_sparse_structure_scipy(
             constraint_elements, n_dofs_per_node, K_shape
         )
 
