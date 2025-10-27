@@ -26,6 +26,7 @@ from jax import Array
 from jax.experimental import sparse as jax_sparse
 
 from tatva import Mesh
+import scipy.sparse as sps
 
 
 def jacfwd(func, sparsity_pattern):
@@ -90,6 +91,52 @@ def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
     return sparsity_pattern
 
 
+def _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape):
+    """
+    Creates the sparse structure with maximum performance by offloading the
+    most expensive step (handling duplicate indices) to SciPy.
+
+    Args:
+        elements: (num_elements, nodes_per_element) - Can be JAX or NumPy array
+        n_dofs_per_node: Number of degrees of freedom per node
+        K_shape: Shape of the global stiffness matrix K
+
+    Returns:
+        A jax_sparse.BCOO object representing the sparsity pattern.
+    """
+    
+    # Ensure elements is a NumPy array for fast CPU-based index generation.
+    elements_np = np.asarray(elements)
+    num_elements, nodes_per_element = elements_np.shape
+    num_dofs_per_element = nodes_per_element * n_dofs_per_node
+
+    # Get all global DOF indices for each element using NumPy.
+    dofs = (
+        elements_np[..., None] * n_dofs_per_node
+        + np.arange(n_dofs_per_node, dtype=np.int32)
+    )
+    element_dofs = dofs.reshape(num_elements, -1)
+
+    # Create the list of all potential row and column indices (with duplicates).
+    # These are standard NumPy operations and are very fast.
+    row_indices = np.repeat(element_dofs, num_dofs_per_element, axis=1).flatten()
+    col_indices = np.tile(element_dofs, (1, num_dofs_per_element)).flatten()
+    
+    # It automatically and efficiently handles the duplicate coordinates.
+    # We provide a dummy data array of ones.
+    data = np.ones_like(row_indices, dtype=np.int32)
+    
+    # This single line replaces the entire expensive `unique` operation.
+    coo_matrix = sps.coo_matrix((data, (row_indices, col_indices)), shape=K_shape)
+
+    # Extract the now-unique indices from the SciPy object and build the
+    # final JAX BCOO sparse object.
+    unique_indices = jnp.vstack((coo_matrix.row, coo_matrix.col)).T
+    final_data = jnp.ones(unique_indices.shape[0], dtype=jnp.int32)
+    
+    return jax_sparse.BCOO((final_data, unique_indices), shape=K_shape)
+
+
 def get_bc_indices(sparsity_pattern: jax_sparse.BCOO, fixed_dofs: Array):
     """
     Get the indices of the fixed degrees of freedom.
@@ -140,9 +187,9 @@ def create_sparsity_pattern(
             n_dofs_per_node * mesh.coords.shape[0],
         )
 
-    sparsity_pattern = _create_sparse_structure(elements, n_dofs_per_node, K_shape)
+    sparsity_pattern = _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape)
     if constraint_elements is not None:
-        sparsity_pattern_constraint = _create_sparse_structure(
+        sparsity_pattern_constraint = _create_sparse_structure_scipy(
             constraint_elements, n_dofs_per_node, K_shape
         )
 
