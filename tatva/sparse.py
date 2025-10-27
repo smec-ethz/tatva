@@ -187,9 +187,9 @@ def create_sparsity_pattern(
             n_dofs_per_node * mesh.coords.shape[0],
         )
 
-    sparsity_pattern = _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape)
+    sparsity_pattern = _create_sparse_structure(elements, n_dofs_per_node, K_shape)
     if constraint_elements is not None:
-        sparsity_pattern_constraint = _create_sparse_structure_scipy(
+        sparsity_pattern_constraint = _create_sparse_structure(
             constraint_elements, n_dofs_per_node, K_shape
         )
 
