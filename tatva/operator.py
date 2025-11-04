@@ -25,7 +25,6 @@ from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, c
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import Array
 from jax_autovmap import autovmap
 
@@ -61,7 +60,7 @@ class MappedCallable(Protocol[P, RT]):
     ) -> RT: ...
 
 
-class Operator(Generic[ElementT], eqx.Module):
+class Operator(eqx.Module, Generic[ElementT]):
     """A class that provides an Operator for finite element method (FEM) assembly.
 
     Args:
