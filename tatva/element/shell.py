@@ -6,7 +6,7 @@ from jax import Array, vmap
 
 from tatva.mesh import Mesh
 
-from ._element import Element
+from .base import Element
 
 
 def skew(v: Array) -> Array:
