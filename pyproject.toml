@@ -12,14 +12,14 @@ license-files = [
     "COPYING.LESSER",
 ]
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "jax>=0.4.1",
-    "equinox",
+    "jax==0.8.0",
+    "equinox==0.13.0",
     "numpy",
     "sparsejac",
     "jax-autovmap>=0.3.0",
