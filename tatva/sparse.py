@@ -21,13 +21,12 @@ from typing import Optional, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+import scipy.sparse as sps
 import sparsejac
 from jax import Array
 from jax.experimental import sparse as jax_sparse
 
 from tatva import Mesh
-import scipy.sparse as sps
-import math
 
 
 def jacfwd(func, sparsity_pattern):
@@ -39,12 +38,13 @@ def jacrev(func, sparsity_pattern):
 
 
 def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
-    """
-    Create a sparse structure for a given set of elements and constraints.
+    """Create a sparse structure for a given set of elements and constraints.
+
     Args:
         elements: (num_elements, nodes_per_element)
         n_dofs_per_node: Number of degrees of freedom per node
         K_shape: Shape of the matrix K
+
     Returns:
         data: (num_nonzero_elements,)
         indices: (num_nonzero_elements, 2)
@@ -93,8 +93,7 @@ def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
 
 
 def _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape):
-    """
-    Creates the sparse structure with maximum performance and guaranteed correctness.
+    """Creates the sparse structure with maximum performance and guaranteed correctness.
 
     - Uses SciPy for the fastest possible reduction of duplicate coordinates.
     - Uses NumPy's `unique` on a linearized index to perfectly replicate the
@@ -108,15 +107,14 @@ def _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape):
     Returns:
         A jax_sparse.BCOO object with canonically sorted indices.
     """
-    
+
     # Use 64-bit integers throughout the CPU-based setup to prevent any overflow.
     elements_np = np.asarray(elements, dtype=np.int64)
     num_elements, nodes_per_element = elements_np.shape
     num_dofs_per_element = nodes_per_element * n_dofs_per_node
 
-    dofs = (
-        elements_np[..., None] * n_dofs_per_node
-        + np.arange(n_dofs_per_node, dtype=np.int64)
+    dofs = elements_np[..., None] * n_dofs_per_node + np.arange(
+        n_dofs_per_node, dtype=np.int64
     )
     element_dofs = dofs.reshape(num_elements, -1)
 
@@ -129,12 +127,13 @@ def _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape):
     unique_rows = coo_matrix.row
     unique_cols = coo_matrix.col
 
-
     # Linearize the indices. This is the key to matching the original sorting logic.
     num_cols = K_shape[1]
-    linear_indices = unique_rows.astype(np.int64) * num_cols + unique_cols.astype(np.int64)
+    linear_indices = unique_rows.astype(np.int64) * num_cols + unique_cols.astype(
+        np.int64
+    )
 
-    #The critical step: Use NumPy's fast, C-based `unique` function.
+    # The critical step: Use NumPy's fast, C-based `unique` function.
     # This sorts the linearized indices, perfectly replicating the slow JAX
     # version's logic but orders of magnitude faster.
     sorted_linear_indices = np.unique(linear_indices)
@@ -146,17 +145,21 @@ def _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape):
     # === Part 3: Final Assembly (JAX) ===
 
     # The result is now correct, sorted, and ready to be passed to JAX.
-    final_indices = jnp.asarray(np.vstack((sorted_rows, sorted_cols)).T, dtype=jnp.int32)
+    final_indices = jnp.asarray(
+        np.vstack((sorted_rows, sorted_cols)).T, dtype=jnp.int32
+    )
     final_data = jnp.ones(final_indices.shape[0], dtype=jnp.int32)
 
     return jax_sparse.BCOO((final_data, final_indices), shape=K_shape)
 
+
 def get_bc_indices(sparsity_pattern: jax_sparse.BCOO, fixed_dofs: Array):
-    """
-    Get the indices of the fixed degrees of freedom.
+    """Get the indices of the fixed degrees of freedom.
+
     Args:
         sparsity_pattern: jax.experimental.sparse.BCOO
         fixed_dofs: (num_fixed_dofs,)
+
     Returns:
         zero_indices: (num_zero_indices,)
         one_indices: (num_one_indices,)
@@ -183,12 +186,13 @@ def create_sparsity_pattern(
     K_shape: Optional[Tuple[int, int]] = None,
     constraint_elements: Optional[Array] = None,
 ):
-    """
-    Create a sparsity pattern for a given set of elements and constraints.
+    """Create a sparsity pattern for a given set of elements and constraints.
+
     Args:
         mesh: Mesh object
         n_dofs_per_node: Number of degrees of freedom per node
         constraint_elements: Optional array of constraint elements. If provided, the sparsity pattern will be created for the constraint elements.
+
     Returns:
         sparsity_pattern: jax.experimental.sparse.BCOO
     """
@@ -201,7 +205,9 @@ def create_sparsity_pattern(
             n_dofs_per_node * mesh.coords.shape[0],
         )
 
-    sparsity_pattern = _create_sparse_structure_scipy(elements, n_dofs_per_node, K_shape)
+    sparsity_pattern = _create_sparse_structure_scipy(
+        elements, n_dofs_per_node, K_shape
+    )
     if constraint_elements is not None:
         sparsity_pattern_constraint = _create_sparse_structure_scipy(
             constraint_elements, n_dofs_per_node, K_shape
@@ -222,12 +228,13 @@ def create_sparsity_pattern(
 
 
 def create_sparsity_pattern_KKT(mesh: Mesh, n_dofs_per_node: int, B: Array):
-    """
-    Create a sparsity pattern for the KKT system.
+    """Create a sparsity pattern for the KKT system.
+
     Args:
         mesh: Mesh object
         n_dofs_per_node: Number of degrees of freedom per node
         B: Constraint matrix (nb_cons, n_dofs)
+
     Returns:
         sparsity_pattern_KKT: jax.experimental.sparse.BCOO
     """
