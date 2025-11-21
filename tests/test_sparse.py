@@ -2,26 +2,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from jax import Array
 from jax_autovmap import autovmap
 
-from tatva import Operator, element, Mesh, sparse
+from tatva import Mesh, Operator, element, sparse
 
 jax.config.update("jax_enable_x64", True)
-
-
-from typing import NamedTuple
-
-
-class Material(NamedTuple):
-    """Material properties for the elasticity operator."""
-
-    mu: float  # Shear modulus
-    lmbda: float  # First Lamé parameter
-
-
-mat = Material(mu=0.5, lmbda=1.0)
 
 
 @autovmap(grad_u=2)
@@ -41,32 +27,31 @@ def compute_stress(eps: Array, mu: float, lmbda: float) -> Array:
 def strain_energy(grad_u: Array, mu: float, lmbda: float) -> Array:
     """Compute the strain energy density."""
     eps = compute_strain(grad_u)
-    sig = compute_stress(eps, mat.mu, mat.lmbda)
+    sig = compute_stress(eps, mu, lmbda)
     return 0.5 * jnp.einsum("ij,ij->", sig, eps)
 
 
-mesh = Mesh.unit_square(8, 8)
-tri = element.Tri3()
-op = Operator(mesh, tri)
+@pytest.fixture(scope="module")
+def op():
+    mesh = Mesh.unit_square(8, 8)
+    tri = element.Tri3()
+    return Operator(mesh, tri)
 
 
-@jax.jit
-def total_energy(u_flat):
-    u = u_flat.reshape(-1, 2)
-    u_grad = op.grad(u)
-    energy_density = strain_energy(u_grad, 1.0, 0.0)
-    return op.integrate(energy_density)
+def test_sparse_matrix(op: Operator):
+    @jax.jit
+    def total_energy(u_flat):
+        u = u_flat.reshape(-1, 2)
+        u_grad = op.grad(u)
+        energy_density = strain_energy(u_grad, 1.0, 0.0)
+        return op.integrate(energy_density)
 
+    K = jax.jacfwd(jax.jacrev(total_energy))(jnp.zeros(op.mesh.coords.shape[0] * 2))
 
-def test_sparse_matrix():
+    sparsity_pattern = sparse.create_sparsity_pattern(op.mesh, n_dofs_per_node=2)
 
-    K = jax.jacfwd(jax.jacrev(total_energy))(jnp.zeros(mesh.coords.shape[0] * 2))
-
-    sparsity_pattern = sparse.create_sparsity_pattern(mesh, n_dofs_per_node=2)
-
-
-    K_sparse = sparse.jacfwd(jax.jacrev(total_energy), sparsity_pattern=sparsity_pattern)(
-        jnp.zeros(mesh.coords.shape[0] * 2)
-    )
+    K_sparse = sparse.jacfwd(
+        jax.jacrev(total_energy), sparsity_pattern=sparsity_pattern
+    )(jnp.zeros(op.mesh.coords.shape[0] * 2))
 
     np.testing.assert_allclose(K, K_sparse.todense())
