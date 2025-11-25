@@ -18,8 +18,8 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "jax==0.8.0",
-    "equinox==0.13.0",
+    "jax>=0.8.0",
+    "equinox>=0.13.0",
     "numpy",
     "sparsejac",
     "jax-autovmap>=0.3.0",
