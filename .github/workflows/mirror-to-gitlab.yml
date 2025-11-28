@@ -58,7 +58,7 @@ jobs:
           cd mirror.git
 
           # Add GitLab mirror remote
-          git remote add gitlab git@gitlab.ethz.ch:smec/tatva-mirror.git
+          git remote add gitlab git@gitlab.ethz.ch:smec/software/tatva-mirror.git
 
           # Mirror everything (branches + tags) and delete extras on GitLab
           git push gitlab --mirror
