@@ -14,13 +14,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0        # full history for current branch
           fetch-tags: true
 
-      - name: Fetch all branches and tags from origin
+      - name: Fetch ALL branches and tags from origin
         run: |
-          # Update remote-tracking branches and tags from GitHub (origin)
-          git fetch origin --prune --tags
+          # Explicitly fetch ALL branches from origin into refs/remotes/origin/*
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*' --prune
+
+          # Fetch all tags as well
+          git fetch origin --tags --prune
 
           # Remove the remote HEAD ref so we don't try to push it as a branch named 'HEAD'
           git update-ref -d refs/remotes/origin/HEAD || true
@@ -49,8 +52,10 @@ jobs:
           git remote remove mirror 2>/dev/null || true
           git remote add mirror git@gitlab.ethz.ch:smec/tatva-mirror.git
 
-          # Force-update all branches from origin/* to GitLab branches
+          # Force-update ALL branches:
+          #  - local:  refs/remotes/origin/*  (all branches from GitHub)
+          #  - remote: refs/heads/*           (normal branches on GitLab)
           git push mirror --force --prune 'refs/remotes/origin/*:refs/heads/*'
 
-          # Force-update all tags
+          # Force-update ALL tags
           git push mirror --force --prune --tags
