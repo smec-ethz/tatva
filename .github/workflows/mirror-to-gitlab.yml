@@ -3,8 +3,8 @@ name: Mirror to GitLab (SSH, force)
 on:
   push:
     branches:
-      - '**'          # run on any branch push
-  workflow_dispatch:   # allow manual runs from the Actions tab
+      - '**'
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -14,7 +14,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0      # full history for the checked-out branch
+          fetch-depth: 0
           fetch-tags: true
 
       - name: Fetch all branches and tags from origin
@@ -22,18 +22,18 @@ jobs:
           # Update remote-tracking branches and tags from GitHub (origin)
           git fetch origin --prune --tags
 
+          # Remove the remote HEAD ref so we don't try to push it as a branch named 'HEAD'
+          git update-ref -d refs/remotes/origin/HEAD || true
+
       - name: Set up SSH for GitLab
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          # Prepare SSH directory
           install -m 700 -d ~/.ssh
 
-          # Write private key from the GitHub secret
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-          # Trust gitlab.ethz.ch host key
           ssh-keyscan gitlab.ethz.ch >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
@@ -46,15 +46,10 @@ jobs:
         env:
           GIT_SSH_COMMAND: "ssh -i ~/.ssh/id_ed25519"
         run: |
-          # Clean up remote if it already exists
           git remote remove mirror 2>/dev/null || true
-
-          # GitLab mirror repo
           git remote add mirror git@gitlab.ethz.ch:smec/tatva-mirror.git
 
-          # Force-update all branches:
-          #   refs/remotes/origin/* (remote-tracking branches from GitHub)
-          #   → refs/heads/* (normal branches on GitLab)
+          # Force-update all branches from origin/* to GitLab branches
           git push mirror --force --prune 'refs/remotes/origin/*:refs/heads/*'
 
           # Force-update all tags
