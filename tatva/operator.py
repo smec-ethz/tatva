@@ -25,6 +25,7 @@ from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, c
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jax import Array
 import numpy as np
 from jax_autovmap import autovmap
 
@@ -83,8 +84,22 @@ class Operator(Generic[ElementT], eqx.Module):
 
     mesh: Mesh
     element: ElementT
+    det_J_elements_weights: Array
 
-    def __post_init__(self) -> None:
+    def __init__(self, mesh: Mesh, element: Element):
+        self.mesh = mesh
+        self.element = element
+
+        def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
+            """Calls the function element.get_jacobian and returns the second output."""
+            return self.element.get_jacobian(xi, el_nodal_coords)[1]
+
+        det_J_elements = self.map(_get_det_J)(self.mesh.coords)
+        self.det_J_elements_weights = jnp.einsum(
+            "eq,q->eq", det_J_elements, self.element.quad_weights
+        )
+
+    def __check_init__(self) -> None:
         """Validates the mesh and element compatibility. Does a series of checks to ensure
         that the mesh and element are useable together.
 
@@ -303,17 +318,7 @@ class Operator(Generic[ElementT], eqx.Module):
             element (shape: (n_elements, n_values)).
         """
 
-        def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
-            """Calls the function element.get_jacobian and returns the second output."""
-            return self.element.get_jacobian(xi, el_nodal_coords)[1]
-
-        det_J_elements = self.map(_get_det_J)(self.mesh.coords)
-
-        return jnp.einsum(
-            "eq...,eq->e...",
-            quad_values,
-            jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights),
-        )
+        return jnp.einsum("eq...,eq->e...", quad_values, self.det_J_elements_weights)
 
     def eval(self, nodal_values: jax.Array) -> jax.Array:
         """Evaluates the nodal values at the quadrature points.
