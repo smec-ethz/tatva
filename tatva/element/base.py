@@ -246,5 +246,4 @@ class Hexahedron8(Element):
                 [(1 + eta) * (1 + zeta), (1 + xi) * (1 + zeta), (1 + xi) * (1 + eta)],
                 [-(1 + eta) * (1 + zeta), (1 - xi) * (1 + zeta), (1 - xi) * (1 + eta)],
             ]
-        )
-
+        ).T
