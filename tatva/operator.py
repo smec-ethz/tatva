@@ -25,8 +25,8 @@ from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, c
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jax import Array
 import numpy as np
+from jax import Array
 from jax_autovmap import autovmap
 
 from tatva.element import Element
