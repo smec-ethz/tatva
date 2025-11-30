@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from functools import partial
-from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, cast
+from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, cast, Tuple
 
 import equinox as eqx
 import jax
@@ -177,7 +177,7 @@ class Operator(Generic[ElementT], eqx.Module):
             of each element (shape: (n_elements, n_quad_points, n_values)).
         """
 
-        def _at_each_element(
+        """def _at_each_element(
             el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             return eqx.filter_vmap(
@@ -191,7 +191,24 @@ class Operator(Generic[ElementT], eqx.Module):
         return eqx.filter_vmap(
             _at_each_element,
             in_axes=(0, 0),
-        )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
+        )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])"""
+
+        def _at_each_element(args: Tuple[Array, Array]) -> Array:
+            el_nodal_values, el_nodal_coords = args
+
+            return eqx.filter_vmap(
+                partial(
+                    func,
+                    el_nodal_values=el_nodal_values,
+                    el_nodal_coords=el_nodal_coords,
+                )
+            )(self.element.quad_points)
+
+        return jax.lax.map(
+            _at_each_element,
+            xs=(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements]),
+            batch_size=1000,
+        )
 
     def map(
         self,
