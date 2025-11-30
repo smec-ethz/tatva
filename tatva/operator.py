@@ -20,7 +20,17 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from functools import partial
-from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, cast, Tuple
+from typing import (
+    Callable,
+    Generic,
+    ParamSpec,
+    Protocol,
+    TypeAlias,
+    TypeVar,
+    cast,
+    Tuple,
+    Optional,
+)
 
 import equinox as eqx
 import jax
@@ -28,6 +38,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from jax_autovmap import autovmap
+from jax.experimental import sparse
 
 from tatva.element import Element
 from tatva.mesh import Mesh, find_containing_polygons
@@ -37,6 +48,57 @@ RT = TypeVar("RT", bound=jax.Array | tuple, covariant=True)
 ElementT = TypeVar("ElementT", bound=Element)
 Numeric: TypeAlias = float | int | jnp.number
 
+'''
+class Functional(eqx.Module):
+    op: "Operator"
+    energy_fn: Callable
+    integrand_fn: Optional[Callable] = None
+
+    def __call__(self, u_flat: jax.Array) -> jax.Array:
+        """Allows the functional to be called like a standard function."""
+        return self.energy_fn(u_flat)
+
+    def evaluate(self, u_flat: jax.Array) -> jax.Array:
+        return self.energy_fn(u_flat)
+
+    def grad(self, u_flat: jax.Array) -> jax.Array:
+        """Computes the global residual vector (gradient of energy)."""
+        return jax.grad(self.energy_fn)(u_flat)
+
+    def jvp(self, u_flat: jax.Array, v_flat: jax.Array) -> jax.Array:
+        """
+        Matrix-Free Solver Support (Memory Efficient).
+        Computes Jacobian-Vector Product: J(u) @ v
+        """
+
+        # We use jax.jvp which is generally memory efficient as it
+        # doesn't store the full Hessian graph, only the forward-mode tangents.
+        # This is safe for 8M+ DOFs on GPUs.
+        def residual_fn(u):
+            return jax.jacrev(self.energy_fn)(u)
+
+        return jax.jvp(residual_fn, (u_flat,), (v_flat,))[1]
+
+    def hessian(self, u_flat: jax.Array) -> sparse.BCOO:
+        """
+        Matrix-Based Solver Support (Assembly Optimized).
+        Computes the Sparse Stiffness Matrix.
+        """
+        if self.integrand_fn is None:
+            # Fallback: If user didn't provide the element kernel, we MUST use
+            # global differentiation. To avoid OOM, we would need to implement
+            # a chunked coloring strategy here (complex).
+            # For now, we warn the user.
+            raise RuntimeError(
+                "To use explicit matrix assembly (op.hessian) without OOM, "
+                "you must provide the `integrand_fn` when creating the functional. "
+                "Use `op.create_functional(total_energy, integrand_fn)`."
+            )
+
+        # Use the highly efficient element-wise assembler
+        assembler = self.op._get_hessian_assembler(self.integrand_fn)
+        return assembler(u_flat)
+'''
 
 class MappableOverElementsAndQuads(Protocol[P, RT]):
     """Internal protocol for functions that are mapped over elements using
@@ -463,3 +525,80 @@ class Operator(Generic[ElementT], eqx.Module):
             nodal_values[valid_elements],
             self.mesh.coords[valid_elements],
         )
+
+'''
+    def create_functional(
+        self, 
+        total_energy_fn: Callable[[jax.Array], jax.Array],
+            : Optional[Callable[[jax.Array], jax.Array]] = None
+    ) -> Functional:
+        """
+        Creates a 'smart' function that supports both matrix-free (JVP) 
+        and matrix-based (Hessian assembly) workflows.
+        """
+        return Functional(self, total_energy_fn, integrand_fn)
+
+    def _get_hessian_assembler(self, integrand_fn):
+        """Internal: compiles the element-wise assembly logic."""
+
+        # 1. PRE-COMPUTE SPARSITY STRUCTURE (Run once, outside JIT)
+        # We generate the index pattern just to count the unique entries (nse).
+        n_nodes, n_dim = self.mesh.coords.shape
+        n_total_dofs = n_nodes * n_dim
+        
+        # Generate raw indices (same logic as in assembly)
+        dof_indices = (self.mesh.elements * n_dim)[:, :, None] + jnp.arange(n_dim)
+        dof_indices = dof_indices.reshape(self.mesh.elements.shape[0], -1)
+        n_dof_el = dof_indices.shape[1]
+        
+        rows = jnp.repeat(dof_indices, n_dof_el, axis=1).flatten()
+        cols = jnp.tile(dof_indices, (1, n_dof_el)).flatten()
+        raw_indices = jnp.stack([rows, cols]).T
+        
+        # Create a dummy matrix to discover the sparsity pattern
+        # We use a concrete (non-traced) calculation here to find 'nse'
+        dummy_vals = jnp.zeros(raw_indices.shape[0])
+        dummy_bcoo = sparse.BCOO((dummy_vals, raw_indices), shape=(n_total_dofs, n_total_dofs))
+        
+        # This sums duplicates to find the exact number of non-zeros
+        structure = dummy_bcoo.sum_duplicates()
+        final_nse = structure.nse # This is the integer JAX needs!
+
+        # ---------------------------------------------------------
+
+        # 2. Define local element energy kernel
+        def element_energy(el_disp_flat, el_coords):
+            n_nodes_el, _ = el_coords.shape
+            el_disp = el_disp_flat.reshape((n_nodes_el, n_dim))
+            grads = jax.vmap(lambda xi: self.element.gradient(xi, el_disp, el_coords))(self.element.quad_points)
+            densities = integrand_fn(grads)
+            det_J = jax.vmap(lambda xi: self.element.get_jacobian(xi, el_coords)[1])(self.element.quad_points)
+            return jnp.dot(densities * det_J, self.element.quad_weights)
+
+        k_e_fn = jax.hessian(element_energy)
+        vmapped_ke = jax.vmap(k_e_fn, in_axes=(0, 0))
+
+        # 3. Define the assembler (JIT compiled)
+        @jax.jit 
+        def assemble(u_flat):
+            # Gather
+            el_u = u_flat.reshape(n_nodes, n_dim)[self.mesh.elements].reshape(self.mesh.elements.shape[0], -1)
+            el_x = self.mesh.coords[self.mesh.elements]
+            
+            # Compute Ke
+            all_ke = vmapped_ke(el_u, el_x)
+            
+            # Use the PRE-CALCULATED indices to save time
+            # (We can just capture 'raw_indices' from the outer scope since it's constant!)
+            vals = all_ke.flatten()
+            
+            # Create BCOO
+            # Note: We pass indices and vals. 
+            # We MUST ensure raw_indices is moved to device if needed, but JAX handles this capture.
+            mat = sparse.BCOO((vals, raw_indices), shape=(u_flat.size, u_flat.size))
+            
+            # FIX: Pass the pre-computed 'nse' to sum_duplicates
+            return mat.sum_duplicates(nse=final_nse)
+
+        return assemble
+'''
