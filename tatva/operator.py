@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from collections.abc import Sequence
 from functools import partial
 from typing import (
@@ -56,9 +57,7 @@ _local_state = threading.local()
 
 
 def get_context():
-    if not hasattr(_local_state, "stack"):
-        _local_state.stack = []
-    return _local_state.stack[-1] if _local_state.stack else None
+    return getattr(_local_state, "ctx", None)
 
 
 class AssemblyContext:
@@ -67,8 +66,7 @@ class AssemblyContext:
     def __init__(self, active_op: "Operator", el_coords: jax.Array, el_idx: jax.Array):
         self.active_op = active_op
         self.el_coords = el_coords
-        self.el_idx = el_idx  # Needed for fast-path projection
-        self.active_quad_points_phys = None  # Lazy cache
+        self.el_idx = el_idx
 
 
 class MappableOverElementsAndQuads(Protocol[P, RT]):
@@ -105,6 +103,7 @@ class Operator(Generic[ElementT], eqx.Module):
     mesh: Mesh
     element: ElementT
     det_J_elements_weights: Array
+    _id: int = eqx.field(static=True)
 
     # Pre-computed sparsity info (NSE) for efficient JIT assembly
     _nse: Optional[int]
@@ -113,6 +112,9 @@ class Operator(Generic[ElementT], eqx.Module):
     def __init__(self, mesh: Mesh, element: Element):
         self.mesh = mesh
         self.element = element
+        # Assign a unique ID to this operator instance
+        # We use uuid to ensure uniqueness even if memory addresses are reused
+        self._id = uuid.uuid4().int
 
         # Precompute sparsity for assembly
         self._precompute_sparsity()
@@ -149,7 +151,7 @@ class Operator(Generic[ElementT], eqx.Module):
 
         # Compute exact NSE (Number of Specified Elements) after summing duplicates
         # We do this concretely (no JIT) once during init.
-        dummy_vals = jnp.zeros(raw_indices.shape[0])
+        dummy_vals = jnp.ones(raw_indices.shape[0])
         # Use a temporary unjitted call to avoid tracing issues
         dummy_bcoo = sparse.BCOO(
             (dummy_vals, raw_indices), shape=(n_total_dofs, n_total_dofs)
@@ -157,8 +159,10 @@ class Operator(Generic[ElementT], eqx.Module):
         structure = dummy_bcoo.sum_duplicates()
 
         # Store these for the assembler to use
-        object.__setattr__(self, "_nse", structure.nse)
-        object.__setattr__(self, "_indices_T", raw_indices)
+        # object.__setattr__(self, "_nse", structure.nse)
+        # object.__setattr__(self, "_indices_T", raw_indices)
+        self._nse = structure.nse
+        self._indices_T = raw_indices
 
     def __check_init__(self) -> None:
         """Validates the mesh and element compatibility."""
@@ -277,25 +281,77 @@ class Operator(Generic[ElementT], eqx.Module):
 
         return _mapped
 
-    def integrate(self, arg: jax.Array | Numeric) -> jax.Array:
-        """Integrate a quantity over the mesh. Returns 0 if dormant."""
+    def grad(self, nodal_values: jax.Array) -> jax.Array:
         ctx = get_context()
-
         # 1. GLOBAL MODE
+        if ctx is None:
+
+            def _gradient_quad(xi, el_nodal_values, el_nodal_coords):
+                return self.element.gradient(xi, el_nodal_values, el_nodal_coords)
+
+            return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
+
+        # 2. LOCAL ACTIVE MODE
+        # FIX: Check ID instead of object identity
+        if ctx.active_op._id == self._id:
+            return jax.vmap(
+                lambda xi: self.element.gradient(xi, nodal_values, ctx.el_coords)
+            )(self.element.quad_points)
+
+        # 3. DORMANT MODE
+        dim = self.mesh.coords.shape[1]
+        n_q = self.element.quad_points.shape[0]
+        return jnp.zeros((n_q, dim, dim))
+
+    def integrate(self, arg: jax.Array | Numeric) -> jax.Array:
+        ctx = get_context()
         if ctx is None:
             res = self.integrate_per_element(arg)
             return jnp.sum(res, axis=(0,))
 
-        # 2. LOCAL ACTIVE MODE
-        if ctx.active_op is self:
-            # arg is local quantity at quad points: shape (n_quad,)
+        # FIX: Check ID instead of object identity
+        if ctx.active_op._id == self._id:
             det_J = jax.vmap(
                 lambda xi: self.element.get_jacobian(xi, ctx.el_coords)[1]
             )(self.element.quad_points)
             return jnp.dot(arg * det_J, self.element.quad_weights)
 
-        # 3. DORMANT MODE
         return 0.0
+
+    def eval(self, nodal_values: jax.Array) -> jax.Array:
+        ctx = get_context()
+
+        if ctx is None:
+
+            def _eval_quad(xi, el_vals, el_coords):
+                return self.element.interpolate(xi, el_vals)
+
+            return self._vmap_over_elements_and_quads(nodal_values, _eval_quad)
+
+        # FIX: Check ID instead of object identity
+        if ctx.active_op._id == self._id:
+            return jax.vmap(lambda xi: self.element.interpolate(xi, nodal_values))(
+                self.element.quad_points
+            )
+
+        # 3. PROJECT MODE
+        # Check Fast Path (Identical Meshes)
+        # FIX: Check ID for fast path too
+        if self._id == ctx.active_op._id or self.mesh is ctx.active_op.mesh:
+            n_nodes = self.mesh.coords.shape[0]
+            el_u_flat = nodal_values.reshape(n_nodes, -1)[
+                self.mesh.elements[ctx.el_idx]
+            ]
+            el_u = el_u_flat.reshape(self.element.quad_points.shape[0], -1)
+            return jax.vmap(lambda xi: self.element.interpolate(xi, el_u))(
+                ctx.active_op.element.quad_points
+            )
+
+        # Slow Path (Different Meshes)
+        target_points = jax.vmap(ctx.active_op.element.interpolate, (0, None))(
+            ctx.active_op.element.quad_points, ctx.el_coords
+        )
+        return jnp.zeros((target_points.shape[0], 1))
 
     def integrate_per_element(self, arg: jax.Array | Numeric) -> jax.Array:
         """Helper for global integration per element."""
@@ -310,81 +366,6 @@ class Operator(Generic[ElementT], eqx.Module):
 
     def _integrate_quad_array(self, quad_values: jax.Array) -> jax.Array:
         return jnp.einsum("eq...,eq->e...", quad_values, self.det_J_elements_weights)
-
-    def eval(self, nodal_values: jax.Array) -> jax.Array:
-        """Evaluates nodal values at quad points. Handles Projection/Multi-mesh."""
-        ctx = get_context()
-
-        # 1. GLOBAL MODE
-        if ctx is None:
-
-            def _eval_quad(xi, el_nodal_values, el_nodal_coords):
-                return self.element.interpolate(xi, el_nodal_values)
-
-            return self._vmap_over_elements_and_quads(nodal_values, _eval_quad)
-
-        # 2. LOCAL ACTIVE MODE
-        if ctx.active_op is self:
-            # nodal_values is the local element vector here
-            return jax.vmap(lambda xi: self.element.interpolate(xi, nodal_values))(
-                self.element.quad_points
-            )
-
-        # 3. PROJECT MODE (Multiphysics A * B)
-        # I am NOT the active operator, but I need to provide values at the ACTIVE operator's points.
-
-        # A. Compute Active Physical Points (Lazy Evaluation)
-        # if ctx.active_quad_points_phys is None:
-        #    ctx.active_quad_points_phys = jax.vmap(ctx.active_op.element.interpolate, (0, None))(
-        #        ctx.active_op.element.quad_points, ctx.el_coords
-        #    )
-        # target_points = ctx.active_quad_points_phys
-
-        # B. Check for FAST PATH (Identical Meshes)
-        if self.mesh is ctx.active_op.mesh:
-            # Gather LOCAL u for this operator using the context's element index
-            n_nodes = self.mesh.coords.shape[0]
-            # nodal_values passed here is Global in project mode
-            el_u_flat = nodal_values.reshape(n_nodes, -1)[
-                self.mesh.elements[ctx.el_idx]
-            ]
-            el_u = el_u_flat.reshape(self.element.quad_points.shape[0], -1)
-
-            # Evaluate at the ACTIVE op's reference points (assuming aligned elements)
-            return jax.vmap(lambda xi: self.element.interpolate(xi, el_u))(
-                ctx.active_op.element.quad_points
-            )
-
-        # C. SLOW PATH (Different Meshes) - Placeholder
-        target_points = jax.vmap(ctx.active_op.element.interpolate, (0, None))(
-            ctx.active_op.element.quad_points, ctx.el_coords
-        )
-        # (Placeholder for generic point search/interpolation)
-        return jnp.zeros((target_points.shape[0], 1))
-
-    def grad(self, nodal_values: jax.Array) -> jax.Array:
-        """Computes gradient. Behaves differently based on context."""
-        ctx = get_context()
-
-        # 1. GLOBAL MODE
-        if ctx is None:
-
-            def _gradient_quad(xi, el_nodal_values, el_nodal_coords):
-                return self.element.gradient(xi, el_nodal_values, el_nodal_coords)
-
-            return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
-
-        # 2. LOCAL ACTIVE MODE
-        if ctx.active_op is self:
-            # nodal_values is the LOCAL element vector here
-            return jax.vmap(
-                lambda xi: self.element.gradient(xi, nodal_values, ctx.el_coords)
-            )(self.element.quad_points)
-
-        # 3. DORMANT MODE (Return zeros of correct shape for JAX tracing)
-        dim = self.mesh.coords.shape[1]
-        n_q = self.element.quad_points.shape[0]
-        return jnp.zeros((n_q, dim, dim))
 
     def interpolate(self, arg: jax.Array, points: jax.Array) -> jax.Array:
         """Inverse Mapping: Interpolates nodal values to physical points.
@@ -487,9 +468,13 @@ class Operator(Generic[ElementT], eqx.Module):
             all_ke = vmapped_ke(el_u, el_x, el_indices)
             vals = all_ke.flatten()
 
+            jax.debug.print("vals={vals}", vals=vals)
+
             # Create Sparse Matrix using PRE-COMPUTED sparsity
             # self._indices_T and self._nse are captured as constants
             mat = sparse.BCOO((vals, self._indices_T), shape=(u_flat.size, u_flat.size))
+
+            jax.debug.print("mat {mat}", mat=mat.todense())
 
             # Sum duplicates using PRE-COMPUTED NSE
             return mat.sum_duplicates(nse=self._nse)

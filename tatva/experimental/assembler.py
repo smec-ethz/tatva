@@ -18,6 +18,7 @@
 
 from typing import Callable, Sequence
 
+import jax
 import jax.numpy as jnp
 from jax.experimental import sparse
 
@@ -64,6 +65,7 @@ def assemble(
         # Generate & Run Assembler
         assembler = active_op.get_element_assembler(element_context_wrapper)
         K_sub = assembler(u_flat)
+        jax.debug.print("K_sub {K_sub}", K_sub=K_sub.todense())
         sparse_matrices.append(K_sub)
 
     if not sparse_matrices:
