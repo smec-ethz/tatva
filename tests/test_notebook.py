@@ -14,6 +14,7 @@ import jax
 jax.config.update("jax_enable_x64", True)  # use double-precision
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_platforms", "cpu")
+from functools import partial
 from typing import NamedTuple
 
 import jax.numpy as jnp
@@ -62,14 +63,15 @@ op = Operator(mesh, tri)
 
 
 @jax.jit
-def total_energy(u_flat):
+def total_energy(u_flat: Array, op: Operator) -> Array:
     u = u_flat.reshape(-1, 2)
     u_grad = op.grad(u)
     energy_density = strain_energy(u_grad, 1.0, 0.0)
     return op.integrate(energy_density)
 
 
-K = jax.jacfwd(jax.jacrev(total_energy))(jnp.zeros(mesh.coords.shape[0] * 2))
+K = jax.jacfwd(jax.jacrev(total_energy))(jnp.zeros(mesh.coords.shape[0] * 2), op)
+
 
 # %%
 u = jnp.zeros(mesh.coords.shape[0] * 2)
@@ -78,8 +80,8 @@ op.grad(u)
 # %%
 K_sparse = assemble(
     total_energy_fn=total_energy,
-    operators=[op],
-    u_flat=jnp.zeros(mesh.coords.shape[0] * 2),
+    operators={"op": op},
+    nodal_values_flat=jnp.zeros(mesh.coords.shape[0] * 2),
 )
 # %%
 
@@ -87,8 +89,60 @@ K
 
 # %%
 
-K_sparse.todense() == K
+jnp.allclose(K_sparse.todense(), K)
+# %%
 
+mesh = Mesh.unit_square(5, 5)
+right_element_indices = jnp.where(
+    jnp.mean(mesh.coords[mesh.elements], axis=1)[:, 0] > 0.5
+)[0]
+left_element_indices = jnp.setdiff1d(
+    jnp.arange(0, mesh.elements.shape[0]), right_element_indices
+)
+
+left_elements = mesh.elements[left_element_indices]
+right_elements = mesh.elements[right_element_indices]
+
+left_nodes = jnp.unique(left_elements.flatten())
+right_nodes = jnp.unique(right_elements.flatten())
+
+op_left = Operator(Mesh(coords=mesh.coords, elements=left_elements), tri)
+op_right = Operator(Mesh(coords=mesh.coords, elements=right_elements), tri)
+
+print("Left elements:", left_nodes)
+print("Right elements:", right_nodes)
+# %%
+
+
+@jax.jit
+def total_energy_regions(u_flat, op_left, op_right):
+    u = u_flat.reshape(-1, 2)
+    u_grad_left = op_left.grad(u)
+    energy_density_left = strain_energy(u_grad_left, 1.0, 0.0)
+    u_grad_right = op_right.grad(u)
+    energy_density_right = strain_energy(u_grad_right, 1.0, 0.0)
+    _total_energy = op_left.integrate(energy_density_left) + op_right.integrate(
+        energy_density_right
+    )
+    return _total_energy
+
+
+# %%
+K_regions = jax.jacfwd(jax.jacrev(total_energy_regions))(
+    jnp.zeros(mesh.coords.shape[0] * 2), op_left, op_right
+)
+# %%
+
+K_sparse_regions = assemble(
+    total_energy_fn=total_energy_regions,
+    operators={"op_left": op_left, "op_right": op_right},
+    nodal_values_flat=jnp.zeros(mesh.coords.shape[0] * 2),
+)
+
+
+# %%
+
+jnp.allclose(K_regions, K_sparse_regions.todense())
 
 # %% [markdown]
 # ::: {.callout-note}
