@@ -8,6 +8,9 @@
 
 </div>
 
+![Action Tests ](https://github.com/smec-ethz/tatva/.github/workflows/run_tests.yml/badge.svg)
+
+
 ## License
 
 `tatva` is distributed under the GNU Lesser General Public License v3.0 or later. See `COPYING` and `COPYING.LESSER` for the complete terms. © 2025 ETH Zurich (Mohit Pundir).
