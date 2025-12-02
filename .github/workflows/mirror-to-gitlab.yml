@@ -1,0 +1,64 @@
+name: Mirror to GitLab (bare mirror, SSH)
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up SSH for GitLab
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          ssh-keyscan gitlab.ethz.ch >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Create bare mirror of GitHub repo
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Start with a bare repo
+          git init --bare mirror.git
+          cd mirror.git
+
+          # Add GitHub as origin (authenticated)
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+
+          # ❗ Remove any default fetch refspecs (which create refs/remotes/origin/*)
+          git config --unset-all remote.origin.fetch || true
+
+          # ✅ Only fetch:
+          #   - branches into refs/heads/*
+          #   - tags into refs/tags/*
+          git config remote.origin.fetch '+refs/heads/*:refs/heads/*'
+          git config --add remote.origin.fetch '+refs/tags/*:refs/tags/*'
+
+          # Fetch according to the clean refspecs
+          git fetch origin --prune
+
+          # Safety: if any refs/remotes/* exist, delete them
+          git for-each-ref 'refs/remotes/' --format='%(refname)' | while read ref; do
+            git update-ref -d "$ref"
+          done
+
+      - name: Push mirror to GitLab
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/id_ed25519"
+        run: |
+          cd mirror.git
+
+          # Add GitLab mirror remote
+          git remote add gitlab git@gitlab.ethz.ch:smec/software/tatva.git
+
+          # Mirror everything (branches + tags) and delete extras on GitLab
+          git push gitlab --mirror
