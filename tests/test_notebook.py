@@ -1,24 +1,12 @@
-# %% [markdown]
-# ## Sparse solvers {#sec-sparse-solvers}
-#
-
 # %%
-# | code-fold: true
-# | code-summary: "Code: Define mesh for square domain"
-# | fig-align: center
-# | fig-cap: "Sparsity pattern of the stiffness matrix for a 5 $\\times$ 5 mesh. Blue dots indicate the non-zero entries of the stiffness matrix. The region in white indicates the zero entries of the stiffness matrix."
-# | label: fig-sparsity-pattern
 
 import jax
 
 jax.config.update("jax_enable_x64", True)  # use double-precision
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update("jax_platforms", "cpu")
 from functools import partial
 from typing import NamedTuple
 
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 from jax import Array
 from jax_autovmap import autovmap
 
@@ -240,9 +228,4 @@ def test_staggered_assembly_fixed_field():
 
 test_staggered_assembly_fixed_field()
 
-# and %% [markdown]
-# ::: {.callout-note}
-# The non-zero entries of the stiffness matrix are concentrated around a diagonal band is indicated by blue dots in the figure above. The zero entries are indicated by white dots.
-# :::
-#
 # %%
