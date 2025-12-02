@@ -14,6 +14,8 @@
 
 ## Features
 
+- Energy-based formulation of FEM operators with automatic differentiation via JAX.
+- Capability to handle coupled-PDE systems with multi-field variables, KKT conditions, and constraints. 
 - Element library covering line, surface, and volume primitives (Line2, Tri3, Quad4, Tet4, Hex8) with consistent JAX-compatible APIs.
 - Mesh and Operator abstractions that map, integrate, differentiate, and interpolate fields on arbitrary meshes.
 - Automatic handling of stacked multi-field variables through the `tatva.compound` utilities while preserving sparsity patterns.
@@ -29,7 +31,7 @@ pip install tatva
 For development work, clone the repository and install it in editable mode (use your preferred virtual environment tool such as `uv` or `venv`):
 
 ```bash
-git clone https://gitlab.ethz.ch/smec/software/tatva.git
+git clone https://github.com/smec-ethz/tatva.git
 cd tatva
 pip install -e .
 ```
@@ -64,16 +66,15 @@ mapping custom kernels, working with compound fields, and sparse assembly helper
 
 ## Dense vs Sparse
 
-A unique aspect of `femsolver` is that it can handle both dense and sparse matrices. This is achieved by using the library `sparsejac` that allows automatic differentiation of a functional based on a sparsity pattern. This significantly reduces the memory consumption. For more details on how the automatic differentiation can be done using sparsity pattern, please check the link below:
+A unique aspect of `tatva` is that it can handle both dense and sparse matrices. This is achieved by using the library `sparsejac` that allows automatic differentiation of a functional based on a sparsity pattern. This significantly reduces the memory consumption. For more details on how the automatic differentiation can be done using sparsity pattern, please check the link below:
 
 - ![Paper](https://arxiv.org/html/2501.17737v1)
 - ![Github: sparsejac](https://github.com/mfschubert/sparsejac)
 - ![Github: Sparsediffax, python interface for the paper](https://github.com/gdalle/sparsediffax)
 
-## Contributing
+## 👉 Where to contribute
 
-If you have a suggestion that would make this better, please fork the repo and create a pull request. You can also simply open an issue with the tag "enhancement".
-Don't forget to give the project a star! Thanks again!
+If you have a suggestion that would make this better, please fork the repo and create a pull request on [**github.com/smec-ethz/tatva**](https://github.com/smec-ethz/tatva). Please use that repository to open issues or submit merge requests. You can also simply open an issue with the tag "enhancement". Don't forget to give the project a star! Thanks again!
 
 1. Fork the Project
 2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
