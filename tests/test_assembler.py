@@ -9,7 +9,7 @@ from jax import Array
 from jax_autovmap import autovmap
 
 from tatva import Mesh, Operator, element, sparse
-from tatva.experimental.assembler import assemble
+from tatva.experimental.assembler import TotalEnergyCallable, assemble
 
 
 @autovmap(grad_u=2)
@@ -75,9 +75,6 @@ def ops():
     left_elements = mesh.elements[left_element_indices]
     right_elements = mesh.elements[right_element_indices]
 
-    left_nodes = jnp.unique(left_elements.flatten())
-    right_nodes = jnp.unique(right_elements.flatten())
-
     op_left = Operator(Mesh(coords=mesh.coords, elements=left_elements), tri)
     op_right = Operator(Mesh(coords=mesh.coords, elements=right_elements), tri)
 
@@ -111,3 +108,61 @@ def test_assembler_multi_operator(ops: dict[str, Operator]):
     )
 
     np.testing.assert_allclose(K, K_sparse.todense())
+
+
+@autovmap(grad_u=2, phi_val=0)
+def coupled_energy_density(grad_u, phi_val):
+    """
+    Energy depending on displacement u and phase-field phi.
+    E = 0.5 * (phi^2 + epsilon) * strain : strain
+    This creates a coupling where stiffness depends on phi.
+    """
+    # Linear Strain
+    eps = 0.5 * (grad_u + grad_u.T)
+    trace_eps = jnp.trace(eps)
+    strain_energy = 1.0 * jnp.trace(eps @ eps) + 0.5 * 0.0 * trace_eps**2
+
+    # Phase field degradation function
+    degradation = phi_val**2 + 0.001
+
+    return strain_energy * degradation
+
+
+@pytest.fixture(scope="module")
+def coupled_ops():
+    mesh = Mesh.unit_square(8, 8)
+    tri = element.Tri3()
+    return Operator(mesh, tri), Operator(mesh, tri)
+
+
+def test_assembler_coupled_operators(coupled_ops: tuple[Operator, Operator]):
+    op_u, op_phi = coupled_ops
+
+    n_dofs_u = op_u.mesh.coords.shape[0] * 2
+    n_dofs_phi = op_phi.mesh.coords.shape[0] * 1
+
+    # Create a random field to make gradients non-zero
+    key = jax.random.PRNGKey(0)
+    phi_fixed = jax.random.uniform(key, (n_dofs_phi,)).flatten()
+
+    # Note: 'u' is active (local element vector), 'phi' is fixed (global vector)
+    def total_elastic_energy(u_flat: Array, op_u: Operator, op_phi: Operator):
+        # active Operator (u): Computes gradients locally
+        u_local = u_flat.reshape(-1, 2)
+        grad_u = op_u.grad(u_local)
+
+        val_phi = op_phi.eval(phi_fixed)
+
+        densities = coupled_energy_density(grad_u, val_phi)
+
+        return op_u.integrate(densities)
+
+    u_zero = jnp.zeros(n_dofs_u)
+
+    operators = {"op_u": op_u, "op_phi": op_phi}
+
+    K_sparse = assemble(total_elastic_energy, operators, u_zero)
+
+    K_dense = jax.jacfwd(jax.jacrev(total_elastic_energy))(u_zero, op_u, op_phi)
+
+    np.testing.assert_allclose(K_sparse.todense(), K_dense, atol=1e-12)
