@@ -16,7 +16,7 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
-from typing import Dict, Protocol
+from typing import Any, Dict, Protocol
 
 import jax.numpy as jnp
 from jax import Array
@@ -39,7 +39,7 @@ class TotalEnergyCallable(Protocol):
 def assemble(
     total_energy_fn: TotalEnergyCallable,
     operators: Dict[str, Operator],
-    nodal_values_flat: jnp.ndarray,
+    nodal_values_flat: Array,
 ) -> sparse.BCOO:
     """
     Orchestrates the assembly of the global stiffness matrix using element-wise assembly.
@@ -63,11 +63,7 @@ def assemble(
 
     for active_op in operators.values():
 
-        def element_context_wrapper(el_u_flat, el_coords, el_idx):
-            n_dim = active_op.mesh.coords.shape[1]
-            n_nodes_el = el_coords.shape[0]
-            el_u = el_u_flat.reshape(n_nodes_el, n_dim)
-
+        def element_context_wrapper(el_nodal_values_flat, el_coords, el_idx):
             local_ops_kwargs = {}
             for name, op in operators.items():
                 if op._id == active_op._id:
@@ -88,7 +84,7 @@ def assemble(
                         source_op=active_op,
                     )
 
-            return total_energy_fn(el_u, **local_ops_kwargs)
+            return total_energy_fn(el_nodal_values_flat, **local_ops_kwargs)
 
         assembler = active_op.get_element_assembler(element_context_wrapper)
         K_sub = assembler(nodal_values_flat)

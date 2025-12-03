@@ -37,7 +37,6 @@ from typing import (
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import Array
 from jax.experimental import sparse
 from jax_autovmap import autovmap
@@ -79,14 +78,14 @@ class MappedCallable(Protocol[P, RT]):
 class Operator(Generic[ElementT]):
     mesh: Mesh
     element: ElementT
+    nb_local_dofs: int = dataclasses.field(metadata=dict(static=True))
 
-    det_J_elements_weights: Array = dataclasses.field(init=False)
+    det_J_elements_weights: Array  # = dataclasses.field(init=False)
     _nse: Optional[int] = dataclasses.field(default=None, init=False)
     _indices_T: Optional[jax.Array] = dataclasses.field(default=None, init=False)
     _id: int = dataclasses.field(init=False)
 
-    # --- Context Configuration ---
-    _ctx_mode: str = "global"
+    _ctx_mode: str = "global"  # "global", "local", "project"
     _ctx_active_op_id: Optional[int] = None
     _ctx_el_coords: Optional[Array] = None
     _ctx_el_idx: Optional[Array] = (
@@ -94,9 +93,10 @@ class Operator(Generic[ElementT]):
     )
     _ctx_source_op: Optional["Operator"] = None
 
-    def __init__(self, mesh: Mesh, element: Element):
+    def __init__(self, mesh: Mesh, element: Element, nb_local_dofs: int):
         self.mesh = mesh
         self.element = element
+        self.nb_local_dofs = nb_local_dofs
         self._id = uuid.uuid4().int
         self._precompute_sparsity()
 
@@ -107,7 +107,6 @@ class Operator(Generic[ElementT]):
         self.det_J_elements_weights = jnp.einsum(
             "eq,q->eq", det_J_elements, self.element.quad_weights
         )
-        self.__check_init__()
 
     def tree_flatten(self):
         children = (
@@ -119,13 +118,19 @@ class Operator(Generic[ElementT]):
             self._ctx_el_idx,
             self._ctx_source_op,
         )
-        aux_data = (self._nse, self._id, self._ctx_mode, self._ctx_active_op_id)
+        aux_data = (
+            self._nse,
+            self._id,
+            self._ctx_mode,
+            self._ctx_active_op_id,
+            self.nb_local_dofs,
+        )
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         mesh, element, weights, indices_t, ctx_coords, ctx_idx, ctx_source = children
-        nse, uid, ctx_mode, ctx_active_id = aux_data
+        nse, uid, ctx_mode, ctx_active_id, nb_local_dofs = aux_data
         obj = object.__new__(cls)
         obj.mesh = mesh
         obj.element = element
@@ -138,6 +143,7 @@ class Operator(Generic[ElementT]):
         obj._id = uid
         obj._ctx_mode = ctx_mode
         obj._ctx_active_op_id = ctx_active_id
+        obj.nb_local_dofs = nb_local_dofs
         return obj
 
     def with_context(
@@ -169,12 +175,13 @@ class Operator(Generic[ElementT]):
         new_op._ctx_source_op = source_op
         return new_op
 
-    # ... (Precompute sparsity and init checks same as before) ...
     def _precompute_sparsity(self):
         """Pre-computes the sparsity pattern (NSE and Indices) for BCOO assembly."""
         n_nodes, n_dim = self.mesh.coords.shape
-        n_total_dofs = n_nodes * n_dim
-        dof_indices = (self.mesh.elements * n_dim)[:, :, None] + jnp.arange(n_dim)
+        n_total_dofs = n_nodes * self.nb_local_dofs
+        dof_indices = (self.mesh.elements * self.nb_local_dofs)[
+            :, :, None
+        ] + jnp.arange(n_dim)
         dof_indices = dof_indices.reshape(self.mesh.elements.shape[0], -1)
         n_dof_el = dof_indices.shape[1]
 
@@ -191,38 +198,98 @@ class Operator(Generic[ElementT]):
         self._nse = structure.nse
         self._indices_T = raw_indices
 
-    def __check_init__(self) -> None:
-        pass
-
     def _prepare_local_input(self, u: jax.Array) -> jax.Array:
         """
         Detects if input u is global and slices it to local if necessary.
         """
         n_nodes_total = self.mesh.coords.shape[0]
 
-        # Heuristic: Is this a global vector?
-        # Check 1: Matches total nodes (Scalar Field)
-        if u.shape == (n_nodes_total,):
+        # check for simple case of scalar field
+        if self.nb_local_dofs == 1 and u.shape == (n_nodes_total,):
             return u[self.mesh.elements[self._ctx_el_idx]]
 
-        # Check 2: Matches total DOFs (Vector Field)
-        # Note: We assume flattened input if it doesn't match local element shape
-        local_shape_flat = self.element.quad_points.shape[0] * self.mesh.coords.shape[1]
+        # expected local size
+        n_nodes_el = self.mesh.elements.shape[1]
+        local_size_flat = n_nodes_el * self.nb_local_dofs
 
-        if u.size >= n_nodes_total and u.size != local_shape_flat:
+        # check if u is Global
+        if u.size >= n_nodes_total and u.size != local_size_flat:
             # Assume it is a flattened global vector
             # We try to infer the dimension per node
             if u.size % n_nodes_total == 0:
-                dim = u.size // n_nodes_total
-                vals_reshaped = u.reshape(n_nodes_total, dim)
+                vals_reshaped = u.reshape(n_nodes_total, self.nb_local_dofs)
                 el_vals = vals_reshaped[self.mesh.elements[self._ctx_el_idx]]
-                # If dim was 1, we might want to squeeze to match (3,) expectation
-                if dim == 1:
+                if self.nb_local_dofs == 1:
                     return el_vals.squeeze(-1)
                 return el_vals
 
         # Fallback: Assume it's already local
         return u
+
+    def get_element_data(self, data: jax.Array) -> jax.Array:
+        if self._ctx_mode == "global":
+            return data
+        n_elems = self.mesh.elements.shape[0]
+        if data.shape[0] == n_elems:
+            return data[self._ctx_el_idx]
+        return data
+
+    def slice(
+        self, nodal_values: Array, global_indices: Sequence[int] | Array
+    ) -> Array:
+        """
+        Extracts values corresponding to specific global nodes. It operates in two modes: Global and Local.
+        In global mode, it directly slices the global displacement vector 'u' using the provided 'global_indices'.
+        In local mode, it identifies which of the 'global_indices' are present in the current element and
+        then gives the corresponding values from the local 'u' vector. This way it can be used both for global
+        and local contexts seamlessly.
+
+        Global Mode:
+            Returns u[global_indices].
+
+        Local Mode (Assembly):
+            Finds which of the 'global_indices' are present in the current element
+            and returns only those values from the local 'u' vector.
+
+        Args:
+            u: Displacement vector (Global or Local depending on context).
+            global_indices: Array of global node IDs to extract.
+        """
+        # Global Mode
+        if self._ctx_mode == "global":
+            # Assume nodal_values is Global (N_nodes_total * dim) or (N_nodes_total, dim)
+            # We reshape to slice by node ID
+            u_vec = nodal_values.reshape(-1, self.nb_local_dofs)
+
+            sliced_val = u_vec[global_indices]
+
+            # Squeeze last dim if it was 1 to return standard vector
+            if self.nb_local_dofs == 1:
+                return sliced_val.flatten()
+            return sliced_val
+
+        # Local Mode (for assembly)
+        # u is Local Element Vector
+        u_local = self._prepare_local_input(nodal_values)
+
+        # Ensure u_local is (N_nodes_per_el, dim)
+        if u_local.ndim == 1:
+            n_nodes_per_el = self.mesh.elements.shape[1]
+            u_local = u_local.reshape(n_nodes_per_el, self.nb_local_dofs)
+
+        # Get the global node IDs for the current element
+        current_el_global_ids = self.mesh.elements[self._ctx_el_idx]
+
+        # Find which nodes in the element are in the requested list
+        # mask is boolean array of shape (N_nodes_per_el,)
+        mask = jnp.isin(current_el_global_ids, jnp.asarray(global_indices))
+
+        # Slice local vector
+        sliced_local = jnp.where(mask[:, None], u_local, 0.0)
+
+        if sliced_local.shape[-1] == 1:
+            return sliced_local.squeeze(-1)
+        return sliced_local
 
     def grad(self, nodal_values: jax.Array) -> jax.Array:
         """Computes the gradient of the nodal values at the quad points.
@@ -529,21 +596,18 @@ class Operator(Generic[ElementT]):
             self.mesh.coords[valid_elements],
         )
 
-    def get_element_assembler(self, energy_wrapper_fn: Callable) -> Callable:
+    def get_element_assembler(self, element_energy_kernel: Callable) -> Callable:
         """Returns a JIT-compiled function that computes the Hessian contribution of THIS
         operator. Used by the API 'assemble' function.
         Args:
-            energy_wrapper_fn: A function that computes the energy of a single element.
+            element_energy_kernel: A function that computes the energy of a single element.
 
         Returns:
             A JIT-compiled function that takes the global nodal values and returns the
             global stiffness matrix contribution from this operator as a sparse BCOO matrix.
         """
 
-        def element_kernel(el_u_flat, el_coords, el_idx):
-            return energy_wrapper_fn(el_u_flat, el_coords, el_idx)
-
-        k_e_fn = jax.hessian(element_kernel, argnums=0)
+        k_e_fn = jax.hessian(element_energy_kernel, argnums=0)
         vmapped_ke = jax.vmap(k_e_fn, in_axes=(0, 0, 0))
 
         @jax.jit
