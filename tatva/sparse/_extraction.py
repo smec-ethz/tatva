@@ -21,20 +21,11 @@ from typing import Optional, Tuple
 import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
-import sparsejac
 from jax import Array
 from jax.experimental import sparse as jax_sparse
 from jax.experimental.sparse.bcoo import BCOO
 
 from tatva import Mesh
-
-
-def jacfwd(func, sparsity_pattern):
-    return sparsejac.jacfwd(func, sparsity=sparsity_pattern)
-
-
-def jacrev(func, sparsity_pattern):
-    return sparsejac.jacrev(func, sparsity=sparsity_pattern)
 
 
 def _create_sparse_structure(elements, n_dofs_per_node, K_shape):
