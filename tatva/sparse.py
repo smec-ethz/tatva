@@ -14,8 +14,6 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
-
-
 from typing import Optional, Tuple
 
 import jax
@@ -24,6 +22,7 @@ import numpy as np
 import sparsejac
 from jax import Array
 from jax.experimental import sparse as jax_sparse
+from jax.experimental.sparse.bcoo import BCOO
 
 from tatva import Mesh
 
@@ -191,3 +190,54 @@ def create_sparsity_pattern_KKT(mesh: Mesh, n_dofs_per_node: int, B: Array):
     )
 
     return sparsity_pattern_KKT
+
+
+def reduce_sparsity_pattern(pattern: BCOO, free_dofs: Array) -> BCOO:
+    """Reduce a sparse matrix pattern to only the free dofs (for K_ff).
+
+    Args:
+        pattern (BCOO): Sparse matrix pattern in BCOO format on the full
+            set of dofs.
+        free_dofs: Array of free dofs as integer indices.
+
+    Returns:
+        BCOO: Reduced sparse matrix pattern with rows and columns remapped
+            to the reduced indexing of free dofs.
+    """
+    # Pull to host (avoid device OOM for big masks)
+    I = np.asarray(pattern.indices[:, 0])  # noqa: E741
+    J = np.asarray(pattern.indices[:, 1])
+    D = np.asarray(pattern.data)
+
+    n_full = int(pattern.shape[0])
+    free = np.asarray(free_dofs, dtype=np.int64)
+
+    # Membership mask: O(n_full) setup, O(nnz) index
+    is_free = np.zeros(n_full, dtype=bool)
+    is_free[free] = True
+    mask = is_free[I] & is_free[J]
+
+    I = I[mask]  # noqa: E741
+    J = J[mask]
+    D = D[mask]
+
+    # Full -> reduced reindex
+    index_map = -np.ones(n_full, dtype=np.int64)
+    index_map[free] = np.arange(free.size, dtype=np.int64)
+    I_red = index_map[I]
+    J_red = index_map[J]
+
+    # Deduplicate (sum data; for pure pattern set to 1)
+    keys = I_red * free.size + J_red
+    uniq, inv = np.unique(keys, return_inverse=True)
+    # accumulate
+    D_red = np.bincount(inv, weights=D, minlength=uniq.size)
+    I_red = (uniq // free.size).astype(np.int32)
+    J_red = (uniq % free.size).astype(np.int32)
+
+    # Back to JAX
+    indices_red = jnp.stack([jnp.asarray(I_red), jnp.asarray(J_red)], axis=1)
+    data_red = jnp.asarray(D_red)
+    shape = (free.size, free.size)
+
+    return BCOO((data_red, indices_red), shape=shape)
