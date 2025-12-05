@@ -23,6 +23,7 @@ dependencies = [
     "numpy",
     "sparsejac",
     "jax-autovmap>=0.3.0",
+    "tatva-coloring",
 ]
 
 [project.optional-dependencies]
@@ -49,3 +50,6 @@ version_provider = "pep621"
 update_changelog_on_bump = true
 major_version_zero = true
 template = ".changelog.tpl"
+
+[tool.uv.sources]
+tatva-coloring = { workspace = true }

@@ -20,3 +20,5 @@ arguments-*
 *egg-info*
 *build*
 uv.lock
+
+tatva-coloring/target

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.6"]
+build-backend = "maturin"
+
+[project]
+name = "tatva-coloring"
+version = "0.1.0"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+]
+dependencies = ["numpy"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "tatva_color._tatva_color"
+python-source = "python"

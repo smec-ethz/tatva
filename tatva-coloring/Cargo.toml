@@ -1,0 +1,13 @@
+[package]
+name = "tatva-color"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_tatva_color"
+crate-type = ["cdylib"]
+
+[dependencies]
+ahash = "0.8.12"
+numpy = "0.27.1"
+pyo3 = { version = "0.27.2", features = ["extension-module"] }
