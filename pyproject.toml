@@ -18,8 +18,8 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "jax>=0.4.1",
-    "equinox",
+    "jax>=0.8.0",
+    "equinox>=0.13.0",
     "numpy",
     "sparsejac",
     "jax-autovmap>=0.3.0",
@@ -49,3 +49,8 @@ version_provider = "pep621"
 update_changelog_on_bump = true
 major_version_zero = true
 template = ".changelog.tpl"
+
+[dependency-groups]
+examples = [
+    "jupyter>=1.1.1",
+]
