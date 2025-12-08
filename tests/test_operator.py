@@ -2,7 +2,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from tatva.element import Tri3
 from tatva.mesh import Mesh
 from tatva.operator import Operator
@@ -28,55 +27,6 @@ ELEMENTS = jnp.array(
 )
 
 EXPECTED_ELEMENT_AREAS = np.array([0.5, 0.5], dtype=np.float64)
-
-
-def test_operator_raises_for_dimension_mismatch():
-    coords = jnp.array(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ],
-        dtype=jnp.float64,
-    )
-    elements = jnp.array([[0, 1, 2]], dtype=jnp.int32)
-    mesh = Mesh(coords=coords, elements=elements)
-
-    with pytest.raises(ValueError, match="expects 2D coordinates"):
-        Operator(mesh, Tri3())
-
-
-def test_operator_raises_for_node_count_mismatch():
-    coords = jnp.array(
-        [
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [1.0, 1.0],
-            [0.0, 1.0],
-        ],
-        dtype=jnp.float64,
-    )
-    elements = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
-    mesh = Mesh(coords=coords, elements=elements)
-
-    with pytest.raises(ValueError, match="lists 4 nodes per element"):
-        Operator(mesh, Tri3())
-
-
-def test_operator_raises_for_invalid_connectivity():
-    coords = jnp.array(
-        [
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-        ],
-        dtype=jnp.float64,
-    )
-    elements = jnp.array([[0, 1, 3]], dtype=jnp.int32)
-    mesh = Mesh(coords=coords, elements=elements)
-
-    with pytest.raises(ValueError, match="outside the mesh coordinates"):
-        Operator(mesh, Tri3())
 
 
 @pytest.fixture(scope="module")

@@ -12,7 +12,7 @@ arguments-*
 *.cpython-37.pyc*
 *notebooks/plot*
 *.pdf
-*.err 
+*.err
 *.out
 *_venv*
 *venv*
@@ -22,3 +22,5 @@ arguments-*
 uv.lock
 
 tatva-coloring/target
+*.so
+Cargo.lock
