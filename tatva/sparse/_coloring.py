@@ -1,3 +1,5 @@
+from functools import partial
+
 import jax
 import jax.experimental.sparse as jsp
 import jax.numpy as jnp
@@ -125,6 +127,7 @@ def seeds_from_coloring(colors):
     return seeds
 
 
+@partial(jax.jit, static_argnames=["F"])
 def colored_jacobian(F, u, seeds):
     _, f_jvp = jax.linearize(F, u)
 
@@ -132,14 +135,11 @@ def colored_jacobian(F, u, seeds):
         return f_jvp(s)
 
     rows = jax.vmap(_jvp)(seeds)
-    # rows = []
-    # for s in seeds:
-    #    col_block = f_jvp(s)
-    #    rows.append(col_block)
     J = jnp.stack(rows, axis=1)
     return J
 
 
+@jax.jit
 def recover_stiffness_matrix(J_compressed, row_ptr, col_indices, colors):
     """
     Recover the exact values from the compressed Jacobian and build BCOO.
@@ -153,7 +153,7 @@ def recover_stiffness_matrix(J_compressed, row_ptr, col_indices, colors):
 
     # 1. Expand row pointers to get row indices for every non-zero
     diffs = jnp.diff(row_ptr)
-    rows = jnp.repeat(jnp.arange(n_dofs), diffs)
+    rows = jnp.repeat(jnp.arange(n_dofs), diffs, total_repeat_length=len(col_indices))
     cols = col_indices
 
     # 2. Find where the value for (i, j) is hiding in J_compressed
@@ -173,7 +173,9 @@ def recover_stiffness_matrix(J_compressed, row_ptr, col_indices, colors):
     return K_bcoo
 
 
+@partial(jax.jit, static_argnames=["gradient"])
 def sparse_jacfwd(u, gradient, seeds, row_ptr, col_indices, colors):
     J_compressed = colored_jacobian(gradient, u, seeds)
+
     K_bcoo = recover_stiffness_matrix(J_compressed, row_ptr, col_indices, colors)
     return K_bcoo
