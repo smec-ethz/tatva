@@ -39,3 +39,20 @@ build-backend = "hatchling.build"
 
 [project.urls]
 repository = "https://gitlab.ethz.ch/smec/software/tatva"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+version_scheme = "pep440"
+version_provider = "pep621"
+update_changelog_on_bump = true
+major_version_zero = true
+template = ".changelog.tpl"
+
+[tool.uv.sources]
+tatva-coloring = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    "tatva-coloring",
+]

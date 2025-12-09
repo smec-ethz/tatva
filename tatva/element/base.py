@@ -1,4 +1,4 @@
-# Copyright (C) 2025 ETH Zurich (Mohit Pundir)
+# Copyright (C) 2025 ETH Zurich (SMEC)
 #
 # This file is part of tatva.
 #
@@ -247,4 +247,3 @@ class Hexahedron8(Element):
                 [-(1 + eta) * (1 + zeta), (1 - xi) * (1 + zeta), (1 - xi) * (1 + eta)],
             ]
         )
-
