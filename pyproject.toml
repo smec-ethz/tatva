@@ -53,3 +53,8 @@ template = ".changelog.tpl"
 
 [tool.uv.sources]
 tatva-coloring = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    "tatva-coloring",
+]

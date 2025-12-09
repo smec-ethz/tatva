@@ -1,10 +1,32 @@
+# Copyright (C) 2025 ETH Zurich (SMEC)
+#
+# This file is part of tatva.
+#
+# tatva is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# tatva is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with tatva.  If not, see <https://www.gnu.org/licenses/>.
+
+from __future__ import annotations
+
 from functools import partial
+from multiprocessing import Array
+from typing import Callable
 
 import jax
 import jax.experimental.sparse as jsp
 import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
+from jax import Array
 
 
 def get_distance2_adjacency_fast(n_dofs, row_ptr, col_idx):
@@ -128,7 +150,16 @@ def seeds_from_coloring(colors):
 
 
 @partial(jax.jit, static_argnames=["F"])
-def colored_jacobian(F, u, seeds):
+def colored_jacobian(F: Callable, u: Array, seeds: Array) -> Array:
+    """
+    Compute the colored Jacobian of F at u using the provided seeds.
+    Args:
+        F: function to differentiate
+        u: Point at which to evaluate the Jacobian, shape (N,)
+        seeds: List of seed vectors, each of shape (N,). Length = n_colors
+    Returns:
+
+    """
     _, f_jvp = jax.linearize(F, u)
 
     def _jvp(s):
@@ -139,8 +170,14 @@ def colored_jacobian(F, u, seeds):
     return J
 
 
-@jax.jit
-def recover_stiffness_matrix(J_compressed, row_ptr, col_indices, colors):
+@partial(jax.jit, static_argnames=["n_dofs"])
+def recover_stiffness_matrix(
+    J_compressed: Array,
+    row_ptr: Array,
+    col_indices: Array,
+    colors: Array,
+    n_dofs: int,
+) -> jsp.BCOO:
     """
     Recover the exact values from the compressed Jacobian and build BCOO.
 
@@ -148,23 +185,25 @@ def recover_stiffness_matrix(J_compressed, row_ptr, col_indices, colors):
         J_compressed: Output from colored_jacobian, shape (N, n_colors)
         row_ptr, col_indices: The ORIGINAL sparsity pattern of the matrix
         colors: The array of colors used for compression
-    """
-    n_dofs = J_compressed.shape[0]
 
-    # 1. Expand row pointers to get row indices for every non-zero
+    Returns:
+        K_bcoo: The recovered sparse Jacobian in BCOO format
+    """
+
+    # expand row pointers to get row indices for every non-zero
     diffs = jnp.diff(row_ptr)
     rows = jnp.repeat(jnp.arange(n_dofs), diffs, total_repeat_length=len(col_indices))
     cols = col_indices
 
-    # 2. Find where the value for (i, j) is hiding in J_compressed
+    # find where the value for (i, j) is hiding in J_compressed
     # The value K_ij is stored at row 'i' and column 'color[j]'
     col_colors = colors[cols]
 
-    # 3. Extract values using fancy indexing
+    # extract values using fancy indexing
     # values[k] = J_compressed[ rows[k], col_colors[k] ]
     values = J_compressed[rows, col_colors]
 
-    # 4. Construct BCOO Matrix
+    # construct BCOO Matrix
     indices = jnp.stack([rows, cols], axis=1)
 
     # BCOO requires explicit shape
@@ -174,8 +213,32 @@ def recover_stiffness_matrix(J_compressed, row_ptr, col_indices, colors):
 
 
 @partial(jax.jit, static_argnames=["gradient"])
-def sparse_jacfwd(u, gradient, seeds, row_ptr, col_indices, colors):
-    J_compressed = colored_jacobian(gradient, u, seeds)
+def sparse_jacfwd(
+    u: Array,
+    gradient: Callable,
+    seeds: Array,
+    row_ptr: Array,
+    col_indices: Array,
+    colors: Array,
+) -> jsp.BCOO:
+    """
+    Compute the sparse Jacobian using forward-mode automatic differentiation
+    and graph coloring.
 
-    K_bcoo = recover_stiffness_matrix(J_compressed, row_ptr, col_indices, colors)
+    Args:
+        u: Point at which to evaluate the Jacobian, shape (N,)
+        gradient: Function whose Jacobian is to be computed
+        seeds: List of seed vectors for coloring
+        row_ptr, col_indices: The ORIGINAL sparsity pattern of the matrix
+        colors: The array of colors used for compression
+    Returns:
+        K_bcoo: The recovered sparse Jacobian in BCOO format
+
+    """
+    J_compressed = colored_jacobian(gradient, u, seeds)
+    n_dofs = J_compressed.shape[0]
+
+    K_bcoo = recover_stiffness_matrix(
+        J_compressed, row_ptr, col_indices, colors, n_dofs
+    )
     return K_bcoo
