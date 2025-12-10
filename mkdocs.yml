@@ -1,0 +1,12 @@
+site_name: tatva
+site_description: The documentation for the tatva software package
+site_author: David Büeler
+
+repo_url: https://github.com/smec-ethz/tatva
+repo_name: GitHub
+
+nav:
+  - Home: index.md
+  - About: about.md
+
+theme: material

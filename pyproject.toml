@@ -33,6 +33,7 @@ dev = [
     "commitizen>=4.9.1",
     "pytest>=8.4.2",
     "mkdocs>=1.6.1",
+    "mkdocs-material>=9.7.0",
 ]
 
 [build-system]
