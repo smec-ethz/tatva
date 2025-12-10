@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+from jax._src.sharding_impls import NonUniformShardingError
 from jax_autovmap import autovmap
 
 from tatva.element import Element
@@ -85,10 +86,17 @@ class Operator(Generic[ElementT], eqx.Module):
     mesh: Mesh
     element: ElementT
     det_J_elements_weights: Array
+    batch_size: int = eqx.field(static=True)
 
-    def __init__(self, mesh: Mesh, element: Element):
+    def __init__(
+        self, mesh: Mesh, element: Element, batch_size: int | None = None
+    ) -> None:
         self.mesh = mesh
         self.element = element
+        if batch_size is None:
+            self.batch_size = mesh.elements.shape[0]
+        else:
+            self.batch_size = batch_size
 
         def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
             """Calls the function element.get_jacobian and returns the second output."""
@@ -177,6 +185,7 @@ class Operator(Generic[ElementT], eqx.Module):
             of each element (shape: (n_elements, n_quad_points, n_values)).
         """
 
+        """
         def _at_each_element(
             el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
@@ -192,6 +201,23 @@ class Operator(Generic[ElementT], eqx.Module):
             _at_each_element,
             in_axes=(0, 0),
         )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
+        """
+
+        def _at_each_element(args: Tuple[Array, Array]) -> Array:
+            el_nodal_values, el_nodal_coords = args
+            return jax.vmap(
+                partial(
+                    func,
+                    el_nodal_values=el_nodal_values,
+                    el_nodal_coords=el_nodal_coords,
+                )
+            )(self.element.quad_points)
+
+        return jax.lax.map(
+            _at_each_element,
+            xs=(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements]),
+            batch_size=self.batch_size,
+        )
 
     def map(
         self,
@@ -215,6 +241,7 @@ class Operator(Generic[ElementT], eqx.Module):
             # values should be arrays!
             _values = cast(tuple[jax.Array, ...], values)
 
+            """
             def _at_each_element(*el_values) -> jax.Array:
                 return eqx.filter_vmap(
                     lambda xi: func(xi, *el_values, **kwargs),
@@ -228,6 +255,25 @@ class Operator(Generic[ElementT], eqx.Module):
                     v[self.mesh.elements] if i not in element_quantity else v
                     for i, v in enumerate(_values)
                 )
+            )
+            """
+
+            def _at_each_element(el_values: tuple) -> jax.Array:
+                return eqx.filter_vmap(
+                    lambda xi: func(xi, *el_values, **kwargs),
+                )(self.element.quad_points)
+
+            # Construct the tuple of inputs (xs) by iterating over _values
+            # and gathering nodal values to elements where necessary.
+            xs = tuple(
+                v[self.mesh.elements] if i not in element_quantity else v
+                for i, v in enumerate(_values)
+            )
+
+            return jax.lax.map(
+                _at_each_element,
+                xs=xs,
+                batch_size=self.batch_size,
             )
 
         return _mapped
@@ -254,6 +300,7 @@ class Operator(Generic[ElementT], eqx.Module):
             # values should be arrays!
             _values = cast(tuple[jax.Array, ...], values)
 
+            """
             def _at_each_element(*el_values) -> RT:
                 return func(*el_values, **kwargs)
 
@@ -265,6 +312,22 @@ class Operator(Generic[ElementT], eqx.Module):
                     v[self.mesh.elements] if i not in element_quantity else v
                     for i, v in enumerate(_values)
                 )
+            )
+            """
+
+            def _at_each_element(el_values: tuple) -> RT:
+                return func(*el_values, **kwargs)
+
+            # Construct the tuple of inputs (xs) by iterating over _values
+            # and gathering nodal values to elements where necessary.
+            xs = tuple(
+                v[self.mesh.elements] if i not in element_quantity else v
+                for i, v in enumerate(_values)
+            )
+            return jax.lax.map(
+                _at_each_element,
+                xs=xs,
+                batch_size=self.batch_size,
             )
 
         return _mapped
