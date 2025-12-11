@@ -5,8 +5,15 @@ site_author: David Büeler
 repo_url: https://github.com/smec-ethz/tatva
 repo_name: GitHub
 
+docs_dir: docs
+extra_files:
+  - ../assets
+
 nav:
   - Home: index.md
   - About: about.md
+  - Examples: examples.md
 
-theme: material
+theme:
+  name: material
+  favicon: "../assets/favicon.png"
