@@ -1,3 +1,7 @@
+from ._coloring import (
+    distance2_color_and_seeds,
+    jacfwd,
+)
 from ._extraction import (
     create_sparsity_pattern,
     create_sparsity_pattern_KKT,
@@ -10,4 +14,6 @@ __all__ = [
     "reduce_sparsity_pattern",
     "get_bc_indices",
     "create_sparsity_pattern_KKT",
+    "distance2_color_and_seeds",
+    "jacfwd",
 ]

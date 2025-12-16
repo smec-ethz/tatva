@@ -149,6 +149,26 @@ def seeds_from_coloring(colors):
     return seeds
 
 
+def distance2_color_and_seeds(row_ptr: Array, col_idx: Array, n_dofs: int):
+    """
+    Compute distance-2 coloring and corresponding seed vectors.
+
+    Args:
+        row_ptr: CSR row pointer array
+        col_idx: CSR column indices array
+        n_dofs: Number of degrees of freedom (size of the matrix)
+    Returns:
+        colors: Array of colors assigned to each DOF
+        seeds: List of seed vectors for each color
+    """
+    adjacency = get_distance2_adjacency_fast(
+        n_dofs, np.array(row_ptr), np.array(col_idx)
+    )
+    colors = greedy_coloring(adjacency)
+    seeds = seeds_from_coloring(jnp.array(colors))
+    return jnp.array(colors), jnp.stack(seeds, axis=0)
+
+
 @partial(jax.jit, static_argnames=["F"])
 def colored_jacobian(F: Callable, u: Array, seeds: Array) -> Array:
     """
@@ -212,33 +232,34 @@ def recover_stiffness_matrix(
     return K_bcoo
 
 
-@partial(jax.jit, static_argnames=["gradient"])
-def sparse_jacfwd(
-    u: Array,
+def jacfwd(
     gradient: Callable,
     seeds: Array,
     row_ptr: Array,
     col_indices: Array,
     colors: Array,
-) -> jsp.BCOO:
+) -> Callable:
     """
     Compute the sparse Jacobian using forward-mode automatic differentiation
     and graph coloring.
 
     Args:
-        u: Point at which to evaluate the Jacobian, shape (N,)
         gradient: Function whose Jacobian is to be computed
         seeds: List of seed vectors for coloring
         row_ptr, col_indices: The ORIGINAL sparsity pattern of the matrix
         colors: The array of colors used for compression
     Returns:
-        K_bcoo: The recovered sparse Jacobian in BCOO format
+        A function that computes the sparse Jacobian in BCOO format
 
     """
-    J_compressed = colored_jacobian(gradient, u, seeds)
-    n_dofs = J_compressed.shape[0]
 
-    K_bcoo = recover_stiffness_matrix(
-        J_compressed, row_ptr, col_indices, colors, n_dofs
-    )
-    return K_bcoo
+    def _wraped_jacfwd(u: Array) -> jsp.BCOO:
+        J_compressed = colored_jacobian(gradient, u, seeds)
+        n_dofs = J_compressed.shape[0]
+
+        K_bcoo = recover_stiffness_matrix(
+            J_compressed, row_ptr, col_indices, colors, n_dofs
+        )
+        return K_bcoo
+
+    return _wraped_jacfwd
