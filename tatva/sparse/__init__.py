@@ -1,6 +1,10 @@
 from ._coloring import (
-    distance2_color_and_seeds,
+    distance2_colors,
     jacfwd,
+    jacfwd_with_batch,
+    jacfwd_with_streaming_recovery,
+    largest_degree_first_distance2_colors,
+    smallest_last_distance2_colors,
 )
 from ._extraction import (
     create_sparsity_pattern,
@@ -14,6 +18,10 @@ __all__ = [
     "reduce_sparsity_pattern",
     "get_bc_indices",
     "create_sparsity_pattern_KKT",
-    "distance2_color_and_seeds",
+    "distance2_colors",
+    "smallest_last_distance2_colors",
+    "largest_degree_first_distance2_colors",
     "jacfwd",
+    "jacfwd_with_batch",
+    "jacfwd_with_streaming_recovery",
 ]

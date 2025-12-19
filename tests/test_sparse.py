@@ -15,6 +15,13 @@ from tatva import Mesh, Operator, element, sparse
 jax.config.update("jax_enable_x64", True)
 
 
+COLORING_VARIANTS = [
+    sparse.distance2_colors,  # Standard implementation
+    sparse.largest_degree_first_distance2_colors,  # Hypothetical variant 1
+    sparse.smallest_last_distance2_colors,  # Hypothetical variant 2
+]
+
+
 @autovmap(grad_u=2)
 def compute_strain(grad_u: Array) -> Array:
     """Compute the strain tensor from the gradient of the displacement."""
@@ -43,7 +50,8 @@ def op():
     return Operator(mesh, tri)
 
 
-def test_sparse_matrix(op: Operator):
+@pytest.mark.parametrize("coloring_func", COLORING_VARIANTS)
+def test_sparse_matrix(op: Operator, coloring_func):
     @jax.jit
     def total_energy(u_flat):
         u = u_flat.reshape(-1, 2)
@@ -65,13 +73,10 @@ def test_sparse_matrix(op: Operator):
     indptr = sparsity_pattern_csr.indptr
     indices = sparsity_pattern_csr.indices
 
-    colors, seeds = sparse.distance2_color_and_seeds(
-        row_ptr=indptr, col_idx=indices, n_dofs=n_dofs
-    )
+    colors = coloring_func(row_ptr=indptr, col_idx=indices, n_dofs=n_dofs)
 
     K_sparse = sparse.jacfwd(
         gradient=jax.jacrev(total_energy),
-        seeds=seeds,
         row_ptr=indptr,
         col_indices=indices,
         colors=colors,
