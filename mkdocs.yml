@@ -5,15 +5,42 @@ site_author: David Büeler
 repo_url: https://github.com/smec-ethz/tatva
 repo_name: GitHub
 
-docs_dir: docs
-extra_files:
-  - ../assets
-
 nav:
   - Home: index.md
+  - Getting started: getting_started.md
+  - Concepts: concepts.md
+  - API Reference: api.md
+  - Examples:
+    - Hertzian Contact: examples/hertzian_contact.ipynb
   - About: about.md
-  - Examples: examples.md
+
+markdown_extensions:
+  - toc:
+      permalink: true
 
 theme:
   name: material
-  favicon: "../assets/favicon.png"
+  favicon: "assets/favicon.png"
+  logo: "assets/logo.png"
+
+
+plugins:
+  - mkdocs-jupyter:
+      execute: false              # Execute notebooks during build
+      include_source: true       # Add download link for source notebooks
+      theme: light               # Use dark theme for code cells
+      include: ["*.ipynb", "*.nb.py"]  # File patterns to include
+      execute_ignore: ["notebooks/drafts/*.ipynb"]  # Skip certain files
+      allow_errors: true        # Fail build on notebook errors
+      kernel_name: python3       # Specify kernel to use
+      ignore_h1_titles: false    # Include H1 from notebooks
+      show_input: true          # Show input cells by default
+      no_input: false           # Don't hide all inputs
+      remove_tag_config:
+        remove_cell_tags:
+          - "hide"              # Hide cells with these tags
+          - "hide-cell"
+        remove_all_outputs_tags:
+          - "hide-output"       # Hide outputs for tagged cells
+        remove_input_tags:
+          - "hide-input"        # Hide input for tagged cells
