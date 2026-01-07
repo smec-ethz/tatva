@@ -18,6 +18,7 @@ nav:
     - Plotting: reference/plotting.md
   - Examples:
     - Hertzian Contact: examples/hertzian_contact.ipynb
+    - Crack Nucleation using LEFM: examples/crack_nucleation_LEFM.ipynb
   - About: about.md
 
 markdown_extensions:
@@ -29,6 +30,8 @@ theme:
   favicon: "assets/favicon.png"
   logo: "assets/logo.png"
 
+extra_css:
+  - stylesheets/extra.css
 
 plugins:
   - search

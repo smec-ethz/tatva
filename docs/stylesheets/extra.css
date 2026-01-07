@@ -1,0 +1,11 @@
+/* Hide Jupyter input prompts like "In [1]:" */
+.jp-InputPrompt,
+.jp-InputArea-prompt {
+  display: none !important;
+}
+
+/* Hide Jupyter output prompt area*/
+.jp-OutputPrompt,
+.jp-OutputArea-prompt {
+  display: none !important;
+}
