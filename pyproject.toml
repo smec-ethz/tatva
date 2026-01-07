@@ -39,6 +39,7 @@ docs = [
     "mkdocs-jupyter>=0.25.1",
     "gmsh>=4.15.0",
     "meshio>=5.3.5",
+    "mkdocstrings-python>=2.0.1",
 ]
 
 [build-system]

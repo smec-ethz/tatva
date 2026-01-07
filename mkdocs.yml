@@ -9,7 +9,13 @@ nav:
   - Home: index.md
   - Getting started: getting_started.md
   - Concepts: concepts.md
-  - API Reference: api.md
+  - API Reference:
+    - Element: reference/element.md
+    - Mesh: reference/mesh.md
+    - Operator: reference/operator.md
+    - Compound: reference/compound.md
+    - Sparse: reference/sparse.md
+    - Plotting: reference/plotting.md
   - Examples:
     - Hertzian Contact: examples/hertzian_contact.ipynb
   - About: about.md
@@ -25,6 +31,19 @@ theme:
 
 
 plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [tatva]
+          options:
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: true
+            show_root_toc_entry: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+
   - mkdocs-jupyter:
       execute: false              # Execute notebooks during build
       include_source: true       # Add download link for source notebooks
