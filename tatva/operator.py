@@ -141,11 +141,6 @@ class Operator(Generic[ElementT], eqx.Module):
             )
 
         local_dim = quad_points.shape[1]
-        global_dim = coords.shape[1]
-        if local_dim > 1 and local_dim != global_dim:
-            raise ValueError(
-                f"Element {self.element.__class__.__name__} expects {local_dim}D coordinates but mesh provides {global_dim}D nodes."
-            )
         if local_dim == 0:
             raise ValueError("Element must have a positive number of local dimensions.")
 
