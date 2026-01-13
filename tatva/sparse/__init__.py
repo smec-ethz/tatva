@@ -2,7 +2,6 @@ from ._coloring import (
     distance2_colors,
     jacfwd,
     jacfwd_with_batch,
-    jacfwd_with_streaming_recovery,
     largest_degree_first_distance2_colors,
     smallest_last_distance2_colors,
 )
@@ -23,5 +22,4 @@ __all__ = [
     "largest_degree_first_distance2_colors",
     "jacfwd",
     "jacfwd_with_batch",
-    "jacfwd_with_streaming_recovery",
 ]

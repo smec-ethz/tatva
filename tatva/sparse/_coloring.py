@@ -29,7 +29,7 @@ import scipy.sparse as sp
 from jax import Array
 
 
-def get_distance2_adjacency_fast(n_dofs, row_ptr, col_idx):
+def get_distance2_adjacency(n_dofs, row_ptr, col_idx):
     """
     Creates the adjacency list for the 'squared' graph.
     Args:
@@ -48,12 +48,12 @@ def get_distance2_adjacency_fast(n_dofs, row_ptr, col_idx):
     # this finds all nodes reachable in 2 steps
     A2 = A @ A
 
-    # convert to Adjacency List (Your preferred format)
+    # convert to Adjacency List
     # we use the existing csr_to_adjacency logic but on A2
-    return csr_to_adjacency_fast(n_dofs, A2.indptr, A2.indices, symmetric=False)
+    return csr_to_adjacency(n_dofs, A2.indptr, A2.indices, symmetric=False)
 
 
-def csr_to_adjacency_fast(n_dofs, row_ptr, col_idx, symmetric=True):
+def csr_to_adjacency(n_dofs, row_ptr, col_idx, symmetric=True):
     """
     Vectorized conversion of CSR to Adjacency List.
     Removes the Python loop entirely.
@@ -198,11 +198,11 @@ def get_smallest_last_order(adjacency):
     to handle millions of nodes efficiently.
     """
     n = len(adjacency)
-    # 1. Initial degrees of all nodes
+    # initial degrees of all nodes
     degrees = np.array([len(adj) for adj in adjacency], dtype=np.int32)
     max_degree = np.max(degrees)
 
-    # 2. Setup Buckets: list of sets where buckets[d] contains nodes with degree d
+    # list of sets where buckets[d] contains nodes with degree d
     buckets = [set() for _ in range(max_degree + 1)]
     for i, d in enumerate(degrees):
         buckets[d].add(i)
@@ -283,9 +283,7 @@ def distance2_colors(row_ptr: Array, col_idx: Array, n_dofs: int):
     Returns:
         colors: Array of colors assigned to each DOF
     """
-    adjacency = get_distance2_adjacency_fast(
-        n_dofs, np.array(row_ptr), np.array(col_idx)
-    )
+    adjacency = get_distance2_adjacency(n_dofs, np.array(row_ptr), np.array(col_idx))
     colors = greedy_coloring(adjacency)
     return jnp.array(colors)
 
@@ -302,9 +300,7 @@ def largest_degree_first_distance2_colors(
     Returns:
         colors: Array of colors assigned to each DOF
     """
-    adjacency = get_distance2_adjacency_fast(
-        n_dofs, np.array(row_ptr), np.array(col_idx)
-    )
+    adjacency = get_distance2_adjacency(n_dofs, np.array(row_ptr), np.array(col_idx))
     colors = greedy_coloring_ldf(adjacency)
     return jnp.array(colors)
 
@@ -321,9 +317,7 @@ def smallest_last_distance2_colors(
     Returns:
         colors: Array of colors assigned to each DOF
     """
-    adjacency = get_distance2_adjacency_fast(
-        n_dofs, np.array(row_ptr), np.array(col_idx)
-    )
+    adjacency = get_distance2_adjacency(n_dofs, np.array(row_ptr), np.array(col_idx))
     colors = greedy_coloring_sl(adjacency)
     return jnp.array(colors)
 
@@ -356,9 +350,7 @@ def distance2_color_and_seeds(row_ptr: Array, col_idx: Array, n_dofs: int):
         colors: Array of colors assigned to each DOF
         seeds: List of seed vectors for each color
     """
-    adjacency = get_distance2_adjacency_fast(
-        n_dofs, np.array(row_ptr), np.array(col_idx)
-    )
+    adjacency = get_distance2_adjacency(n_dofs, np.array(row_ptr), np.array(col_idx))
     colors = greedy_coloring(adjacency)
     seeds = seeds_from_coloring(jnp.array(colors))
     return jnp.array(colors), jnp.stack(seeds, axis=0)
@@ -366,14 +358,14 @@ def distance2_color_and_seeds(row_ptr: Array, col_idx: Array, n_dofs: int):
 
 @partial(jax.jit, static_argnames=["F", "n_colors", "color_batch_size"])
 def colored_jacobian_batch(
-    F: Callable, u: Array, colors: Array, n_colors: int, color_batch_size: int = 1
+    F: Callable, x: Array, colors: Array, n_colors: int, color_batch_size: int = 1
 ) -> Array:
     """
     Computes the compressed Jacobian by processing colors in batches. By default,
     processes one color at a time to minimize memory usage.
     Args:
         F: function to differentiate
-        u: Point at which to evaluate the Jacobian, shape (N,)
+        x: Point at which to evaluate the Jacobian, shape (N,)
         colors: Array of colors assigned to each DOF
         n_colors: Number of unique colors
         color_batch_size: Number of colors to process in each batch
@@ -384,7 +376,7 @@ def colored_jacobian_batch(
     def compute_single_jvp(color_id: Array):
         # Discard primal output, keep tangent (Jacobian column)
         seed = jnp.where(colors == color_id, 1.0, 0.0)
-        _, jvp_out = jax.jvp(F, (u,), (seed,))
+        _, jvp_out = jax.jvp(F, (x,), (seed,))
         return jvp_out
 
     # Use lax.map to iterate over seeds (colors) one-by-one or in small batches
@@ -396,26 +388,30 @@ def colored_jacobian_batch(
 
 
 @partial(jax.jit, static_argnames=["F", "n_colors"])
-def colored_jacobian(F: Callable, u: Array, colors: Array, n_colors: int) -> Array:
+def colored_jacobian(F: Callable, x: Array, colors: Array, n_colors: int) -> Array:
     """
-    100% JAX/GPU implementation.
+    Computes the compressed Jacobian using forward-mode AD and graph coloring without batching.
     Reconstructs seeds on-the-fly via masking to avoid OOM and jagged arrays.
+    Args:
+        F: function to differentiate
+        x: Point at which to evaluate the Jacobian, shape (N,)
+        colors: Array of colors assigned to each DOF
+        n_colors: Number of unique colors
+    Returns:
+        J: Compressed Jacobian matrix, shape (N, n_colors)
     """
-    n_dofs = u.shape[0]
+    n_dofs = x.shape[0]
 
     def scan_body(carry, color_id):
         # Generate seed for the current color_id on-the-fly
-        # This is done entirely on GPU and is extremely fast
-        #seed = (colors == color_id).astype(u.dtype)
-        seed = jnp.where(colors == color_id, 1.0, 0.0)#.astype(u.dtype)
+        # seed = (colors == color_id)
+        seed = jnp.where(colors == color_id, 1.0, 0.0)
 
         # Compute JVP
-        _, jvp_out = jax.jvp(F, (u,), (seed,))
+        _, jvp_out = jax.jvp(F, (x,), (seed,))
 
         return None, jvp_out
 
-    # lax.scan iterates from color 0 to n_colors-1
-    # This compiles ONCE and runs 90 times on GPU.
     color_ids = jnp.arange(n_colors)
     _, J_columns = jax.lax.scan(scan_body, None, color_ids)
 
@@ -455,10 +451,7 @@ def recover_stiffness_matrix(
     # values[k] = J_compressed[ rows[k], col_colors[k] ]
     values = J_compressed[rows, col_colors]
 
-    # construct BCOO Matrix
     indices = jnp.stack([rows, cols], axis=1)
-
-    # BCOO requires explicit shape
     K_bcoo = jsp.BCOO((values, indices), shape=(n_dofs, n_dofs))
 
     return K_bcoo
@@ -484,7 +477,6 @@ def jacfwd_with_batch(
     """
 
     n_colors = len(jnp.unique(colors)) + 1
-
 
     def _wraped_jacfwd(u: Array) -> jsp.BCOO:
         J_compressed = colored_jacobian_batch(
@@ -522,7 +514,7 @@ def jacfwd(
 
     def _wraped_jacfwd(u: Array) -> jsp.BCOO:
         J_compressed = colored_jacobian(
-            gradient, u=u, colors=colors, n_colors=int(n_colors)
+            gradient, x=u, colors=colors, n_colors=int(n_colors)
         )
         n_dofs = J_compressed.shape[0]
 
@@ -530,90 +522,5 @@ def jacfwd(
             J_compressed, row_ptr, col_indices, colors, n_dofs
         )
         return K_bcoo
-
-    return _wraped_jacfwd
-
-
-def jacfwd_with_streaming_recovery(gradient, row_ptr, col_indices, colors):
-    n_colors = int(np.max(colors) + 1)
-    n_dofs = colors.shape[0]
-    nnz = len(col_indices)
-    
-    # --- 1. PRE-PROCESSING (CPU/NumPy - Zero VRAM used here) ---
-    # Expand row pointers to get row index 'i' for every (i, j)
-    diffs = np.diff(row_ptr)
-    rows_all = np.repeat(np.arange(n_dofs), diffs)
-    
-    # Sort ALL non-zero entries by the color of their column
-    # This allows us to process the 1D sparse array as a sequence of contiguous blocks
-    entry_colors = np.array(colors[col_indices])
-    sort_idx = np.argsort(entry_colors)
-    
-    sorted_rows = rows_all[sort_idx].astype(np.int32)
-    sorted_cols = col_indices[sort_idx].astype(np.int32)
-    
-    # Calculate exactly where each color starts in the sorted 1D array
-    counts = np.bincount(entry_colors, minlength=n_colors)
-    offsets = np.cumsum(np.insert(counts, 0, 0))[:-1]
-    
-    # To avoid JAX Tracer errors, we use a fixed block size for the JVP extraction
-    # We will process every color using the same 'max_entries_per_color' size
-    max_block = int(np.max(counts))
-    
-    # Pre-calculate a 2D index map for the JVP extraction (CPU side)
-    # Shape: (n_colors, max_block)
-    padded_rows = np.full((n_colors, max_block), 0, dtype=np.int32)
-    for c in range(n_colors):
-        c_size = counts[c]
-        padded_rows[c, :c_size] = sorted_rows[offsets[c] : offsets[c] + c_size]
-
-    # --- 2. GPU TRANSFER (One-Time) ---
-    # We stack the indices on CPU to avoid the GPU 'stack' OOM
-    indices_bcoo_jax = jnp.array(np.column_stack([sorted_rows, sorted_cols]))
-    padded_rows_jax = jnp.array(padded_rows)
-    offsets_jax = jnp.array(offsets)
-    counts_jax = jnp.array(counts)
-    
-    # Free CPU memory immediately
-    del sorted_rows, sorted_cols, padded_rows, rows_all, sort_idx
-
-    def _wraped_jacfwd(u: jax.Array) -> jsp.BCOO:
-        
-        def scan_body(val_carry, loop_vars):
-            color_id, row_block, start_idx, num_valid = loop_vars
-            
-            # A. Compute JVP for this color group
-            seed = (colors == color_id).astype(u.dtype)
-            _, jvp_out = jax.jvp(gradient, (u,), (seed,))
-            
-            # B. Extract values from JVP result
-            # Using the pre-baked rows for this color
-            raw_vals = jvp_out[row_block]
-            
-            # C. Mask padding to zero to avoid corrupting neighbor color data
-            mask = jax.lax.broadcasted_iota(jnp.int32, (max_block,), 0) < num_valid
-            clean_vals = jnp.where(mask, raw_vals, 0.0)
-            
-            # D. IN-PLACE OVERWRITE (The Memory Saver)
-            # We update the 1D carry at the specific offset for this color
-            # Since max_block is a static Python int, this won't crash the Tracer
-            new_val_carry = jax.lax.dynamic_update_slice_in_dim(
-                val_carry, clean_vals, start_idx, axis=0
-            )
-            
-            return new_val_carry, None
-
-        # Start with an empty 1D array of size NNZ + slight padding
-        # We add 'max_block' at the end to safe-guard the final dynamic_update_slice
-        init_values = jnp.zeros(nnz + max_block)
-        
-        final_values_padded, _ = jax.lax.scan(
-            scan_body, 
-            init_values, 
-            (jnp.arange(n_colors), padded_rows_jax, offsets_jax, counts_jax)
-        )
-        
-        # Trim back to exact NNZ and return BCOO
-        return jsp.BCOO((final_values_padded[:nnz], indices_bcoo_jax), shape=(n_dofs, n_dofs))
 
     return _wraped_jacfwd
