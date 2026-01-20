@@ -19,4 +19,4 @@
 # pyright: reportUnusedImport=false
 
 from .base import Element as Element
-from .base import Hexahedron8, Line2, Quad4, Tetrahedron4, Tri3
+from .base import Hexahedron8, Line2, Quad4, Tetrahedron4, Tri3, Tri3Manifold

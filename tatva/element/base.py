@@ -135,6 +135,27 @@ class Tri3(Element):
         return jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]]).T
 
 
+class Tri3Manifold(Tri3):
+    """A 3-node linear triangular element on a 2D manifold embedded in 3D space."""
+
+    def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
+        dNdr = self.shape_function_derivative(xi)
+        J = dNdr @ nodal_coords  # shape (2, 2) or (2, 3)
+        G = J @ J.T  # shape (2, 2)
+        detJ = jnp.sqrt(jnp.linalg.det(G))
+        return J, detJ
+
+    def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
+        dNdr = self.shape_function_derivative(xi)  # shape (2, 3)
+        J, _ = self.get_jacobian(xi, nodal_coords)  # shape (2, 3)
+
+        G_inv = jnp.linalg.inv(J @ J.T)  # shape (2, 2)
+        J_plus = J.T @ G_inv  # shape (3, 2)
+
+        dudxi = dNdr @ nodal_values  # shape (2, n_values)
+        return J_plus @ dudxi  # shape (3, n_values)
+
+
 def _get_quad4_quadrature() -> tuple[Array, Array]:
     xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
     w_vals = jnp.array([1.0, 1.0])
@@ -247,4 +268,3 @@ class Hexahedron8(Element):
                 [-(1 + eta) * (1 + zeta), (1 - xi) * (1 + zeta), (1 - xi) * (1 + eta)],
             ]
         )
-
