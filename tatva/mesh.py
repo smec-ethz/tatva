@@ -18,11 +18,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal, Mapping, TypeAlias
 
 import jax
 import jax.numpy as jnp
+
+if TYPE_CHECKING:
+    import numpy.typing as npt
+
+    ArrayLike: TypeAlias = jax.Array | npt.NDArray
 
 
 class ElementType(Enum):
@@ -34,7 +40,8 @@ class ElementType(Enum):
     HEXAHEDRON = "hexahedron"
 
 
-class Mesh(NamedTuple):
+@dataclass(frozen=True)
+class Mesh:
     """A class used to represent a Mesh for finite element method (FEM) simulations.
 
     Attributes:
@@ -42,8 +49,15 @@ class Mesh(NamedTuple):
         elements: The connectivity of the mesh elements.
     """
 
-    coords: jax.Array  # Shape (n_nodes, n_dim)
-    elements: jax.Array  # Shape (n_elements, n_nodes_per_element)
+    coords: ArrayLike  # Shape (n_nodes, n_dim)
+    """The coordinates of the mesh nodes."""
+
+    elements: ArrayLike  # Shape (n_elements, n_nodes_per_element)
+    """The connectivity of the mesh elements."""
+
+    groups: Mapping[str, ArrayLike] = field(default_factory=dict)
+    """Optional named sets of nodes or elements. Can be used to define physical groups for
+    boundary conditions or material properties."""
 
     @classmethod
     def unit_square(
