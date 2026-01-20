@@ -20,11 +20,14 @@ from __future__ import annotations
 
 from abc import ABC
 from dataclasses import dataclass
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 import equinox
 import jax.numpy as jnp
 from jax import Array
+
+if TYPE_CHECKING:
+    from numpy.typing import ArrayLike
 
 
 class Constraint(ABC):
@@ -57,9 +60,9 @@ class PeriodicMap(Constraint):
 
 class DirichletBC(Constraint):
     dofs: Array
-    values: Array
+    values: Array | ArrayLike
 
-    def __init__(self, dofs: Array, values: Array | None = None):
+    def __init__(self, dofs: Array, values: Array | ArrayLike | None = None):
         self.dofs = dofs
         if values is None:
             self.values = jnp.zeros(dofs.shape, dtype=jnp.float64)
