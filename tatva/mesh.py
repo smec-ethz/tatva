@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, Mapping, TypeAlias
 
@@ -58,6 +58,10 @@ class Mesh:
     groups: Mapping[str, ArrayLike] = field(default_factory=dict)
     """Optional named sets of nodes or elements. Can be used to define physical groups for
     boundary conditions or material properties."""
+
+    def _replace(self, **changes) -> Mesh:
+        """Return a new Mesh instance with updated fields."""
+        return replace(self, **changes)
 
     @classmethod
     def unit_square(
