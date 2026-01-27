@@ -5,6 +5,25 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0](https://github.com/smec-ethz/tatva/compare/v0.3.1...v0.4.0) (2026-01-27)
+
+
+### Features
+
+* add solver_utils a Lifter class making bcs easier ([29de30b](https://github.com/smec-ethz/tatva/commit/29de30b15827bfd1d1650e215d4439e082ff0556))
+* **lifter:** include periodic boundary conditions in the lifter ([2e7ee32](https://github.com/smec-ethz/tatva/commit/2e7ee320ac72c02cdd367488228a23dba0b33b2b))
+
+
+### Bug Fixes
+
+* **lifter:** implement improvements based on review ([250a4e0](https://github.com/smec-ethz/tatva/commit/250a4e0ad224c4de614609a80194642ad3b97e6f))
+* **lifter:** make constructor arguments 1 and 2 positional only ([5230c75](https://github.com/smec-ethz/tatva/commit/5230c750730f4299b188297454f3d1b8853d42e2))
+
+
+### Documentation
+
+* **lifter:** extend docs for lifter module ([77de185](https://github.com/smec-ethz/tatva/commit/77de185d15ff534f846694a104854fe09379beda))
+
 ## v0.3.1 (2025-10-14)
 
 ### Fix
