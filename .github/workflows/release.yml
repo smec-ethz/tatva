@@ -1,0 +1,47 @@
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+name: release-please
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release-type: python
+
+      # each step must have the "if" guard
+      # it ensures that a publication only occurs when a new release is created
+      - uses: actions/checkout@v6
+        if: ${{ steps.release.outputs.release_created }}
+      - name: "Set up Python"
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: "pyproject.toml"
+        if: ${{ steps.release.outputs.release_created }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.25"
+        if: ${{ steps.release.outputs.release_created }}
+      - name: Build package
+        run: uv build
+        if: ${{ steps.release.outputs.release_created }}
+      # TODO: run a basic test to check if we didn't miss crucial files
+      # name: Smoke test (wheel)
+      # run: uv run --isolated --no-project --with dist/*.whl tests/...
+      - name: Publish to PyPi
+        run: uv publish
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN_FLOREZ }}
+        if: ${{ steps.release.outputs.release_created }}
