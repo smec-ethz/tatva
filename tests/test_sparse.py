@@ -8,7 +8,7 @@ import pytest
 import scipy.sparse as sp
 from jax import Array
 from jax_autovmap import autovmap
-from tatva_color import distance2_color_and_seeds
+from tatva_coloring import distance2_color_and_seeds
 
 from tatva import Mesh, Operator, element, sparse
 
@@ -16,9 +16,8 @@ jax.config.update("jax_enable_x64", True)
 
 
 COLORING_VARIANTS = [
-    sparse.distance2_colors,  # Standard implementation
-    sparse.largest_degree_first_distance2_colors,  # Hypothetical variant 1
-    sparse.smallest_last_distance2_colors,  # Hypothetical variant 2
+    distance2_color_and_seeds,
+    # Add other coloring functions here if needed
 ]
 
 
@@ -73,7 +72,7 @@ def test_sparse_matrix(op: Operator, coloring_func):
     indptr = sparsity_pattern_csr.indptr
     indices = sparsity_pattern_csr.indices
 
-    colors = coloring_func(row_ptr=indptr, col_idx=indices, n_dofs=n_dofs)
+    colors, seeds = coloring_func(row_ptr=indptr, col_idx=indices, n_dofs=n_dofs)
 
     K_sparse = sparse.jacfwd(
         gradient=jax.jacrev(total_energy),
