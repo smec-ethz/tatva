@@ -27,7 +27,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
-from jax._src.sharding_impls import NonUniformShardingError
 from jax_autovmap import autovmap
 
 from tatva.element import Element
@@ -135,26 +134,6 @@ class Operator(Generic[ElementT], eqx.Module):
         if not jnp.issubdtype(elements.dtype, jnp.integer):
             raise TypeError("Mesh element connectivity must contain integer indices.")
 
-        if quad_points.ndim != 2 or quad_points.shape[0] == 0:
-            raise ValueError(
-                "Element must define at least one quadrature point in an (n_q, n_dim) array."
-            )
-
-        local_dim = quad_points.shape[1]
-        if local_dim == 0:
-            raise ValueError("Element must have a positive number of local dimensions.")
-
-        n_nodes_per_element = elements.shape[1]
-        shape_fn = np.asarray(self.element.shape_function(self.element.quad_points[0]))
-        if shape_fn.ndim != 1:
-            raise ValueError(
-                "Element shape function must return a 1D array of nodal weights."
-            )
-        if shape_fn.shape[0] != n_nodes_per_element:
-            raise ValueError(
-                f"Mesh connectivity lists {n_nodes_per_element} nodes per element but {self.element.__class__.__name__} expects {shape_fn.shape[0]}."
-            )
-
         flat_elements = elements.ravel()
         if flat_elements.min() < 0:
             raise ValueError(
@@ -178,24 +157,6 @@ class Operator(Generic[ElementT], eqx.Module):
         Returns:
             A jax.Array with the results of the function applied at each quadrature point
             of each element (shape: (n_elements, n_quad_points, n_values)).
-        """
-
-        """
-        def _at_each_element(
-            el_nodal_values: jax.Array, el_nodal_coords: jax.Array
-        ) -> jax.Array:
-            return eqx.filter_vmap(
-                partial(
-                    func,
-                    el_nodal_values=el_nodal_values,
-                    el_nodal_coords=el_nodal_coords,
-                )
-            )(self.element.quad_points)
-
-        return eqx.filter_vmap(
-            _at_each_element,
-            in_axes=(0, 0),
-        )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
         """
 
         def _at_each_element(args: Tuple[Array, Array]) -> Array:
@@ -235,23 +196,6 @@ class Operator(Generic[ElementT], eqx.Module):
         def _mapped(*values: P.args, **kwargs: P.kwargs) -> RT:
             # values should be arrays!
             _values = cast(tuple[jax.Array, ...], values)
-
-            """
-            def _at_each_element(*el_values) -> jax.Array:
-                return eqx.filter_vmap(
-                    lambda xi: func(xi, *el_values, **kwargs),
-                )(self.element.quad_points)
-
-            return eqx.filter_vmap(
-                _at_each_element,
-                in_axes=(0,) * len(values),
-            )(
-                *(
-                    v[self.mesh.elements] if i not in element_quantity else v
-                    for i, v in enumerate(_values)
-                )
-            )
-            """
 
             def _at_each_element(el_values: tuple) -> jax.Array:
                 return eqx.filter_vmap(
@@ -294,21 +238,6 @@ class Operator(Generic[ElementT], eqx.Module):
         def _mapped(*values: P.args, **kwargs: P.kwargs) -> RT:
             # values should be arrays!
             _values = cast(tuple[jax.Array, ...], values)
-
-            """
-            def _at_each_element(*el_values) -> RT:
-                return func(*el_values, **kwargs)
-
-            return eqx.filter_vmap(
-                _at_each_element,
-                in_axes=(0,) * len(values),
-            )(
-                *(
-                    v[self.mesh.elements] if i not in element_quantity else v
-                    for i, v in enumerate(_values)
-                )
-            )
-            """
 
             def _at_each_element(el_values: tuple) -> RT:
                 return func(*el_values, **kwargs)
