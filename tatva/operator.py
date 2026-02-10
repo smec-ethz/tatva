@@ -1,4 +1,4 @@
-# Copyright (C) 2025 ETH Zurich (Mohit Pundir)
+# Copyright (C) 2025 ETH Zurich (SMEC)
 #
 # This file is part of tatva.
 #
@@ -25,8 +25,8 @@ from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, c
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jax import Array
 import numpy as np
+from jax import Array
 from jax_autovmap import autovmap
 
 from tatva.element import Element
@@ -85,10 +85,17 @@ class Operator(Generic[ElementT], eqx.Module):
     mesh: Mesh
     element: ElementT
     det_J_elements_weights: Array
+    batch_size: int = eqx.field(static=True)
 
-    def __init__(self, mesh: Mesh, element: Element):
+    def __init__(
+        self, mesh: Mesh, element: Element, batch_size: int | None = None
+    ) -> None:
         self.mesh = mesh
         self.element = element
+        if batch_size is None:
+            self.batch_size = mesh.elements.shape[0]
+        else:
+            self.batch_size = batch_size
 
         def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
             """Calls the function element.get_jacobian and returns the second output."""
@@ -127,31 +134,6 @@ class Operator(Generic[ElementT], eqx.Module):
         if not jnp.issubdtype(elements.dtype, jnp.integer):
             raise TypeError("Mesh element connectivity must contain integer indices.")
 
-        if quad_points.ndim != 2 or quad_points.shape[0] == 0:
-            raise ValueError(
-                "Element must define at least one quadrature point in an (n_q, n_dim) array."
-            )
-
-        local_dim = quad_points.shape[1]
-        global_dim = coords.shape[1]
-        if local_dim > 1 and local_dim != global_dim:
-            raise ValueError(
-                f"Element {self.element.__class__.__name__} expects {local_dim}D coordinates but mesh provides {global_dim}D nodes."
-            )
-        if local_dim == 0:
-            raise ValueError("Element must have a positive number of local dimensions.")
-
-        n_nodes_per_element = elements.shape[1]
-        shape_fn = np.asarray(self.element.shape_function(self.element.quad_points[0]))
-        if shape_fn.ndim != 1:
-            raise ValueError(
-                "Element shape function must return a 1D array of nodal weights."
-            )
-        if shape_fn.shape[0] != n_nodes_per_element:
-            raise ValueError(
-                f"Mesh connectivity lists {n_nodes_per_element} nodes per element but {self.element.__class__.__name__} expects {shape_fn.shape[0]}."
-            )
-
         flat_elements = elements.ravel()
         if flat_elements.min() < 0:
             raise ValueError(
@@ -177,10 +159,9 @@ class Operator(Generic[ElementT], eqx.Module):
             of each element (shape: (n_elements, n_quad_points, n_values)).
         """
 
-        def _at_each_element(
-            el_nodal_values: jax.Array, el_nodal_coords: jax.Array
-        ) -> jax.Array:
-            return eqx.filter_vmap(
+        def _at_each_element(args: Tuple[Array, Array]) -> Array:
+            el_nodal_values, el_nodal_coords = args
+            return jax.vmap(
                 partial(
                     func,
                     el_nodal_values=el_nodal_values,
@@ -188,10 +169,11 @@ class Operator(Generic[ElementT], eqx.Module):
                 )
             )(self.element.quad_points)
 
-        return eqx.filter_vmap(
+        return jax.lax.map(
             _at_each_element,
-            in_axes=(0, 0),
-        )(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements])
+            xs=(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements]),
+            batch_size=self.batch_size,
+        )
 
     def map(
         self,
@@ -215,19 +197,22 @@ class Operator(Generic[ElementT], eqx.Module):
             # values should be arrays!
             _values = cast(tuple[jax.Array, ...], values)
 
-            def _at_each_element(*el_values) -> jax.Array:
+            def _at_each_element(el_values: tuple) -> jax.Array:
                 return eqx.filter_vmap(
                     lambda xi: func(xi, *el_values, **kwargs),
                 )(self.element.quad_points)
 
-            return eqx.filter_vmap(
+            # Construct the tuple of inputs (xs) by iterating over _values
+            # and gathering nodal values to elements where necessary.
+            xs = tuple(
+                v[self.mesh.elements] if i not in element_quantity else v
+                for i, v in enumerate(_values)
+            )
+
+            return jax.lax.map(
                 _at_each_element,
-                in_axes=(0,) * len(values),
-            )(
-                *(
-                    v[self.mesh.elements] if i not in element_quantity else v
-                    for i, v in enumerate(_values)
-                )
+                xs=xs,
+                batch_size=self.batch_size,
             )
 
         return _mapped
@@ -254,17 +239,19 @@ class Operator(Generic[ElementT], eqx.Module):
             # values should be arrays!
             _values = cast(tuple[jax.Array, ...], values)
 
-            def _at_each_element(*el_values) -> RT:
+            def _at_each_element(el_values: tuple) -> RT:
                 return func(*el_values, **kwargs)
 
-            return eqx.filter_vmap(
+            # Construct the tuple of inputs (xs) by iterating over _values
+            # and gathering nodal values to elements where necessary.
+            xs = tuple(
+                v[self.mesh.elements] if i not in element_quantity else v
+                for i, v in enumerate(_values)
+            )
+            return jax.lax.map(
                 _at_each_element,
-                in_axes=(0,) * len(values),
-            )(
-                *(
-                    v[self.mesh.elements] if i not in element_quantity else v
-                    for i, v in enumerate(_values)
-                )
+                xs=xs,
+                batch_size=self.batch_size,
             )
 
         return _mapped

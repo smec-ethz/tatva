@@ -2,15 +2,18 @@
 
 <img src="assets/logo-small.png" alt="drawing" width="400"/>
 
-<h3 align="center">Tatva (टत्तव) : Lego-like building blocks for FEM</h3>
+<h3 align="center">Tatva (टत्तव) : Lego-like building blocks for differentiable FEM</h3>
 
-`tatva` (is a Sanskrit word which means principle or elements of reality). True to its name, `tatva` provide fundamental Lego-like building blocks (elements) which can be used to construct complex finite element method (FEM) simulations. `tatva` is purely written in Python library for FEM simulations and is built on top of JAX and Equinox, making it easy to use FEM in a differentiable way.
+`tatva` (is a Sanskrit word which means principle or elements of reality). True to its name, `tatva` provide fundamental Lego-like building blocks (elements) which can be used to construct complex finite element method (FEM) simulations. `tatva` is purely written in Python library for FEM simulations and is built on top of JAX ecosystem, making it easy to use FEM in a differentiable way.
 
 </div>
 
+[![Documentation](https://github.com/smec-ethz/tatva-docs/actions/workflows/pages/pages-build-deployment/badge.svg)](https://github.com/smec-ethz/tatva-docs/actions/workflows/pages/pages-build-deployment)
+[![Tests](https://github.com/smec-ethz/tatva/actions/workflows/run_tests.yml/badge.svg)](https://github.com/smec-ethz/tatva/actions/workflows/run_tests.yml)
+
 ## License
 
-`tatva` is distributed under the GNU Lesser General Public License v3.0 or later. See `COPYING` and `COPYING.LESSER` for the complete terms. © 2025 ETH Zurich (Mohit Pundir).
+`tatva` is distributed under the GNU Lesser General Public License v3.0 or later. See `COPYING` and `COPYING.LESSER` for the complete terms. © 2025 ETH Zurich (SMEC).
 
 ## Features
 
@@ -35,6 +38,10 @@ git clone https://github.com/smec-ethz/tatva.git
 cd tatva
 pip install -e .
 ```
+
+## Documentation
+
+Available at [**smec-ethz.github.io/tatva-docs**](https://smec-ethz.github.io/tatva-docs/). The documentation includes API references, tutorials, and examples to help you get started with `tatva`.
 
 ## Usage
 
@@ -64,13 +71,10 @@ gradients = op.grad(nodal_values)
 Examples for various applications will be added very soon. They showcase patterns such as
 mapping custom kernels, working with compound fields, and sparse assembly helpers.
 
-## Dense vs Sparse
+## Dense vs Sparse vs Matrix-free
 
-A unique aspect of `tatva` is that it can handle both dense and sparse matrices. This is achieved by using the library `sparsejac` that allows automatic differentiation of a functional based on a sparsity pattern. This significantly reduces the memory consumption. For more details on how the automatic differentiation can be done using sparsity pattern, please check the link below:
+A unique aspect of `tatva` is that it can handle construct dense matrices, sparse matrices, and matrix-free operators. `tatva` uses matrix-coloring algorithm and sparse differentiation to construct a sparse matrix. We use our own coloring library ![tatva-coloring](https://github.com/smec-ethz/tatva-coloring) to color a matrix based on sparsity pattern, one can use other coloring libraries such as ![pysparsematrixcolorings](https://github.com/gdalle/pysparsematrixcolorings) for more advanced coloring algorithms. This significantly reduces the memory consumption. For large problems, we can also use matrix-free operators which do not require storing the matrix in memory. Since we have a energy functional, we can make use of `jax.jvp` ti compute the matrix-vector product without explicitly forming the matrix. This is particularly useful for large problems where storing the matrix is not feasible.
 
-- ![Paper](https://arxiv.org/html/2501.17737v1)
-- ![Github: sparsejac](https://github.com/mfschubert/sparsejac)
-- ![Github: Sparsediffax, python interface for the paper](https://github.com/gdalle/sparsediffax)
 
 ## 👉 Where to contribute
 

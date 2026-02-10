@@ -1,4 +1,4 @@
-# Copyright (C) 2025 ETH Zurich (Mohit Pundir)
+# Copyright (C) 2025 ETH Zurich (SMEC)
 #
 # This file is part of tatva.
 #

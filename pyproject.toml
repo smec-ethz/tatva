@@ -1,7 +1,7 @@
 [project]
 name = "tatva"
 version = "0.4.0"
-description = "Lego-like building blocks for finite element analysis"
+description = "Lego-like building blocks for differentiable finite element analysis"
 authors = [
     { name = "Mohit Pundir", email = "mpundir@ethz.ch" },
     { name = "Flavio Lorez", email = "florez@ethz.ch" },
@@ -21,8 +21,8 @@ dependencies = [
     "jax>=0.4.1",
     "equinox",
     "numpy",
-    "sparsejac",
     "jax-autovmap>=0.3.0",
+    "tatva-coloring"
 ]
 
 [project.optional-dependencies]
@@ -38,4 +38,4 @@ requires = [ "hatchling", ]
 build-backend = "hatchling.build"
 
 [project.urls]
-repository = "https://gitlab.ethz.ch/smec/software/tatva"
+repository = "https://github.com/smec-ethz/tatva"
