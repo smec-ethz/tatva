@@ -1,6 +1,6 @@
 [project]
 name = "tatva"
-version = "0.4.0"
+version = "0.5.0"
 description = "Lego-like building blocks for differentiable finite element analysis"
 authors = [
     { name = "Mohit Pundir", email = "mpundir@ethz.ch" },

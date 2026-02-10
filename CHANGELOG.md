@@ -5,6 +5,23 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0](https://github.com/smec-ethz/tatva/compare/v0.4.0...v0.5.0) (2026-02-10)
+
+
+### Features
+
+* **sparse:** add coloring code (source mpundir) ([0623e2c](https://github.com/smec-ethz/tatva/commit/0623e2c6cb3f6c0b2959915bc48a2cbd38e397fb))
+* **sparse:** add method to generate sparsity pattern with full master-slave dof map (from zrlf) ([5d37d56](https://github.com/smec-ethz/tatva/commit/5d37d56f8eb074cb9aee1789543003849227b014))
+
+
+### Bug Fixes
+
+* **operator:** removes check on quad points dimnension to be equal to coords dimension, necessary for 2D elements in 3D space ([3827149](https://github.com/smec-ethz/tatva/commit/382714951796c920cf16be1ee5e9eac7da3a9e63))
+* **operator:** replaces jax.vmap with batched jax.lax.map for memory efficiency and scalin ([fbab11a](https://github.com/smec-ethz/tatva/commit/fbab11a9c5e8f7e8a990f2a8bf4ef524eb0bc376))
+* **sparse:** enables sparse jacfwd with args without performance issue ([9ba9530](https://github.com/smec-ethz/tatva/commit/9ba953089032593c6d9d74b6279921428a131070))
+* **sparse:** process color based jacobian in batches, replaces jax.linearize with jax.jvp ([6b361d7](https://github.com/smec-ethz/tatva/commit/6b361d704856102bd429d2f9b2a0e1d83fd65584))
+* **sparse:** wraps jacfwd func to accept single parameter ([9fe01e3](https://github.com/smec-ethz/tatva/commit/9fe01e33db3a3a3c15d159d451793010a2132cbf))
+
 ## [0.4.0](https://github.com/smec-ethz/tatva/compare/v0.3.1...v0.4.0) (2026-01-27)
 
 
