@@ -206,6 +206,8 @@ class Compound(metaclass=_CompoundMeta):
 
     """
 
+    fields: tuple[tuple[str, field], ...]
+    size: int
     arr: Array
     size: int = 0
 
@@ -308,6 +310,12 @@ class Compound(metaclass=_CompoundMeta):
             self.arr = arr
         else:
             self.arr = jnp.zeros(self.size, dtype=float)
+            # initialize fields with default factories if provided
+            for name, field_obj in self.fields:
+                if field_obj.default_factory is not None:
+                    self.arr = self.arr.at[field_obj.slice].set(
+                        jnp.asarray(field_obj.default_factory()).flatten()
+                    )
 
     def __len__(self) -> int:
         return len(self.fields)
