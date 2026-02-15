@@ -5,6 +5,15 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1](https://github.com/smec-ethz/tatva/compare/v0.5.0...v0.5.1) (2026-02-15)
+
+
+### Bug Fixes
+
+* **compound:** respect default_factory for initialization of compound instances ([#9](https://github.com/smec-ethz/tatva/issues/9)) ([7449120](https://github.com/smec-ethz/tatva/commit/74491201ec9a0672988f7a6f8718ebb3daaea2e3))
+* corrected Hex8 implementation, test for elements added ([70755e6](https://github.com/smec-ethz/tatva/commit/70755e6d9993fd1c6313a438951ea2668650672d))
+* corrected Hex8 implementation, test for elements added ([402080d](https://github.com/smec-ethz/tatva/commit/402080d7945d24c07c58d82fff2922ec1055fa42))
+
 ## [0.5.0](https://github.com/smec-ethz/tatva/compare/v0.4.0...v0.5.0) (2026-02-10)
 
 
