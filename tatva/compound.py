@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from math import prod
 from typing import Any, Callable, Generator, Self, overload
 
 import jax.numpy as jnp
@@ -25,32 +26,18 @@ from jax import Array
 from jax.tree_util import register_pytree_node_class
 
 
-class _field:
-    """A descriptor to define fields in the State class."""
-
-    shape: tuple[int, ...]
-    default_factory: Callable | None
-    slice: slice | None
-
-    def __init__(
-        self,
-        shape: tuple[int, ...],
-        default_factory: Callable | None = None,
-        *,
-        _slice: slice | None = None,
-    ) -> None:
+class _FieldBase:
+    def __init__(self, shape: tuple[int, ...], _slice: slice | None = None) -> None:
         self.shape = shape if len(shape) > 1 else (*shape, 1)
-        self.default_factory = default_factory
         self.slice = _slice
 
-    def __getitem__(self, arg) -> Array:
+    def indices(self, arg: int | slice | tuple[int | slice, ...]) -> Array:
         # Normalize to tuple
         if not isinstance(arg, tuple):
             arg = (arg,)
-        # extend with full slices
         if len(arg) < len(self.shape):
             arg = arg + (slice(None),) * (len(self.shape) - len(arg))
-        # build index arrays
+
         idxs = []
         for dim, sub in enumerate(arg):
             if isinstance(sub, slice):
@@ -65,21 +52,40 @@ class _field:
         multi_idx = [m.flatten() for m in mesh]
         flat_local = jnp.ravel_multi_index(multi_idx, dims=self.shape)
 
-        assert self.slice is not None, (
-            "Field slice is not set. This should be set by the Compound metaclass."
-        )
+        if self.slice is None:
+            raise RuntimeError(
+                "Field slice is not set. This should be set by the Compound metaclass."
+            )
 
         return jnp.array(flat_local + self.slice.start)
 
+    def __getitem__(self, arg) -> Array:
+        return self.indices(arg)
 
-class field(_field):
+
+class Field(_FieldBase):
+    """A descriptor to define fields in the State class."""
+
+    shape: tuple[int, ...]
+    default_factory: Callable | None
+
     def __init__(
-        self, shape: tuple[int, ...], default_factory: Callable | None = None
+        self,
+        shape: tuple[int, ...],
+        default_factory: Callable | None = None,
+        *,
+        _slice: slice | None = None,
     ) -> None:
-        super().__init__(shape, default_factory)
+        super().__init__(shape, _slice)
+        self.default_factory = default_factory
+
+    def _copy_with_slice(self, _slice: slice) -> Self:
+        return self.__class__(
+            shape=self.shape, default_factory=self.default_factory, _slice=_slice
+        )
 
     @overload
-    def __get__(self, instance: None, owner) -> field: ...
+    def __get__(self, instance: None, owner) -> Self: ...
     @overload
     def __get__(self, instance: Compound, owner) -> Array: ...
     def __get__(self, instance, owner=None):
@@ -98,13 +104,18 @@ class field(_field):
         )
 
 
-class _field_sub_of_stack(field):
+def field(shape: tuple[int, ...], default_factory: Callable | None = None) -> Field:
+    """Helper function to create a FieldSpec for defining fields in the Compound class."""
+    return Field(shape=shape, default_factory=default_factory)
+
+
+class FieldStackedView(Field):
     """A descriptor to define fields that are sub-fields of a stacked field in the State class."""
 
     def __init__(
         self,
         shape: tuple[int, ...],
-        parent_field: _field,
+        parent_field: _FieldBase,
         parent_slice: tuple[slice, ...],
     ) -> None:
         super().__init__(shape)
@@ -112,7 +123,7 @@ class _field_sub_of_stack(field):
         self.parent_slice = parent_slice
 
     @overload
-    def __get__(self, instance: None, owner) -> field: ...
+    def __get__(self, instance: None, owner) -> Field: ...
     @overload
     def __get__(self, instance: Compound, owner) -> Array: ...
     def __get__(self, instance, owner=None):
@@ -125,14 +136,15 @@ class _field_sub_of_stack(field):
 
     def __set__(self, instance: Compound, value: Array | float | int) -> None:
         arr = jnp.asarray(value)
-        instance.arr = (
+        parent = (
             instance.arr[self.parent_field.slice]
             .reshape(self.parent_field.shape)
             .at[self.parent_slice]
             .set(arr)
-        ).flatten()
+        ).reshape(-1)
+        instance.arr = instance.arr.at[self.parent_field.slice].set(parent)
 
-    def __getitem__(self, arg) -> Array:
+    def indices(self, arg) -> Array:
         # Normalize to tuple
         if not isinstance(arg, tuple):
             arg = (arg,)
@@ -141,39 +153,41 @@ class _field_sub_of_stack(field):
             arg = arg + (slice(None),) * (len(self.shape) - len(arg))
 
         # get indices in the parent field
-        parent_idxs = self.parent_field.__getitem__(slice(None)).reshape(
+        parent_idxs = self.parent_field.indices(slice(None)).reshape(
             self.parent_field.shape
         )
         return parent_idxs[self.parent_slice].__getitem__(arg).flatten()
 
 
 class _CompoundMeta(type):
-    fields: tuple[tuple[str, field], ...]
+    fields: tuple[tuple[str, Field], ...]
     size: int
 
     def __new__(
         mcls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs
     ):
-        fields: list[tuple[str, field]] = []
+        fields: list[tuple[str, Field]] = []
         size: int = 0
 
         # find all fields in the namespace and compute their slices in the flat array
         for attr_name, attr_value in namespace.items():
-            if isinstance(attr_value, field):
-                n = int(jnp.prod(jnp.asarray(attr_value.shape)))
-                # get slice indices
-                start = size
-                end = start + n
-                attr_value.slice = slice(start, end)
+            if isinstance(attr_value, Field):
+                n = int(prod(attr_value.shape))
+                s = slice(size, size + n)
 
-                fields.append((attr_name, attr_value))
+                # copy (reconstruct) the field with the correct slice and set it in the namespace
+                f = attr_value._copy_with_slice(s)
+
+                namespace[attr_name] = f
+                fields.append((attr_name, f))
                 size += n
 
         cls = super().__new__(mcls, name, bases, namespace)
         cls.fields = tuple(fields)
         cls.size = size
-        if kwargs.get("stack_fields") is not None:
-            cls._stack_fields(**kwargs)  # type: ignore
+
+        if kwargs.get("stack_fields"):
+            cls._stack_fields(**kwargs)
 
         # register as pytree node for JAX transformations
         register_pytree_node_class(cls)
@@ -187,49 +201,6 @@ class _CompoundMeta(type):
         )
         return (nodal_vals[:, *dofs] if dofs else nodal_vals).flatten()
 
-
-class Compound(metaclass=_CompoundMeta):
-    """A compound array/state.
-
-    A helper class to create a compound state with multiple fields. It simplifies packing
-    and unpacking into and from a flat array. Useful to manage fields while working with a
-    flat array for the solver.
-
-    Args:
-        arr: The flat data array. If None, initializes to zeros.
-
-    Examples:
-
-    Create a compound state with fields::
-
-        class MyState(Compound):
-            u = field(shape=(N, 3))
-            phi = field(shape=(N,), default_factory=lambda: jnp.ones(N))
-
-        state = MyState()
-
-    Use `state.arr` to access the flat array, and `state.u`, `state.phi` to access the
-    individual fields.
-
-    You can use iterator unpacking to directly unpack the fields from the state::
-
-        u, phi = MyState(arr)
-
-    """
-
-    fields: tuple[tuple[str, field], ...]
-    size: int
-    arr: Array
-    size: int = 0
-
-    def tree_flatten(self) -> tuple[tuple[Array], Any]:
-        return (self.arr,), None
-
-    @classmethod
-    def tree_unflatten(cls, aux_data: Any, children: tuple[Array]) -> Self:
-        return cls(*children)
-
-    @classmethod
     def _stack_fields(cls, stack_fields: tuple[str, ...], stack_axis: int = -1) -> None:
         """Reorder fields by stacking specified fields along some axis. Modifies the class
         in place!
@@ -252,13 +223,13 @@ class Compound(metaclass=_CompoundMeta):
         stacked_shape = jnp.insert(base_shape, stack_axis, stack_size)
         size = int(jnp.prod(jnp.asarray(stacked_shape)))
         stacked_slice = slice(0, size)
-        stacked_field = _field(tuple(stacked_shape), slice=stacked_slice)
+        stacked_field = _FieldBase(tuple(stacked_shape), _slice=stacked_slice)
 
         new_fields = []
 
         # create new fields that are sub-fields of the stacked field
         for idx, name in enumerate(stack_fields):
-            new_field = _field_sub_of_stack(
+            new_field = FieldStackedView(
                 shape=fields[name].shape,
                 parent_field=stacked_field,
                 parent_slice=tuple(
@@ -311,6 +282,47 @@ class Compound(metaclass=_CompoundMeta):
 
         # finally update class fields and size
         cls.fields = tuple(new_fields)
+
+
+class Compound(metaclass=_CompoundMeta):
+    """A compound array/state.
+
+    A helper class to create a compound state with multiple fields. It simplifies packing
+    and unpacking into and from a flat array. Useful to manage fields while working with a
+    flat array for the solver.
+
+    Args:
+        arr: The flat data array. If None, initializes to zeros.
+
+    Examples:
+
+    Create a compound state with fields::
+
+        class MyState(Compound):
+            u = field(shape=(N, 3))
+            phi = field(shape=(N,), default_factory=lambda: jnp.ones(N))
+
+        state = MyState()
+
+    Use `state.arr` to access the flat array, and `state.u`, `state.phi` to access the
+    individual fields.
+
+    You can use iterator unpacking to directly unpack the fields from the state::
+
+        u, phi = MyState(arr)
+
+    """
+
+    fields: tuple[tuple[str, Field], ...]
+    arr: Array
+    size: int = 0
+
+    def tree_flatten(self) -> tuple[tuple[Array], Any]:
+        return (self.arr,), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data: Any, children: tuple[Array]) -> Self:
+        return cls(*children)
 
     def __init__(self, arr: Array | None = None) -> None:
         """Initialize the state with given keyword arguments."""
