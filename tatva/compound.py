@@ -30,16 +30,18 @@ class _field:
 
     shape: tuple[int, ...]
     default_factory: Callable | None
+    slice: slice | None
 
     def __init__(
         self,
         shape: tuple[int, ...],
         default_factory: Callable | None = None,
-        slice: slice | None = None,
+        *,
+        _slice: slice | None = None,
     ) -> None:
         self.shape = shape if len(shape) > 1 else (*shape, 1)
         self.default_factory = default_factory
-        self.slice: slice = slice  # type: ignore
+        self.slice = _slice
 
     def __getitem__(self, arg) -> Array:
         # Normalize to tuple
@@ -63,10 +65,19 @@ class _field:
         multi_idx = [m.flatten() for m in mesh]
         flat_local = jnp.ravel_multi_index(multi_idx, dims=self.shape)
 
+        assert self.slice is not None, (
+            "Field slice is not set. This should be set by the Compound metaclass."
+        )
+
         return jnp.array(flat_local + self.slice.start)
 
 
 class field(_field):
+    def __init__(
+        self, shape: tuple[int, ...], default_factory: Callable | None = None
+    ) -> None:
+        super().__init__(shape, default_factory)
+
     @overload
     def __get__(self, instance: None, owner) -> field: ...
     @overload
