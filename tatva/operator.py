@@ -25,7 +25,6 @@ from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, c
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import Array
 from jax_autovmap import autovmap
 
@@ -61,7 +60,7 @@ class MappedCallable(Protocol[P, RT]):
     ) -> RT: ...
 
 
-class Operator(Generic[ElementT], eqx.Module):
+class Operator(eqx.Module, Generic[ElementT]):
     """A class that provides an Operator for finite element method (FEM) assembly.
 
     Args:
@@ -88,7 +87,7 @@ class Operator(Generic[ElementT], eqx.Module):
     batch_size: int = eqx.field(static=True)
 
     def __init__(
-        self, mesh: Mesh, element: Element, batch_size: int | None = None
+        self, mesh: Mesh, element: ElementT, batch_size: int | None = None
     ) -> None:
         self.mesh = mesh
         self.element = element
@@ -116,7 +115,6 @@ class Operator(Generic[ElementT], eqx.Module):
         """
         coords = self.mesh.coords
         elements = self.mesh.elements
-        quad_points = self.element.quad_points
 
         if coords.ndim != 2:
             raise ValueError(
@@ -159,7 +157,7 @@ class Operator(Generic[ElementT], eqx.Module):
             of each element (shape: (n_elements, n_quad_points, n_values)).
         """
 
-        def _at_each_element(args: Tuple[Array, Array]) -> Array:
+        def _at_each_element(args: tuple[Array, Array]) -> Array:
             el_nodal_values, el_nodal_coords = args
             return jax.vmap(
                 partial(
