@@ -25,6 +25,12 @@ import jax.numpy as jnp
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 
+__all__ = ["Compound", "field", "stack_fields"]
+
+
+class CompoundStackError(ValueError):
+    pass
+
 
 class _FieldBase:
     def __init__(self, shape: tuple[int, ...], _slice: slice | None = None) -> None:
@@ -159,98 +165,6 @@ class FieldStackedView(Field):
         return parent_idxs[self.parent_slice].__getitem__(arg).flatten()
 
 
-def _apply_stacked_fields(
-    cls: type[Compound], stack_fields: tuple[str, ...], stack_axis: int = -1
-) -> type[Compound]:
-    """Reorder fields by stacking specified fields along an axis. Modifies class in place."""
-    fields = {k: v for k, v in cls.fields}
-    base_shape = fields[stack_fields[0]].shape
-    stack_axis = stack_axis % len(base_shape)  # get positive axis
-    base_shape = jnp.asarray(base_shape)[
-        jnp.array([i for i in range(len(base_shape)) if i != stack_axis])
-    ]
-
-    stack_size = sum(
-        int(prod(fields[name].shape)) // base_shape.prod() for name in stack_fields
-    )
-    stacked_shape = jnp.insert(base_shape, stack_axis, stack_size)
-    size = int(jnp.prod(stacked_shape))
-    stacked_slice = slice(0, size)
-    stacked_field = _FieldBase(tuple(stacked_shape), _slice=stacked_slice)
-
-    new_fields = []
-
-    # create new fields that are sub-fields of the stacked field
-    for idx, name in enumerate(stack_fields):
-        new_field = FieldStackedView(
-            shape=fields[name].shape,
-            parent_field=stacked_field,
-            parent_slice=tuple(
-                slice(None)
-                if i != stack_axis
-                else slice(
-                    sum(
-                        int(jnp.prod(jnp.asarray(fields[n].shape))) // base_shape.prod()
-                        for n in stack_fields[:idx]
-                    ),
-                    sum(
-                        int(jnp.prod(jnp.asarray(fields[n].shape))) // base_shape.prod()
-                        for n in stack_fields[: idx + 1]
-                    ),
-                )
-                for i in range(len(stacked_shape))
-            ),
-        )
-        # check base shape compatibility or raise error
-        if not jnp.all(
-            jnp.asarray(new_field.shape)[
-                jnp.array([i for i in range(len(new_field.shape)) if i != stack_axis])
-            ]
-            == base_shape
-        ):
-            raise ValueError(
-                f"Field {name} with shape {new_field.shape} is not compatible with "
-                f"base shape {base_shape} along axis {stack_axis}."
-            )
-
-        # set new field in class and add to new fields list
-        setattr(cls, name, new_field)
-        new_fields.append((name, new_field))
-
-    # update other fields slices
-    offset = size
-    for name, field_obj in cls.fields:
-        if name in stack_fields:
-            continue
-        n = int(jnp.prod(jnp.asarray(field_obj.shape)))
-        start = offset
-        end = start + n
-        field_obj.slice = slice(start, end)
-        offset += n
-        new_fields.append((name, field_obj))
-
-    # finally update class fields and size
-    cls.fields = tuple(new_fields)
-    cls.size = offset
-    return cls
-
-
-def stack_fields(
-    *fields: str, axis: int = -1
-) -> Callable[[type[Compound]], type[Compound]]:
-    """Class decorator to stack compatible fields into a shared contiguous layout."""
-
-    if not fields:
-        raise ValueError("At least one field name is required.")
-
-    field_names = tuple(fields)
-
-    def decorator(cls: type[Compound]) -> type[Compound]:
-        return _apply_stacked_fields(cls, stack_fields=field_names, stack_axis=axis)
-
-    return decorator
-
-
 class _CompoundMeta(type):
     fields: tuple[tuple[str, Field], ...]
     size: int
@@ -378,3 +292,131 @@ class Compound(metaclass=_CompoundMeta):
 
     def __add__(self, other: Self) -> Self:
         return self.__class__(self.arr + other.arr)
+
+
+def _apply_stacked_fields(
+    cls: type[Compound], stack_fields: tuple[str, ...], stack_axis: int = -1
+) -> type[Compound]:
+    """Reorder fields by stacking specified fields along an axis. Modifies class in place.
+
+    Args:
+        cls: The Compound class to modify.
+        stack_fields: The field names to stack together. Must be compatible in shape
+            except along the stack_axis.
+        stack_axis: The axis along which to stack the fields. Negative values are
+            supported and interpreted as counting from the end of the shape. Default is -1
+            (stack along the last axis).
+    """
+    if not stack_fields:
+        raise CompoundStackError("At least one field name is required.")
+    if len(set(stack_fields)) != len(stack_fields):
+        raise CompoundStackError(
+            "Duplicate field names are not allowed in stack_fields."
+        )
+
+    fields_map = {name: field_obj for name, field_obj in cls.fields}
+    missing = [name for name in stack_fields if name not in fields_map]
+    if missing:
+        raise CompoundStackError(f"Unknown field names in stack_fields: {missing}")
+
+    base_shape = fields_map[stack_fields[0]].shape
+    rank = len(base_shape)
+    if rank == 0:  # should never; Field makes sure shape is at least rank 2
+        raise CompoundStackError("Cannot stack scalar fields.")
+    if not (-rank <= stack_axis < rank):
+        raise CompoundStackError(
+            f"Invalid stack_axis={stack_axis} for field rank {rank}. "
+            f"Expected in [{-rank}, {rank - 1}]."
+        )
+    axis = stack_axis % rank
+    base_reduced = base_shape[:axis] + base_shape[axis + 1 :]
+
+    # Precompute per-field layout and validate compatibility in one pass.
+    stack_layout: list[tuple[str, tuple[int, ...], int, int]] = []
+    stack_size = 0
+    for name in stack_fields:
+        shape = fields_map[name].shape
+        if len(shape) != rank:
+            raise CompoundStackError(
+                f"Field {name} with shape {shape} is not compatible with base rank {rank}."
+            )
+        reduced = shape[:axis] + shape[axis + 1 :]
+        if reduced != base_reduced:
+            raise CompoundStackError(
+                f"Field {name} with shape {shape} is not compatible with "
+                f"base shape {base_shape} along axis {axis}."
+            )
+        extent = shape[axis]
+        start = stack_size
+        end = start + extent
+        stack_layout.append((name, shape, start, end))
+        stack_size = end
+
+    stacked_shape = (*base_shape[:axis], stack_size, *base_shape[axis + 1 :])
+    stacked_size = int(prod(stacked_shape))
+    # we put the stacked fields first in the global dof array
+    stacked_field = _FieldBase(stacked_shape, _slice=slice(0, stacked_size))
+
+    # create new FieldStackedView descriptors for the stacked fields, and prepare to set
+    # them on the class after validation and layout construction is complete.
+    new_fields: list[tuple[str, Field]] = []
+    pending_setattrs: list[tuple[str, FieldStackedView]] = []
+    for name, shape, start, end in stack_layout:
+        parent_slice = tuple(
+            slice(None) if i != axis else slice(start, end) for i in range(rank)
+        )
+        new_field = FieldStackedView(
+            shape=shape, parent_field=stacked_field, parent_slice=parent_slice
+        )
+        pending_setattrs.append((name, new_field))
+        new_fields.append((name, new_field))
+
+    # now we need to reset the field descriptors for the stacked fields to point to the
+    # new layout, and update the slices of all trailing fields accordingly.
+    stack_name_set = set(stack_fields)
+    offset = stacked_size
+    trailing_updates: list[tuple[Field, slice]] = []
+    trailing_fields: list[tuple[str, Field]] = []
+    for name, field_obj in cls.fields:
+        if name in stack_name_set:
+            continue
+        n = int(prod(field_obj.shape))
+        new_slice = slice(offset, offset + n)
+        trailing_updates.append((field_obj, new_slice))
+        trailing_fields.append((name, field_obj))
+        offset += n
+
+    # Commit mutations only after all validation and layout construction passes.
+    for name, new_field in pending_setattrs:
+        setattr(cls, name, new_field)
+    for field_obj, new_slice in trailing_updates:
+        field_obj.slice = new_slice
+
+    new_fields.extend(trailing_fields)
+    cls.fields = tuple(new_fields)
+    cls.size = offset
+
+    return cls
+
+
+def stack_fields(
+    *fields: str, axis: int = -1
+) -> Callable[[type[Compound]], type[Compound]]:
+    """Class decorator to stack compatible fields into a shared contiguous layout.
+
+    Args:
+        *fields: The field names to stack together. Must be compatible in shape except
+            along the stack axis.
+        axis: The axis along which to stack the fields. Negative values are supported and
+            interpreted as counting from the end of the shape. Default is -1.
+    """
+
+    if not fields:
+        raise ValueError("At least one field name is required.")
+
+    field_names = tuple(fields)
+
+    def decorator(cls: type[Compound]) -> type[Compound]:
+        return _apply_stacked_fields(cls, stack_fields=field_names, stack_axis=axis)
+
+    return decorator
