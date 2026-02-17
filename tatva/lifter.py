@@ -18,8 +18,6 @@
 
 from __future__ import annotations
 
-from abc import ABC
-from dataclasses import dataclass
 from typing import Self
 
 import equinox
@@ -27,28 +25,40 @@ import jax.numpy as jnp
 from jax import Array
 
 
-class Constraint(ABC):
-    """Abstract base class for conditions applied during lifting.
+class Constraint:
+    """Base class for conditions applied during lifting.
 
     Subclasses define how constrained degrees of freedom (dofs) are enforced
     when mapping a reduced vector back to the full vector.
     """
 
     dofs: Array
-    """The constrained dofs (an array of integer indices)."""
+    """The dofs to constrain; every constraint must specify which dofs it applies to."""
 
     def __hash__(self):
-        return hash((type(self), tuple(self.dofs.tolist())))
+        # hashing is required for using lifters and constraints as static args in jax
+        # transformations.
+        #
+        # This is the cheapest possible hash implementation, but it means that two
+        # constraints with the same parameters will not be considered equal. If we want to
+        # have value-based equality and hashing, we have to implement __eq__ and __hash__,
+        # e.g., by using dataclasses or manually comparing the relevant attributes.
+        return id(self)
 
     def apply_lift(self, u_full: Array) -> Array:  # override in subclasses
         """Apply the constraint to a full vector and return the modified copy."""
         return u_full
 
 
-@dataclass
 class PeriodicMap(Constraint):
     dofs: Array
+    """The dofs to constrain; these will be set equal to the corresponding ``master_dofs`` during lifting."""
     master_dofs: Array
+    """The master dofs that the constrained ``dofs`` will be set equal to during lifting."""
+
+    def __init__(self, dofs: Array, master_dofs: Array):
+        self.dofs = dofs
+        self.master_dofs = master_dofs
 
     def apply_lift(self, u_full: Array) -> Array:
         """Copy values from ``master_dofs`` into the constrained ``dofs``."""
@@ -57,7 +67,9 @@ class PeriodicMap(Constraint):
 
 class DirichletBC(Constraint):
     dofs: Array
+    """The dofs to constrain; these will be set to fixed values during lifting."""
     values: Array
+    """The fixed values to set at the constrained dofs during lifting."""
 
     def __init__(self, dofs: Array, values: Array | None = None):
         self.dofs = dofs
@@ -87,7 +99,7 @@ class Lifter(equinox.Module):
             PeriodicMap(dofs=jnp.array([2]), master_dofs=jnp.array([1])),
         )
         u_reduced = jnp.array([10.0, 20.0, 30.0])
-        u_full = lifter.lift_from_null(u_reduced)
+        u_full = lifter.lift_from_zeros(u_reduced)
         # u_full -> [0., 10., 10., 20., 30., 0.]
         u_reduced_back = lifter.reduce(u_full)
 
