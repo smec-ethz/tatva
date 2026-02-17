@@ -159,6 +159,98 @@ class FieldStackedView(Field):
         return parent_idxs[self.parent_slice].__getitem__(arg).flatten()
 
 
+def _apply_stacked_fields(
+    cls: type[Compound], stack_fields: tuple[str, ...], stack_axis: int = -1
+) -> type[Compound]:
+    """Reorder fields by stacking specified fields along an axis. Modifies class in place."""
+    fields = {k: v for k, v in cls.fields}
+    base_shape = fields[stack_fields[0]].shape
+    stack_axis = stack_axis % len(base_shape)  # get positive axis
+    base_shape = jnp.asarray(base_shape)[
+        jnp.array([i for i in range(len(base_shape)) if i != stack_axis])
+    ]
+
+    stack_size = sum(
+        int(prod(fields[name].shape)) // base_shape.prod() for name in stack_fields
+    )
+    stacked_shape = jnp.insert(base_shape, stack_axis, stack_size)
+    size = int(jnp.prod(stacked_shape))
+    stacked_slice = slice(0, size)
+    stacked_field = _FieldBase(tuple(stacked_shape), _slice=stacked_slice)
+
+    new_fields = []
+
+    # create new fields that are sub-fields of the stacked field
+    for idx, name in enumerate(stack_fields):
+        new_field = FieldStackedView(
+            shape=fields[name].shape,
+            parent_field=stacked_field,
+            parent_slice=tuple(
+                slice(None)
+                if i != stack_axis
+                else slice(
+                    sum(
+                        int(jnp.prod(jnp.asarray(fields[n].shape))) // base_shape.prod()
+                        for n in stack_fields[:idx]
+                    ),
+                    sum(
+                        int(jnp.prod(jnp.asarray(fields[n].shape))) // base_shape.prod()
+                        for n in stack_fields[: idx + 1]
+                    ),
+                )
+                for i in range(len(stacked_shape))
+            ),
+        )
+        # check base shape compatibility or raise error
+        if not jnp.all(
+            jnp.asarray(new_field.shape)[
+                jnp.array([i for i in range(len(new_field.shape)) if i != stack_axis])
+            ]
+            == base_shape
+        ):
+            raise ValueError(
+                f"Field {name} with shape {new_field.shape} is not compatible with "
+                f"base shape {base_shape} along axis {stack_axis}."
+            )
+
+        # set new field in class and add to new fields list
+        setattr(cls, name, new_field)
+        new_fields.append((name, new_field))
+
+    # update other fields slices
+    offset = size
+    for name, field_obj in cls.fields:
+        if name in stack_fields:
+            continue
+        n = int(jnp.prod(jnp.asarray(field_obj.shape)))
+        start = offset
+        end = start + n
+        field_obj.slice = slice(start, end)
+        offset += n
+        new_fields.append((name, field_obj))
+
+    # finally update class fields and size
+    cls.fields = tuple(new_fields)
+    cls.size = offset
+    return cls
+
+
+def stack_fields(
+    *fields: str, axis: int = -1
+) -> Callable[[type[Compound]], type[Compound]]:
+    """Class decorator to stack compatible fields into a shared contiguous layout."""
+
+    if not fields:
+        raise ValueError("At least one field name is required.")
+
+    field_names = tuple(fields)
+
+    def decorator(cls: type[Compound]) -> type[Compound]:
+        return _apply_stacked_fields(cls, stack_fields=field_names, stack_axis=axis)
+
+    return decorator
+
+
 class _CompoundMeta(type):
     fields: tuple[tuple[str, Field], ...]
     size: int
@@ -187,7 +279,19 @@ class _CompoundMeta(type):
         cls.size = size
 
         if kwargs.get("stack_fields"):
-            cls._stack_fields(**kwargs)
+            import warnings
+
+            warnings.warn(
+                "Class keyword arguments 'stack_fields'/'stack_axis' are deprecated. "
+                "Use the @stack_fields(...) decorator instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _apply_stacked_fields(
+                cls,  # ty:ignore[invalid-argument-type]
+                stack_fields=tuple(kwargs["stack_fields"]),
+                stack_axis=kwargs.get("stack_axis", -1),
+            )
 
         # register as pytree node for JAX transformations
         register_pytree_node_class(cls)
@@ -200,88 +304,6 @@ class _CompoundMeta(type):
             dtype=int,
         )
         return (nodal_vals[:, *dofs] if dofs else nodal_vals).flatten()
-
-    def _stack_fields(cls, stack_fields: tuple[str, ...], stack_axis: int = -1) -> None:
-        """Reorder fields by stacking specified fields along some axis. Modifies the class
-        in place!
-
-        Args:
-            stack_fields: Names of the fields to be stacked.
-            stack_axis: Axis along which to stack the fields. Defaults to -1.
-        """
-        fields = {k: v for k, v in cls.fields}
-        base_shape = fields[stack_fields[0]].shape
-        stack_axis = stack_axis % len(base_shape)  # get positive axis
-        base_shape = jnp.asarray(base_shape)[
-            jnp.array([i for i in range(len(base_shape)) if i != stack_axis])
-        ]
-
-        stack_size = sum(
-            int(jnp.prod(jnp.asarray(fields[name].shape))) // base_shape.prod()
-            for name in stack_fields
-        )
-        stacked_shape = jnp.insert(base_shape, stack_axis, stack_size)
-        size = int(jnp.prod(jnp.asarray(stacked_shape)))
-        stacked_slice = slice(0, size)
-        stacked_field = _FieldBase(tuple(stacked_shape), _slice=stacked_slice)
-
-        new_fields = []
-
-        # create new fields that are sub-fields of the stacked field
-        for idx, name in enumerate(stack_fields):
-            new_field = FieldStackedView(
-                shape=fields[name].shape,
-                parent_field=stacked_field,
-                parent_slice=tuple(
-                    slice(None)
-                    if i != stack_axis
-                    else slice(
-                        sum(
-                            int(jnp.prod(jnp.asarray(fields[n].shape)))
-                            // base_shape.prod()
-                            for n in stack_fields[:idx]
-                        ),
-                        sum(
-                            int(jnp.prod(jnp.asarray(fields[n].shape)))
-                            // base_shape.prod()
-                            for n in stack_fields[: idx + 1]
-                        ),
-                    )
-                    for i in range(len(stacked_shape))
-                ),
-            )
-            # check base shape compatibility or raise error
-            if not jnp.all(
-                jnp.asarray(new_field.shape)[
-                    jnp.array(
-                        [i for i in range(len(new_field.shape)) if i != stack_axis]
-                    )
-                ]
-                == base_shape
-            ):
-                raise ValueError(
-                    f"Field {name} with shape {new_field.shape} is not compatible with "
-                    f"base shape {base_shape} along axis {stack_axis}."
-                )
-
-            # set new field in class and add to new fields list
-            setattr(cls, name, new_field)
-            new_fields.append((name, new_field))
-
-        # update other fields slices
-        offset = size
-        for name, field_obj in cls.fields:
-            if name in stack_fields:
-                continue
-            n = int(jnp.prod(jnp.asarray(field_obj.shape)))
-            start = offset
-            end = start + n
-            field_obj.slice = slice(start, end)
-            offset += n
-            new_fields.append((name, field_obj))
-
-        # finally update class fields and size
-        cls.fields = tuple(new_fields)
 
 
 class Compound(metaclass=_CompoundMeta):

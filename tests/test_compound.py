@@ -5,7 +5,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from tatva.compound import Compound, field
+from tatva.compound import Compound, field, stack_fields
 
 
 class SimpleState(Compound):
@@ -13,7 +13,8 @@ class SimpleState(Compound):
     phi = field((2,))
 
 
-class StackedState(Compound, stack_fields=("u", "v"), stack_axis=-1):
+@stack_fields("u", "v", axis=-1)
+class StackedState(Compound):
     u = field((2, 2))
     v = field((2, 2))
     w = field((2,))
