@@ -50,7 +50,7 @@ class Element(eqx.Module):
         J = dNdr @ nodal_coords
         return J, jnp.linalg.det(J)
 
-    def interpolate(self, xi: Array, nodal_values: Array) -> Array:
+    def interpolate(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         N = self.shape_function(xi)
         return N @ nodal_values
 

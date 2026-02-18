@@ -320,7 +320,9 @@ class Operator(eqx.Module, Generic[ElementT]):
             xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             """Calls the function (interpolator) on a quad point."""
-            return self.element.interpolate(xi, el_nodal_values)
+            return self.element.interpolate(
+                xi, el_nodal_values, el_nodal_coords
+            )  # nodal coords are needed for hermite elements, but not for lagrange elements, so we pass them in either way
 
         return self._vmap_over_elements_and_quads(nodal_values, _eval_quad)
 
@@ -421,7 +423,9 @@ class Operator(eqx.Module, Generic[ElementT]):
             xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             """Calls the function (interpolator) on a quad point."""
-            return self.element.interpolate(xi, el_nodal_values)
+            return self.element.interpolate(
+                xi, el_nodal_values, el_nodal_coords
+            )  # nodal coords are needed for hermite elements, but not for lagrange elements, so we pass them in either way
 
         return eqx.filter_vmap(
             _interpolate_quad,

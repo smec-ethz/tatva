@@ -76,6 +76,11 @@ mapping custom kernels, working with compound fields, and sparse assembly helper
 A unique aspect of `tatva` is that it can handle construct dense matrices, sparse matrices, and matrix-free operators. `tatva` uses matrix-coloring algorithm and sparse differentiation to construct a sparse matrix. We use our own coloring library ![tatva-coloring](https://github.com/smec-ethz/tatva-coloring) to color a matrix based on sparsity pattern, one can use other coloring libraries such as ![pysparsematrixcolorings](https://github.com/gdalle/pysparsematrixcolorings) for more advanced coloring algorithms. This significantly reduces the memory consumption. For large problems, we can also use matrix-free operators which do not require storing the matrix in memory. Since we have a energy functional, we can make use of `jax.jvp` ti compute the matrix-vector product without explicitly forming the matrix. This is particularly useful for large problems where storing the matrix is not feasible.
 
 
+## Paper
+
+To know more about `tatva` and how it works please check: ([arXiv link](https://arxiv.org/abs/2602.12365v1))
+
+
 ## 👉 Where to contribute
 
 If you have a suggestion that would make this better, please fork the repo and create a pull request on [**github.com/smec-ethz/tatva**](https://github.com/smec-ethz/tatva). Please use that repository to open issues or submit merge requests. You can also simply open an issue with the tag "enhancement". Don't forget to give the project a star! Thanks again!
