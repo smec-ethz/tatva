@@ -18,19 +18,14 @@
 
 from __future__ import annotations
 
-import copy
-from typing import (
-    Any,
-    Generic,
-    Hashable,
-    MutableMapping,
-    Self,
-    TypeVar,
-    overload,
-)
+from collections.abc import Iterable, Mapping
+from functools import wraps
+from typing import Any, Generic, Hashable, Self, Sequence, Set, TypeAlias, TypeVar
+from uuid import uuid4
 
 import jax.numpy as jnp
 from jax import Array
+from jax.tree_util import register_pytree_node_class
 from jax.typing import ArrayLike
 
 
@@ -38,37 +33,24 @@ class LifterError(ValueError):
     """Error raised when there is a problem with the lifter, e.g., missing runtime values."""
 
 
+RuntimeValueMap: TypeAlias = dict[Hashable, Any]
+PyTree: TypeAlias = Any
+
 T = TypeVar("T", bound=ArrayLike)
+V = TypeVar("V")
 
 
 class RuntimeValue(Generic[T]):
     """Descriptor for a constraint value that must be provided at runtime."""
 
     def __init__(self, key: Hashable | None = None):
-        self.key = key
-        self._name: str | None = None
+        self.key = key or uuid4()
 
-    def __set_name__(self, owner: type[Constraint], name: str):
-        self._name = name
-        if self.key is None:
-            # default key is (constraint class, attribute name)
-            self.key = (owner, name)
-
-    @overload
-    def __get__(self, instance: None, owner: type[Constraint]) -> RuntimeValue[T]: ...
-    @overload
-    def __get__(self, instance: Constraint, owner: type[Constraint]) -> T: ...
-    def __get__(self, instance: Constraint, owner: type[Constraint]) -> T:
-        if instance is None:
-            return self
-        if self.key not in instance._runtime_values:
-            raise LifterError(
-                f"Dynamic value for {self.key} not set on instance {instance}"
-            )
-        return instance._runtime_values[self.key]
-
-    def __set__(self, instance: Constraint, value: T):
-        instance._runtime_values[self.key] = value
+    def get_value(self, runtime_values: RuntimeValueMap) -> T:
+        """Get the value of this attribute from the given lifter instance."""
+        if self.key not in runtime_values:
+            raise LifterError(f"Runtime value for (key={self.key}) not set on lifter")
+        return runtime_values[self.key]
 
 
 class Constraint:
@@ -78,18 +60,29 @@ class Constraint:
     when mapping a reduced vector back to the full vector.
     """
 
-    _dynamic: bool = False
-    """Whether this constraint is dynamic and requires runtime values during lifting."""
-
     dofs: Array
     """The dofs to constrain; every constraint must specify which dofs it applies to."""
 
-    _runtime_values: MutableMapping[Hashable, Any]
-    """Mapping of keys to dynamic attributes that require runtime values during lifting."""
+    _runtime_specs: tuple[RuntimeValue[Any], ...]
+    _lifter: Lifter | None
 
     def __init__(self, dofs: Array):
         self.dofs = dofs
-        self._runtime_values = {}
+        self._lifter = None
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        orig_init = cls.__init__
+
+        @wraps(orig_init)
+        def wrapped_init(self, *args, **kwargs) -> None:
+            # Call the original __init__ to set up the instance, then find all
+            # RuntimeValue attributes and store them in _runtime_specs and
+            # _runtime_values.
+            orig_init(self, *args, **kwargs)
+            self._runtime_specs = tuple(_iter_runtime_values(self))
+
+        cls.__init__ = wrapped_init  # ty:ignore[invalid-assignment]
 
     def __hash__(self):
         # hashing is required for using lifters and constraints as static args in jax
@@ -101,29 +94,42 @@ class Constraint:
         # e.g., by using dataclasses or manually comparing the relevant attributes.
         return id(self)
 
-    def apply_lift(self, u_full: Array) -> Array:  # override in subclasses
+    def apply_lift(self, u_full: Array) -> Array:
         """Apply the constraint to a full vector and return the modified copy."""
         return u_full
 
-    @classmethod
-    def _get_runtime_specs(cls) -> tuple[RuntimeValue, ...]:
-        """Return a tuple of all RuntimeValue attributes in this constraint."""
-        out: list[RuntimeValue] = []
-        for c in cls.__mro__:
-            out.extend(
-                obj for obj in c.__dict__.values() if isinstance(obj, RuntimeValue)
+    def _get_runtime_specs(self) -> tuple[RuntimeValue, ...]:
+        """Return a tuple of all RuntimeValue attributes in this constraint instance."""
+        return self._runtime_specs
+
+    def _bind(self, lifter: Lifter) -> Self:
+        """Return a shallow bound copy of this constraint for the given lifter."""
+        bound = self.__class__.__new__(self.__class__)
+        bound.__dict__ = dict(self.__dict__)
+        bound._lifter = lifter
+        return bound
+
+    def _resolve_runtime(
+        self, obj: V, runtime_values: RuntimeValueMap | None = None
+    ) -> V:
+        """Recursively resolve any RuntimeValue attributes in obj using runtime_values."""
+        if runtime_values is None:
+            if self._lifter is None:
+                raise LifterError("Constraint is not bound to a lifter")
+            runtime_values = self._lifter._runtime_values
+
+        if isinstance(obj, ArrayLike):
+            return obj
+        elif isinstance(obj, RuntimeValue):
+            return obj.get_value(runtime_values)  # ty:ignore[invalid-return-type]
+        elif isinstance(obj, Mapping):
+            return type(obj)(
+                (k, self._resolve_runtime(v, runtime_values)) for k, v in obj.items()
             )
-        return tuple(out)
-
-    def _semi_shallow_copy(self) -> Self:
-        """Return a copy of this constraint with a separate _dynamic_attrs dict."""
-        new = copy.copy(self)
-        new._runtime_values = dict(self._runtime_values)
-        return new
-
-    def _is_set(self, attr: RuntimeValue[Any]) -> bool:
-        """Check if a RuntimeValue attribute has been set on this instance."""
-        return attr.key in self._runtime_values
+        elif isinstance(obj, Iterable) and not isinstance(obj, (str, bytes)):
+            return type(obj)(self._resolve_runtime(o, runtime_values) for o in obj)
+        else:
+            return obj
 
 
 class PeriodicMap(Constraint):
@@ -144,38 +150,69 @@ class PeriodicMap(Constraint):
 class DirichletBC(Constraint):
     dofs: Array
     """The dofs to constrain; these will be set to fixed values during lifting."""
-    values: RuntimeValue[ArrayLike] = RuntimeValue()
-    """Values to set on the constrained ``dofs`` during lifting; if None, these
-    values must be provided at runtime via ``Lifter.lift(..., dynamic_values=...)``"""
+    values: ArrayLike | RuntimeValue[ArrayLike] | None = None
+    """Values to set on the constrained ``dofs`` during lifting; Defaults to 0.0 if not
+    provided at init or runtime."""
 
     def __init__(
         self,
         dofs: Array,
-        values: ArrayLike | None = None,
+        values: ArrayLike | RuntimeValue[ArrayLike] | None = None,
     ):
         """Initialize a Dirichlet boundary condition.
 
         Args:
             dofs: The dofs to constrain; these will be set to fixed values during lifting.
-            values: Fixed values to set on the constrained ``dofs`` during lifting; if None, these
-                values must be provided at runtime via ``Lifter.set(*values)``.
+            values: Fixed values to set on the constrained ``dofs`` during lifting; Can be
+            an instance of ``RuntimeValue``.
         """
-        super().__init__(dofs)
-        if values is not None:
-            self.values = values
+        self.dofs = dofs
+        self.values = values if values is not None else 0.0
 
     def apply_lift(self, u_full: Array) -> Array:
         """Set constrained ``dofs`` to ``values``."""
-        return u_full.at[self.dofs].set(self.values)
+        return u_full.at[self.dofs].set(self._resolve_runtime(self.values))
 
 
+class RuntimeValueSetter:
+    """Set runtime values on a lifter by position. Similar to jnp.array's .at[] setter syntax,
+    but for setting values on the lifter's internal runtime value mapping."""
+
+    def __init__(self, lifter: Lifter, key: Hashable):
+        self.lifter = lifter
+        self.key = key
+
+    def set(self, *value: Any) -> Lifter:
+        """Set the runtime value for this key and return a new lifter with the updated value."""
+        if isinstance(self.key, tuple):
+            assert isinstance(value, tuple) and len(value) == len(self.key), (
+                "Expected a tuple of values with the same length as the key tuple"
+            )
+            updates = {k: v for k, v in zip(self.key, value)}
+        else:
+            updates = {self.key: value}
+
+        return self.lifter._update_runtime_values(updates)
+
+
+class RuntimeValueIndexer:
+    """Set runtime values on a lifter by key. Similar to jnp.array's .at[] setter syntax,
+    but for setting values on the lifter's internal runtime value mapping."""
+
+    def __init__(self, lifter: Lifter):
+        self.lifter = lifter
+
+    def __getitem__(self, key: Hashable) -> Any:
+        return RuntimeValueSetter(self.lifter, key)
+
+
+@register_pytree_node_class
 class Lifter:
     """Create a lifter that maps between reduced and full vectors.
 
     Args:
         size: Total number of dofs in the full vector.
         *constraints: Extra constraints (e.g., periodic maps).
-        **kwargs: Ignored; kept for compatibility with equinox.Module init.
 
     Examples::
 
@@ -204,62 +241,89 @@ class Lifter:
     """Number of dofs in the reduced vector (free dofs only)."""
 
     constraints: tuple[Constraint, ...] = ()
-    """Tuple of additional constraints (e.g., periodic maps)."""
+    """Tuple of constraints, which are applied in order during lifting. Constraints must
+    specify which dofs they apply to, and can optionally specify runtime values that are
+    provided to the lifter at runtime. These constraints are bound to the lifter instance,
+    which allows them to access the lifter's runtime values when applying the lift."""
+
+    _runtime_values: RuntimeValueMap
+    """Mapping of runtime values for dynamic constraints; keys are RuntimeValue keys."""
+
+    def tree_flatten(self) -> tuple[tuple[PyTree, ...], tuple[Any, ...]]:
+        # We want to be able to use lifters as static args in jax transformations, but they contain
+        # runtime values that are not hashable. By treating the runtime values as non-static
+        # children, we can keep the lifter itself as a static arg while still allowing the
+        # runtime values to be passed in and used during lifting.
+        children = (self._runtime_values,)
+        aux_data = (
+            self.size,
+            self.constraints,
+            self.free_dofs,
+            self.constrained_dofs,
+            self.size_reduced,
+            self._runtime_keys,
+        )
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(
+        cls, aux_data: tuple[Any, ...], children: tuple[PyTree, ...]
+    ) -> Self:
+        # We create a new instance without calling __init__, since we already have all the
+        # necessary data and don't want to recompute anything.
+        # This is a bit hacky, but it allows us to reconstruct the lifter with the correct
+        # runtime values without having to go through the normal initialization process,
+        # which would require us to recompute the sizes and runtime pairs.
+        size, constraints, free_dofs, constrained_dofs, size_reduced, _runtime_keys = (
+            aux_data
+        )
+        (_runtime_values,) = children
+
+        lifter = cls.__new__(cls)
+        lifter.__dict__ = {
+            "size": size,
+            "constraints": tuple(c._bind(lifter) for c in constraints),
+            "free_dofs": free_dofs,
+            "constrained_dofs": constrained_dofs,
+            "size_reduced": size_reduced,
+            "_runtime_keys": _runtime_keys,
+        }
+        lifter._runtime_values = _runtime_values
+        return lifter
+
+    @property
+    def at(self) -> RuntimeValueIndexer:
+        """Return a ValueIndexer for setting runtime values by key."""
+        return RuntimeValueIndexer(self)
 
     def __init__(
         self,
         size: int,
         /,
         *constraints: Constraint,
-        **kwargs,
     ):
         self.size = size
-        self.constraints = constraints
-        self._runtime_pairs = tuple(
-            (cond, attr)
-            for cond in constraints
-            for attr in cond._get_runtime_specs()
-            if attr.key not in cond._runtime_values  # not fixed -> dynamic at runtime
+        self.constraints = tuple(cond._bind(self) for cond in constraints)
+        self._runtime_keys = tuple(
+            attr.key for cond in self.constraints for attr in cond._get_runtime_specs()
         )
+        self._runtime_values = {}
         self._compute_sizes()
 
     def __hash__(self):
         return hash((self.size, self.constraints))
 
+    def __eq__(self, other) -> bool:
+        """Check equality based on size and constraints; runtime values are not considered."""
+        return (
+            isinstance(other, Lifter)
+            and self.size == other.size
+            and self.constraints == other.constraints
+        )
+
     def add(self, condition: Constraint) -> Self:
         """Return a new lifter with ``condition`` appended to constraints."""
         return self.__class__(self.size, *self.constraints, condition)
-
-    def set(self, *values: ArrayLike) -> Self:
-        """Set the dynamic values for this lifter's constraints and return a new lifter with those values.
-
-        Args:
-            *values: Values to set on the dynamic attributes of this lifter's constraints;
-                the order of values must match the order of the lifter's constraints with
-                dynamic attributes (i.e., the order of ``lifter._dynamic_pairs``).
-
-        Returns:
-            a new lifter with dynamic constraints set to provided values
-        """
-        if len(values) != len(self._runtime_pairs):
-            raise LifterError(
-                f"Expected {len(self._runtime_pairs)} dynamic values, but got {len(values)}"
-            )
-
-        # create a new lifter with the same constraints but separate _dynamic_attrs dicts
-        new_constraints = tuple(c._semi_shallow_copy() for c in self.constraints)
-
-        # recompute dynamic pairs for the new constraints
-        new_dynamic_pairs = self._compute_runtime_pairs(new_constraints)
-
-        # set the dynamic values on the new constraints
-        for (cond, attr), val in zip(new_dynamic_pairs, values):
-            attr.__set__(cond, val)
-
-        # return new lifter with updated constraints/pairs; reuse dof arrays/sizes
-        return self._replace(
-            constraints=new_constraints, _dynamic_pairs=new_dynamic_pairs
-        )
 
     def lift(
         self,
@@ -283,7 +347,10 @@ class Lifter:
 
         return u_full
 
-    def lift_from_zeros(self, u_reduced: Array) -> Array:
+    def lift_from_zeros(
+        self,
+        u_reduced: Array,
+    ) -> Array:
         """Lift reduced vector to a full vector starting from zeros."""
         u_full = jnp.zeros(self.size, dtype=u_reduced.dtype)
         return self.lift(u_reduced, u_full)
@@ -295,7 +362,17 @@ class Lifter:
     def _replace(self, **updates) -> Self:
         new = self.__class__.__new__(self.__class__)
         new.__dict__ = {**self.__dict__, **updates}
+        new.constraints = tuple(cond._bind(new) for cond in new.constraints)
         return new
+
+    def _update_runtime_values(self, updates: RuntimeValueMap) -> Self:
+        """Update the internal runtime values mapping with the given updates."""
+        for key in updates:
+            if key not in self._runtime_keys:
+                raise LifterError(
+                    f"There is no runtime value with key={key} in the lifter's constraints"
+                )
+        return self._replace(_runtime_values=self._runtime_values | updates)
 
     def _compute_sizes(self):
         """Compute free/constrained dofs and reduced size."""
@@ -316,13 +393,50 @@ class Lifter:
         self.constrained_dofs = constrained
         self.size_reduced = free.size
 
-    @staticmethod
-    def _compute_runtime_pairs(
-        constraints: tuple[Constraint, ...],
-    ) -> tuple[tuple[Constraint, RuntimeValue], ...]:
-        return tuple(
-            (c, a)
-            for c in constraints
-            for a in c._get_runtime_specs()
-            if a.key not in c._runtime_values
-        )
+    def _runtime_args_to_map(self, *values: ArrayLike) -> RuntimeValueMap:
+        """Convert positional runtime values to a mapping by key for all required runtime pairs."""
+        if len(values) != len(self._runtime_keys):
+            raise LifterError(
+                f"Expected {len(self._runtime_keys)} runtime values, but got {len(values)}"
+            )
+        return {key: val for key, val in zip(self._runtime_keys, values)}
+
+
+def _iter_runtime_values(obj, seen: set[int] | None = None):
+    if seen is None:
+        seen = set()
+
+    oid = id(obj)
+    if oid in seen:
+        return
+    seen.add(oid)
+
+    if isinstance(obj, RuntimeValue):
+        yield obj
+        return
+
+    # dict / mapping
+    if isinstance(obj, Mapping):
+        for v in obj.values():
+            yield from _iter_runtime_values(v, seen)
+        return
+
+    # list / tuple / set (but not str/bytes)
+    if isinstance(obj, (Sequence, Set)) and not isinstance(
+        obj, (str, bytes, bytearray)
+    ):
+        for v in obj:
+            yield from _iter_runtime_values(v, seen)
+        return
+
+    # normal Python objects
+    if hasattr(obj, "__dict__"):
+        for v in vars(obj).values():
+            yield from _iter_runtime_values(v, seen)
+        return
+
+    # optional: __slots__
+    if hasattr(obj, "__slots__"):
+        for name in obj.__slots__:
+            if hasattr(obj, name):
+                yield from _iter_runtime_values(getattr(obj, name), seen)
