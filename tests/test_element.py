@@ -29,9 +29,12 @@ def test_element_patch_test(element_class, dim):
     key = jax.random.PRNGKey(42)
 
     if dim == 1:
-        dummy_xi = (
-            element.quad_points
-        )  # because Line2 has only one quadrature point, we can use it directly
+        if element_class is Line2:
+            dummy_xi = (
+                element.quad_points
+            )  # because Line2 has only one quadrature point, we can use it directly
+        else:
+            dummy_xi = element.quad_points[0]
     else:
         dummy_xi = element.quad_points[
             0
