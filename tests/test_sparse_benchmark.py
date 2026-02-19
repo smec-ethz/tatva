@@ -110,22 +110,20 @@ def test_sparse_benchmark(nx, ny):
         _build_problem(nx=nx, ny=ny)
     )
 
-    hessian_sparse_with_args = sparse.jacfwd_with_batch(
+    hessian_sparse_with_args = sparse.jacfwd(
         gradient=jax.jacrev(total_energy_with_args, argnums=0),
         row_ptr=jnp.array(sparsity_pattern_csr.indptr),
         col_indices=jnp.array(sparsity_pattern_csr.indices),
         colors=jnp.array(colors),
         color_batch_size=10,  # Batch size for evaluating the element routine
-        has_aux_args=True,  # Whether the gradient function has auxiliary arguments (x, y, damage, etc.)
     )
 
-    hessian_sparse = sparse.jacfwd_with_batch(
+    hessian_sparse = sparse.jacfwd(
         gradient=jax.jacrev(total_energy, argnums=0),
         row_ptr=jnp.array(sparsity_pattern_csr.indptr),
         col_indices=jnp.array(sparsity_pattern_csr.indices),
         colors=jnp.array(colors),
         color_batch_size=10,  # Batch size for evaluating the element routine
-        has_aux_args=False,  # Whether the gradient function has auxiliary arguments (x, y, damage, etc.)
     )
 
     u_flat = jnp.zeros(op.mesh.coords.shape[0] * 2)  # Initial guess for displacements

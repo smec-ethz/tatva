@@ -66,48 +66,6 @@ def colored_jacobian_batch(
     return J_rows.T
 
 
-@partial(jax.jit, static_argnames=["F", "n_colors"])
-def colored_jacobian(
-    F: Callable,
-    x: Array,
-    colors: Array,
-    args: Tuple[Any, ...],
-    kwargs: Dict[str, Any],
-    n_colors: int,
-) -> Array:
-    """
-    Computes the compressed Jacobian using forward-mode AD and graph coloring without batching.
-    Reconstructs seeds on-the-fly via masking to avoid OOM and jagged arrays.
-    Args:
-        F: function to differentiate
-        x: Point at which to evaluate the Jacobian, shape (N,)
-        colors: Array of colors assigned to each DOF
-        args: Positional arguments to pass to F
-        kwargs: Keyword arguments to pass to F
-        n_colors: Number of unique colors
-    Returns:
-        J: Compressed Jacobian matrix, shape (N, n_colors)
-    """
-
-    def scan_body(carry, color_id):
-        # Generate seed for the current color_id on-the-fly
-        # seed = (colors == color_id)
-        seed = jnp.where(colors == color_id, 1.0, 0.0)
-
-        # Compute JVP
-        def F_x_only(u):
-            return F(u, *args, **kwargs)
-
-        _, jvp_out = jax.jvp(F_x_only, (x,), (seed,))
-
-        return None, jvp_out
-
-    color_ids = jnp.arange(n_colors)
-    _, J_columns = jax.lax.scan(scan_body, None, color_ids)
-
-    return J_columns.T  # Final shape (N_dof, n_colors)
-
-
 @partial(jax.jit, static_argnames=["n_dofs"])
 def recover_stiffness_matrix(
     J_compressed: Array,
@@ -147,13 +105,12 @@ def recover_stiffness_matrix(
     return K_bcoo
 
 
-def jacfwd_with_batch(
+def jacfwd(
     gradient: Callable,
     row_ptr: Array,
     col_indices: Array,
     colors: Array,
-    color_batch_size: int = 1,
-    has_aux_args: bool = False,
+    color_batch_size: int = 10,
 ) -> Callable:
     """
     Compute the sparse Jacobian using forward-mode automatic differentiation and graph coloring and provided seeds.
@@ -165,98 +122,21 @@ def jacfwd_with_batch(
         seeds: List of seed vectors for each color
         colors: The array of colors used for compression
         color_batch_size: Number of colors to process in each batch (1 for minimal memory usage, >1 for faster computation but higher memory)
-        has_aux_args: Whether the gradient function has auxiliary arguments.
-                      If True, the returned function will expect additional arguments after 'u'.
+        By default, 10 colors are processed.
     Returns:
         A function that computes the sparse Jacobian in BCOO format
     """
 
     n_colors = len(jnp.unique(colors)) + 1
 
-    if not has_aux_args:
+    def _wraped_jacfwd_with_args(u: Array, *args: Any, **kwargs: Any) -> jsp.BCOO:
+        # Pass args explicitly to the JIT-compiled function
+        J_compressed = colored_jacobian_batch(
+            gradient, u, colors, args, kwargs, n_colors, color_batch_size
+        )
+        n_dofs = J_compressed.shape[0]
+        return recover_stiffness_matrix(
+            J_compressed, row_ptr, col_indices, colors, n_dofs
+        )
 
-        def _wraped_jacfwd(u: Array) -> jsp.BCOO:
-            # Pass an empty tuple for args
-            J_compressed = colored_jacobian_batch(
-                gradient, u, colors, (), {}, n_colors, color_batch_size
-            )
-            n_dofs = J_compressed.shape[0]
-            return recover_stiffness_matrix(
-                J_compressed, row_ptr, col_indices, colors, n_dofs
-            )
-
-        return _wraped_jacfwd
-
-    if has_aux_args:
-
-        def _wraped_jacfwd_with_args(u: Array, *args: Any, **kwargs: Any) -> jsp.BCOO:
-            # Pass args explicitly to the JIT-compiled function
-            J_compressed = colored_jacobian_batch(
-                gradient, u, colors, args, kwargs, n_colors, color_batch_size
-            )
-            n_dofs = J_compressed.shape[0]
-            return recover_stiffness_matrix(
-                J_compressed, row_ptr, col_indices, colors, n_dofs
-            )
-
-        return _wraped_jacfwd_with_args
-
-
-def jacfwd(
-    gradient: Callable,
-    row_ptr: Array,
-    col_indices: Array,
-    colors: Array,
-    has_aux_args: bool = False,
-) -> Callable:
-    """
-    Compute the sparse Jacobian using forward-mode automatic differentiation and graph coloring.
-    The seeds are reconstructed on-the-fly to save memory. Use jax.lax.scan to iterate over colors
-    without materializing the entire compressed Jacobian in memory at once.
-
-    Args:
-        gradient: Function whose Jacobian is to be computed
-        row_ptr, col_indices: The sparsity pattern of the matrix
-        colors: The array of colors used for compression
-        has_aux_args: Whether the gradient function has auxiliary arguments.
-                     If True, the returned function will expect additional arguments after 'u'.
-    Returns:
-        A function that computes the sparse Jacobian in BCOO format
-
-    """
-    n_colors = len(jnp.unique(colors)) + 1
-
-    if not has_aux_args:
-
-        def _wraped_jacfwd(u: Array) -> jsp.BCOO:
-            J_compressed = colored_jacobian(
-                gradient, x=u, colors=colors, args=(), kwargs={}, n_colors=int(n_colors)
-            )
-            n_dofs = J_compressed.shape[0]
-
-            K_bcoo = recover_stiffness_matrix(
-                J_compressed, row_ptr, col_indices, colors, n_dofs
-            )
-            return K_bcoo
-
-        return _wraped_jacfwd
-    if has_aux_args:
-
-        def _wraped_jacfwd_with_args(u: Array, *args: Any, **kwargs: Any) -> jsp.BCOO:
-
-            J_compressed = colored_jacobian(
-                gradient,
-                x=u,
-                colors=colors,
-                args=args,
-                kwargs=kwargs,
-                n_colors=int(n_colors),
-            )
-            n_dofs = J_compressed.shape[0]
-
-            K_bcoo = recover_stiffness_matrix(
-                J_compressed, row_ptr, col_indices, colors, n_dofs
-            )
-            return K_bcoo
-
-        return _wraped_jacfwd_with_args
+    return _wraped_jacfwd_with_args
