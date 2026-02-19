@@ -5,12 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from tatva.lifter import (
-    DirichletBC,
-    Lifter,
-    PeriodicMap,
-    RuntimeValue,
-)
+from tatva.lifter import Fixed, Lifter, Periodic, RuntimeValue
 
 jax.config.update("jax_enable_x64", True)
 
@@ -30,8 +25,8 @@ def test_lifter_without_constraints_roundtrips():
 def test_lifter_applies_dirichlet_and_periodic_constraints():
     lifter = Lifter(
         6,
-        DirichletBC(jnp.array([0, 5], dtype=jnp.int32)),
-        PeriodicMap(
+        Fixed(jnp.array([0, 5], dtype=jnp.int32)),
+        Periodic(
             dofs=jnp.array([2], dtype=jnp.int32),
             master_dofs=jnp.array([1], dtype=jnp.int32),
         ),
@@ -46,11 +41,11 @@ def test_lifter_applies_dirichlet_and_periodic_constraints():
 
 
 def test_constraints_and_lifter_are_hashable():
-    periodic = PeriodicMap(
+    periodic = Periodic(
         dofs=jnp.array([2], dtype=jnp.int32),
         master_dofs=jnp.array([1], dtype=jnp.int32),
     )
-    dirichlet = DirichletBC(
+    dirichlet = Fixed(
         jnp.array([0, 5], dtype=jnp.int32),
         jnp.array([0.0, 1.0], dtype=jnp.float64),
     )
@@ -64,8 +59,8 @@ def test_constraints_and_lifter_are_hashable():
 def test_lifter_as_static_arg_in_jit():
     lifter = Lifter(
         6,
-        DirichletBC(jnp.array([0, 5], dtype=jnp.int32)),
-        PeriodicMap(
+        Fixed(jnp.array([0, 5], dtype=jnp.int32)),
+        Periodic(
             dofs=jnp.array([2], dtype=jnp.int32),
             master_dofs=jnp.array([1], dtype=jnp.int32),
         ),
@@ -84,7 +79,7 @@ def test_lifter_as_static_arg_in_jit():
 def test_lifter_eq_handles_array_runtime_values():
     lifter = Lifter(
         4,
-        DirichletBC(jnp.array([0, 3], dtype=jnp.int32), RuntimeValue("top")),
+        Fixed(jnp.array([0, 3], dtype=jnp.int32), RuntimeValue("top")),
     )
     lhs = lifter.with_values({"top": jnp.array([1.0, 2.0])})
     rhs = lifter.with_values({"top": jnp.array([1.0, 2.0])})

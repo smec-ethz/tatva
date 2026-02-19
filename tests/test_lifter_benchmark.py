@@ -37,7 +37,7 @@ from jax_autovmap import autovmap
 
 from tatva import Mesh, Operator, element
 from tatva.compound import Compound, field
-from tatva.lifter import DirichletBC, Lifter, RuntimeValue
+from tatva.lifter import Fixed, Lifter, RuntimeValue
 
 jax.config.update("jax_enable_x64", True)
 
@@ -172,8 +172,8 @@ def test_lifter_total_energy_benchmark():
 
     lifter = Lifter(
         Solution.size,
-        DirichletBC(dofs_bottom, RuntimeValue("bottom", 0.0)),
-        DirichletBC(dofs_top, RuntimeValue("top", 0.5)),
+        Fixed(dofs_bottom, RuntimeValue("bottom", 0.0)),
+        Fixed(dofs_top, RuntimeValue("top", 0.5)),
     )
 
     @partial(jax.jit, static_argnames=("lifter",))
