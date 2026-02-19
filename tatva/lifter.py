@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from functools import wraps
 from typing import (
     Any,
@@ -34,6 +34,7 @@ from typing import (
 from uuid import uuid4
 
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import ArrayLike
@@ -92,6 +93,9 @@ class Constraint:
 
     _runtime_specs: tuple[RuntimeValue[Any], ...]
     _lifter: Lifter | None
+    _constraint_id: Hashable
+    """Unique id for this constraint instance that survives `._bind(lifter)`, used for
+    hashing and equality; assigned at init."""
 
     def __init__(self, dofs: Array):
         self.dofs = dofs
@@ -109,17 +113,22 @@ class Constraint:
             orig_init(self, *args, **kwargs)
             self._runtime_specs = tuple(_iter_runtime_values(self))
 
+            # assign a unique id for this constraint instance, used for hashing and equality
+            self._constraint_id = uuid4()
+
         cls.__init__ = wrapped_init  # ty:ignore[invalid-assignment]
+
+    def __eq__(self, other) -> bool:
+        """Check equality based on class and dofs; runtime values are not considered."""
+        return type(self) is type(other) and self._constraint_id == other._constraint_id
 
     def __hash__(self):
         # hashing is required for using lifters and constraints as static args in jax
         # transformations.
-        #
-        # This is the cheapest possible hash implementation, but it means that two
-        # constraints with the same parameters will not be considered equal. If we want to
-        # have value-based equality and hashing, we have to implement __eq__ and __hash__,
-        # e.g., by using dataclasses or manually comparing the relevant attributes.
-        return id(self)
+        # We hash based on the class and a unique id for this constraint instance, which
+        # allows us to treat constraints as unique even if they are bound to a lifter and
+        # have potentially different runtime values.
+        return hash((type(self), self._constraint_id))
 
     def apply_lift(self, u_full: Array) -> Array:
         """Apply the constraint to a full vector and return the modified copy."""
@@ -205,21 +214,13 @@ class RuntimeValueSetter:
     """Set runtime values on a lifter by position. Similar to jnp.array's .at[] setter syntax,
     but for setting values on the lifter's internal runtime value mapping."""
 
-    def __init__(self, lifter: Lifter, key: Hashable):
+    def __init__(self, lifter: Lifter, key: str):
         self.lifter = lifter
         self.key = key
 
-    def set(self, *value: Any) -> Lifter:
+    def set(self, value: ArrayLike) -> Lifter:
         """Set the runtime value for this key and return a new lifter with the updated value."""
-        if isinstance(self.key, tuple):
-            assert isinstance(value, tuple) and len(value) == len(self.key), (
-                "Expected a tuple of values with the same length as the key tuple"
-            )
-            updates = {k: v for k, v in zip(self.key, value)}
-        else:
-            updates = {self.key: value}
-
-        return self.lifter._update_runtime_values(updates)
+        return self.lifter.with_values(RuntimeValueMap({self.key: value}))
 
 
 class RuntimeValueIndexer:
@@ -229,7 +230,7 @@ class RuntimeValueIndexer:
     def __init__(self, lifter: Lifter):
         self.lifter = lifter
 
-    def __getitem__(self, key: Hashable) -> Any:
+    def __getitem__(self, key) -> RuntimeValueSetter:
         return RuntimeValueSetter(self.lifter, key)
 
 
@@ -338,9 +339,13 @@ class Lifter:
             spec for cond in self.constraints for spec in cond._get_runtime_specs()
         )
         self._runtime_keys = tuple(spec.key for spec in runtime_specs)
-        self._runtime_values = {
-            spec.key: spec.default for spec in runtime_specs if spec.default is not None
-        }
+        self._runtime_values = RuntimeValueMap(
+            {
+                spec.key: spec.default
+                for spec in runtime_specs
+                if spec.default is not None
+            }
+        )
 
         # compute free/constrained dofs and reduced size based on the constraints; this is
         # only based on the dofs specified in the constraints, not on any runtime values,
@@ -352,11 +357,15 @@ class Lifter:
         return hash((self.size, self.constraints))
 
     def __eq__(self, other) -> bool:
-        """Check equality based on size and constraints; runtime values are not considered."""
+        """Check equality based on size, constraints, and runtime values. If a lifter is a
+        ``static_arg`` in a jax transformation, the runtime values must be equal for
+        the lifter to be considered equal.
+        """
         return (
             isinstance(other, Lifter)
             and self.size == other.size
             and self.constraints == other.constraints
+            and _runtime_value_map_is_equal(self._runtime_values, other._runtime_values)
         )
 
     def add(self, condition: Constraint) -> Self:
@@ -397,13 +406,7 @@ class Lifter:
         """Extract the reduced vector by selecting free dofs from ``u_full``."""
         return u_full[self.free_dofs]
 
-    def _replace(self, **updates) -> Self:
-        new = self.__class__.__new__(self.__class__)
-        new.__dict__ = {**self.__dict__, **updates}
-        new.constraints = tuple(cond._bind(new) for cond in new.constraints)
-        return new
-
-    def _update_runtime_values(self, updates: RuntimeValueMap) -> Self:
+    def with_values(self, updates: RuntimeValueMap) -> Self:
         """Update the internal runtime values mapping with the given updates."""
         for key in updates:
             if key not in self._runtime_keys:
@@ -411,6 +414,12 @@ class Lifter:
                     f"There is no runtime value with key={key} in the lifter's constraints"
                 )
         return self._replace(_runtime_values=self._runtime_values | updates)
+
+    def _replace(self, **updates) -> Self:
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__ = {**self.__dict__, **updates}
+        new.constraints = tuple(cond._bind(new) for cond in new.constraints)
+        return new
 
     def _compute_sizes(self) -> tuple[Array, Array, int]:
         """Compute free/constrained dofs and reduced size."""
@@ -429,6 +438,13 @@ class Lifter:
 def _iter_runtime_values(
     obj, seen: set[int] | None = None
 ) -> Generator[RuntimeValue[Any], None, None]:
+    """Recursively iterate over all RuntimeValue attributes in obj, yielding them one by
+    one.
+
+    This is used to collect all runtime specs from a constraint instance, which may be
+    nested in dicts, lists, or other objects. We keep track of seen object ids to avoid
+    infinite recursion in case of cycles in the object graph.
+    """
     if seen is None:
         seen = set()
 
@@ -466,3 +482,22 @@ def _iter_runtime_values(
         for name in obj.__slots__:
             if hasattr(obj, name):
                 yield from _iter_runtime_values(getattr(obj, name), seen)
+
+
+def _runtime_value_map_is_equal(left: RuntimeValueMap, right: RuntimeValueMap) -> bool:
+    if left.keys() != right.keys():
+        return False
+
+    for key in left:
+        _left = left[key]
+        _right = right[key]
+
+        if _left is _right:
+            continue
+
+        if np.array_equal(np.asarray(_left), np.asarray(_right)):
+            continue
+
+        return False
+
+    return True
