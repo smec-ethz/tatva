@@ -173,37 +173,6 @@ class Quad4(Element):
             ).T
         )
 
-
-class Tetrahedron4(Element):
-    """A 4-node linear tetrahedral element."""
-
-    quad_points = jnp.array([[1.0 / 4, 1.0 / 4, 1.0 / 4]])
-    quad_weights = jnp.array([1.0 / 6])
-
-    def shape_function(self, xi: Array) -> Array:
-        """Returns the shape functions evaluated at the local coordinates (xi, eta, zeta)."""
-        xi, eta, zeta = xi
-        return jnp.array([1.0 - xi - eta - zeta, xi, eta, zeta])
-
-    def shape_function_derivative(self, *_args, **_kwargs) -> Array:
-        """Returns the derivative of the shape functions with respect to the local coordinates (xi, eta, zeta)."""
-        # shape (n_q, 3, 4)
-        return jnp.array(
-            [[-1.0, -1.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-        ).T
-
-
-def _get_hex8_quadrature() -> tuple[Array, Array]:
-    xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
-    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals, xi_vals), axis=-1).reshape(
-        -1, 3
-    )
-    weights = jnp.full(quad_points.shape[0], fill_value=1.0)
-    return quad_points, weights
-
-
-_hex8_qp, _hex8_w = _get_hex8_quadrature()
-
 def _get_quad8_quadrature() -> tuple[Array, Array]:
     xi_1d = jnp.array([-jnp.sqrt(3.0 / 5.0), 0.0, jnp.sqrt(3.0 / 5.0)])
     w_1d = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
@@ -284,7 +253,6 @@ class Line3(Element):
 
     def shape_function_derivative(self, xi: Array) -> Array:
         r = xi[0]
-        # dN/dr
         dN1 = r - 0.5
         dN2 = r + 0.5
         dN3 = -2.0 * r
@@ -313,6 +281,36 @@ class Line3(Element):
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdS = dNdr / J
         return N @ nodal_values, dNdS @ nodal_values, detJ
+
+class Tetrahedron4(Element):
+    """A 4-node linear tetrahedral element."""
+
+    quad_points = jnp.array([[1.0 / 4, 1.0 / 4, 1.0 / 4]])
+    quad_weights = jnp.array([1.0 / 6])
+
+    def shape_function(self, xi: Array) -> Array:
+        """Returns the shape functions evaluated at the local coordinates (xi, eta, zeta)."""
+        xi, eta, zeta = xi
+        return jnp.array([1.0 - xi - eta - zeta, xi, eta, zeta])
+
+    def shape_function_derivative(self, *_args, **_kwargs) -> Array:
+        """Returns the derivative of the shape functions with respect to the local coordinates (xi, eta, zeta)."""
+        # shape (n_q, 3, 4)
+        return jnp.array(
+            [[-1.0, -1.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        ).T
+
+
+def _get_hex8_quadrature() -> tuple[Array, Array]:
+    xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
+    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals, xi_vals), axis=-1).reshape(
+        -1, 3
+    )
+    weights = jnp.full(quad_points.shape[0], fill_value=1.0)
+    return quad_points, weights
+
+
+_hex8_qp, _hex8_w = _get_hex8_quadrature()
 
 class Hexahedron8(Element):
     """A 8-node linear hexahedral element."""
