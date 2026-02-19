@@ -20,13 +20,32 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from functools import wraps
-from typing import Any, Generic, Hashable, Self, Sequence, Set, TypeAlias, TypeVar
+from typing import (
+    Any,
+    Generator,
+    Generic,
+    Hashable,
+    Self,
+    Sequence,
+    Set,
+    TypeAlias,
+    TypeVar,
+)
 from uuid import uuid4
 
 import jax.numpy as jnp
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import ArrayLike
+
+__all__ = [
+    "Lifter",
+    "Constraint",
+    "DirichletBC",
+    "PeriodicMap",
+    "RuntimeValue",
+    "LifterError",
+]
 
 
 class LifterError(ValueError):
@@ -41,10 +60,18 @@ V = TypeVar("V")
 
 
 class RuntimeValue(Generic[T]):
-    """Descriptor for a constraint value that must be provided at runtime."""
+    """Descriptor for a constraint value that must be provided at runtime.
 
-    def __init__(self, key: Hashable | None = None):
+    Args:
+        key: A hashable key to identify this runtime value; used for setting values on the
+            lifter and for error messages when the value is missing at runtime.
+        default: An optional default value to use. If not provided, the lifter will raise
+            an error if this value is not set at runtime.
+    """
+
+    def __init__(self, key: Hashable | None = None, default: T | None = None):
         self.key = key or uuid4()
+        self.default = default
 
     def get_value(self, runtime_values: RuntimeValueMap) -> T:
         """Get the value of this attribute from the given lifter instance."""
@@ -304,11 +331,22 @@ class Lifter:
     ):
         self.size = size
         self.constraints = tuple(cond._bind(self) for cond in constraints)
-        self._runtime_keys = tuple(
-            attr.key for cond in self.constraints for attr in cond._get_runtime_specs()
+
+        # collect all runtime specs from the constraints and store their keys and default
+        # values for easy access during lifting.
+        runtime_specs = tuple(
+            spec for cond in self.constraints for spec in cond._get_runtime_specs()
         )
-        self._runtime_values = {}
-        self._compute_sizes()
+        self._runtime_keys = tuple(spec.key for spec in runtime_specs)
+        self._runtime_values = {
+            spec.key: spec.default for spec in runtime_specs if spec.default is not None
+        }
+
+        # compute free/constrained dofs and reduced size based on the constraints; this is
+        # only based on the dofs specified in the constraints, not on any runtime values,
+        # so we can compute it once at init and not have to worry about it changing at
+        # runtime.
+        self.free_dofs, self.constrained_dofs, self.size_reduced = self._compute_sizes()
 
     def __hash__(self):
         return hash((self.size, self.constraints))
@@ -374,35 +412,23 @@ class Lifter:
                 )
         return self._replace(_runtime_values=self._runtime_values | updates)
 
-    def _compute_sizes(self):
+    def _compute_sizes(self) -> tuple[Array, Array, int]:
         """Compute free/constrained dofs and reduced size."""
         all_dofs = jnp.arange(self.size)
 
         if not self.constraints:
             # base case: no constraints
-            self.free_dofs = all_dofs
-            self.constrained_dofs = jnp.array([], dtype=jnp.int32)
-            self.size_reduced = self.size
-            return
+            return all_dofs, jnp.array([], dtype=jnp.int32), self.size
 
         constrained = jnp.concatenate([cond.dofs for cond in self.constraints])
         constrained = jnp.unique(constrained)
         free = jnp.setdiff1d(all_dofs, constrained, assume_unique=True)
-
-        self.free_dofs = free
-        self.constrained_dofs = constrained
-        self.size_reduced = free.size
-
-    def _runtime_args_to_map(self, *values: ArrayLike) -> RuntimeValueMap:
-        """Convert positional runtime values to a mapping by key for all required runtime pairs."""
-        if len(values) != len(self._runtime_keys):
-            raise LifterError(
-                f"Expected {len(self._runtime_keys)} runtime values, but got {len(values)}"
-            )
-        return {key: val for key, val in zip(self._runtime_keys, values)}
+        return free, constrained, free.size
 
 
-def _iter_runtime_values(obj, seen: set[int] | None = None):
+def _iter_runtime_values(
+    obj, seen: set[int] | None = None
+) -> Generator[RuntimeValue[Any], None, None]:
     if seen is None:
         seen = set()
 
