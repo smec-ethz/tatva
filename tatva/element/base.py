@@ -204,6 +204,115 @@ def _get_hex8_quadrature() -> tuple[Array, Array]:
 
 _hex8_qp, _hex8_w = _get_hex8_quadrature()
 
+def _get_quad8_quadrature() -> tuple[Array, Array]:
+    xi_1d = jnp.array([-jnp.sqrt(3.0 / 5.0), 0.0, jnp.sqrt(3.0 / 5.0)])
+    w_1d = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
+
+    rr, ss = jnp.meshgrid(xi_1d, xi_1d, indexing="xy")
+    quad_points = jnp.stack([rr.ravel(), ss.ravel()], axis=-1).reshape(-1, 2)  # (9, 2)
+    quad_weights = jnp.kron(w_1d, w_1d)                         # (9,)
+    return quad_points, quad_weights
+
+
+_quad8_qp, _quad8_w = _get_quad8_quadrature()
+
+class Quad8(Element):
+    """An 8-node biquadratic quadrilateral element."""
+
+    quad_points = _quad8_qp
+    quad_weights = _quad8_w
+
+    def shape_function(self, xi: Array) -> Array:
+        r, s = xi
+
+        N1 = 0.25 * (1 - r) * (1 - s) * (-r - s - 1)
+        N2 = 0.25 * (1 + r) * (1 - s) * ( r - s - 1)
+        N3 = 0.25 * (1 + r) * (1 + s) * ( r + s - 1)
+        N4 = 0.25 * (1 - r) * (1 + s) * (-r + s - 1)
+        N5 = 0.5  * (1 - r**2) * (1 - s)
+        N6 = 0.5  * (1 + r)    * (1 - s**2)
+        N7 = 0.5  * (1 - r**2) * (1 + s)
+        N8 = 0.5  * (1 - r)    * (1 - s**2)
+
+        return jnp.array([N1, N2, N3, N4, N5, N6, N7, N8])
+
+    def shape_function_derivative(self, xi: Array) -> Array:
+        """dN/d(r,s) as array of shape (2, 8)."""
+        r, s = xi
+
+        # dN/dr
+        dN1_dr = 0.25 * (-2 * r - s) * (s - 1)
+        dN2_dr = 0.25 * (-2 * r + s) * (s - 1)
+        dN3_dr = 0.25 * ( 2 * r + s) * (s + 1)
+        dN4_dr = 0.25 * ( 2 * r - s) * (s + 1)
+        dN5_dr = r * (s - 1)
+        dN6_dr = 0.5 - 0.5 * s**2
+        dN7_dr = -r * (s + 1)
+        dN8_dr = 0.5 * s**2 - 0.5
+
+        dN_dr = jnp.array([dN1_dr, dN2_dr, dN3_dr, dN4_dr,
+                           dN5_dr, dN6_dr, dN7_dr, dN8_dr])
+
+        # dN/ds
+        dN1_ds = 0.25 * (-r - 2 * s) * (r - 1)
+        dN2_ds = 0.25 * (-r + 2 * s) * (r + 1)
+        dN3_ds = 0.25 * ( r + 1)     * (r + 2 * s)
+        dN4_ds = 0.25 * ( r - 1)     * (r - 2 * s)
+        dN5_ds = 0.5 * r**2 - 0.5
+        dN6_ds = -s * (r + 1)
+        dN7_ds = 0.5 - 0.5 * r**2
+        dN8_ds = s * (r - 1)
+
+        dN_ds = jnp.array([dN1_ds, dN2_ds, dN3_ds, dN4_ds,
+                           dN5_ds, dN6_ds, dN7_ds, dN8_ds])
+
+        return jnp.vstack((dN_dr, dN_ds))
+
+class Line3(Element):
+    """3-node quadratic line element."""
+
+    quad_points = jnp.array([[-jnp.sqrt(3.0 / 5.0)], [0.0], [jnp.sqrt(3.0 / 5.0)]])
+    quad_weights = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
+
+    def shape_function(self, xi: Array) -> Array:
+        r = xi[0]
+
+        N1 = 0.5 * r * (r - 1.0)
+        N2 = 0.5 * r * (r + 1.0)
+        N3 = 1.0 - r**2
+        return jnp.array([N1, N2, N3])
+
+    def shape_function_derivative(self, xi: Array) -> Array:
+        r = xi[0]
+        # dN/dr
+        dN1 = r - 0.5
+        dN2 = r + 0.5
+        dN3 = -2.0 * r
+        return jnp.array([dN1, dN2, dN3])
+
+    def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
+        dNdr = self.shape_function_derivative(xi) 
+        Jvec = dNdr @ nodal_coords
+
+        t = Jvec / jnp.linalg.norm(Jvec)
+        J = jnp.dot(Jvec, t)
+        return J, J
+
+    def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
+        dNdr = self.shape_function_derivative(xi) 
+        J, _ = self.get_jacobian(xi, nodal_coords)
+        dNdS = dNdr / J                           
+        return dNdS @ nodal_values
+
+    def get_local_values(
+        self, xi: Array, nodal_values: Array, nodal_coords: Array
+    ) -> tuple[Array, Array, Array]:
+
+        N = self.shape_function(xi)
+        dNdr = self.shape_function_derivative(xi)
+        J, detJ = self.get_jacobian(xi, nodal_coords)
+        dNdS = dNdr / J
+        return N @ nodal_values, dNdS @ nodal_values, detJ
 
 class Hexahedron8(Element):
     """A 8-node linear hexahedral element."""
