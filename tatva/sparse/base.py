@@ -85,15 +85,27 @@ class SparseMatrix:
         as a new instance of `Sparsity`.
         """
         nb_colors = len(jnp.unique(self.colors)) + 1
+        # precompute the indices needed to recover the full Jacobian from the compressed version
+        # rows: row index per non-zero entry (length nnz)
+        diffs = jnp.diff(self.indptr)
+        rows = jnp.repeat(
+            jnp.arange(len(self.indptr) - 1),
+            diffs,
+            total_repeat_length=len(self.indices),
+        )
+        # find where the value for (i, j) is hiding in J_compressed
+        # The value K_ij is stored at row 'i' and column 'color[j]'
+        # col_colors: color of the column for each non-zero entry (length nnz)
+        col_colors = self.colors[self.indices]
 
         def _wrapped_jacfwd(u: Array, *args: P.args, **kwargs: P.kwargs) -> Self:
             # Pass args explicitly to the JIT-compiled function
             J_compressed = colored_jacobian_batch(
                 fn, u, self.colors, args, kwargs, nb_colors, color_batch_size
             )
-            data = recover_matrix_data(
-                J_compressed, self.indptr, self.indices, self.colors
-            )
+            # TODO: this function is a one-liner, could do here directly:
+            # data = J_compressed[rows, col_colors]
+            data = recover_matrix_data(J_compressed, rows, col_colors)
             return replace(self, data=data)
 
         return _wrapped_jacfwd
@@ -147,6 +159,7 @@ def colored_jacobian_batch(
     """
 
     def compute_single_jvp(color_id: Array):
+        # TODO: Can this be moved outside the loop? Precompute it when creating jacfwd?
         seed = jnp.where(colors == color_id, 1.0, 0.0)
 
         def fn_partial(u: Array) -> Array:
@@ -155,6 +168,7 @@ def colored_jacobian_batch(
         _, jvp_out = jax.jvp(fn_partial, (x,), (seed,))
         return jvp_out
 
+    # TODO: Can this be moved outside the loop? Precompute it when creating jacfwd?
     colors_array = jnp.arange(n_colors)
     J_rows = jax.lax.map(compute_single_jvp, colors_array, batch_size=color_batch_size)
 
@@ -163,32 +177,19 @@ def colored_jacobian_batch(
 
 @jax.jit
 def recover_matrix_data(
-    J_compressed: Array, row_ptr: Array, col_indices: Array, colors: Array
+    J_compressed: Array, coo_rows: Array, col_colors: Array
 ) -> Array:
     """
     Recover the exact values from the compressed Jacobian.
 
     Args:
         J_compressed: Output from colored_jacobian, shape (N, n_colors)
-        row_ptr, col_indices: The ORIGINAL sparsity pattern of the matrix
-        colors: The array of colors used for compression
+        coo_rows: row index per non-zero entry (length nnz)
+        col_colors: color of the column for each non-zero entry (length nnz)
     """
-    # expand row pointers to get row indices for every non-zero
-    diffs = jnp.diff(row_ptr)
-    rows = jnp.repeat(
-        jnp.arange(len(row_ptr) - 1), diffs, total_repeat_length=len(col_indices)
-    )
-    cols = col_indices
-
-    # find where the value for (i, j) is hiding in J_compressed
-    # The value K_ij is stored at row 'i' and column 'color[j]'
-    col_colors = colors[cols]
-
     # extract values using fancy indexing
     # values[k] = J_compressed[ rows[k], col_colors[k] ]
-    values = J_compressed[rows, col_colors]
-
-    return values
+    return J_compressed[coo_rows, col_colors]
 
 
 @partial(jax.jit, static_argnames=["n_dofs"])
