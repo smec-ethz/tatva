@@ -5,6 +5,25 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0](https://github.com/smec-ethz/tatva/compare/v0.5.1...v0.6.0) (2026-02-20)
+
+
+### Features
+
+* **element:** add quadratic Line3 and Quad8 elements ([#18](https://github.com/smec-ethz/tatva/issues/18)) ([37bffdd](https://github.com/smec-ethz/tatva/commit/37bffdd9f898d28fd7bf0ef857d51253b13baa1a))
+* **lifter:** renamed constraints; DirichletBC -&gt; Fixed; PeriodicMap -&gt; ([f4b9a78](https://github.com/smec-ethz/tatva/commit/f4b9a78b2916ca323195c9ad66f5cf98cd3279e6))
+* **lifter:** reworked Lifter with support for changing values (RuntimeValue) ([f4b9a78](https://github.com/smec-ethz/tatva/commit/f4b9a78b2916ca323195c9ad66f5cf98cd3279e6))
+
+
+### Bug Fixes
+
+* **compound:** refactor stack_fields into a class decorator ([305b87f](https://github.com/smec-ethz/tatva/commit/305b87fd4b3be30c34c6087d149776d59971e80d))
+* **element:** allow interpolate func to accept nodal_coords ([#16](https://github.com/smec-ethz/tatva/issues/16)) ([2042d98](https://github.com/smec-ethz/tatva/commit/2042d9849e87e4e981aed8599fc74efd8b3a2666))
+* **lifter:** clarify constraint contract and make constraints hashable for jax.jit static args ([ad08049](https://github.com/smec-ethz/tatva/commit/ad0804931cf57e077274d963ab4e965cf62b0f3b))
+* **lifter:** support lifters as dynamic and static arguments to jitted ([f4b9a78](https://github.com/smec-ethz/tatva/commit/f4b9a78b2916ca323195c9ad66f5cf98cd3279e6))
+* **sparse:** pass args and kwargs directly to colored jacobian to prevent recompilation and slowness ([2d497df](https://github.com/smec-ethz/tatva/commit/2d497dfd3d71d9685a5fa1ef88d4f6f75951c8f5))
+* **sparse:** single jacfwd function with color batching by default ([4f96770](https://github.com/smec-ethz/tatva/commit/4f96770f01e2203a82a0cfa8695da6506ea193fe))
+
 ## [0.5.1](https://github.com/smec-ethz/tatva/compare/v0.5.0...v0.5.1) (2026-02-15)
 
 
