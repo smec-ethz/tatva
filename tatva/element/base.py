@@ -17,7 +17,8 @@
 
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING
+from functools import lru_cache
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -27,6 +28,64 @@ if TYPE_CHECKING:
     from typing import ClassVar as AbstractClassVar
 else:
     from equinox import AbstractClassVar
+
+
+T = TypeVar("T")
+
+
+class _LazyClassAttribute(Generic[T]):
+    """A lazy class attribute that defers computation until first access.
+    
+    This avoids expensive computations at import time while maintaining
+    compatibility with equinox.AbstractClassVar.
+    """
+    
+    def __init__(self, factory: callable):
+        self.factory = factory
+        self._value: T | None = None
+        self._name: str = ""
+    
+    def __set_name__(self, owner: type, name: str):
+        self._name = name
+    
+    def __get__(self, obj: object, objtype: type = None) -> T:
+        if self._value is None:
+            self._value = self.factory()
+        return self._value
+
+
+# Lazily computed quadrature rules to avoid slow import times
+@lru_cache(maxsize=None)
+def _get_quad4_quadrature_cached() -> tuple[Array, Array]:
+    """Compute quadrature points and weights for Quad4 (cached)."""
+    xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
+    w_vals = jnp.array([1.0, 1.0])
+    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals), axis=-1).reshape(-1, 2)
+    weights = jnp.kron(w_vals, w_vals)
+    return quad_points, weights
+
+
+@lru_cache(maxsize=None)
+def _get_quad8_quadrature_cached() -> tuple[Array, Array]:
+    """Compute quadrature points and weights for Quad8 (cached)."""
+    xi_1d = jnp.array([-jnp.sqrt(3.0 / 5.0), 0.0, jnp.sqrt(3.0 / 5.0)])
+    w_1d = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
+
+    rr, ss = jnp.meshgrid(xi_1d, xi_1d, indexing="xy")
+    quad_points = jnp.stack([rr.ravel(), ss.ravel()], axis=-1).reshape(-1, 2)  # (9, 2)
+    quad_weights = jnp.kron(w_1d, w_1d)  # (9,)
+    return quad_points, quad_weights
+
+
+@lru_cache(maxsize=None)
+def _get_hex8_quadrature_cached() -> tuple[Array, Array]:
+    """Compute quadrature points and weights for Hexahedron8 (cached)."""
+    xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
+    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals, xi_vals), axis=-1).reshape(
+        -1, 3
+    )
+    weights = jnp.full(quad_points.shape[0], fill_value=1.0)
+    return quad_points, weights
 
 
 class Element(eqx.Module):
@@ -181,22 +240,11 @@ class Tri3(Element):
         return jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]]).T
 
 
-def _get_quad4_quadrature() -> tuple[Array, Array]:
-    xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
-    w_vals = jnp.array([1.0, 1.0])
-    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals), axis=-1).reshape(-1, 2)
-    weights = jnp.kron(w_vals, w_vals)
-    return quad_points, weights
-
-
-_quad4_qp, _quad4_w = _get_quad4_quadrature()
-
-
 class Quad4(Element):
     """A 4-node bilinear quadrilateral element."""
 
-    quad_points = _quad4_qp
-    quad_weights = _quad4_w
+    quad_points = _LazyClassAttribute(lambda: _get_quad4_quadrature_cached()[0])
+    quad_weights = _LazyClassAttribute(lambda: _get_quad4_quadrature_cached()[1])
 
     def shape_function(self, xi: Array) -> Array:
         r, s = xi
@@ -220,24 +268,11 @@ class Quad4(Element):
         )
 
 
-def _get_quad8_quadrature() -> tuple[Array, Array]:
-    xi_1d = jnp.array([-jnp.sqrt(3.0 / 5.0), 0.0, jnp.sqrt(3.0 / 5.0)])
-    w_1d = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
-
-    rr, ss = jnp.meshgrid(xi_1d, xi_1d, indexing="xy")
-    quad_points = jnp.stack([rr.ravel(), ss.ravel()], axis=-1).reshape(-1, 2)  # (9, 2)
-    quad_weights = jnp.kron(w_1d, w_1d)  # (9,)
-    return quad_points, quad_weights
-
-
-_quad8_qp, _quad8_w = _get_quad8_quadrature()
-
-
 class Quad8(Element):
     """An 8-node biquadratic quadrilateral element."""
 
-    quad_points = _quad8_qp
-    quad_weights = _quad8_w
+    quad_points = _LazyClassAttribute(lambda: _get_quad8_quadrature_cached()[0])
+    quad_weights = _LazyClassAttribute(lambda: _get_quad8_quadrature_cached()[1])
 
     def shape_function(self, xi: Array) -> Array:
         r, s = xi
@@ -307,24 +342,9 @@ class Tetrahedron4(Element):
         ).T
 
 
-def _get_hex8_quadrature() -> tuple[Array, Array]:
-    xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
-    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals, xi_vals), axis=-1).reshape(
-        -1, 3
-    )
-    weights = jnp.full(quad_points.shape[0], fill_value=1.0)
-    return quad_points, weights
-
-
-_hex8_qp, _hex8_w = _get_hex8_quadrature()
-
-
-class Hexahedron8(Element):
-    """A 8-node linear hexahedral element."""
-
+def _compute_hex8_quadrature() -> tuple[Array, Array]:
+    """Compute quadrature points and weights for Hexahedron8."""
     a = 1 / jnp.sqrt(3)
-
-    # 2x2x2 Gauss Quadrature Rule
     quad_points = jnp.array(
         [
             [-a, -a, -a],
@@ -337,9 +357,18 @@ class Hexahedron8(Element):
             [-a, a, a],
         ]
     )
-
-    # Weights are all 1.0 for this rule (since interval is [-1, 1])
     quad_weights = jnp.ones(8)
+    return quad_points, quad_weights
+
+
+class Hexahedron8(Element):
+    """A 8-node linear hexahedral element."""
+
+    a = 1 / jnp.sqrt(3)
+
+    # 2x2x2 Gauss Quadrature Rule (lazily computed)
+    quad_points = _LazyClassAttribute(lambda: _compute_hex8_quadrature()[0])
+    quad_weights = _LazyClassAttribute(lambda: _compute_hex8_quadrature()[1])
 
     def shape_function(self, xi: Array) -> Array:
         """Returns the shape functions evaluated at the local coordinates (xi, eta, zeta)."""
