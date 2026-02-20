@@ -1,11 +1,7 @@
 import jax
-
-jax.config.update("jax_enable_x64", True)  # use double-precision
-
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import scipy.sparse as sp
 from jax import Array
 from jax_autovmap import autovmap
 from tatva_coloring import distance2_color_and_seeds
@@ -62,23 +58,14 @@ def test_sparse_matrix(op: Operator, coloring_func):
 
     K = jax.jacfwd(jax.jacrev(total_energy))(jnp.zeros(op.mesh.coords.shape[0] * 2))
 
-    sparsity_pattern = sparse.create_sparsity_pattern(op.mesh, n_dofs_per_node=2)
-    sparsity_pattern_csr = sp.csr_matrix(
-        (
-            sparsity_pattern.data,
-            (sparsity_pattern.indices[:, 0], sparsity_pattern.indices[:, 1]),
-        )
-    )
+    sparsity_pattern_csr = sparse.create_sparsity_pattern(op.mesh, n_dofs_per_node=2)
     indptr = sparsity_pattern_csr.indptr
     indices = sparsity_pattern_csr.indices
 
     colors, seeds = coloring_func(row_ptr=indptr, col_idx=indices, n_dofs=n_dofs)
 
-    K_sparse = sparse.jacfwd(
-        gradient=jax.jacrev(total_energy),
-        row_ptr=indptr,
-        col_indices=indices,
-        colors=colors,
+    K_sparse = sparse.SparseMatrix.from_csr(sparsity_pattern_csr, colors=colors).jacfwd(
+        jax.jacrev(total_energy), color_batch_size=10
     )(jnp.zeros(op.mesh.coords.shape[0] * 2))
 
-    np.testing.assert_allclose(K, K_sparse.todense())
+    np.testing.assert_allclose(K, K_sparse.to_dense())
