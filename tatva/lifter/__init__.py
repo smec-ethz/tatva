@@ -23,3 +23,23 @@ from tatva.lifter.common import RuntimeValue as RuntimeValue
 from tatva.lifter.constraints import Constraint as Constraint
 from tatva.lifter.constraints import Fixed as Fixed
 from tatva.lifter.constraints import Periodic as Periodic
+
+
+def __getattr__(name: str):
+    from warnings import warn
+
+    if name == "DirichletBC":
+        warn(
+            "`DirichletBC` is deprecated; use `Fixed` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return Fixed
+    if name == "PeriodicMap":
+        warn(
+            "`PeriodicMap` is deprecated; use `Periodic` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return Periodic
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
