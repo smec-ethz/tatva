@@ -64,8 +64,9 @@ def test_sparse_matrix(op: Operator, coloring_func):
 
     colors, seeds = coloring_func(row_ptr=indptr, col_idx=indices, n_dofs=n_dofs)
 
-    K_sparse = sparse.SparseMatrix.from_csr(sparsity_pattern_csr, colors=colors).jacfwd(
-        jax.jacrev(total_energy), color_batch_size=10
+    colored_matrix = sparse.ColoredMatrix.from_csr(sparsity_pattern_csr, colors=colors)
+    K_sparse = sparse.jacfwd(
+        jax.jacrev(total_energy), colored_matrix, color_batch_size=10
     )(jnp.zeros(op.mesh.coords.shape[0] * 2))
 
     np.testing.assert_allclose(K, K_sparse.to_dense())

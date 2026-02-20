@@ -35,7 +35,7 @@ P = ParamSpec("P")
 
 @register_dataclass
 @dataclass(frozen=True)
-class SparseMatrix:
+class ColoredMatrix:
     """Class to represent the sparsity pattern of a matrix, including the row pointers,
     column indices, and colors for graph coloring.
     """
@@ -77,39 +77,6 @@ class SparseMatrix:
             colors=colors,
         )
 
-    def jacfwd(
-        self, fn: Callable[[Concatenate[Array, P]], Array], *, color_batch_size: int
-    ) -> Callable[[Concatenate[Array, P]], SparseMatrix]:
-        """Returns a function that computes the Jacobian of `fn` using forward-mode automatic differentiation
-        and graph coloring. The returned function takes the same arguments as `fn` and returns a sparse Jacobian
-        as a new instance of `Sparsity`.
-        """
-        nb_colors = len(jnp.unique(self.colors)) + 1
-        # precompute the indices needed to recover the full Jacobian from the compressed version
-        # rows: row index per non-zero entry (length nnz)
-        diffs = jnp.diff(self.indptr)
-        rows = jnp.repeat(
-            jnp.arange(len(self.indptr) - 1),
-            diffs,
-            total_repeat_length=len(self.indices),
-        )
-        # find where the value for (i, j) is hiding in J_compressed
-        # The value K_ij is stored at row 'i' and column 'color[j]'
-        # col_colors: color of the column for each non-zero entry (length nnz)
-        col_colors = self.colors[self.indices]
-
-        def _wrapped_jacfwd(u: Array, *args: P.args, **kwargs: P.kwargs) -> Self:
-            # Pass args explicitly to the JIT-compiled function
-            J_compressed = colored_jacobian_batch(
-                fn, u, self.colors, args, kwargs, nb_colors, color_batch_size
-            )
-            # TODO: this function is a one-liner, could do here directly:
-            # data = J_compressed[rows, col_colors]
-            data = recover_matrix_data(J_compressed, rows, col_colors)
-            return replace(self, data=data)
-
-        return _wrapped_jacfwd
-
     def to_csr(self) -> sp.csr_matrix:
         """Convert the sparse matrix to SciPy's CSR format."""
         return sp.csr_matrix((self.data, self.indices, self.indptr), shape=self.shape)
@@ -131,6 +98,43 @@ class SparseMatrix:
         """Convert the sparse matrix to a dense array."""
         bcoo = self.to_bcoo()
         return bcoo.todense()
+
+
+def jacfwd(
+    fn: Callable[[Concatenate[Array, P]], Array],
+    colored_matrix: ColoredMatrix,
+    *,
+    color_batch_size: int,
+) -> Callable[[Concatenate[Array, P]], ColoredMatrix]:
+    """Returns a function that computes the Jacobian of `fn` using forward-mode automatic differentiation
+    and graph coloring. The returned function takes the same arguments as `fn` and returns a sparse Jacobian
+    as a new instance of `Sparsity`.
+    """
+    nb_colors = len(jnp.unique(colored_matrix.colors)) + 1
+    # precompute the indices needed to recover the full Jacobian from the compressed version
+    # rows: row index per non-zero entry (length nnz)
+    diffs = jnp.diff(colored_matrix.indptr)
+    rows = jnp.repeat(
+        jnp.arange(len(colored_matrix.indptr) - 1),
+        diffs,
+        total_repeat_length=len(colored_matrix.indices),
+    )
+    # find where the value for (i, j) is hiding in J_compressed
+    # The value K_ij is stored at row 'i' and column 'color[j]'
+    # col_colors: color of the column for each non-zero entry (length nnz)
+    col_colors = colored_matrix.colors[colored_matrix.indices]
+
+    def _wrapped_jacfwd(u: Array, *args: P.args, **kwargs: P.kwargs) -> ColoredMatrix:
+        # Pass args explicitly to the JIT-compiled function
+        J_compressed = colored_jacobian_batch(
+            fn, u, colored_matrix.colors, args, kwargs, nb_colors, color_batch_size
+        )
+        # TODO: this function is a one-liner, could do here directly:
+        # data = J_compressed[rows, col_colors]
+        data = recover_matrix_data(J_compressed, rows, col_colors)
+        return replace(colored_matrix, data=data)
+
+    return _wrapped_jacfwd
 
 
 @partial(jax.jit, static_argnames=["fn", "n_colors", "color_batch_size"])
