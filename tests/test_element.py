@@ -6,15 +6,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import Array
-from tatva.element import Hexahedron8, Line2, Quad4, Tetrahedron4, Tri3
+from tatva.element import Hexahedron8, Line2, Line3, Quad4, Quad8, Tetrahedron4, Tri3
 
 
 @pytest.mark.parametrize(
     "element_class, dim",
     [
         (Line2, 1),
+        (Line3, 1),
         (Tri3, 2),
         (Quad4, 2),
+        (Quad8, 2),
         (Tetrahedron4, 3),
         (Hexahedron8, 3),
     ],
@@ -27,9 +29,12 @@ def test_element_patch_test(element_class, dim):
     key = jax.random.PRNGKey(42)
 
     if dim == 1:
-        dummy_xi = (
-            element.quad_points
-        )  # because Line2 has only one quadrature point, we can use it directly
+        if element_class is Line2:
+            dummy_xi = (
+                element.quad_points
+            )  # because Line2 has only one quadrature point, we can use it directly
+        else:
+            dummy_xi = element.quad_points[0]
     else:
         dummy_xi = element.quad_points[
             0
