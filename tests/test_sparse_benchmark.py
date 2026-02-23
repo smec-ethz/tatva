@@ -81,13 +81,7 @@ def _build_problem(
     def total_energy_with_args(u_flat: Array, damage: Array) -> Array:
         return total_energy(u_flat) * jnp.mean(damage)
 
-    sparsity_pattern = sparse.create_sparsity_pattern(mesh, n_dofs_per_node=2)
-    sparsity_pattern_csr = sp.csr_matrix(
-        (
-            sparsity_pattern.data,
-            (sparsity_pattern.indices[:, 0], sparsity_pattern.indices[:, 1]),
-        )
-    )
+    sparsity_pattern_csr = sparse.create_sparsity_pattern(mesh, n_dofs_per_node=2)
 
     colors = distance2_color_and_seeds(
         row_ptr=sparsity_pattern_csr.indptr,
@@ -95,7 +89,9 @@ def _build_problem(
         n_dofs=mesh.coords.shape[0] * 2,
     )[0]
 
-    return op, total_energy, total_energy_with_args, sparsity_pattern_csr, colors
+    colored_matrix = sparse.ColoredMatrix.from_csr(sparsity_pattern_csr, colors=colors)
+
+    return op, total_energy, total_energy_with_args, colored_matrix
 
 
 @pytest.mark.skipif(
@@ -106,23 +102,19 @@ def _build_problem(
     "nx, ny", [(100, 100), (200, 200)]
 )  # Test with different mesh sizes
 def test_sparse_benchmark(nx, ny):
-    op, total_energy, total_energy_with_args, sparsity_pattern_csr, colors = (
-        _build_problem(nx=nx, ny=ny)
+    op, total_energy, total_energy_with_args, colored_matrix = _build_problem(
+        nx=nx, ny=ny
     )
 
     hessian_sparse_with_args = sparse.jacfwd(
-        gradient=jax.jacrev(total_energy_with_args, argnums=0),
-        row_ptr=jnp.array(sparsity_pattern_csr.indptr),
-        col_indices=jnp.array(sparsity_pattern_csr.indices),
-        colors=jnp.array(colors),
+        fn=jax.jacrev(total_energy_with_args, argnums=0),
+        colored_matrix=colored_matrix,
         color_batch_size=10,  # Batch size for evaluating the element routine
     )
 
     hessian_sparse = sparse.jacfwd(
-        gradient=jax.jacrev(total_energy, argnums=0),
-        row_ptr=jnp.array(sparsity_pattern_csr.indptr),
-        col_indices=jnp.array(sparsity_pattern_csr.indices),
-        colors=jnp.array(colors),
+        fn=jax.jacrev(total_energy, argnums=0),
+        colored_matrix=colored_matrix,
         color_batch_size=10,  # Batch size for evaluating the element routine
     )
 
