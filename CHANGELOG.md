@@ -5,6 +5,24 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0](https://github.com/smec-ethz/tatva/compare/v0.6.0...v0.7.0) (2026-02-24)
+
+
+### Features
+
+* **sparse:** add a ColoredMatrix type for sparse differentiation ([2ab3214](https://github.com/smec-ethz/tatva/commit/2ab3214678473ed83abd6a01aec8497b8bb66c2b))
+
+
+### Bug Fixes
+
+* adapt sparse benchmark with new api ([93d1cf4](https://github.com/smec-ethz/tatva/commit/93d1cf4e70436934af45f419c306dcf9d968cb27))
+* **sparse:** switch to scipy csr matrix in all sparsity pattern creation ([2ab3214](https://github.com/smec-ethz/tatva/commit/2ab3214678473ed83abd6a01aec8497b8bb66c2b))
+
+
+### Performance Improvements
+
+* **sparse:** precompute reconstruction of data from J_compressed ([d2f6a37](https://github.com/smec-ethz/tatva/commit/d2f6a3704bdaebeafa30c5c75f5b9e6de2a33781))
+
 ## [0.6.0](https://github.com/smec-ethz/tatva/compare/v0.5.1...v0.6.0) (2026-02-20)
 
 
