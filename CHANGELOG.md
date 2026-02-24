@@ -5,6 +5,13 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.1](https://github.com/smec-ethz/tatva/compare/v0.7.0...v0.7.1) (2026-02-24)
+
+
+### Bug Fixes
+
+* remove jax BCOO based code for master-slave sparsity ([ac49fc5](https://github.com/smec-ethz/tatva/commit/ac49fc5e6f8a23f6eafc06097b8d7f224e2b2c3d))
+
 ## [0.7.0](https://github.com/smec-ethz/tatva/compare/v0.6.0...v0.7.0) (2026-02-24)
 
 
