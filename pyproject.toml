@@ -22,7 +22,7 @@ dependencies = [
     "equinox",
     "numpy",
     "jax-autovmap>=0.3.0",
-    "tatva-coloring"
+    "tatva-coloring>=0.0.2"
 ]
 
 [project.optional-dependencies]

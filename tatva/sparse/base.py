@@ -28,7 +28,7 @@ import scipy.sparse as sp
 from jax import Array
 from jax.tree_util import register_dataclass
 from numpy.typing import NDArray
-from tatva_coloring import distance2_color_and_seeds
+from tatva_coloring import distance2_colors
 
 P = ParamSpec("P")
 
@@ -63,11 +63,7 @@ class ColoredMatrix:
 
         if colors is None:
             # If no colors are provided, compute them using distance-2 coloring
-            colors, _seeds = distance2_color_and_seeds(
-                indptr,  # ty:ignore[invalid-argument-type]
-                indices,  # ty:ignore[invalid-argument-type]
-                csr_matrix.shape[0],
-            )
+            colors = distance2_colors(indptr, indices, csr_matrix.shape[0])
 
         return cls(
             data=jnp.asarray(csr_matrix.data),
@@ -194,42 +190,3 @@ def recover_matrix_data(
     # extract values using fancy indexing
     # values[k] = J_compressed[ rows[k], col_colors[k] ]
     return J_compressed[coo_rows, col_colors]
-
-
-@partial(jax.jit, static_argnames=["n_dofs"])
-def recover_stiffness_matrix(
-    J_compressed: Array,
-    row_ptr: Array,
-    col_indices: Array,
-    colors: Array,
-    n_dofs: int,
-) -> jsp.BCOO:
-    """
-    Recover the exact values from the compressed Jacobian and build BCOO.
-
-    Args:
-        J_compressed: Output from colored_jacobian, shape (N, n_colors)
-        row_ptr, col_indices: The ORIGINAL sparsity pattern of the matrix
-        colors: The array of colors used for compression
-
-    Returns:
-        K_bcoo: The recovered sparse Jacobian in BCOO format
-    """
-
-    # expand row pointers to get row indices for every non-zero
-    diffs = jnp.diff(row_ptr)
-    rows = jnp.repeat(jnp.arange(n_dofs), diffs, total_repeat_length=len(col_indices))
-    cols = col_indices
-
-    # find where the value for (i, j) is hiding in J_compressed
-    # The value K_ij is stored at row 'i' and column 'color[j]'
-    col_colors = colors[cols]
-
-    # extract values using fancy indexing
-    # values[k] = J_compressed[ rows[k], col_colors[k] ]
-    values = J_compressed[rows, col_colors]
-
-    indices = jnp.stack([rows, cols], axis=1)
-    K_bcoo = jsp.BCOO((values, indices), shape=(n_dofs, n_dofs))
-
-    return K_bcoo
