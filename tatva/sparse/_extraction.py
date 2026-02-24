@@ -229,12 +229,13 @@ def create_sparsity_pattern_master_slave(
         map_arr = new_map
 
     # Create full-system sparsity from connectivity, then project via mapping
-    full_pattern = _create_sparse_structure(
+    full_pattern_csr = _create_sparse_structure(
         mesh.elements, n_dofs_per_node, K_shape=(n_full, n_full)
     )
+    full_pattern = full_pattern_csr.tocoo()  # COO for easy access to indices
 
-    I_full = np.asarray(full_pattern.indices[:, 0], dtype=np.int64)
-    J_full = np.asarray(full_pattern.indices[:, 1], dtype=np.int64)
+    I_full = full_pattern.row.astype(np.int64)
+    J_full = full_pattern.col.astype(np.int64)
 
     # Unique masters and compaction to 0..n_red-1
     masters = np.unique(map_arr)
