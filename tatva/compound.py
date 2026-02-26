@@ -19,13 +19,16 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Any, Callable, Generator, Self, overload
+from typing import Any, Callable, Generator, Self, TypeVar, overload
 
 import jax.numpy as jnp
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 
 __all__ = ["Compound", "field", "stack_fields"]
+
+
+T_Compound = TypeVar("T_Compound", bound="Compound")
 
 
 class CompoundStackError(ValueError):
@@ -304,8 +307,8 @@ class Compound(metaclass=_CompoundMeta):
 
 
 def _apply_stacked_fields(
-    cls: type[Compound], stack_fields: tuple[str, ...], stack_axis: int = -1
-) -> type[Compound]:
+    cls: type[T_Compound], stack_fields: tuple[str, ...], stack_axis: int = -1
+) -> type[T_Compound]:
     """Reorder fields by stacking specified fields along an axis. Modifies class in place.
 
     Args:
@@ -414,7 +417,7 @@ def _apply_stacked_fields(
 
 def stack_fields(
     *fields: str, axis: int = -1
-) -> Callable[[type[Compound]], type[Compound]]:
+) -> Callable[[type[T_Compound]], type[T_Compound]]:
     """Class decorator to stack compatible fields into a shared contiguous layout.
 
     Args:
