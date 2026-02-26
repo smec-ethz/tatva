@@ -97,11 +97,11 @@ class ColoredMatrix:
 
 
 def jacfwd(
-    fn: Callable[[Concatenate[Array, P]], Array],
+    fn: Callable[Concatenate[Array, P], Array],
     colored_matrix: ColoredMatrix,
     *,
     color_batch_size: int,
-) -> Callable[[Concatenate[Array, P]], ColoredMatrix]:
+) -> Callable[Concatenate[Array, P], ColoredMatrix]:
     """Returns a function that computes the Jacobian of `fn` using forward-mode automatic differentiation
     and graph coloring. The returned function takes the same arguments as `fn` and returns a sparse Jacobian
     as a new instance of `Sparsity`.
