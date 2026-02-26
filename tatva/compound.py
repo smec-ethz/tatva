@@ -121,10 +121,12 @@ class FieldStackedView(Field):
     def __init__(
         self,
         shape: tuple[int, ...],
+        default_factory: Callable | None,
         parent_field: _FieldBase,
         parent_slice: tuple[slice, ...],
     ) -> None:
-        super().__init__(shape)
+        self.shape = shape if len(shape) > 1 else (*shape, 1)
+        self.default_factory = default_factory
         self.parent_field = parent_field
         self.parent_slice = parent_slice
 
@@ -163,6 +165,13 @@ class FieldStackedView(Field):
             self.parent_field.shape
         )
         return parent_idxs[self.parent_slice].__getitem__(arg).flatten()
+
+    @property
+    def slice(self):
+        # The slice of a FieldStackedView is not contiguous, so we cannot return a single slice.
+        # Instead, we return an int array of the global indices corresponding to this
+        # field, which can be used for indexing.
+        return self.indices(slice(None))
 
 
 class _CompoundMeta(type):
@@ -332,10 +341,11 @@ def _apply_stacked_fields(
     base_reduced = base_shape[:axis] + base_shape[axis + 1 :]
 
     # Precompute per-field layout and validate compatibility in one pass.
-    stack_layout: list[tuple[str, tuple[int, ...], int, int]] = []
+    stack_layout: list[tuple[str, tuple[int, ...], Callable | None, int, int]] = []
     stack_size = 0
     for name in stack_fields:
-        shape = fields_map[name].shape
+        f = fields_map[name]
+        shape = f.shape
         if len(shape) != rank:
             raise CompoundStackError(
                 f"Field {name} with shape {shape} is not compatible with base rank {rank}."
@@ -349,7 +359,7 @@ def _apply_stacked_fields(
         extent = shape[axis]
         start = stack_size
         end = start + extent
-        stack_layout.append((name, shape, start, end))
+        stack_layout.append((name, shape, f.default_factory, start, end))
         stack_size = end
 
     stacked_shape = (*base_shape[:axis], stack_size, *base_shape[axis + 1 :])
@@ -361,12 +371,15 @@ def _apply_stacked_fields(
     # them on the class after validation and layout construction is complete.
     new_fields: list[tuple[str, Field]] = []
     pending_setattrs: list[tuple[str, FieldStackedView]] = []
-    for name, shape, start, end in stack_layout:
+    for name, shape, default_factory, start, end in stack_layout:
         parent_slice = tuple(
             slice(None) if i != axis else slice(start, end) for i in range(rank)
         )
         new_field = FieldStackedView(
-            shape=shape, parent_field=stacked_field, parent_slice=parent_slice
+            shape=shape,
+            default_factory=default_factory,
+            parent_field=stacked_field,
+            parent_slice=parent_slice,
         )
         pending_setattrs.append((name, new_field))
         new_fields.append((name, new_field))
