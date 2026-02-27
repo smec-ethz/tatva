@@ -37,7 +37,7 @@ class CompoundStackError(ValueError):
 
 class _FieldBase:
     def __init__(self, shape: tuple[int, ...], _slice: slice | None = None) -> None:
-        self.shape = shape if len(shape) > 1 else (*shape, 1)
+        self.shape = shape
         self.slice = _slice
 
     def indices(self, arg: int | slice | tuple[int | slice, ...]) -> Array:
@@ -128,7 +128,7 @@ class FieldStackedView(Field):
         parent_field: _FieldBase,
         parent_slice: tuple[slice, ...],
     ) -> None:
-        self.shape = shape if len(shape) > 1 else (*shape, 1)
+        self.shape = shape
         self.default_factory = default_factory
         self.parent_field = parent_field
         self.parent_slice = parent_slice
@@ -141,12 +141,19 @@ class FieldStackedView(Field):
         if instance is None:
             return self
         # get slice
-        return instance.arr[self.parent_field.slice].reshape(self.parent_field.shape)[
-            self.parent_slice
-        ]
+        return (
+            instance.arr[self.parent_field.slice]
+            .reshape(self.parent_field.shape)[self.parent_slice]
+            .reshape(self.shape)
+        )
 
     def __set__(self, instance: Compound, value: Array | float | int) -> None:
         arr = jnp.asarray(value)
+        # arr must be reshapable to self.shape
+        # if self.shape is rank 1, then we extend it to rank 2 with a singleton dimension
+        # to allow broadcasting
+        shape_in_parent = self.shape if len(self.shape) > 1 else (*self.shape, 1)
+        arr = jnp.reshape(arr, shape_in_parent)
         parent = (
             instance.arr[self.parent_field.slice]
             .reshape(self.parent_field.shape)
@@ -214,7 +221,7 @@ class _CompoundMeta(type):
                 stacklevel=2,
             )
             _apply_stacked_fields(
-                cls,  # ty:ignore[invalid-argument-type]
+                cls,  # pyright: ignore[reportArgumentType]
                 stack_fields=tuple(kwargs["stack_fields"]),
                 stack_axis=kwargs.get("stack_axis", -1),
             )
@@ -331,10 +338,23 @@ def _apply_stacked_fields(
     if missing:
         raise CompoundStackError(f"Unknown field names in stack_fields: {missing}")
 
-    base_shape = fields_map[stack_fields[0]].shape
+    # the dimension in the fields to stack along must be compatible, we take the first field as reference
+    # if the field is rank 1 (a scalar per node), we reshape it to rank 2 with a singleton dimension
+    def _reshape_rank_1_if_needed(field: Field) -> tuple[Field, tuple[int, ...]]:
+        rank = len(original_shape := field.shape)
+        if rank == 0:
+            raise CompoundStackError("Cannot stack scalar fields.")
+        if rank == 1:
+            return Field(
+                shape=(*field.shape, 1),
+                default_factory=field.default_factory,
+                _slice=field.slice,
+            ), original_shape
+        return field, original_shape
+
+    base_field, _ = _reshape_rank_1_if_needed(fields_map[stack_fields[0]])
+    base_shape = base_field.shape
     rank = len(base_shape)
-    if rank == 0:  # should never; Field makes sure shape is at least rank 2
-        raise CompoundStackError("Cannot stack scalar fields.")
     if not (-rank <= stack_axis < rank):
         raise CompoundStackError(
             f"Invalid stack_axis={stack_axis} for field rank {rank}. "
@@ -344,10 +364,12 @@ def _apply_stacked_fields(
     base_reduced = base_shape[:axis] + base_shape[axis + 1 :]
 
     # Precompute per-field layout and validate compatibility in one pass.
+    # collect new fields in stack_layout as (name, shape, default_factory, start, end)
+    # tuples for the stacked fields.
     stack_layout: list[tuple[str, tuple[int, ...], Callable | None, int, int]] = []
     stack_size = 0
     for name in stack_fields:
-        f = fields_map[name]
+        f, original_shape = _reshape_rank_1_if_needed(fields_map[name])
         shape = f.shape
         if len(shape) != rank:
             raise CompoundStackError(
@@ -362,7 +384,7 @@ def _apply_stacked_fields(
         extent = shape[axis]
         start = stack_size
         end = start + extent
-        stack_layout.append((name, shape, f.default_factory, start, end))
+        stack_layout.append((name, original_shape, f.default_factory, start, end))
         stack_size = end
 
     stacked_shape = (*base_shape[:axis], stack_size, *base_shape[axis + 1 :])
@@ -432,7 +454,7 @@ def stack_fields(
 
     field_names = tuple(fields)
 
-    def decorator(cls: type[Compound]) -> type[Compound]:
+    def decorator(cls: type[T_Compound]) -> type[T_Compound]:
         return _apply_stacked_fields(cls, stack_fields=field_names, stack_axis=axis)
 
     return decorator
