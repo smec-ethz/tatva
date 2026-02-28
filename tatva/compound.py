@@ -103,6 +103,13 @@ class _FieldBase:
             )
         return arr[self._slice].reshape(self.shape)
 
+    def _set_in_array(self, arr: Array, value: Array) -> Array:
+        if self._slice is None:
+            raise RuntimeError(
+                "Field slice is not set. This should be set by the Compound metaclass."
+            )
+        return arr.at[self._slice].set(value.reshape(-1))
+
     def _indices_impl(self, arg: tuple[int | slice | Array, ...]) -> Array:
         if self._base_offset is None:
             raise RuntimeError(
@@ -253,6 +260,13 @@ class FieldStackedView(Field):
             .reshape(self.shape)
         )
 
+    @override
+    def _set_in_array(self, arr: Array, value: Array) -> Array:
+        parent = arr[self._root_slice].reshape(self._root_shape)
+        parent_shape = parent[self._view_slice].shape
+        parent = parent.at[self._view_slice].set(value.reshape(parent_shape))
+        return arr.at[self._root_slice].set(parent.reshape(-1))
+
     @property
     def slice(self):
         # The slice of a FieldStackedView is not contiguous, so we cannot return a single slice.
@@ -368,8 +382,8 @@ class Compound(metaclass=_CompoundMeta):
             # initialize fields with default factories if provided
             for name, field_obj in self.fields:
                 if field_obj.default_factory is not None:
-                    self.arr = self.arr.at[field_obj.slice].set(
-                        jnp.asarray(field_obj.default_factory()).flatten()
+                    self.arr = field_obj._set_in_array(
+                        self.arr, jnp.asarray(field_obj.default_factory())
                     )
 
     def __len__(self) -> int:
@@ -402,9 +416,8 @@ class _CompoundAtHelper:
         self.field_obj = field_obj
 
     def set(self, value: Array | float | int) -> Compound:
-        arr = jnp.asarray(value)
         return self.state.__class__(
-            self.state.arr.at[self.field_obj.slice].set(arr.flatten())
+            self.field_obj._set_in_array(self.state.arr, jnp.asarray(value))
         )
 
 
