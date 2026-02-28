@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Any, Callable, Generator, Self, TypeVar, overload
+from typing import Any, Callable, Generator, Self, TypeVar, overload, override
 
 import jax.numpy as jnp
 from jax import Array
@@ -35,38 +35,117 @@ class CompoundStackError(ValueError):
     pass
 
 
+def _normalize_index(
+    arg: int | slice | Array | tuple[int | slice | Array, ...],
+    shape: tuple[int, ...],
+) -> tuple[int | slice | Array, ...]:
+    if not isinstance(arg, tuple):
+        arg = (arg,)
+    if len(arg) < len(shape):
+        arg = arg + (slice(None),) * (len(shape) - len(arg))
+    return arg
+
+
+def _row_major_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    stride = 1
+    strides_rev: list[int] = []
+    for extent in reversed(shape):
+        strides_rev.append(stride)
+        stride *= extent
+    return tuple(reversed(strides_rev))
+
+
+def _reshape_affine_metadata(
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+    target_shape: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    if shape == target_shape:
+        return shape, strides
+
+    compact_shape = tuple(extent for extent in shape if extent != 1)
+    compact_strides = tuple(
+        stride for extent, stride in zip(shape, strides, strict=True) if extent != 1
+    )
+    if compact_shape == target_shape:
+        return compact_shape, compact_strides
+
+    raise ValueError(
+        f"Cannot reshape affine metadata from shape {shape} to {target_shape}."
+    )
+
+
 class _FieldBase:
-    def __init__(self, shape: tuple[int, ...], _slice: slice | None = None) -> None:
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        _slice: slice | None = None,
+    ) -> None:
         self.shape = shape
-        self.slice = _slice
+        self._slice: slice | None = None
+        self._base_offset: int | None = None
+        self._strides: tuple[int, ...] = ()
+        self._set_contiguous_slice(_slice)
 
-    def indices(self, arg: int | slice | tuple[int | slice, ...]) -> Array:
-        # Normalize to tuple
-        if not isinstance(arg, tuple):
-            arg = (arg,)
-        if len(arg) < len(self.shape):
-            arg = arg + (slice(None),) * (len(self.shape) - len(arg))
+    def _set_contiguous_slice(self, _slice: slice | None) -> None:
+        self._slice = _slice
+        if _slice is None:
+            self._base_offset = None
+            self._strides = ()
+            return
+        self._base_offset = _slice.start
+        self._strides = _row_major_strides(self.shape)
 
-        idxs = []
-        for dim, sub in enumerate(arg):
-            if isinstance(sub, slice):
-                start, stop, step = sub.indices(self.shape[dim])
-                idxs.append(jnp.arange(start, stop, step))
-            elif isinstance(sub, (int, jnp.integer)):
-                idxs.append(jnp.array([sub]))
-            else:
-                idxs.append(jnp.asarray(sub))
-
-        mesh = jnp.meshgrid(*idxs, indexing="ij")
-        multi_idx = [m.flatten() for m in mesh]
-        flat_local = jnp.ravel_multi_index(multi_idx, dims=self.shape)
-
-        if self.slice is None:
+    def _view(self, arr: Array) -> Array:
+        if self._slice is None:
             raise RuntimeError(
                 "Field slice is not set. This should be set by the Compound metaclass."
             )
+        return arr[self._slice].reshape(self.shape)
 
-        return jnp.array(flat_local + self.slice.start)
+    def _indices_impl(self, arg: tuple[int | slice | Array, ...]) -> Array:
+        if self._base_offset is None:
+            raise RuntimeError(
+                "Field indexing metadata is not set. This should be set by the Compound metaclass."
+            )
+
+        axis_indices: list[Array] = []
+        for sub, extent in zip(arg, self.shape, strict=True):
+            if isinstance(sub, int):
+                idx = sub if sub >= 0 else sub + extent
+                axis_indices.append(jnp.asarray([idx], dtype=int))
+            elif isinstance(sub, slice):
+                start, stop, step = sub.indices(extent)
+                axis_indices.append(jnp.arange(start, stop, step, dtype=int))
+            else:
+                values = jnp.asarray(sub, dtype=int).reshape(-1)
+                axis_indices.append(jnp.where(values < 0, values + extent, values))
+
+        if not axis_indices:
+            return jnp.asarray([self._base_offset], dtype=int)
+
+        grid_shape = tuple(len(values) for values in axis_indices)
+        index = jnp.full(grid_shape, self._base_offset, dtype=int)
+        for axis, (stride, values) in enumerate(
+            zip(self._strides, axis_indices, strict=True)
+        ):
+            broadcast_shape = tuple(
+                len(values) if i == axis else 1 for i in range(len(axis_indices))
+            )
+            index = index + jnp.reshape(
+                values * stride,
+                broadcast_shape,
+            )
+        return index.reshape(-1)
+
+    @property
+    def slice(self) -> slice | Array | None:
+        return self._slice
+
+    def indices(
+        self, arg: int | slice | Array | tuple[int | slice | Array, ...]
+    ) -> Array:
+        return self._indices_impl(_normalize_index(arg, self.shape))
 
     def __getitem__(self, arg) -> Array:
         return self.indices(arg)
@@ -100,17 +179,7 @@ class Field(_FieldBase):
     def __get__(self, instance, owner=None):
         if instance is None:
             return self
-        # get slice
-        return instance.arr[self.slice].reshape(self.shape)
-
-    def __set__(self, instance: Compound, value: Array | float | int) -> None:
-        arr = jnp.asarray(value)
-        instance.arr = instance.arr.at[self.slice].set(arr.flatten())
-
-    def __delete__(self, instance):
-        raise AttributeError(
-            f"Cannot delete field ... from {instance.__class__.__name__}."
-        )
+        return self._view(instance.arr)
 
 
 def field(shape: tuple[int, ...], default_factory: Callable | None = None) -> Field:
@@ -121,6 +190,10 @@ def field(shape: tuple[int, ...], default_factory: Callable | None = None) -> Fi
 class FieldStackedView(Field):
     """A descriptor to define fields that are sub-fields of a stacked field in the State class."""
 
+    _root_slice: slice
+    _root_shape: tuple[int, ...]
+    _view_slice: tuple[slice | int, ...]
+
     def __init__(
         self,
         shape: tuple[int, ...],
@@ -128,53 +201,57 @@ class FieldStackedView(Field):
         parent_field: _FieldBase,
         parent_slice: tuple[slice, ...],
     ) -> None:
-        self.shape = shape
+        _FieldBase.__init__(self, shape=shape)
+        if parent_field._slice is None:
+            raise RuntimeError("Parent field slice is not set.")
+
         self.default_factory = default_factory
-        self.parent_field = parent_field
-        self.parent_slice = parent_slice
+
+        self._root_slice = parent_field._slice
+        self._root_shape = parent_field.shape
+        self._view_slice = parent_slice
+        if parent_field._base_offset is None:
+            raise RuntimeError("Parent field indexing metadata is not set.")
+
+        base_offset = parent_field._base_offset
+        view_shape = list(parent_field.shape)
+        strides = list(parent_field._strides)
+        for axis, sub in enumerate(parent_slice):
+            if isinstance(sub, int):
+                idx = sub % parent_field.shape[axis]  # handle negative indices
+                base_offset += idx * strides[axis]
+                view_shape[axis] = 1
+            else:
+                start, stop, step = sub.indices(parent_field.shape[axis])
+                base_offset += start * strides[axis]
+                strides[axis] *= step
+                view_shape[axis] = len(range(start, stop, step))
+        _, reshaped_strides = _reshape_affine_metadata(
+            tuple(view_shape), tuple(strides), self.shape
+        )
+        self._base_offset = base_offset
+        self._strides = reshaped_strides
 
     @overload
     def __get__(self, instance: None, owner) -> Field: ...
     @overload
     def __get__(self, instance: Compound, owner) -> Array: ...
-    def __get__(self, instance, owner=None):
+    def __get__(self, instance, owner) -> Field | Array:
         if instance is None:
             return self
-        # get slice
+        return self._view(instance.arr)
+
+    @override
+    def _view(self, arr: Array) -> Array:
+        if self._root_slice is None:
+            raise RuntimeError(
+                "Field slice is not set. This should be set by the Compound metaclass."
+            )
         return (
-            instance.arr[self.parent_field.slice]
-            .reshape(self.parent_field.shape)[self.parent_slice]
+            arr[self._root_slice]
+            .reshape(self._root_shape)[self._view_slice]
             .reshape(self.shape)
         )
-
-    def __set__(self, instance: Compound, value: Array | float | int) -> None:
-        arr = jnp.asarray(value)
-        # arr must be reshapable to self.shape
-        # if self.shape is rank 1, then we extend it to rank 2 with a singleton dimension
-        # to allow broadcasting
-        shape_in_parent = self.shape if len(self.shape) > 1 else (*self.shape, 1)
-        arr = jnp.reshape(arr, shape_in_parent)
-        parent = (
-            instance.arr[self.parent_field.slice]
-            .reshape(self.parent_field.shape)
-            .at[self.parent_slice]
-            .set(arr)
-        ).reshape(-1)
-        instance.arr = instance.arr.at[self.parent_field.slice].set(parent)
-
-    def indices(self, arg) -> Array:
-        # Normalize to tuple
-        if not isinstance(arg, tuple):
-            arg = (arg,)
-        # extend with full slices
-        if len(arg) < len(self.shape):
-            arg = arg + (slice(None),) * (len(self.shape) - len(arg))
-
-        # get indices in the parent field
-        parent_idxs = self.parent_field.indices(slice(None)).reshape(
-            self.parent_field.shape
-        )
-        return parent_idxs[self.parent_slice].__getitem__(arg).flatten()
 
     @property
     def slice(self):
@@ -312,6 +389,24 @@ class Compound(metaclass=_CompoundMeta):
     def __add__(self, other: Self) -> Self:
         return self.__class__(self.arr + other.arr)
 
+    def at(self, name: str) -> _CompoundAtHelper:
+        field_obj = dict(self.fields).get(name)
+        if field_obj is None:
+            raise AttributeError(f"Unknown field name: {name}")
+        return _CompoundAtHelper(self, field_obj)
+
+
+class _CompoundAtHelper:
+    def __init__(self, state: Compound, field_obj: Field):
+        self.state = state
+        self.field_obj = field_obj
+
+    def set(self, value: Array | float | int) -> Compound:
+        arr = jnp.asarray(value)
+        return self.state.__class__(
+            self.state.arr.at[self.field_obj.slice].set(arr.flatten())
+        )
+
 
 def _apply_stacked_fields(
     cls: type[T_Compound], stack_fields: tuple[str, ...], stack_axis: int = -1
@@ -348,7 +443,7 @@ def _apply_stacked_fields(
             return Field(
                 shape=(*field.shape, 1),
                 default_factory=field.default_factory,
-                _slice=field.slice,
+                _slice=field._slice,
             ), original_shape
         return field, original_shape
 
@@ -428,7 +523,7 @@ def _apply_stacked_fields(
     for name, new_field in pending_setattrs:
         setattr(cls, name, new_field)
     for field_obj, new_slice in trailing_updates:
-        field_obj.slice = new_slice
+        field_obj._set_contiguous_slice(new_slice)
 
     new_fields.extend(trailing_fields)
     cls.fields = tuple(new_fields)
