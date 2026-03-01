@@ -321,14 +321,6 @@ class _CompoundMeta(type):
         register_pytree_node_class(cls)
         return cls
 
-    def __getitem__(cls, arg) -> Array:
-        node, *dofs = arg if isinstance(arg, tuple) else (arg,)
-        nodal_vals = jnp.hstack(
-            [f[node].reshape(-1, *f.shape[1:]) for _, f in cls.fields],
-            dtype=int,
-        )
-        return (nodal_vals[:, *dofs] if dofs else nodal_vals).flatten()
-
 
 class Compound(metaclass=_CompoundMeta):
     """A compound array/state.
