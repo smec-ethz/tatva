@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Any, Callable, Generator, Self, TypeVar, overload, override
+from typing import Any, Callable, Generator, Generic, Self, TypeVar, overload
 
 import jax.numpy as jnp
 from jax import Array
@@ -248,7 +248,6 @@ class FieldStackedView(Field):
             return self
         return self._view(instance.arr)
 
-    @override
     def _view(self, arr: Array) -> Array:
         if self._root_slice is None:
             raise RuntimeError(
@@ -260,7 +259,6 @@ class FieldStackedView(Field):
             .reshape(self.shape)
         )
 
-    @override
     def _set_in_array(self, arr: Array, value: Array) -> Array:
         parent = arr[self._root_slice].reshape(self._root_shape)
         parent_shape = parent[self._view_slice].shape
