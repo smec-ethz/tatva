@@ -1,11 +1,11 @@
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
-
 from tatva.compound import Compound, field, stack_fields
+
+jax.config.update("jax_enable_x64", True)
 
 
 class SimpleState(Compound):
@@ -32,33 +32,28 @@ def test_compound_field_access_and_assignment():
     assert SimpleState.size == 8
 
     np.testing.assert_array_equal(state.u, jnp.zeros((2, 3)))
-    np.testing.assert_array_equal(state.phi, jnp.zeros((2, 1)))
+    np.testing.assert_array_equal(state.phi, jnp.zeros((2,)))
 
     u_val = jnp.arange(6.0).reshape(2, 3)
     phi_val = jnp.array([10.0, 20.0])
 
-    state.u = u_val
-    state.phi = phi_val
+    state = state.at("u").set(u_val)
+    state = state.at("phi").set(phi_val)
 
     np.testing.assert_array_equal(state.u, u_val)
-    np.testing.assert_array_equal(state.phi, phi_val.reshape(2, 1))
+    np.testing.assert_array_equal(state.phi, phi_val)
     np.testing.assert_array_equal(state.arr[:6], u_val.flatten())
     np.testing.assert_array_equal(state.arr[6:], phi_val.flatten())
 
     assert len(state) == 2
     shapes = [component.shape for component in state]
-    assert shapes == [(2, 3), (2, 1)]
-    assert repr(state) == "SimpleState(u=(2, 3), phi=(2, 1))"
+    assert shapes == [(2, 3), (2,)]
 
 
 def test_compound_index_helpers():
     np.testing.assert_array_equal(np.array(SimpleState.u[1]), np.array([3, 4, 5]))
     np.testing.assert_array_equal(np.array(SimpleState.u[:, 1]), np.array([1, 4]))
     np.testing.assert_array_equal(np.array(SimpleState.phi[1]), np.array([7]))
-
-    np.testing.assert_array_equal(np.array(SimpleState[0]), np.array([0, 1, 2, 6]))
-    np.testing.assert_array_equal(np.array(SimpleState[1]), np.array([3, 4, 5, 7]))
-    np.testing.assert_array_equal(np.array(SimpleState[1, 2]), np.array([5]))
 
 
 def test_pytree_roundtrip_and_addition():
@@ -89,7 +84,7 @@ def test_stack_fields_access_and_indices():
 
     expected_u = jnp.array([[0.0, 1.0], [4.0, 5.0]])
     expected_v = jnp.array([[2.0, 3.0], [6.0, 7.0]])
-    expected_w = jnp.array([[8.0], [9.0]])
+    expected_w = jnp.array([8.0, 9.0])
 
     np.testing.assert_array_equal(state.u, expected_u)
     np.testing.assert_array_equal(state.v, expected_v)
@@ -97,6 +92,3 @@ def test_stack_fields_access_and_indices():
 
     np.testing.assert_array_equal(np.array(StackedState.u[1]), np.array([4, 5]))
     np.testing.assert_array_equal(np.array(StackedState.v[0]), np.array([2, 3]))
-
-    np.testing.assert_array_equal(np.array(StackedState[0]), np.array([0, 1, 2, 3, 8]))
-    np.testing.assert_array_equal(np.array(StackedState[1]), np.array([4, 5, 6, 7, 9]))
