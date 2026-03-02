@@ -163,6 +163,18 @@ def find_containing_polygons(
         p1s = vertices
         p2s = jnp.roll(vertices, -1, axis=0)  # Get p_{i+1} for each p_i
 
+        # Treat points on polygon edges as inside so shared boundaries are not missed.
+        edge_dx = p2s[:, 0] - p1s[:, 0]
+        edge_dy = p2s[:, 1] - p1s[:, 1]
+        cross = edge_dx * (py - p1s[:, 1]) - edge_dy * (px - p1s[:, 0])
+        on_segment = (
+            (jnp.minimum(p1s[:, 0], p2s[:, 0]) <= px)
+            & (px <= jnp.maximum(p1s[:, 0], p2s[:, 0]))
+            & (jnp.minimum(p1s[:, 1], p2s[:, 1]) <= py)
+            & (py <= jnp.maximum(p1s[:, 1], p2s[:, 1]))
+        )
+        on_boundary = jnp.any(jnp.isclose(cross, 0.0) & on_segment)
+
         # Conditions for a valid intersection of the horizontal ray from the point
         # 1. The point's y-coord must be between the edge's y-endpoints
         y_cond = (p1s[:, 1] <= py) & (p2s[:, 1] > py) | (p2s[:, 1] <= py) & (
@@ -180,7 +192,7 @@ def find_containing_polygons(
         intersections = jnp.sum(y_cond & x_cond)
 
         # The point is inside if the number of intersections is odd.
-        return intersections % 2 == 1
+        return on_boundary | (intersections % 2 == 1)
 
     # --- Vectorize and apply the function ---
     # Create a boolean matrix: matrix[i, j] is True if point i is in polygon j
