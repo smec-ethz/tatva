@@ -23,7 +23,6 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, cast
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -224,10 +223,11 @@ class Operator(Generic[ElementT]):
             # values should be arrays!
             _values = cast(tuple[jax.Array, ...], values)
 
-            def _at_each_element(el_values: tuple) -> jax.Array:
-                return eqx.filter_vmap(
-                    lambda xi: func(xi, *el_values, **kwargs),
-                )(self.element.quad_points)
+            def _at_each_element(el_values: tuple) -> RT:
+                def _at_each_quad(xi: jax.Array) -> RT:
+                    return func(xi, *el_values, **kwargs)
+
+                return jax.vmap(_at_each_quad)(self.element.quad_points)
 
             # Construct the tuple of inputs (xs) by iterating over _values
             # and gathering nodal values to elements where necessary.
@@ -456,7 +456,7 @@ class Operator(Generic[ElementT]):
                 xi, el_nodal_values, el_nodal_coords
             )  # nodal coords are needed for hermite elements, but not for lagrange elements, so we pass them in either way
 
-        return eqx.filter_vmap(
+        return jax.vmap(
             _interpolate_quad,
             in_axes=(0, 0, 0),
         )(
