@@ -16,24 +16,47 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
-from abc import abstractmethod
-from typing import TYPE_CHECKING
+from abc import ABC, abstractmethod
 
-import equinox as eqx
 import jax.numpy as jnp
-from jaxtyping import Array
-
-if TYPE_CHECKING:
-    from typing import ClassVar as AbstractClassVar
-else:
-    from equinox import AbstractClassVar
+from jax import Array
 
 
-class Element(eqx.Module):
-    """Base Module for all finite elements, compatible with JAX."""
+class Element(ABC):
+    """Abstract base class for all finite elements in tatva. Subclasses must implement
+    methods to compute shape functions, their derivatives, and the Jacobian.
 
-    quad_points: AbstractClassVar[Array]
-    quad_weights: AbstractClassVar[Array]
+    Elements are to be used as static objects only in jax transformations! Considered
+    immutable. Do not mutate.
+
+    Currently, equality and hash are based on object identity, meaning two elements are
+    only equal if they are the same object in memory. Even if two elements have the same
+    type and quad rule.
+    """
+
+    quad_points: Array
+    quad_weights: Array
+
+    def __init__(
+        self, quad_points: Array | None = None, quad_weights: Array | None = None
+    ):
+        """Initializes the element, optionally with custom quadrature points and weights.
+
+        Args:
+            quad_points: An array of shape (n_q, n_dim) containing the quadrature points
+                in local coordinates.
+            quad_weights: An array of shape (n_q,) containing the quadrature weights.
+        """
+        if (quad_points is not None) and (quad_weights is not None):
+            self.quad_points = quad_points
+            self.quad_weights = quad_weights
+        else:
+            self.quad_points, self.quad_weights = self._default_quadrature()
+
+    @abstractmethod
+    def _default_quadrature(self) -> tuple[Array, Array]:
+        """Returns the default quadrature points and weights for this element."""
+        raise NotImplementedError
 
     @abstractmethod
     def shape_function(self, xi: Array) -> Array:
@@ -86,8 +109,10 @@ class Element(eqx.Module):
 class Line2(Element):
     """A 2-node linear interval element."""
 
-    quad_points = jnp.array([[0.0]])
-    quad_weights = jnp.array([2.0])
+    def _default_quadrature(self):
+        quad_points = jnp.array([[0.0]])
+        quad_weights = jnp.array([2.0])
+        return quad_points, quad_weights
 
     def shape_function(self, xi: Array) -> Array:
         xi_val = xi[0]
@@ -121,8 +146,10 @@ class Line2(Element):
 class Line3(Element):
     """3-node quadratic line element."""
 
-    quad_points = jnp.array([[-jnp.sqrt(3.0 / 5.0)], [0.0], [jnp.sqrt(3.0 / 5.0)]])
-    quad_weights = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
+    def _default_quadrature(self):
+        quad_points = jnp.array([[-jnp.sqrt(3.0 / 5.0)], [0.0], [jnp.sqrt(3.0 / 5.0)]])
+        quad_weights = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
+        return quad_points, quad_weights
 
     def shape_function(self, xi: Array) -> Array:
         r = xi[0]
@@ -167,8 +194,10 @@ class Line3(Element):
 class Tri3(Element):
     """A 3-node linear triangular element."""
 
-    quad_points = jnp.array([[1.0 / 3, 1.0 / 3]])
-    quad_weights = jnp.array([1.0 / 2])
+    def _default_quadrature(self) -> tuple[Array, Array]:
+        quad_points = jnp.array([[1.0 / 3, 1.0 / 3]])
+        quad_weights = jnp.array([1.0 / 2])
+        return quad_points, quad_weights
 
     def shape_function(self, xi: Array) -> Array:
         """Returns the shape functions evaluated at the local coordinates (xi, eta)."""
@@ -181,22 +210,16 @@ class Tri3(Element):
         return jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]]).T
 
 
-def _get_quad4_quadrature() -> tuple[Array, Array]:
-    xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
-    w_vals = jnp.array([1.0, 1.0])
-    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals), axis=-1).reshape(-1, 2)
-    weights = jnp.kron(w_vals, w_vals)
-    return quad_points, weights
-
-
-_quad4_qp, _quad4_w = _get_quad4_quadrature()
-
-
 class Quad4(Element):
     """A 4-node bilinear quadrilateral element."""
 
-    quad_points = _quad4_qp
-    quad_weights = _quad4_w
+    def _default_quadrature(self) -> tuple[Array, Array]:
+        xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
+        w_vals = jnp.array([1.0, 1.0])
+        quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals), axis=-1).reshape(-1, 2)
+        weights = jnp.kron(w_vals, w_vals)
+
+        return quad_points, weights
 
     def shape_function(self, xi: Array) -> Array:
         r, s = xi
@@ -220,24 +243,19 @@ class Quad4(Element):
         )
 
 
-def _get_quad8_quadrature() -> tuple[Array, Array]:
-    xi_1d = jnp.array([-jnp.sqrt(3.0 / 5.0), 0.0, jnp.sqrt(3.0 / 5.0)])
-    w_1d = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
-
-    rr, ss = jnp.meshgrid(xi_1d, xi_1d, indexing="xy")
-    quad_points = jnp.stack([rr.ravel(), ss.ravel()], axis=-1).reshape(-1, 2)  # (9, 2)
-    quad_weights = jnp.kron(w_1d, w_1d)  # (9,)
-    return quad_points, quad_weights
-
-
-_quad8_qp, _quad8_w = _get_quad8_quadrature()
-
-
 class Quad8(Element):
     """An 8-node biquadratic quadrilateral element."""
 
-    quad_points = _quad8_qp
-    quad_weights = _quad8_w
+    def _default_quadrature(self) -> tuple[Array, Array]:
+        xi_1d = jnp.array([-jnp.sqrt(3.0 / 5.0), 0.0, jnp.sqrt(3.0 / 5.0)])
+        w_1d = jnp.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
+
+        rr, ss = jnp.meshgrid(xi_1d, xi_1d, indexing="xy")
+        quad_points = jnp.stack([rr.ravel(), ss.ravel()], axis=-1).reshape(
+            -1, 2
+        )  # (9, 2)
+        quad_weights = jnp.kron(w_1d, w_1d)  # (9,)
+        return quad_points, quad_weights
 
     def shape_function(self, xi: Array) -> Array:
         r, s = xi
@@ -291,8 +309,10 @@ class Quad8(Element):
 class Tetrahedron4(Element):
     """A 4-node linear tetrahedral element."""
 
-    quad_points = jnp.array([[1.0 / 4, 1.0 / 4, 1.0 / 4]])
-    quad_weights = jnp.array([1.0 / 6])
+    def _default_quadrature(self) -> tuple[Array, Array]:
+        quad_points = jnp.array([[1.0 / 4, 1.0 / 4, 1.0 / 4]])
+        quad_weights = jnp.array([1.0 / 6])
+        return quad_points, quad_weights
 
     def shape_function(self, xi: Array) -> Array:
         """Returns the shape functions evaluated at the local coordinates (xi, eta, zeta)."""
@@ -307,39 +327,30 @@ class Tetrahedron4(Element):
         ).T
 
 
-def _get_hex8_quadrature() -> tuple[Array, Array]:
-    xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
-    quad_points = jnp.stack(jnp.meshgrid(xi_vals, xi_vals, xi_vals), axis=-1).reshape(
-        -1, 3
-    )
-    weights = jnp.full(quad_points.shape[0], fill_value=1.0)
-    return quad_points, weights
-
-
-_hex8_qp, _hex8_w = _get_hex8_quadrature()
-
-
 class Hexahedron8(Element):
     """A 8-node linear hexahedral element."""
 
-    a = 1 / jnp.sqrt(3)
+    def _default_quadrature(self) -> tuple[Array, Array]:
+        a = 1 / jnp.sqrt(3)
 
-    # 2x2x2 Gauss Quadrature Rule
-    quad_points = jnp.array(
-        [
-            [-a, -a, -a],
-            [a, -a, -a],
-            [a, a, -a],
-            [-a, a, -a],
-            [-a, -a, a],
-            [a, -a, a],
-            [a, a, a],
-            [-a, a, a],
-        ]
-    )
+        # 2x2x2 Gauss Quadrature Rule
+        quad_points = jnp.array(
+            [
+                [-a, -a, -a],
+                [a, -a, -a],
+                [a, a, -a],
+                [-a, a, -a],
+                [-a, -a, a],
+                [a, -a, a],
+                [a, a, a],
+                [-a, a, a],
+            ]
+        )
 
-    # Weights are all 1.0 for this rule (since interval is [-1, 1])
-    quad_weights = jnp.ones(8)
+        # Weights are all 1.0 for this rule (since interval is [-1, 1])
+        quad_weights = jnp.ones(8)
+
+        return quad_points, quad_weights
 
     def shape_function(self, xi: Array) -> Array:
         """Returns the shape functions evaluated at the local coordinates (xi, eta, zeta)."""

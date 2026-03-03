@@ -82,7 +82,7 @@ class Operator(eqx.Module, Generic[ElementT]):
     """
 
     mesh: Mesh
-    element: ElementT
+    element: ElementT = eqx.field(static=True)
     det_J_elements_weights: Array
     batch_size: int = eqx.field(static=True)
 
