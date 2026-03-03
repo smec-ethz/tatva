@@ -18,11 +18,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Literal, NamedTuple
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
+from jax import Array
 
 
 class ElementType(Enum):
@@ -34,7 +36,9 @@ class ElementType(Enum):
     HEXAHEDRON = "hexahedron"
 
 
-class Mesh(NamedTuple):
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Mesh:
     """A class used to represent a Mesh for finite element method (FEM) simulations.
 
     Attributes:
@@ -42,8 +46,20 @@ class Mesh(NamedTuple):
         elements: The connectivity of the mesh elements.
     """
 
-    coords: jax.Array  # Shape (n_nodes, n_dim)
-    elements: jax.Array  # Shape (n_elements, n_nodes_per_element)
+    coords: Array
+    """Coordinates of the mesh nodes, shape (n_nodes, n_dim)"""
+
+    elements: Array
+    """Connectivity of the mesh elements, shape (n_elements, nodes_per_element)"""
+
+    def set_coords(self, new_coords: Array) -> Mesh:
+        """Return a new Mesh with the same connectivity but updated node coordinates.
+
+        Args:
+            new_coords: An array of shape (n_nodes, n_dim) containing the new coordinates
+                for the mesh nodes.
+        """
+        return replace(self, coords=new_coords)
 
     @classmethod
     def unit_square(
@@ -82,7 +98,7 @@ class Mesh(NamedTuple):
     @staticmethod
     def _rectangle_triangular(
         x: tuple[float, float], y: tuple[float, float], n_x: int, n_y: int, dim: int = 2
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> tuple[Array, Array]:
         x_vals = jnp.linspace(x[0], x[1], n_x + 1)
         y_vals = jnp.linspace(y[0], y[1], n_y + 1)
         xv, yv = jnp.meshgrid(x_vals, y_vals, indexing="ij")
@@ -109,7 +125,7 @@ class Mesh(NamedTuple):
     @staticmethod
     def _rectangle_quadrilateral(
         x: tuple[float, float], y: tuple[float, float], n_x: int, n_y: int, dim: int = 2
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> tuple[Array, Array]:
         x_vals = jnp.linspace(x[0], x[1], n_x + 1)
         y_vals = jnp.linspace(y[0], y[1], n_y + 1)
         xv, yv = jnp.meshgrid(x_vals, y_vals, indexing="ij")
@@ -134,10 +150,7 @@ class Mesh(NamedTuple):
 
 
 @jax.jit
-def find_containing_polygons(
-    points: jax.Array,
-    polygons: jax.Array,
-) -> jax.Array:
+def find_containing_polygons(points: Array, polygons: Array) -> Array:
     """
     Finds the index of the containing polygon for each point.
 

@@ -178,9 +178,7 @@ def test_operator_can_be_used_as_dynamic_jit_argument(tri_operator: Operator):
     np.testing.assert_allclose(result, np.sum(EXPECTED_ELEMENT_AREAS))
 
 
-@pytest.mark.skip(
-    reason="Currently fails due to operator not being hashable, which is required for static JIT arguments."
-)
+@pytest.mark.skip(reason="Not supported")
 def test_operator_can_be_used_as_static_jit_argument(tri_operator: Operator):
     nodal_values = jnp.ones(NODES.shape[0], dtype=jnp.float64)
 
