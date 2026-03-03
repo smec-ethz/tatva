@@ -1,7 +1,10 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from tatva.element import Tri3
 from tatva.mesh import Mesh
 from tatva.operator import Operator
@@ -161,3 +164,30 @@ def test_interpolate_raises_for_points_outside_mesh(tri_operator: Operator):
     points = jnp.array([[1.5, 0.5]], dtype=jnp.float64)
     with pytest.raises(RuntimeError):
         tri_operator.interpolate(nodal_values, points)
+
+
+def test_operator_can_be_used_as_dynamic_jit_argument(tri_operator: Operator):
+    nodal_values = jnp.ones(NODES.shape[0], dtype=jnp.float64)
+
+    @jax.jit
+    def integrated_area(op: Operator, values: jax.Array) -> jax.Array:
+        return op.integrate(values)
+
+    result = integrated_area(tri_operator, nodal_values)
+
+    np.testing.assert_allclose(result, np.sum(EXPECTED_ELEMENT_AREAS))
+
+
+@pytest.mark.skip(
+    reason="Currently fails due to operator not being hashable, which is required for static JIT arguments."
+)
+def test_operator_can_be_used_as_static_jit_argument(tri_operator: Operator):
+    nodal_values = jnp.ones(NODES.shape[0], dtype=jnp.float64)
+
+    @partial(jax.jit, static_argnames=("op",))
+    def integrated_area(op: Operator, values: jax.Array) -> jax.Array:
+        return op.integrate(values)
+
+    result = integrated_area(tri_operator, nodal_values)
+
+    np.testing.assert_allclose(result, np.sum(EXPECTED_ELEMENT_AREAS))
