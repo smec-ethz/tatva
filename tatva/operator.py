@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, cast
 
@@ -60,7 +61,9 @@ class MappedCallable(Protocol[P, RT]):
     ) -> RT: ...
 
 
-class Operator(eqx.Module, Generic[ElementT]):
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Operator(Generic[ElementT]):
     """A class that provides an Operator for finite element method (FEM) assembly.
 
     Args:
@@ -82,28 +85,54 @@ class Operator(eqx.Module, Generic[ElementT]):
     """
 
     mesh: Mesh
-    element: ElementT = eqx.field(static=True)
-    det_J_elements_weights: Array
-    batch_size: int = eqx.field(static=True)
+    element: ElementT = field(metadata=dict(static=True))
+    batch_size: int | None = field(metadata=dict(static=True), default=None)
+    cache_weights: bool = field(metadata=dict(static=True), default=False)
 
-    def __init__(
-        self, mesh: Mesh, element: ElementT, batch_size: int | None = None
-    ) -> None:
-        self.mesh = mesh
-        self.element = element
-        if batch_size is None:
-            self.batch_size = mesh.elements.shape[0]
+    def set_coords(self, new_coords: Array) -> Operator[ElementT]:
+        """Return a new Operator with the same connectivity but updated node coordinates.
+
+        Args:
+            new_coords: An array of shape (n_nodes, n_dim) containing the new coordinates
+                for the mesh nodes.
+        """
+        return replace(self, mesh=self.mesh.set_coords(new_coords))
+
+    def __post_init__(self) -> None:
+        if self.cache_weights:
+
+            def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
+                """Calls the function element.get_jacobian and returns the second output."""
+                return self.element.get_jacobian(xi, el_nodal_coords)[1]
+
+            det_J_elements = self.map(_get_det_J)(self.mesh.coords)
+            object.__setattr__(
+                self,
+                "_det_J_elements_weights",
+                jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights),
+            )
+
+    def get_integration_weights(self) -> Array:
+        """Returns the integration weights for the quadrature points of the mesh. This is
+        the product of the determinant of the Jacobian and the quadrature weights, which
+        can be used for integrating functions over the mesh.
+
+        Returns:
+            A `jax.Array` with the integration weights at each quadrature point of each
+            element (shape: (n_elements, n_quad_points)).
+        """
+        if self.cache_weights:
+            # if cache_weights is True, we have computed the integration weights in
+            # __post_init__ and stored them in _det_J_elements_weights
+            return self._det_J_elements_weights  # pyright: ignore[reportAttributeAccessIssue]
         else:
-            self.batch_size = batch_size
 
-        def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
-            """Calls the function element.get_jacobian and returns the second output."""
-            return self.element.get_jacobian(xi, el_nodal_coords)[1]
+            def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
+                """Calls the function element.get_jacobian and returns the second output."""
+                return self.element.get_jacobian(xi, el_nodal_coords)[1]
 
-        det_J_elements = self.map(_get_det_J)(self.mesh.coords)
-        self.det_J_elements_weights = jnp.einsum(
-            "eq,q->eq", det_J_elements, self.element.quad_weights
-        )
+            det_J_elements = self.map(_get_det_J)(self.mesh.coords)
+            return jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights)
 
     def __check_init__(self) -> None:
         """Validates the mesh and element compatibility. Does a series of checks to ensure
@@ -303,7 +332,7 @@ class Operator(eqx.Module, Generic[ElementT]):
             element (shape: (n_elements, n_values)).
         """
 
-        return jnp.einsum("eq...,eq->e...", quad_values, self.det_J_elements_weights)
+        return jnp.einsum("eq...,eq->e...", quad_values, self.get_integration_weights())
 
     def eval(self, nodal_values: jax.Array) -> jax.Array:
         """Evaluates the nodal values at the quadrature points.
