@@ -19,7 +19,6 @@ classifiers = [
 ]
 dependencies = [
     "jax>=0.4.1",
-    "equinox",
     "numpy",
     "jax-autovmap>=0.3.0",
     "tatva-coloring>=0.0.2"
