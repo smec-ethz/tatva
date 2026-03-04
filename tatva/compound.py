@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Any, Callable, Generator, Self, overload
+from typing import Any, Callable, Generator, Generic, Self, TypeVar, overload
 
 import jax.numpy as jnp
 from jax import Array
@@ -28,42 +28,130 @@ from jax.tree_util import register_pytree_node_class
 __all__ = ["Compound", "field", "stack_fields"]
 
 
+T_Compound = TypeVar("T_Compound", bound="Compound")
+
+
 class CompoundStackError(ValueError):
     pass
 
 
+def _normalize_index(
+    arg: int | slice | Array | tuple[int | slice | Array, ...],
+    shape: tuple[int, ...],
+) -> tuple[int | slice | Array, ...]:
+    if not isinstance(arg, tuple):
+        arg = (arg,)
+    if len(arg) < len(shape):
+        arg = arg + (slice(None),) * (len(shape) - len(arg))
+    return arg
+
+
+def _row_major_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    stride = 1
+    strides_rev: list[int] = []
+    for extent in reversed(shape):
+        strides_rev.append(stride)
+        stride *= extent
+    return tuple(reversed(strides_rev))
+
+
+def _reshape_affine_metadata(
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+    target_shape: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    if shape == target_shape:
+        return shape, strides
+
+    compact_shape = tuple(extent for extent in shape if extent != 1)
+    if compact_shape != target_shape:
+        raise ValueError(
+            f"Cannot reshape affine metadata from shape {shape} to {target_shape}."
+        )
+
+    compact_strides = tuple(
+        stride for extent, stride in zip(shape, strides, strict=True) if extent != 1
+    )
+    return compact_shape, compact_strides
+
+
 class _FieldBase:
-    def __init__(self, shape: tuple[int, ...], _slice: slice | None = None) -> None:
-        self.shape = shape if len(shape) > 1 else (*shape, 1)
-        self.slice = _slice
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        _slice: slice | None = None,
+    ) -> None:
+        self.shape = shape
+        self._set_slice_and_strides(_slice)
 
-    def indices(self, arg: int | slice | tuple[int | slice, ...]) -> Array:
-        # Normalize to tuple
-        if not isinstance(arg, tuple):
-            arg = (arg,)
-        if len(arg) < len(self.shape):
-            arg = arg + (slice(None),) * (len(self.shape) - len(arg))
+    def _set_slice_and_strides(self, _slice: slice | None) -> None:
+        self._slice = _slice
+        if _slice is None:
+            self._base_offset = None
+            self._strides = ()
+            return
+        self._base_offset = _slice.start
+        self._strides = _row_major_strides(self.shape)
 
-        idxs = []
-        for dim, sub in enumerate(arg):
-            if isinstance(sub, slice):
-                start, stop, step = sub.indices(self.shape[dim])
-                idxs.append(jnp.arange(start, stop, step))
-            elif isinstance(sub, (int, jnp.integer)):
-                idxs.append(jnp.array([sub]))
-            else:
-                idxs.append(jnp.asarray(sub))
-
-        mesh = jnp.meshgrid(*idxs, indexing="ij")
-        multi_idx = [m.flatten() for m in mesh]
-        flat_local = jnp.ravel_multi_index(multi_idx, dims=self.shape)
-
-        if self.slice is None:
+    def _view(self, arr: Array) -> Array:
+        if self._slice is None:
             raise RuntimeError(
                 "Field slice is not set. This should be set by the Compound metaclass."
             )
+        return arr[self._slice].reshape(self.shape)
 
-        return jnp.array(flat_local + self.slice.start)
+    def _set_in_array(self, arr: Array, value: Array) -> Array:
+        if self._slice is None:
+            raise RuntimeError(
+                "Field slice is not set. This should be set by the Compound metaclass."
+            )
+        return arr.at[self._slice].set(value.reshape(-1))
+
+    def _indices_impl(self, arg: tuple[int | slice | Array, ...]) -> Array:
+        if self._base_offset is None:
+            raise RuntimeError(
+                "Field indexing metadata is not set. This should be set by the Compound metaclass."
+            )
+
+        axis_indices: list[Array] = []
+        for sub, extent in zip(arg, self.shape, strict=True):
+            if isinstance(sub, int):
+                idx = sub if sub >= 0 else sub + extent
+                axis_indices.append(jnp.asarray([idx], dtype=int))
+            elif isinstance(sub, slice):
+                start, stop, step = sub.indices(extent)
+                axis_indices.append(jnp.arange(start, stop, step, dtype=int))
+            else:
+                values = jnp.asarray(sub, dtype=int).reshape(-1)
+                axis_indices.append(jnp.where(values < 0, values + extent, values))
+
+        # no axes means this is a scalar field, return the base offset as the only index
+        # this is only reached if the field shape is (), and arg is an empty tuple too
+        if not axis_indices:
+            return jnp.asarray([self._base_offset], dtype=int)
+
+        grid_shape = tuple(len(values) for values in axis_indices)
+        index = jnp.full(grid_shape, self._base_offset, dtype=int)
+        for axis, (stride, values) in enumerate(
+            zip(self._strides, axis_indices, strict=True)
+        ):
+            broadcast_shape = tuple(
+                len(values) if i == axis else 1 for i in range(len(axis_indices))
+            )
+            index = index + jnp.reshape(
+                values * stride,
+                broadcast_shape,
+            )
+        return index.reshape(-1)
+
+    @property
+    def slice(self) -> slice | Array | None:
+        return self._slice
+
+    def indices(
+        self, arg: int | slice | Array | tuple[int | slice | Array, ...]
+    ) -> Array:
+        return self._indices_impl(_normalize_index(arg, self.shape))
 
     def __getitem__(self, arg) -> Array:
         return self.indices(arg)
@@ -97,17 +185,7 @@ class Field(_FieldBase):
     def __get__(self, instance, owner=None):
         if instance is None:
             return self
-        # get slice
-        return instance.arr[self.slice].reshape(self.shape)
-
-    def __set__(self, instance: Compound, value: Array | float | int) -> None:
-        arr = jnp.asarray(value)
-        instance.arr = instance.arr.at[self.slice].set(arr.flatten())
-
-    def __delete__(self, instance):
-        raise AttributeError(
-            f"Cannot delete field ... from {instance.__class__.__name__}."
-        )
+        return self._view(instance.arr)
 
 
 def field(shape: tuple[int, ...], default_factory: Callable | None = None) -> Field:
@@ -118,51 +196,89 @@ def field(shape: tuple[int, ...], default_factory: Callable | None = None) -> Fi
 class FieldStackedView(Field):
     """A descriptor to define fields that are sub-fields of a stacked field in the State class."""
 
+    _root_slice: slice
+    _root_shape: tuple[int, ...]
+    _view_slice: tuple[slice | int, ...]
+
     def __init__(
         self,
         shape: tuple[int, ...],
+        default_factory: Callable | None,
         parent_field: _FieldBase,
         parent_slice: tuple[slice, ...],
     ) -> None:
-        super().__init__(shape)
-        self.parent_field = parent_field
-        self.parent_slice = parent_slice
+        if parent_field._slice is None:
+            raise RuntimeError(
+                "Parent field slice is not set. This should be set by the Compound metaclass."
+            )
+
+        _FieldBase.__init__(self, shape=shape)
+        self.default_factory = default_factory
+
+        self._root_slice = parent_field._slice
+        self._root_shape = parent_field.shape
+        self._view_slice = parent_slice
+
+        if parent_field._base_offset is None:
+            raise RuntimeError("Parent field indexing metadata is not set.")
+        base_offset = parent_field._base_offset
+        view_shape = list(parent_field.shape)
+        strides = list(parent_field._strides)
+
+        for axis, sub in enumerate(parent_slice):
+            if isinstance(sub, int):
+                idx = sub % parent_field.shape[axis]  # handle negative indices
+                base_offset += idx * strides[axis]
+                view_shape[axis] = 1
+            else:  # sub is a slice
+                start, stop, step = sub.indices(parent_field.shape[axis])
+                base_offset += start * strides[axis]
+                strides[axis] *= step
+                view_shape[axis] = len(range(start, stop, step))
+
+        _, reshaped_strides = _reshape_affine_metadata(
+            tuple(view_shape), tuple(strides), self.shape
+        )
+        self._base_offset = base_offset
+        self._strides = reshaped_strides
+
+        # precompute the update shape for the _set_in_array method
+        self._update_shape = tuple(
+            len(range(*sub.indices(parent_field.shape[axis])))
+            for axis, sub in enumerate(parent_slice)
+        )
 
     @overload
     def __get__(self, instance: None, owner) -> Field: ...
     @overload
     def __get__(self, instance: Compound, owner) -> Array: ...
-    def __get__(self, instance, owner=None):
+    def __get__(self, instance, owner) -> Field | Array:
         if instance is None:
             return self
-        # get slice
-        return instance.arr[self.parent_field.slice].reshape(self.parent_field.shape)[
-            self.parent_slice
-        ]
+        return self._view(instance.arr)
 
-    def __set__(self, instance: Compound, value: Array | float | int) -> None:
-        arr = jnp.asarray(value)
-        parent = (
-            instance.arr[self.parent_field.slice]
-            .reshape(self.parent_field.shape)
-            .at[self.parent_slice]
-            .set(arr)
-        ).reshape(-1)
-        instance.arr = instance.arr.at[self.parent_field.slice].set(parent)
-
-    def indices(self, arg) -> Array:
-        # Normalize to tuple
-        if not isinstance(arg, tuple):
-            arg = (arg,)
-        # extend with full slices
-        if len(arg) < len(self.shape):
-            arg = arg + (slice(None),) * (len(self.shape) - len(arg))
-
-        # get indices in the parent field
-        parent_idxs = self.parent_field.indices(slice(None)).reshape(
-            self.parent_field.shape
+    def _view(self, arr: Array) -> Array:
+        if self._root_slice is None:
+            raise RuntimeError(
+                "Field slice is not set. This should be set by the Compound metaclass."
+            )
+        return (
+            arr[self._root_slice]
+            .reshape(self._root_shape)[self._view_slice]
+            .reshape(self.shape)
         )
-        return parent_idxs[self.parent_slice].__getitem__(arg).flatten()
+
+    def _set_in_array(self, arr: Array, value: Array) -> Array:
+        parent = arr[self._root_slice].reshape(self._root_shape)
+        parent = parent.at[self._view_slice].set(value.reshape(self._update_shape))
+        return arr.at[self._root_slice].set(parent.reshape(-1))
+
+    @property
+    def slice(self):
+        # The slice of a FieldStackedView is not contiguous, so we cannot return a single slice.
+        # Instead, we return an int array of the global indices corresponding to this
+        # field, which can be used for indexing.
+        return self.indices(slice(None))
 
 
 class _CompoundMeta(type):
@@ -202,7 +318,7 @@ class _CompoundMeta(type):
                 stacklevel=2,
             )
             _apply_stacked_fields(
-                cls,  # ty:ignore[invalid-argument-type]
+                cls,  # pyright: ignore[reportArgumentType]
                 stack_fields=tuple(kwargs["stack_fields"]),
                 stack_axis=kwargs.get("stack_axis", -1),
             )
@@ -210,14 +326,6 @@ class _CompoundMeta(type):
         # register as pytree node for JAX transformations
         register_pytree_node_class(cls)
         return cls
-
-    def __getitem__(cls, arg) -> Array:
-        node, *dofs = arg if isinstance(arg, tuple) else (arg,)
-        nodal_vals = jnp.hstack(
-            [f[node].reshape(-1, *f.shape[1:]) for _, f in cls.fields],
-            dtype=int,
-        )
-        return (nodal_vals[:, *dofs] if dofs else nodal_vals).flatten()
 
 
 class Compound(metaclass=_CompoundMeta):
@@ -272,8 +380,8 @@ class Compound(metaclass=_CompoundMeta):
             # initialize fields with default factories if provided
             for name, field_obj in self.fields:
                 if field_obj.default_factory is not None:
-                    self.arr = self.arr.at[field_obj.slice].set(
-                        jnp.asarray(field_obj.default_factory()).flatten()
+                    self.arr = field_obj._set_in_array(
+                        self.arr, jnp.asarray(field_obj.default_factory())
                     )
 
     def __len__(self) -> int:
@@ -293,10 +401,37 @@ class Compound(metaclass=_CompoundMeta):
     def __add__(self, other: Self) -> Self:
         return self.__class__(self.arr + other.arr)
 
+    def at(self, name: str) -> _CompoundAtHelper[Self]:
+        """Helper for functional updates to fields. Usage: `new_state =
+        state.at('field_name').set(new_value)`.
+
+        Args:
+            name: The name of the field to update.
+        """
+        field_obj = dict(self.fields).get(name)
+        if field_obj is None:
+            raise AttributeError(f"Unknown field name: {name}")
+        return _CompoundAtHelper(self, field_obj)
+
+    def flatten(self) -> Array:
+        """Return the flat array representation of the state. Same as `state.arr`."""
+        return self.arr
+
+
+class _CompoundAtHelper(Generic[T_Compound]):
+    def __init__(self, state: T_Compound, field_obj: Field):
+        self.state = state
+        self.field_obj = field_obj
+
+    def set(self, value: Array | float | int) -> T_Compound:
+        return self.state.__class__(
+            self.field_obj._set_in_array(self.state.arr, jnp.asarray(value))
+        )
+
 
 def _apply_stacked_fields(
-    cls: type[Compound], stack_fields: tuple[str, ...], stack_axis: int = -1
-) -> type[Compound]:
+    cls: type[T_Compound], stack_fields: tuple[str, ...], stack_axis: int = -1
+) -> type[T_Compound]:
     """Reorder fields by stacking specified fields along an axis. Modifies class in place.
 
     Args:
@@ -319,10 +454,23 @@ def _apply_stacked_fields(
     if missing:
         raise CompoundStackError(f"Unknown field names in stack_fields: {missing}")
 
-    base_shape = fields_map[stack_fields[0]].shape
+    # the dimension in the fields to stack along must be compatible, we take the first field as reference
+    # if the field is rank 1 (a scalar per node), we reshape it to rank 2 with a singleton dimension
+    def _reshape_rank_1_if_needed(field: Field) -> tuple[Field, tuple[int, ...]]:
+        rank = len(original_shape := field.shape)
+        if rank == 0:
+            raise CompoundStackError("Cannot stack scalar fields.")
+        if rank == 1:
+            return Field(
+                shape=(*field.shape, 1),
+                default_factory=field.default_factory,
+                _slice=field._slice,
+            ), original_shape
+        return field, original_shape
+
+    base_field, _ = _reshape_rank_1_if_needed(fields_map[stack_fields[0]])
+    base_shape = base_field.shape
     rank = len(base_shape)
-    if rank == 0:  # should never; Field makes sure shape is at least rank 2
-        raise CompoundStackError("Cannot stack scalar fields.")
     if not (-rank <= stack_axis < rank):
         raise CompoundStackError(
             f"Invalid stack_axis={stack_axis} for field rank {rank}. "
@@ -332,10 +480,13 @@ def _apply_stacked_fields(
     base_reduced = base_shape[:axis] + base_shape[axis + 1 :]
 
     # Precompute per-field layout and validate compatibility in one pass.
-    stack_layout: list[tuple[str, tuple[int, ...], int, int]] = []
+    # collect new fields in stack_layout as (name, shape, default_factory, start, end)
+    # tuples for the stacked fields.
+    stack_layout: list[tuple[str, tuple[int, ...], Callable | None, int, int]] = []
     stack_size = 0
     for name in stack_fields:
-        shape = fields_map[name].shape
+        f, original_shape = _reshape_rank_1_if_needed(fields_map[name])
+        shape = f.shape
         if len(shape) != rank:
             raise CompoundStackError(
                 f"Field {name} with shape {shape} is not compatible with base rank {rank}."
@@ -349,7 +500,7 @@ def _apply_stacked_fields(
         extent = shape[axis]
         start = stack_size
         end = start + extent
-        stack_layout.append((name, shape, start, end))
+        stack_layout.append((name, original_shape, f.default_factory, start, end))
         stack_size = end
 
     stacked_shape = (*base_shape[:axis], stack_size, *base_shape[axis + 1 :])
@@ -361,12 +512,15 @@ def _apply_stacked_fields(
     # them on the class after validation and layout construction is complete.
     new_fields: list[tuple[str, Field]] = []
     pending_setattrs: list[tuple[str, FieldStackedView]] = []
-    for name, shape, start, end in stack_layout:
+    for name, shape, default_factory, start, end in stack_layout:
         parent_slice = tuple(
             slice(None) if i != axis else slice(start, end) for i in range(rank)
         )
         new_field = FieldStackedView(
-            shape=shape, parent_field=stacked_field, parent_slice=parent_slice
+            shape=shape,
+            default_factory=default_factory,
+            parent_field=stacked_field,
+            parent_slice=parent_slice,
         )
         pending_setattrs.append((name, new_field))
         new_fields.append((name, new_field))
@@ -390,7 +544,7 @@ def _apply_stacked_fields(
     for name, new_field in pending_setattrs:
         setattr(cls, name, new_field)
     for field_obj, new_slice in trailing_updates:
-        field_obj.slice = new_slice
+        field_obj._set_slice_and_strides(new_slice)
 
     new_fields.extend(trailing_fields)
     cls.fields = tuple(new_fields)
@@ -401,7 +555,7 @@ def _apply_stacked_fields(
 
 def stack_fields(
     *fields: str, axis: int = -1
-) -> Callable[[type[Compound]], type[Compound]]:
+) -> Callable[[type[T_Compound]], type[T_Compound]]:
     """Class decorator to stack compatible fields into a shared contiguous layout.
 
     Args:
@@ -416,7 +570,7 @@ def stack_fields(
 
     field_names = tuple(fields)
 
-    def decorator(cls: type[Compound]) -> type[Compound]:
+    def decorator(cls: type[T_Compound]) -> type[T_Compound]:
         return _apply_stacked_fields(cls, stack_fields=field_names, stack_axis=axis)
 
     return decorator

@@ -19,17 +19,20 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, cast
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.errors import TracerBoolConversionError
 from jax_autovmap import autovmap
 
+from tatva import sparse
 from tatva.element import Element
 from tatva.mesh import Mesh, find_containing_polygons
+from tatva.utils import virtual_work_to_residual
 
 P = ParamSpec("P")
 RT = TypeVar("RT", bound=jax.Array | tuple, covariant=True)
@@ -60,7 +63,9 @@ class MappedCallable(Protocol[P, RT]):
     ) -> RT: ...
 
 
-class Operator(eqx.Module, Generic[ElementT]):
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Operator(Generic[ElementT]):
     """A class that provides an Operator for finite element method (FEM) assembly.
 
     Args:
@@ -82,28 +87,54 @@ class Operator(eqx.Module, Generic[ElementT]):
     """
 
     mesh: Mesh
-    element: ElementT
-    det_J_elements_weights: Array
-    batch_size: int = eqx.field(static=True)
+    element: ElementT = field(metadata=dict(static=True))
+    batch_size: int | None = field(metadata=dict(static=True), default=None)
+    cache_weights: bool = field(metadata=dict(static=True), default=False)
 
-    def __init__(
-        self, mesh: Mesh, element: ElementT, batch_size: int | None = None
-    ) -> None:
-        self.mesh = mesh
-        self.element = element
-        if batch_size is None:
-            self.batch_size = mesh.elements.shape[0]
+    def set_coords(self, new_coords: Array) -> Operator[ElementT]:
+        """Return a new Operator with the same connectivity but updated node coordinates.
+
+        Args:
+            new_coords: An array of shape (n_nodes, n_dim) containing the new coordinates
+                for the mesh nodes.
+        """
+        return replace(self, mesh=self.mesh.set_coords(new_coords))
+
+    def __post_init__(self) -> None:
+        if self.cache_weights:
+
+            def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
+                """Calls the function element.get_jacobian and returns the second output."""
+                return self.element.get_jacobian(xi, el_nodal_coords)[1]
+
+            det_J_elements = self.map(_get_det_J)(self.mesh.coords)
+            object.__setattr__(
+                self,
+                "_det_J_elements_weights",
+                jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights),
+            )
+
+    def get_integration_weights(self) -> Array:
+        """Returns the integration weights for the quadrature points of the mesh. This is
+        the product of the determinant of the Jacobian and the quadrature weights, which
+        can be used for integrating functions over the mesh.
+
+        Returns:
+            A `jax.Array` with the integration weights at each quadrature point of each
+            element (shape: (n_elements, n_quad_points)).
+        """
+        if self.cache_weights:
+            # if cache_weights is True, we have computed the integration weights in
+            # __post_init__ and stored them in _det_J_elements_weights
+            return self._det_J_elements_weights  # pyright: ignore[reportAttributeAccessIssue]
         else:
-            self.batch_size = batch_size
 
-        def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
-            """Calls the function element.get_jacobian and returns the second output."""
-            return self.element.get_jacobian(xi, el_nodal_coords)[1]
+            def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
+                """Calls the function element.get_jacobian and returns the second output."""
+                return self.element.get_jacobian(xi, el_nodal_coords)[1]
 
-        det_J_elements = self.map(_get_det_J)(self.mesh.coords)
-        self.det_J_elements_weights = jnp.einsum(
-            "eq,q->eq", det_J_elements, self.element.quad_weights
-        )
+            det_J_elements = self.map(_get_det_J)(self.mesh.coords)
+            return jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights)
 
     def __check_init__(self) -> None:
         """Validates the mesh and element compatibility. Does a series of checks to ensure
@@ -195,10 +226,11 @@ class Operator(eqx.Module, Generic[ElementT]):
             # values should be arrays!
             _values = cast(tuple[jax.Array, ...], values)
 
-            def _at_each_element(el_values: tuple) -> jax.Array:
-                return eqx.filter_vmap(
-                    lambda xi: func(xi, *el_values, **kwargs),
-                )(self.element.quad_points)
+            def _at_each_element(el_values: tuple) -> RT:
+                def _at_each_quad(xi: jax.Array) -> RT:
+                    return func(xi, *el_values, **kwargs)
+
+                return jax.vmap(_at_each_quad)(self.element.quad_points)
 
             # Construct the tuple of inputs (xs) by iterating over _values
             # and gathering nodal values to elements where necessary.
@@ -303,7 +335,7 @@ class Operator(eqx.Module, Generic[ElementT]):
             element (shape: (n_elements, n_values)).
         """
 
-        return jnp.einsum("eq...,eq->e...", quad_values, self.det_J_elements_weights)
+        return jnp.einsum("eq...,eq->e...", quad_values, self.get_integration_weights())
 
     def eval(self, nodal_values: jax.Array) -> jax.Array:
         """Evaluates the nodal values at the quadrature points.
@@ -377,27 +409,41 @@ class Operator(eqx.Module, Generic[ElementT]):
             delta_xi = jnp.linalg.solve(lhs, -rhs)
             return self.element.quad_points[0] + delta_xi
 
-        def map_physical_to_reference(points: jax.Array) -> tuple[jax.Array, jax.Array]:
-            element_indices = find_containing_polygons(
+        def map_physical_to_reference(
+            points: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            element_indices: Array = find_containing_polygons(
                 points, self.mesh.coords[self.mesh.elements]
             )
             valid_indices = element_indices != -1
+            safe_element_indices = jnp.where(valid_indices, element_indices, 0)
+            valid_elements = self.mesh.elements[safe_element_indices]
             return (
                 _map_physical_to_reference(
-                    points[valid_indices],
-                    self.mesh.coords[
-                        self.mesh.elements[element_indices[valid_indices]]
-                    ],
+                    points,
+                    self.mesh.coords[valid_elements],
                 ),
-                self.mesh.elements[element_indices[valid_indices]],
+                valid_elements,
+                valid_indices,
             )
 
-        valid_quad_points, valid_elements = map_physical_to_reference(points)
+        valid_quad_points, valid_elements, valid_indices = map_physical_to_reference(
+            points
+        )
+        interpolated = self._interpolate_direct(arg, valid_quad_points, valid_elements)
 
-        if valid_quad_points.shape[0] != points.shape[0]:
-            raise RuntimeError("Some points are outside the mesh, revise the points")
+        try:
+            if bool(jnp.any(~valid_indices)):
+                raise RuntimeError(
+                    "Some points are outside the mesh, revise the points"
+                )
+        except TracerBoolConversionError:
+            pass
 
-        return self._interpolate_direct(arg, valid_quad_points, valid_elements)
+        mask = valid_indices.reshape(
+            (valid_indices.shape[0],) + (1,) * (interpolated.ndim - 1)
+        )
+        return jnp.where(mask, interpolated, jnp.nan)
 
     def _interpolate_direct(
         self,
@@ -427,7 +473,7 @@ class Operator(eqx.Module, Generic[ElementT]):
                 xi, el_nodal_values, el_nodal_coords
             )  # nodal coords are needed for hermite elements, but not for lagrange elements, so we pass them in either way
 
-        return eqx.filter_vmap(
+        return jax.vmap(
             _interpolate_quad,
             in_axes=(0, 0, 0),
         )(
@@ -435,3 +481,55 @@ class Operator(eqx.Module, Generic[ElementT]):
             nodal_values[valid_elements],
             self.mesh.coords[valid_elements],
         )
+
+    def quads(self) -> jax.Array:
+        """Returns the quadrature points of the mesh in physical coordinates.
+
+        Same as `op.eval(op.mesh.coords)`.
+
+        Returns:
+            An array with the quadrature points of the mesh in physical coordinates
+            (shape: (n_elements, n_quad_points, n_dim)).
+        """
+        return self.eval(self.mesh.coords)
+
+    def project(self, field: Array, colored_matrix: sparse.ColoredMatrix) -> Array:
+        """Projects a given field onto the finite element space defined by the mesh and
+        element.
+
+        Uses ``jax.experimental.sparse.linalg.spsolve`` to solve the linear system
+        resulting from the projection. Therefore, the colored matrix must be provided. It
+        must be compatible with the dimensions of the provided field.
+
+        Args:
+            field: The field to project, defined at the quad points (shape: (n_elements, n_quad_points, n_values)).
+            colored_matrix: The colored matrix representing the finite element space.
+        """
+        from jax.experimental.sparse.linalg import spsolve
+
+        field_dim = field.shape[-1] if field.ndim > 2 else 0
+        field_dim_multiplier = field_dim if field_dim > 0 else 1
+        n = self.mesh.coords.shape[0] * field_dim_multiplier
+
+        def reshape_to_field_dim(arr: Array) -> Array:
+            if field_dim > 0:
+                return arr.reshape(-1, field_dim)
+            else:
+                return arr
+
+        @virtual_work_to_residual(test_size=n)
+        def _lhs(test: Array, trial: Array) -> Array:
+            test_reshaped = reshape_to_field_dim(test)
+            trial_reshaped = reshape_to_field_dim(trial)
+            return self.integrate(test_reshaped * trial_reshaped)
+
+        @virtual_work_to_residual(test_size=n)
+        def _rhs(test: Array) -> Array:
+            test_reshaped = reshape_to_field_dim(test)
+            test_quad = self.eval(test_reshaped)
+            return self.integrate(test_quad * field)
+
+        lhs = sparse.jacfwd(_lhs, colored_matrix, color_batch_size=None)
+        M = lhs(jnp.zeros(n))
+
+        return spsolve(M.data, M.indices, M.indptr, _rhs())

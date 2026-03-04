@@ -25,6 +25,7 @@ from typing import (
     Hashable,
     Self,
     TypeVar,
+    overload,
 )
 from uuid import uuid4
 
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 __all__ = ["Constraint", "Periodic", "Fixed"]
 
 T = TypeVar("T")
+T_ArrayLike = TypeVar("T_ArrayLike", bound=ArrayLike)
 
 
 class Constraint:
@@ -116,9 +118,17 @@ class Constraint:
         bound._lifter = lifter
         return bound
 
+    @overload
     def _resolve_runtime(
-        self, obj: T, runtime_values: RuntimeValueMap | None = None
-    ) -> T:
+        self,
+        obj: RuntimeValue[T_ArrayLike],
+        runtime_values: RuntimeValueMap | None = None,
+    ) -> T_ArrayLike: ...
+    @overload
+    def _resolve_runtime(
+        self, obj: T_ArrayLike, runtime_values: RuntimeValueMap | None = None
+    ) -> T_ArrayLike: ...
+    def _resolve_runtime(self, obj, runtime_values: RuntimeValueMap | None = None):
         """Recursively resolve any RuntimeValue attributes in obj using runtime_values."""
         if runtime_values is None:
             if self._lifter is None:
