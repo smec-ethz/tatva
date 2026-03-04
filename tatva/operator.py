@@ -26,6 +26,7 @@ from typing import Callable, Generic, ParamSpec, Protocol, TypeAlias, TypeVar, c
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.errors import TracerBoolConversionError
 from jax_autovmap import autovmap
 
 from tatva.element import Element
@@ -406,27 +407,41 @@ class Operator(Generic[ElementT]):
             delta_xi = jnp.linalg.solve(lhs, -rhs)
             return self.element.quad_points[0] + delta_xi
 
-        def map_physical_to_reference(points: jax.Array) -> tuple[jax.Array, jax.Array]:
-            element_indices = find_containing_polygons(
+        def map_physical_to_reference(
+            points: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            element_indices: Array = find_containing_polygons(
                 points, self.mesh.coords[self.mesh.elements]
             )
             valid_indices = element_indices != -1
+            safe_element_indices = jnp.where(valid_indices, element_indices, 0)
+            valid_elements = self.mesh.elements[safe_element_indices]
             return (
                 _map_physical_to_reference(
-                    points[valid_indices],
-                    self.mesh.coords[
-                        self.mesh.elements[element_indices[valid_indices]]
-                    ],
+                    points,
+                    self.mesh.coords[valid_elements],
                 ),
-                self.mesh.elements[element_indices[valid_indices]],
+                valid_elements,
+                valid_indices,
             )
 
-        valid_quad_points, valid_elements = map_physical_to_reference(points)
+        valid_quad_points, valid_elements, valid_indices = map_physical_to_reference(
+            points
+        )
+        interpolated = self._interpolate_direct(arg, valid_quad_points, valid_elements)
 
-        if valid_quad_points.shape[0] != points.shape[0]:
-            raise RuntimeError("Some points are outside the mesh, revise the points")
+        try:
+            if bool(jnp.any(~valid_indices)):
+                raise RuntimeError(
+                    "Some points are outside the mesh, revise the points"
+                )
+        except TracerBoolConversionError:
+            pass
 
-        return self._interpolate_direct(arg, valid_quad_points, valid_elements)
+        mask = valid_indices.reshape(
+            (valid_indices.shape[0],) + (1,) * (interpolated.ndim - 1)
+        )
+        return jnp.where(mask, interpolated, jnp.nan)
 
     def _interpolate_direct(
         self,
