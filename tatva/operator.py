@@ -29,8 +29,10 @@ from jax import Array
 from jax.errors import TracerBoolConversionError
 from jax_autovmap import autovmap
 
+from tatva import sparse
 from tatva.element import Element
 from tatva.mesh import Mesh, find_containing_polygons
+from tatva.utils import virtual_work_to_residual
 
 P = ParamSpec("P")
 RT = TypeVar("RT", bound=jax.Array | tuple, covariant=True)
@@ -479,3 +481,55 @@ class Operator(Generic[ElementT]):
             nodal_values[valid_elements],
             self.mesh.coords[valid_elements],
         )
+
+    def quads(self) -> jax.Array:
+        """Returns the quadrature points of the mesh in physical coordinates.
+
+        Same as `op.eval(op.mesh.coords)`.
+
+        Returns:
+            An array with the quadrature points of the mesh in physical coordinates
+            (shape: (n_elements, n_quad_points, n_dim)).
+        """
+        return self.eval(self.mesh.coords)
+
+    def project(self, field: Array, colored_matrix: sparse.ColoredMatrix) -> Array:
+        """Projects a given field onto the finite element space defined by the mesh and
+        element.
+
+        Uses ``jax.experimental.sparse.linalg.spsolve`` to solve the linear system
+        resulting from the projection. Therefore, the colored matrix must be provided. It
+        must be compatible with the dimensions of the provided field.
+
+        Args:
+            field: The field to project, defined at the quad points (shape: (n_elements, n_quad_points, n_values)).
+            colored_matrix: The colored matrix representing the finite element space.
+        """
+        from jax.experimental.sparse.linalg import spsolve
+
+        field_dim = field.shape[-1] if field.ndim > 2 else 0
+        field_dim_multiplier = field_dim if field_dim > 0 else 1
+        n = self.mesh.coords.shape[0] * field_dim_multiplier
+
+        def reshape_to_field_dim(arr: Array) -> Array:
+            if field_dim > 0:
+                return arr.reshape(-1, field_dim)
+            else:
+                return arr
+
+        @virtual_work_to_residual(test_size=n)
+        def _lhs(test: Array, trial: Array) -> Array:
+            test_reshaped = reshape_to_field_dim(test)
+            trial_reshaped = reshape_to_field_dim(trial)
+            return self.integrate(test_reshaped * trial_reshaped)
+
+        @virtual_work_to_residual(test_size=n)
+        def _rhs(test: Array) -> Array:
+            test_reshaped = reshape_to_field_dim(test)
+            test_quad = self.eval(test_reshaped)
+            return self.integrate(test_quad * field)
+
+        lhs = sparse.jacfwd(_lhs, colored_matrix, color_batch_size=None)
+        M = lhs(jnp.zeros(n))
+
+        return spsolve(M.data, M.indices, M.indptr, _rhs())
