@@ -5,6 +5,13 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.2](https://github.com/smec-ethz/tatva/compare/v0.7.1...v0.7.2) (2026-03-05)
+
+
+### Bug Fixes
+
+* **element:** move quadrature to instance, add quadrature as constructor args ([#27](https://github.com/smec-ethz/tatva/issues/27)) ([06c9c19](https://github.com/smec-ethz/tatva/commit/06c9c19668881f537f160e2a9eaec16e44487f18))
+
 ## [0.7.1](https://github.com/smec-ethz/tatva/compare/v0.7.0...v0.7.1) (2026-02-24)
 
 
