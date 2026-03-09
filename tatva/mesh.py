@@ -61,6 +61,24 @@ class Mesh:
         """
         return replace(self, coords=new_coords)
 
+    def hmin(self) -> Array:
+        """Compute the minimum edge length in the mesh."""
+        return jnp.min(
+            jnp.linalg.norm(
+                self.coords[self.elements[:, 1:]] - self.coords[self.elements[:, :1]],
+                axis=-1,
+            )
+        )
+
+    def hmax(self) -> Array:
+        """Compute the maximum edge length in the mesh."""
+        return jnp.max(
+            jnp.linalg.norm(
+                self.coords[self.elements[:, 1:]] - self.coords[self.elements[:, :1]],
+                axis=-1,
+            )
+        )
+
     @classmethod
     def unit_square(
         cls,
