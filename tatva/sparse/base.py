@@ -109,7 +109,7 @@ def jacfwd(
     fn: Callable[Concatenate[Array, P], Array],
     colored_matrix: ColoredMatrix,
     *,
-    color_batch_size: int,
+    color_batch_size: int | None = None,
 ) -> Callable[Concatenate[Array, P], ColoredMatrix]:
     """Returns a function that computes the Jacobian of `fn` using forward-mode automatic differentiation
     and graph coloring. The returned function takes the same arguments as `fn` and returns a sparse Jacobian
@@ -134,7 +134,7 @@ def jacfwd(
 
     def _wrapped_jacfwd(u: Array, *args: P.args, **kwargs: P.kwargs) -> ColoredMatrix:
         J_compressed = colored_jacobian_batch(
-            fn, u, _colors, args, kwargs, nb_colors, color_batch_size
+            fn, u, colored_matrix.colors, nb_colors, color_batch_size, *args, **kwargs
         )
         # TODO: this function is a one-liner, could do here directly:
         # data = J_compressed[rows, col_colors]
@@ -146,13 +146,13 @@ def jacfwd(
 
 @partial(jax.jit, static_argnames=["fn", "n_colors", "color_batch_size"])
 def colored_jacobian_batch(
-    fn: Callable[[Concatenate[Array, P]], Array],
+    fn: Callable[Concatenate[Array, P], Array],
     x: Array,
     colors: Array,
-    args: P.args,
-    kwargs: P.kwargs,
     n_colors: int,
-    color_batch_size: int = 1,
+    color_batch_size: int = 0,
+    *args: P.args,
+    **kwargs: P.kwargs,
 ) -> Array:
     """
     Computes the compressed Jacobian by processing colors in batches. By default,
@@ -161,10 +161,10 @@ def colored_jacobian_batch(
         fn: function to differentiate
         x: Point at which to evaluate the Jacobian, shape (N,)
         colors: Array of colors assigned to each DOF
-        args: Positional arguments to pass to F
-        kwargs: Keyword arguments to pass to F
         n_colors: Number of unique colors
         color_batch_size: Number of colors to process in each batch
+        *args: Positional arguments to pass to F
+        **kwargs: Keyword arguments to pass to F
     Returns:
         J: Compressed Jacobian matrix, shape (N, n_colors)
     """
