@@ -87,3 +87,55 @@ def test_lifter_eq_handles_array_runtime_values():
 
     assert lhs == rhs
     assert lhs != diff
+
+
+def test_lifter_lifted_as_decorator():
+    lifter = Lifter(4, Fixed(jnp.array([0, 3]), 0.0))
+
+    @lifter.lifted(argnums=0)
+    def my_fn(u_full):
+        return u_full.sum()
+
+    u_reduced = jnp.array([10.0, 20.0])
+    # lift_from_zeros -> [0.0, 10.0, 20.0, 0.0]
+    assert my_fn(u_reduced) == 30.0
+
+
+def test_lifter_lifted_reduce_output():
+    lifter = Lifter(4, Fixed(jnp.array([0, 3]), 0.0))
+
+    @lifter.lifted(argnums=0, reduce_output=True)
+    def my_fn(u_full):
+        return u_full * 2
+
+    u_reduced = jnp.array([10.0, 20.0])
+    # lift_from_zeros -> [0.0, 10.0, 20.0, 0.0]
+    # * 2 -> [0.0, 20.0, 40.0, 0.0]
+    # reduce -> [20.0, 40.0]
+    np.testing.assert_array_equal(my_fn(u_reduced), jnp.array([20.0, 40.0]))
+
+
+def test_lifted_function_is_pytree():
+    lifter = Lifter(4, Fixed(jnp.array([0, 3]), 0.0))
+
+    @lifter.lifted(argnums=0)
+    def my_fn(u_full):
+        return u_full.sum()
+
+    # Should be able to jit a lifted function
+    @jax.jit
+    def jit_step(u):
+        return my_fn(u)
+
+    assert jit_step(jnp.array([10.0, 20.0])) == 30.0
+
+
+def test_lifted_function_jit_with_tracer_lifter():
+    @jax.jit
+    def solve(u_reduced, lifter):
+        f = lifter.lifted(lambda u: u.sum(), argnums=0)
+        return f(u_reduced)
+
+    lifter = Lifter(4, Fixed(jnp.array([0, 3]), 0.0))
+    res = solve(jnp.array([10.0, 20.0]), lifter)
+    assert res == 30.0

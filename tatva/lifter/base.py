@@ -17,9 +17,15 @@
 
 from __future__ import annotations
 
+from functools import wraps
 from typing import (
     Any,
+    Callable,
+    Generic,
+    ParamSpec,
     Self,
+    TypeVar,
+    overload,
 )
 
 import jax.numpy as jnp
@@ -35,6 +41,9 @@ from tatva.lifter.common import (
 from tatva.lifter.constraints import Constraint
 
 __all__ = ["Lifter"]
+
+P = ParamSpec("P")
+RT = TypeVar("RT")
 
 
 @register_pytree_node_class
@@ -232,6 +241,104 @@ class Lifter:
         constrained = jnp.unique(constrained)
         free = jnp.setdiff1d(all_dofs, constrained, assume_unique=True)
         return free, constrained, free.size
+
+    @overload
+    def lifted(
+        self, *, argnums: tuple[int, ...] | int, reduce_output: bool = False
+    ) -> Callable[[Callable[P, RT]], LiftedFunction[P, RT]]: ...
+    @overload
+    def lifted(
+        self,
+        fn: Callable[P, RT],
+        *,
+        argnums: tuple[int, ...] | int,
+        reduce_output: bool = False,
+    ) -> LiftedFunction[P, RT]: ...
+    def lifted(
+        self,
+        fn: Callable[P, RT] | None = None,
+        *,
+        argnums: tuple[int, ...] | int,
+        reduce_output: bool = False,
+    ) -> LiftedFunction | Callable:
+        argnums = (argnums,) if isinstance(argnums, int) else argnums
+
+        if fn is None:
+            return lambda f: self.lifted(
+                f, argnums=argnums, reduce_output=reduce_output
+            )
+
+        return LiftedFunction(self, fn, argnums, reduce_output)
+
+
+@register_pytree_node_class
+class LiftedFunction(Generic[P, RT]):
+    """A wrapper for a function that has been lifted by a :class:`Lifter`.
+
+    This class is a JAX pytree, meaning it can be passed through JAX transformations like
+    :func:`jax.jit`, :func:`jax.vmap`, etc. It also provides access to the original
+    function and the lifter used to create it.
+    """
+
+    lifter: Lifter
+    original_fn: Callable[P, RT]
+    argnums: tuple[int, ...]
+    reduce_output: bool
+
+    def __init__(
+        self,
+        lifter: Lifter,
+        fn: Callable[P, RT],
+        argnums: tuple[int, ...],
+        reduce_output: bool = False,
+    ):
+        self.lifter = lifter
+        self.original_fn = fn
+        self.argnums = argnums
+        self.reduce_output = reduce_output
+
+        # We use wraps to ensure the LiftedFunction instance looks like the original function.
+        # This copies attributes like __name__, __doc__, etc.
+        wraps(fn)(self)
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> RT:
+        lifted_args = list(args)
+        for i, arg in enumerate(args):
+            if i not in self.argnums:
+                continue
+
+            if not isinstance(arg, Array):
+                raise LifterError(
+                    f"Argument {i} is not an Array and cannot be lifted by the lifter"
+                )
+            if not arg.shape == (self.lifter.size_reduced,):
+                raise LifterError(
+                    f"Argument {i} has shape {arg.shape} but expected "
+                    f"{(self.lifter.size_reduced,)} for lifting"
+                )
+
+            lifted_args[i] = self.lifter.lift_from_zeros(arg)  # pyright: ignore
+
+        out = self.original_fn(*lifted_args, **kwargs)  # pyright: ignore[reportCallIssue]
+
+        if self.reduce_output:
+            if not isinstance(out, Array):
+                raise LifterError(
+                    "Output is not an Array and cannot be reduced by the lifter"
+                )
+            return self.lifter.reduce(out)
+        return out
+
+    def tree_flatten(self) -> tuple[tuple[Lifter], tuple[Any, ...]]:
+        children = (self.lifter,)
+        aux_data = (self.original_fn, self.argnums, self.reduce_output)
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data: tuple[Any, ...], children: tuple[Lifter]) -> Self:
+        (lifter,) = children
+        fn, argnums, reduce_output = aux_data
+        return cls(lifter, fn, argnums, reduce_output)
 
 
 class RuntimeValueSetter:
