@@ -172,8 +172,8 @@ def find_containing_polygons(points: Array, polygons: Array) -> Array:
     """
     Finds the index of the containing polygon for each point.
 
-    This function uses a vectorized Ray Casting algorithm and is JIT-compiled
-    for maximum performance. It assumes polygons are non-overlapping.
+    This function uses a vectorized Ray Casting algorithm with AABB acceleration
+    and is JIT-compiled for maximum performance. It assumes polygons are non-overlapping.
 
     Args:
         points (Array): An array of points to test, shape (num_points, 2).
@@ -190,40 +190,49 @@ def find_containing_polygons(points: Array, polygons: Array) -> Array:
     def is_inside(point, vertices):
         px, py = point
 
-        # Get all edges of the polygon by pairing vertices with the next one
-        p1s = vertices
-        p2s = jnp.roll(vertices, -1, axis=0)  # Get p_{i+1} for each p_i
+        # AABB acceleration: fast reject if point is outside the polygon's bounding box
+        min_v = jnp.min(vertices, axis=0)
+        max_v = jnp.max(vertices, axis=0)
+        in_bbox = (px >= min_v[0]) & (px <= max_v[0]) & (py >= min_v[1]) & (py <= max_v[1])
 
-        # Treat points on polygon edges as inside so shared boundaries are not missed.
-        edge_dx = p2s[:, 0] - p1s[:, 0]
-        edge_dy = p2s[:, 1] - p1s[:, 1]
-        cross = edge_dx * (py - p1s[:, 1]) - edge_dy * (px - p1s[:, 0])
-        on_segment = (
-            (jnp.minimum(p1s[:, 0], p2s[:, 0]) <= px)
-            & (px <= jnp.maximum(p1s[:, 0], p2s[:, 0]))
-            & (jnp.minimum(p1s[:, 1], p2s[:, 1]) <= py)
-            & (py <= jnp.maximum(p1s[:, 1], p2s[:, 1]))
-        )
-        on_boundary = jnp.any(jnp.isclose(cross, 0.0) & on_segment)
+        def ray_cast(_):
+            # Get all edges of the polygon by pairing vertices with the next one
+            p1s = vertices
+            p2s = jnp.roll(vertices, -1, axis=0)  # Get p_{i+1} for each p_i
 
-        # Conditions for a valid intersection of the horizontal ray from the point
-        # 1. The point's y-coord must be between the edge's y-endpoints
-        y_cond = (p1s[:, 1] <= py) & (p2s[:, 1] > py) | (p2s[:, 1] <= py) & (
-            p1s[:, 1] > py
-        )
+            # Treat points on polygon edges as inside so shared boundaries are not missed.
+            edge_dx = p2s[:, 0] - p1s[:, 0]
+            edge_dy = p2s[:, 1] - p1s[:, 1]
+            cross = edge_dx * (py - p1s[:, 1]) - edge_dy * (px - p1s[:, 0])
+            on_segment = (
+                (jnp.minimum(p1s[:, 0], p2s[:, 0]) <= px)
+                & (px <= jnp.maximum(p1s[:, 0], p2s[:, 0]))
+                & (jnp.minimum(p1s[:, 1], p2s[:, 1]) <= py)
+                & (py <= jnp.maximum(p1s[:, 1], p2s[:, 1]))
+            )
+            on_boundary = jnp.any(jnp.isclose(cross, 0.0) & on_segment)
 
-        # 2. The point's x-coord must be to the left of the edge's x-intersection
-        # Calculate the x-intersection of the ray with the edge
-        x_intersect = (p2s[:, 0] - p1s[:, 0]) * (py - p1s[:, 1]) / (
-            p2s[:, 1] - p1s[:, 1]
-        ) + p1s[:, 0]
-        x_cond = px < x_intersect
+            # Conditions for a valid intersection of the horizontal ray from the point
+            # 1. The point's y-coord must be between the edge's y-endpoints
+            y_cond = (p1s[:, 1] <= py) & (p2s[:, 1] > py) | (p2s[:, 1] <= py) & (
+                p1s[:, 1] > py
+            )
 
-        # An intersection occurs if both conditions are met.
-        intersections = jnp.sum(y_cond & x_cond)
+            # 2. The point's x-coord must be to the left of the edge's x-intersection
+            # Calculate the x-intersection of the ray with the edge
+            x_intersect = (p2s[:, 0] - p1s[:, 0]) * (py - p1s[:, 1]) / (
+                p2s[:, 1] - p1s[:, 1]
+            ) + p1s[:, 0]
+            x_cond = px < x_intersect
 
-        # The point is inside if the number of intersections is odd.
-        return on_boundary | (intersections % 2 == 1)
+            # An intersection occurs if both conditions are met.
+            intersections = jnp.sum(y_cond & x_cond)
+
+            # The point is inside if the number of intersections is odd.
+            return on_boundary | (intersections % 2 == 1)
+
+        # Use jax.lax.cond to avoid expensive ray casting if AABB check fails
+        return jax.lax.cond(in_bbox, ray_cast, lambda _: False, None)
 
     # --- Vectorize and apply the function ---
     # Create a boolean matrix: matrix[i, j] is True if point i is in polygon j
