@@ -368,7 +368,7 @@ class Compound(metaclass=_CompoundMeta):
     def tree_unflatten(cls, aux_data: Any, children: tuple[Array]) -> Self:
         return cls(*children)
 
-    def __init__(self, arr: Array | None = None) -> None:
+    def __init__(self, arr: Array | None = None, /, **kwargs) -> None:
         """Initialize the state with given keyword arguments."""
         if arr is not None:
             assert arr.size == self.size, (
@@ -377,9 +377,12 @@ class Compound(metaclass=_CompoundMeta):
             self.arr = arr
         else:
             self.arr = jnp.zeros(self.size, dtype=float)
-            # initialize fields with default factories if provided
+            # initialize fields with provided arrays OR default factories if available
             for name, field_obj in self.fields:
-                if field_obj.default_factory is not None:
+                if name in kwargs:
+                    field_arr = kwargs[name]
+                    self.arr = field_obj._set_in_array(self.arr, jnp.asarray(field_arr))
+                elif field_obj.default_factory is not None:
                     self.arr = field_obj._set_in_array(
                         self.arr, jnp.asarray(field_obj.default_factory())
                     )
