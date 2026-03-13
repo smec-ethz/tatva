@@ -210,6 +210,65 @@ class Tri3(Element):
         return jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]]).T
 
 
+class Tri6(Element):
+    """
+    A 6-node quadratic triangular element Node ordering: 3 vertices then 3 edge midpoints.
+    0:(0,0), 1:(1,0), 2:(0,1), 3:(0.5,0), 4:(0.5,0.5), 5:(0,0.5)
+    """
+
+    def _default_quadrature(self) -> tuple[Array, Array]:
+        quad_points = jnp.array(
+            [[1.0 / 6.0, 1.0 / 6.0], [2.0 / 3.0, 1.0 / 6.0], [1.0 / 6.0, 2.0 / 3.0]]
+        )
+
+        quad_weights = jnp.array([1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0])
+        return quad_points, quad_weights
+
+    def shape_function(self, xi: Array) -> Array:
+        r, s = xi
+        t = 1.0 - r - s
+
+        n0 = t * (2 * t - 1)
+        n1 = r * (2 * r - 1)
+        n2 = s * (2 * s - 1)
+
+        n3 = 4 * r * t
+        n4 = 4 * r * s
+        n5 = 4 * s * t
+
+        return jnp.array([n0, n1, n2, n3, n4, n5])
+
+    def shape_function_derivative(self, xi: Array) -> Array:
+        """Returns the derivative of the shape functions with respect to the local coordinates of shape (2, 6)."""
+        r, s = xi
+        t = 1.0 - r - s
+
+        dt_dr = -1.0
+        dt_ds = -1.0
+
+        dn0_dr = (4 * t - 1) * dt_dr  # = -(4t - 1)
+        dn1_dr = 4 * r - 1
+        dn2_dr = 0.0
+        dn3_dr = 4 * (t + r * dt_dr)  # = 4(t - r)
+        dn4_dr = 4 * s
+        dn5_dr = 4 * s * dt_dr  # = -4s
+
+        dn0_ds = (4 * t - 1) * dt_ds  # = -(4t - 1)
+        dn1_ds = 0.0
+        dn2_ds = 4 * s - 1
+        dn3_ds = 4 * r * dt_ds  # = -4r
+        dn4_ds = 4 * r
+        dn5_ds = 4 * (t + s * dt_ds)  # = 4(t - s)
+
+        # Stack into (2, 6) matrix, Row 0: d/dr, Row 1: d/ds
+        return jnp.array(
+            [
+                [dn0_dr, dn1_dr, dn2_dr, dn3_dr, dn4_dr, dn5_dr],
+                [dn0_ds, dn1_ds, dn2_ds, dn3_ds, dn4_ds, dn5_ds],
+            ]
+        )
+
+
 class Quad4(Element):
     """A 4-node bilinear quadrilateral element."""
 
