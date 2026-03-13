@@ -40,7 +40,7 @@ from jax_autovmap import autovmap
 
 from tatva.element import Element
 from tatva.mesh import Mesh, find_containing_polygons
-from tatva.utils import virtual_work_to_residual
+from tatva.utils import make_project_function
 
 if TYPE_CHECKING:
     from tatva.lifter import Lifter
@@ -508,7 +508,7 @@ class Operator(Generic[ElementT]):
     def project(
         self,
         field: Array,
-        colored_matrix: ColoredMatrix,
+        colored_matrix: ColoredMatrix | None = None,
         lifter: Lifter | None = None,
     ) -> Array:
         """Projects a given field onto the finite element space defined by the mesh and
@@ -519,60 +519,17 @@ class Operator(Generic[ElementT]):
         must be compatible with the dimensions of the provided field.
 
         Args:
-            field: The field to project, defined at the quad points (shape: (n_elements, n_quad_points, n_values)).
+            field: The field to project, defined at the quadrature points
+                (shape: (n_elements, n_quad_points, ...)).
             colored_matrix: The colored matrix representing the finite element space.
             lifter: The lifter used to lift and reduce between the full and reduced spaces.
         """
-        from jax.experimental.sparse.linalg import spsolve
+        nnodes = self.mesh.coords.shape[0]
 
-        from tatva.sparse import jacfwd
-
-        field_dim = field.shape[-1] if field.ndim > 2 else 0
-        field_dim_multiplier = field_dim if field_dim > 0 else 1
-        if lifter is not None:
-            n = lifter.size_reduced
-        else:
-            n = self.mesh.coords.shape[0] * field_dim_multiplier
-
-        def dot(a: Array, b: Array) -> Array:
-            if field_dim > 0:
-                return jnp.einsum("...i,...i->...", a, b)
-            else:
-                return a * b
-
-        def reshape_to_field_dim(arr: Array) -> Array:
-            if field_dim > 0:
-                return arr.reshape(-1, field_dim)
-            else:
-                return arr
-
-        @virtual_work_to_residual(test_size=n)
-        def _lhs(test: Array, trial: Array) -> Array:
-            if lifter is not None:
-                test = jnp.zeros(lifter.size).at[lifter.free_dofs].set(test)
-                trial = lifter.lift_from_zeros(trial)
-
-            test_reshaped = reshape_to_field_dim(test)
-            trial_reshaped = reshape_to_field_dim(trial)
-            v_q = self.eval(test_reshaped)
-            u_q = self.eval(trial_reshaped)
-            integrand = dot(v_q, u_q)
-            return self.integrate(integrand)
-
-        @virtual_work_to_residual(test_size=n)
-        def _rhs(test: Array) -> Array:
-            if lifter is not None:
-                test = jnp.zeros(lifter.size).at[lifter.free_dofs].set(test)
-
-            test_reshaped = reshape_to_field_dim(test)
-            test_quad = self.eval(test_reshaped)
-            integrand = dot(test_quad, field)
-            return self.integrate(integrand)
-
-        lhs = jacfwd(_lhs, colored_matrix, color_batch_size=None)
-        M = lhs(jnp.zeros(n))
-
-        solution_flat = spsolve(M.data, M.indices, M.indptr, _rhs())
-        if lifter is not None:
-            solution_flat = lifter.lift_from_zeros(solution_flat)
-        return reshape_to_field_dim(solution_flat)
+        fn_project = make_project_function(
+            nnodes=nnodes,
+            colored_matrix=colored_matrix,
+            elements=self.mesh.elements,  # ignored if colored_matrix is provided
+            lifter=lifter,
+        )
+        return fn_project(self, field)
