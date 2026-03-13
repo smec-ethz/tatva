@@ -24,4 +24,5 @@ from .base import (  # noqa: F401
     Quad8,
     Tetrahedron4,
     Tri3,
+    Tri6,
 )

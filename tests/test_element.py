@@ -6,7 +6,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import Array
-from tatva.element import Hexahedron8, Line2, Line3, Quad4, Quad8, Tetrahedron4, Tri3
+from tatva.element import (
+    Hexahedron8,
+    Line2,
+    Line3,
+    Quad4,
+    Quad8,
+    Tetrahedron4,
+    Tri3,
+    Tri6,
+)
 
 
 @pytest.mark.parametrize(
@@ -15,6 +24,7 @@ from tatva.element import Hexahedron8, Line2, Line3, Quad4, Quad8, Tetrahedron4,
         (Line2, 1),
         (Line3, 1),
         (Tri3, 2),
+        (Tri6, 2),
         (Quad4, 2),
         (Quad8, 2),
         (Tetrahedron4, 3),
