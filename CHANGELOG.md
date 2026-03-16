@@ -5,6 +5,26 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0](https://github.com/smec-ethz/tatva/compare/v0.7.1...v0.8.0) (2026-03-16)
+
+
+### Features
+
+* add quadratic Tri6 element ([37cf37a](https://github.com/smec-ethz/tatva/commit/37cf37a1c9995fa3eeb33ed59523ef017d1e5743))
+* **compound:** add .at(...).set(...) logic to set subspaces ([84d0c8d](https://github.com/smec-ethz/tatva/commit/84d0c8dabe21dc5f3f42884683741097db80ec28))
+* **compound:** add ability to provide individual shaped fields in init ([921f6c4](https://github.com/smec-ethz/tatva/commit/921f6c421371129502ed91c1fbdfb3c3c63b5f2d))
+* **utils:** add a decorator for virtual residual functions ([#32](https://github.com/smec-ethz/tatva/issues/32)) ([c2d6db3](https://github.com/smec-ethz/tatva/commit/c2d6db3d430f57191e80a7d09ab3e88fb6a2725e))
+
+
+### Bug Fixes
+
+* **compound:** fix compound stack_fields for scalar fields ([92bf79f](https://github.com/smec-ethz/tatva/commit/92bf79f564ab73f8d5c26d58c9eec7e933eb5c7f))
+* **compound:** include default factory when recreating stacked fields ([9ef3972](https://github.com/smec-ethz/tatva/commit/9ef39729b2a8617cf91eb7c127d3442c27d6d3a6))
+* **compound:** manage field indices, and arr updates without materializing a dense integer array of all indices ([17897a1](https://github.com/smec-ethz/tatva/commit/17897a1de546cf4ece27fe516db43b526ed35288))
+* **compound:** preserve shape of scalar fields (don't enforce rank 2) ([92bf79f](https://github.com/smec-ethz/tatva/commit/92bf79f564ab73f8d5c26d58c9eec7e933eb5c7f))
+* **compound:** remove compound metaclass getitem ([e42ad40](https://github.com/smec-ethz/tatva/commit/e42ad409c1b7e181b20cc8196e984f3fa6950ad8))
+* **element:** move quadrature to instance, add quadrature as constructor args ([#27](https://github.com/smec-ethz/tatva/issues/27)) ([06c9c19](https://github.com/smec-ethz/tatva/commit/06c9c19668881f537f160e2a9eaec16e44487f18))
+
 ## [0.7.1](https://github.com/smec-ethz/tatva/compare/v0.7.0...v0.7.1) (2026-02-24)
 
 
