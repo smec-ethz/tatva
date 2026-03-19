@@ -150,7 +150,7 @@ def colored_jacobian_batch(
     x: Array,
     colors: Array,
     n_colors: int,
-    color_batch_size: int = 0,
+    color_batch_size: int | None = None,
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> Array:
