@@ -17,16 +17,7 @@
 
 from __future__ import annotations
 
-from functools import wraps
-from typing import (
-    Any,
-    Callable,
-    Generic,
-    ParamSpec,
-    Self,
-    TypeVar,
-    overload,
-)
+from typing import Any, Callable, Concatenate, ParamSpec, Self, TypeVar, overload
 
 import jax.numpy as jnp
 from jax import Array
@@ -242,103 +233,79 @@ class Lifter:
         free = jnp.setdiff1d(all_dofs, constrained, assume_unique=True)
         return free, constrained, free.size
 
-    @overload
-    def lifted(
-        self, *, argnums: tuple[int, ...] | int, reduce_output: bool = False
-    ) -> Callable[[Callable[P, RT]], LiftedFunction[P, RT]]: ...
-    @overload
-    def lifted(
-        self,
-        fn: Callable[P, RT],
-        *,
-        argnums: tuple[int, ...] | int,
-        reduce_output: bool = False,
-    ) -> LiftedFunction[P, RT]: ...
-    def lifted(
-        self,
-        fn: Callable[P, RT] | None = None,
-        *,
-        argnums: tuple[int, ...] | int,
-        reduce_output: bool = False,
-    ) -> LiftedFunction | Callable:
-        argnums = (argnums,) if isinstance(argnums, int) else argnums
 
-        if fn is None:
-            return lambda f: self.lifted(
-                f, argnums=argnums, reduce_output=reduce_output
-            )
+@overload
+def lifted(
+    *, argnums: tuple[int, ...] | int = 0, reduce_output: bool = False
+) -> Callable[[Callable[P, RT]], Callable[Concatenate[Lifter, P], RT]]: ...
+@overload
+def lifted(
+    fn: Callable[P, RT],
+    *,
+    argnums: tuple[int, ...] | int = 0,
+    reduce_output: bool = False,
+) -> Callable[Concatenate[Lifter, P], RT]: ...
+def lifted(
+    fn: Callable[P, RT] | None = None,
+    *,
+    argnums: tuple[int, ...] | int = 0,
+    reduce_output: bool = False,
+) -> Callable:
+    """Lift a function that operates on reduced vectors to one that operates on full vectors.
 
-        return LiftedFunction(self, fn, argnums, reduce_output)
+    This is a decorator that can be used to lift a function that takes reduced vectors as
+    input and/or output to one that takes full vectors. The lifter instance is passed as the
+    first argument to the lifted function, and the specified arguments are lifted from reduced
+    to full vectors before being passed to the original function. If ``reduce_output`` is True,
+    the output of the original function is reduced from a full vector to a reduced vector
+    before being returned.
 
+    Args:
+        fn: Function to lift; must take reduced vectors as input and/or output.
+        argnums: Indices of arguments to lift from reduced to full vectors; can be an int or
+            a tuple of ints. Default is 0 (lift the first argument).
+        reduce_output: Whether to reduce the output of the original function from a full vector
+            to a reduced vector. Default is False.
 
-@register_pytree_node_class
-class LiftedFunction(Generic[P, RT]):
-    """A wrapper for a function that has been lifted by a :class:`Lifter`.
-
-    This class is a JAX pytree, meaning it can be passed through JAX transformations like
-    :func:`jax.jit`, :func:`jax.vmap`, etc. It also provides access to the original
-    function and the lifter used to create it.
+    Returns:
+        A new function that takes a lifter instance as the first argument, followed by the same
+        arguments as ``fn``, but with the specified arguments lifted from reduced to full vectors,
+        and optionally with the output reduced from a full vector to a reduced vector.
     """
+    argnums = (argnums,) if isinstance(argnums, int) else argnums
 
-    lifter: Lifter
-    original_fn: Callable[P, RT]
-    argnums: tuple[int, ...]
-    reduce_output: bool
+    if fn is None:
+        return lambda f: lifted(f, argnums=argnums, reduce_output=reduce_output)
 
-    def __init__(
-        self,
-        lifter: Lifter,
-        fn: Callable[P, RT],
-        argnums: tuple[int, ...],
-        reduce_output: bool = False,
-    ):
-        self.lifter = lifter
-        self.original_fn = fn
-        self.argnums = argnums
-        self.reduce_output = reduce_output
-
-        # We use wraps to ensure the LiftedFunction instance looks like the original function.
-        # This copies attributes like __name__, __doc__, etc.
-        wraps(fn)(self)
-
-    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> RT:
+    def lifted_fn(lifter: Lifter, *args: P.args, **kwargs: P.kwargs) -> RT:
         lifted_args = list(args)
         for i, arg in enumerate(args):
-            if i not in self.argnums:
+            if i not in argnums:
                 continue
 
             if not isinstance(arg, Array):
                 raise LifterError(
                     f"Argument {i} is not an Array and cannot be lifted by the lifter"
                 )
-            if not arg.shape == (self.lifter.size_reduced,):
+            if not arg.shape == (lifter.size_reduced,):
                 raise LifterError(
                     f"Argument {i} has shape {arg.shape} but expected "
-                    f"{(self.lifter.size_reduced,)} for lifting"
+                    f"{(lifter.size_reduced,)} for lifting"
                 )
 
-            lifted_args[i] = self.lifter.lift_from_zeros(arg)  # pyright: ignore
+            lifted_args[i] = lifter.lift_from_zeros(arg)  # pyright: ignore
 
-        out = self.original_fn(*lifted_args, **kwargs)  # pyright: ignore[reportCallIssue]
+        out = fn(*lifted_args, **kwargs)  # pyright: ignore[reportCallIssue]
 
-        if self.reduce_output:
+        if reduce_output:
             if not isinstance(out, Array):
                 raise LifterError(
                     "Output is not an Array and cannot be reduced by the lifter"
                 )
-            return self.lifter.reduce(out)
+            return lifter.reduce(out)
         return out
 
-    def tree_flatten(self) -> tuple[tuple[Lifter], tuple[Any, ...]]:
-        children = (self.lifter,)
-        aux_data = (self.original_fn, self.argnums, self.reduce_output)
-        return children, aux_data
-
-    @classmethod
-    def tree_unflatten(cls, aux_data: tuple[Any, ...], children: tuple[Lifter]) -> Self:
-        (lifter,) = children
-        fn, argnums, reduce_output = aux_data
-        return cls(lifter, fn, argnums, reduce_output)
+    return lifted_fn
 
 
 class RuntimeValueSetter:
