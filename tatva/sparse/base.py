@@ -21,6 +21,7 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Callable, Concatenate, ParamSpec, Self
 
+import numpy as np
 import jax
 import jax.experimental.sparse as jsp
 import jax.numpy as jnp
@@ -43,17 +44,17 @@ class ColoredMatrix:
     data: Array = field(repr=False)
     """Data values of the sparse matrix"""
 
-    indptr: NDArray = field(metadata=dict(static=True), repr=False)
+    indptr: Array = field(repr=False)
     """Row pointers for the original sparsity pattern (CSR format)"""
 
-    indices: NDArray = field(metadata=dict(static=True), repr=False)
+    indices: Array = field(repr=False)
     """Column indices for the original sparsity pattern (CSR format)"""
 
     shape: tuple[int, int] = field(metadata=dict(static=True))
     """Shape of the sparse matrix"""
 
-    colors: NDArray = field(metadata=dict(static=True), repr=False)
-    """Array of colors assigned to each degree of freedom (DOF) for graph coloring"""
+    colors: Array = field(repr=False)
+    """Colors assigned to each degree of freedom (DOF) for graph coloring"""
 
     @classmethod
     def from_csr(cls, csr_matrix: sp.csr_matrix, colors: NDArray | None = None) -> Self:
@@ -62,20 +63,22 @@ class ColoredMatrix:
         indices = csr_matrix.indices
 
         if colors is None:
-            # If no colors are provided, compute them using distance-2 coloring
             colors = distance2_colors(indptr, indices, csr_matrix.shape[0])
 
         return cls(
             data=jnp.asarray(csr_matrix.data),
-            indptr=indptr,
-            indices=indices,
+            indptr=jnp.asarray(indptr),
+            indices=jnp.asarray(indices),
             shape=csr_matrix.shape,
-            colors=colors,
+            colors=jnp.asarray(colors),
         )
 
     def to_csr(self) -> sp.csr_matrix:
         """Convert the sparse matrix to SciPy's CSR format."""
-        return sp.csr_matrix((self.data, self.indices, self.indptr), shape=self.shape)
+        return sp.csr_matrix(
+            (np.asarray(self.data), np.asarray(self.indices), np.asarray(self.indptr)),
+            shape=self.shape,
+        )
 
     def to_bcoo(self) -> jsp.BCOO:
         """Convert the sparse matrix to JAX's BCOO format."""
@@ -83,12 +86,18 @@ class ColoredMatrix:
         n_dofs = self.shape[0]
         diffs = jnp.diff(self.indptr)
         rows = jnp.repeat(
-            jnp.arange(n_dofs), diffs, total_repeat_length=len(self.indices)
+            jnp.arange(n_dofs), diffs, total_repeat_length=self.indices.shape[0]
         )
-        cols = self.indices
-        indices = jnp.stack([rows, cols], axis=1)
+        indices = jnp.stack([rows, self.indices], axis=1)
 
         return jsp.BCOO((self.data, indices), shape=(n_dofs, n_dofs))
+
+    def to_bcsr(self) -> jsp.BCSR:
+        """Convert the sparse matrix to JAX's BCSR format."""
+        return jsp.BCSR(
+            (self.data, self.indices, self.indptr),
+            shape=self.shape,
+        )
 
     def to_dense(self) -> Array:
         """Convert the sparse matrix to a dense array."""
@@ -106,24 +115,26 @@ def jacfwd(
     and graph coloring. The returned function takes the same arguments as `fn` and returns a sparse Jacobian
     as a new instance of `Sparsity`.
     """
-    nb_colors = len(jnp.unique(colored_matrix.colors)) + 1
+    nb_colors = int(colored_matrix.colors.max()) + 1
+    _indptr = colored_matrix.indptr
+    _indices = colored_matrix.indices
+    _colors = colored_matrix.colors
     # precompute the indices needed to recover the full Jacobian from the compressed version
     # rows: row index per non-zero entry (length nnz)
-    diffs = jnp.diff(colored_matrix.indptr)
+    diffs = jnp.diff(_indptr)
     rows = jnp.repeat(
-        jnp.arange(len(colored_matrix.indptr) - 1),
+        jnp.arange(_indptr.shape[0] - 1),
         diffs,
-        total_repeat_length=len(colored_matrix.indices),
+        total_repeat_length=_indices.shape[0],
     )
     # find where the value for (i, j) is hiding in J_compressed
     # The value K_ij is stored at row 'i' and column 'color[j]'
     # col_colors: color of the column for each non-zero entry (length nnz)
-    col_colors = colored_matrix.colors[colored_matrix.indices]
+    col_colors = _colors[_indices]
 
     def _wrapped_jacfwd(u: Array, *args: P.args, **kwargs: P.kwargs) -> ColoredMatrix:
-        # Pass args explicitly to the JIT-compiled function
         J_compressed = colored_jacobian_batch(
-            fn, u, colored_matrix.colors, args, kwargs, nb_colors, color_batch_size
+            fn, u, _colors, args, kwargs, nb_colors, color_batch_size
         )
         # TODO: this function is a one-liner, could do here directly:
         # data = J_compressed[rows, col_colors]
