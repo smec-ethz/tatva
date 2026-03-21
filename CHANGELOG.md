@@ -5,6 +5,13 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.1](https://github.com/smec-ethz/tatva/compare/v0.8.0...v0.8.1) (2026-03-21)
+
+
+### Bug Fixes
+
+* make ColoredMatrix compatible with JAX&gt;0.9.0 ([ac51668](https://github.com/smec-ethz/tatva/commit/ac51668bc4c0b480f32f73acac0f4aff04758e92))
+
 ## [0.8.0](https://github.com/smec-ethz/tatva/compare/v0.7.1...v0.8.0) (2026-03-16)
 
 
