@@ -85,15 +85,8 @@ class Lifter:
         # runtime values that are not hashable. By treating the runtime values as non-static
         # children, we can keep the lifter itself as a static arg while still allowing the
         # runtime values to be passed in and used during lifting.
-        children = (self._runtime_values,)
-        aux_data = (
-            self.size,
-            self.constraints,
-            self.free_dofs,
-            self.constrained_dofs,
-            self.size_reduced,
-            self._runtime_keys,
-        )
+        children = (self._runtime_values, self.free_dofs, self.constrained_dofs)
+        aux_data = (self.size, self.constraints, self.size_reduced, self._runtime_keys)
         return children, aux_data
 
     @classmethod
@@ -105,10 +98,8 @@ class Lifter:
         # This is a bit hacky, but it allows us to reconstruct the lifter with the correct
         # runtime values without having to go through the normal initialization process,
         # which would require us to recompute the sizes and runtime pairs.
-        size, constraints, free_dofs, constrained_dofs, size_reduced, _runtime_keys = (
-            aux_data
-        )
-        (_runtime_values,) = children
+        size, constraints, size_reduced, _runtime_keys = aux_data
+        _runtime_values, free_dofs, constrained_dofs = children
 
         lifter = cls.__new__(cls)
         lifter.__dict__ = {
@@ -329,4 +320,7 @@ class RuntimeValueIndexer:
         self.lifter = lifter
 
     def __getitem__(self, key) -> RuntimeValueSetter:
+        return RuntimeValueSetter(self.lifter, key)
+
+    def __call__(self, key: str) -> RuntimeValueSetter:
         return RuntimeValueSetter(self.lifter, key)
