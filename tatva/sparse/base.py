@@ -21,10 +21,10 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Callable, Concatenate, ParamSpec, Self
 
-import numpy as np
 import jax
 import jax.experimental.sparse as jsp
 import jax.numpy as jnp
+import numpy as np
 import scipy.sparse as sp
 from jax import Array
 from jax.tree_util import register_dataclass
@@ -116,6 +116,9 @@ def jacfwd(
     as a new instance of `Sparsity`.
     """
     nb_colors = int(colored_matrix.colors.max()) + 1
+    if color_batch_size is None:
+        color_batch_size = nb_colors
+
     _indptr = colored_matrix.indptr
     _indices = colored_matrix.indices
     _colors = colored_matrix.colors
