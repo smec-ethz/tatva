@@ -76,12 +76,16 @@ def _reshape_affine_metadata(
 
 
 class _FieldBase:
+    shape: tuple[int, ...]
+    size: int
+
     def __init__(
         self,
         shape: tuple[int, ...],
         _slice: slice | None = None,
     ) -> None:
         self.shape = shape
+        self.size = int(prod(shape))
         self._set_slice_and_strides(_slice)
 
     def _set_slice_and_strides(self, _slice: slice | None) -> None:
@@ -160,7 +164,6 @@ class _FieldBase:
 class Field(_FieldBase):
     """A descriptor to define fields in the State class."""
 
-    shape: tuple[int, ...]
     default_factory: Callable | None
 
     def __init__(
