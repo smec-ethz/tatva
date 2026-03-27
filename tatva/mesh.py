@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal, Self
 
 import jax
 import jax.numpy as jnp
@@ -51,6 +51,15 @@ class Mesh:
 
     elements: Array
     """Connectivity of the mesh elements, shape (n_elements, nodes_per_element)"""
+
+    def _replace(self, **changes: Any) -> Self:
+        """Returns a new instance of the Mesh with the specified changes. Same as
+        `dataclasses.replace(self, **changes)`. Inspired by NamedTuple's _replace method.
+
+        Args:
+            **changes: The attributes to change and their new values.
+        """
+        return replace(self, **changes)
 
     def set_coords(self, new_coords: Array) -> Mesh:
         """Return a new Mesh with the same connectivity but updated node coordinates.
