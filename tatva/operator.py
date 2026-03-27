@@ -23,10 +23,12 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Generic,
     ParamSpec,
     Protocol,
+    Self,
     TypeAlias,
     TypeVar,
     cast,
@@ -488,6 +490,15 @@ class Operator(Generic[ElementT]):
             nodal_values[valid_elements],
             self.mesh.coords[valid_elements],
         )
+
+    def _replace(self, **changes: Any) -> Self:
+        """Returns a new instance of the Operator with the specified changes. Same as
+        `dataclasses.replace(self, **changes)`. Inspired by NamedTuple's _replace method.
+
+        Args:
+            **changes: The attributes to change and their new values.
+        """
+        return replace(self, **changes)
 
     def quads(self) -> jax.Array:
         """Returns the quadrature points of the mesh in physical coordinates.
