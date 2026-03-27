@@ -61,23 +61,22 @@ class Mesh:
         """
         return replace(self, coords=new_coords)
 
+    def _element_edge_lengths(self) -> Array:
+        """Compute the lengths of all edges in the mesh."""
+        coords_e = self.coords[self.elements]
+        nodes_per_element = coords_e.shape[1]
+        # indices of all unique node pairs within an element (i < j)
+        idx_i, idx_j = jnp.triu_indices(nodes_per_element, k=1)
+        edge_vectors = coords_e[:, idx_j, :] - coords_e[:, idx_i, :]
+        return jnp.linalg.norm(edge_vectors, axis=-1)
+
     def hmin(self) -> Array:
         """Compute the minimum edge length in the mesh."""
-        return jnp.min(
-            jnp.linalg.norm(
-                self.coords[self.elements[:, 1:]] - self.coords[self.elements[:, :1]],
-                axis=-1,
-            )
-        )
+        return jnp.min(self._element_edge_lengths())
 
     def hmax(self) -> Array:
         """Compute the maximum edge length in the mesh."""
-        return jnp.max(
-            jnp.linalg.norm(
-                self.coords[self.elements[:, 1:]] - self.coords[self.elements[:, :1]],
-                axis=-1,
-            )
-        )
+        return jnp.max(self._element_edge_lengths())
 
     @classmethod
     def unit_square(
@@ -193,7 +192,9 @@ def find_containing_polygons(points: Array, polygons: Array) -> Array:
         # AABB acceleration: fast reject if point is outside the polygon's bounding box
         min_v = jnp.min(vertices, axis=0)
         max_v = jnp.max(vertices, axis=0)
-        in_bbox = (px >= min_v[0]) & (px <= max_v[0]) & (py >= min_v[1]) & (py <= max_v[1])
+        in_bbox = (
+            (px >= min_v[0]) & (px <= max_v[0]) & (py >= min_v[1]) & (py <= max_v[1])
+        )
 
         def ray_cast(_):
             # Get all edges of the polygon by pairing vertices with the next one

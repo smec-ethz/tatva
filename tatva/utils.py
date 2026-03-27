@@ -143,9 +143,8 @@ def make_project_function(
     )
 
     if colored_matrix is None:
-        assert elements is not None, (
-            "Must provide elements if colored_matrix is not provided"
-        )
+        if elements is None:
+            raise ValueError("Must provide elements if colored_matrix is not provided")
         # default to scalar projection (multiple RHS for vector/tensor fields)
         dim = 1
         n = nnodes * dim
@@ -155,6 +154,11 @@ def make_project_function(
         colored_matrix = ColoredMatrix.from_csr(sp)
     else:
         dim = colored_matrix.shape[0] // nnodes
+        if lifter is not None and colored_matrix.shape[0] != lifter.size_reduced:
+            raise ValueError(
+                "Colored matrix size does not match lifter reduced size. "
+                f"Expected {lifter.size_reduced}, got {colored_matrix.shape[0]}"
+            )
 
     lhs, rhs = _make_projection(nnodes, dim, colored_matrix, lifter)
     n_solver = colored_matrix.shape[0]

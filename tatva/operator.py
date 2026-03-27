@@ -103,16 +103,11 @@ class Operator(Generic[ElementT]):
     batch_size: int | None = field(metadata=dict(static=True), default=None)
     cache_weights: bool = field(metadata=dict(static=True), default=False)
 
-    def set_coords(self, new_coords: Array) -> Operator[ElementT]:
-        """Return a new Operator with the same connectivity but updated node coordinates.
-
-        Args:
-            new_coords: An array of shape (n_nodes, n_dim) containing the new coordinates
-                for the mesh nodes.
-        """
-        return replace(self, mesh=self.mesh.set_coords(new_coords))
-
     def __post_init__(self) -> None:
+        # run initialization checks to ensure mesh/element compatibility and basic
+        # shape/type validations
+        self.__check_init__()
+
         if self.cache_weights:
 
             def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
@@ -125,28 +120,6 @@ class Operator(Generic[ElementT]):
                 "_det_J_elements_weights",
                 jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights),
             )
-
-    def get_integration_weights(self) -> Array:
-        """Returns the integration weights for the quadrature points of the mesh. This is
-        the product of the determinant of the Jacobian and the quadrature weights, which
-        can be used for integrating functions over the mesh.
-
-        Returns:
-            A `jax.Array` with the integration weights at each quadrature point of each
-            element (shape: (n_elements, n_quad_points)).
-        """
-        if self.cache_weights:
-            # if cache_weights is True, we have computed the integration weights in
-            # __post_init__ and stored them in _det_J_elements_weights
-            return self._det_J_elements_weights  # pyright: ignore[reportAttributeAccessIssue]
-        else:
-
-            def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
-                """Calls the function element.get_jacobian and returns the second output."""
-                return self.element.get_jacobian(xi, el_nodal_coords)[1]
-
-            det_J_elements = self.map(_get_det_J)(self.mesh.coords)
-            return jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights)
 
     def __check_init__(self) -> None:
         """Validates the mesh and element compatibility. Does a series of checks to ensure
@@ -184,6 +157,28 @@ class Operator(Generic[ElementT]):
             raise ValueError(
                 "Mesh element connectivity references nodes outside the mesh coordinates array."
             )
+
+    def get_integration_weights(self) -> Array:
+        """Returns the integration weights for the quadrature points of the mesh. This is
+        the product of the determinant of the Jacobian and the quadrature weights, which
+        can be used for integrating functions over the mesh.
+
+        Returns:
+            A `jax.Array` with the integration weights at each quadrature point of each
+            element (shape: (n_elements, n_quad_points)).
+        """
+        if self.cache_weights:
+            # if cache_weights is True, we have computed the integration weights in
+            # __post_init__ and stored them in _det_J_elements_weights
+            return self._det_J_elements_weights  # pyright: ignore[reportAttributeAccessIssue]
+        else:
+
+            def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
+                """Calls the function element.get_jacobian and returns the second output."""
+                return self.element.get_jacobian(xi, el_nodal_coords)[1]
+
+            det_J_elements = self.map(_get_det_J)(self.mesh.coords)
+            return jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights)
 
     def _vmap_over_elements_and_quads(
         self, nodal_values: jax.Array, func: MappableOverElementsAndQuads
@@ -515,14 +510,18 @@ class Operator(Generic[ElementT]):
         element.
 
         Uses ``jax.experimental.sparse.linalg.spsolve`` to solve the linear system
-        resulting from the projection. Therefore, the colored matrix must be provided. It
-        must be compatible with the dimensions of the provided field.
+        resulting from the projection. If `colored_matrix` is None (the default), a
+        compatible colored matrix is assembled from `self.mesh.elements`. When a
+        `colored_matrix` is passed explicitly, it must be compatible with the dimensions
+        of the projected field and with the chosen fem space.
 
         Args:
             field: The field to project, defined at the quadrature points
                 (shape: (n_elements, n_quad_points, ...)).
-            colored_matrix: The colored matrix representing the finite element space.
-            lifter: The lifter used to lift and reduce between the full and reduced spaces.
+            colored_matrix: Optional colored matrix representing the finite element space.
+                If omitted, it is constructed from `self.mesh.elements`.
+            lifter: Optional lifter used to lift and reduce between the full and reduced
+                spaces.
         """
         nnodes = self.mesh.coords.shape[0]
 
