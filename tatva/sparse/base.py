@@ -114,6 +114,16 @@ def jacfwd(
     """Returns a function that computes the Jacobian of `fn` using forward-mode automatic differentiation
     and graph coloring. The returned function takes the same arguments as `fn` and returns a sparse Jacobian
     as a new instance of `Sparsity`.
+
+    Args:
+        fn: Function for which to compute the Jacobian. Must take an Array as its first
+            argument and return an Array. Will be differentiated with respect to the first
+            argument.
+        colored_matrix: An instance of ColoredMatrix representing the sparsity pattern and
+            coloring of the Jacobian.
+        color_batch_size: Optional batch size for processing colors. If None, processes
+            all colors at once. If memory usage is a concern, set to a smaller value to
+            process colors in batches.
     """
     nb_colors = int(colored_matrix.colors.max()) + 1
     if color_batch_size is None:

@@ -85,6 +85,13 @@ class Operator(Generic[ElementT]):
     Args:
         mesh: The mesh containing the elements and nodes.
         element: The element type used for the finite element method.
+        batch_size: Optional batch size for mapping operations over elements. If None, it
+            defaults to the number of elements in the mesh. If many elements are present,
+            setting a smaller batch size can reduce memory usage.
+        cache_weights: If True, the integration weights (the product of the determinant of
+            the Jacobian and the quadrature weights) are computed once and cached for
+            future use. This can speed up repeated integrations at the cost of increased
+            memory usage.
 
     Provides several operators for evaluating and integrating functions over the mesh,
     such as `integrate`, `eval`, and `grad`. These operators can be used to compute
