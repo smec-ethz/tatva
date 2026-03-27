@@ -151,14 +151,17 @@ class Operator(Generic[ElementT]):
             raise TypeError("Mesh element connectivity must contain integer indices.")
 
         flat_elements = elements.ravel()
-        if flat_elements.min() < 0:
-            raise ValueError(
-                "Mesh element connectivity contains negative node indices."
-            )
-        if flat_elements.max() >= coords.shape[0]:
-            raise ValueError(
-                "Mesh element connectivity references nodes outside the mesh coordinates array."
-            )
+        try:
+            if flat_elements.min() < 0:
+                raise ValueError(
+                    "Mesh element connectivity contains negative node indices."
+                )
+            if flat_elements.max() >= coords.shape[0]:
+                raise ValueError(
+                    "Mesh element connectivity references nodes outside the mesh coordinates array."
+                )
+        except TracerBoolConversionError:
+            pass
 
     def get_integration_weights(self) -> Array:
         """Returns the integration weights for the quadrature points of the mesh. This is
