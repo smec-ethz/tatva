@@ -61,22 +61,64 @@ class Mesh:
         """
         return replace(self, coords=new_coords)
 
-    def _element_edge_lengths(self) -> Array:
-        """Compute the lengths of all edges in the mesh."""
+    def _element_circumdiameters(self) -> Array:
+        """Compute the circumdiameter (2 * circumradius) of each element in the mesh.
+        For non-simplex elements (quads, hexes), falls back to the maximum distance
+        between any two nodes in the element.
+
+        See: https://mathworld.wolfram.com/Circumradius.html
+        """
         coords_e = self.coords[self.elements]
-        nodes_per_element = coords_e.shape[1]
-        # indices of all unique node pairs within an element (i < j)
-        idx_i, idx_j = jnp.triu_indices(nodes_per_element, k=1)
-        edge_vectors = coords_e[:, idx_j, :] - coords_e[:, idx_i, :]
-        return jnp.linalg.norm(edge_vectors, axis=-1)
+        n_dim = self.coords.shape[1]
+        n_nodes = self.elements.shape[1]
+
+        if n_nodes == 3:  # triangle (2D or 3D)
+            v1 = coords_e[:, 1] - coords_e[:, 0]
+            v2 = coords_e[:, 2] - coords_e[:, 0]
+            v3 = coords_e[:, 2] - coords_e[:, 1]
+
+            a = jnp.linalg.norm(v1, axis=-1)
+            b = jnp.linalg.norm(v2, axis=-1)
+            c = jnp.linalg.norm(v3, axis=-1)
+
+            if n_dim == 2:
+                area_2 = jnp.abs(v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])
+            else:
+                area_2 = jnp.linalg.norm(jnp.cross(v1, v2), axis=-1)
+
+            return (a * b * c) / jnp.maximum(area_2, 1e-12)
+
+        if n_nodes == 4 and n_dim == 3:  # tetrahedron
+            a = coords_e[:, 1] - coords_e[:, 0]
+            b = coords_e[:, 2] - coords_e[:, 0]
+            c = coords_e[:, 3] - coords_e[:, 0]
+
+            cross_bc = jnp.cross(b, c)
+            cross_ca = jnp.cross(c, a)
+            cross_ab = jnp.cross(a, b)
+
+            vol_6 = jnp.abs(jnp.sum(a * cross_bc, axis=-1))
+
+            num = jnp.linalg.norm(
+                jnp.sum(a**2, axis=-1, keepdims=True) * cross_bc
+                + jnp.sum(b**2, axis=-1, keepdims=True) * cross_ca
+                + jnp.sum(c**2, axis=-1, keepdims=True) * cross_ab,
+                axis=-1,
+            )
+            return num / jnp.maximum(vol_6, 1e-12)
+
+        # fallback for Quads, Hexes, etc. (max distance between vertices)
+        idx_i, idx_j = jnp.triu_indices(n_nodes, k=1)
+        dist_sq = jnp.sum((coords_e[:, idx_j, :] - coords_e[:, idx_i, :]) ** 2, axis=-1)
+        return jnp.sqrt(jnp.max(dist_sq, axis=1))
 
     def hmin(self) -> Array:
-        """Compute the minimum edge length in the mesh."""
-        return jnp.min(self._element_edge_lengths())
+        """Compute the minimum element diameter in the mesh."""
+        return jnp.min(self._element_circumdiameters())
 
     def hmax(self) -> Array:
-        """Compute the maximum edge length in the mesh."""
-        return jnp.max(self._element_edge_lengths())
+        """Compute the maximum element diameter in the mesh."""
+        return jnp.max(self._element_circumdiameters())
 
     @classmethod
     def unit_square(
