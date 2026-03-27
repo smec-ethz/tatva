@@ -109,6 +109,8 @@ class Operator(Generic[ElementT]):
         # run initialization checks to ensure mesh/element compatibility and basic
         # shape/type validations
         self.__check_init__()
+        if self.batch_size is None:
+            object.__setattr__(self, "batch_size", self.mesh.elements.shape[0])
 
         if self.cache_weights:
 
