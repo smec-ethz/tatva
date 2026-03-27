@@ -5,6 +5,36 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.0](https://github.com/smec-ethz/tatva/compare/v0.8.1...v0.9.0) (2026-03-27)
+
+
+### Features
+
+* **lifter:** add lifted method/decorator to lift functions ([2077ffb](https://github.com/smec-ethz/tatva/commit/2077ffb68d4cf16f322b6486bf3db93dde8ec9e7))
+* **operator:** add an L2 `project` method ([98a16d6](https://github.com/smec-ethz/tatva/commit/98a16d60f76285ca63d2b5c6365a2a7d952295f6))
+
+
+### Bug Fixes
+
+* **compound:** add Field.size attribute ([cf8505d](https://github.com/smec-ethz/tatva/commit/cf8505d9d375b4a69680871553832b6bd844a100))
+* **lifter:** make dof arrays dynamic Array ([b2222bc](https://github.com/smec-ethz/tatva/commit/b2222bce7a75e163842093038c8639202c63a2a0))
+* **mesh:** add _replace helper to update dataclass ([2c1d9b6](https://github.com/smec-ethz/tatva/commit/2c1d9b617d46c1a57fb345351e20e5446eafbdad))
+* **mesh:** add hmin and hmax methods ([489b76a](https://github.com/smec-ethz/tatva/commit/489b76a03fee2b7568f59b5eb982eda878f47152))
+* **mesh:** hmin/hmax is the cell diameter which is 2*circumradius ([6167223](https://github.com/smec-ethz/tatva/commit/61672235b9ee28c2d2c8004be78dae477c579d20))
+* **mesh:** hotfix find_containing_polygons that points exactly on boundary are valid ([3f95f2f](https://github.com/smec-ethz/tatva/commit/3f95f2f6f6e5354dca38e87e6dadb0fd0ac1f536))
+* minor fixes from code review ([97c6bd4](https://github.com/smec-ethz/tatva/commit/97c6bd4e1969428ffc365aefb1705bba082bc882))
+* **operator:** make interpolate jittable ([d9fe62b](https://github.com/smec-ethz/tatva/commit/d9fe62bf6f179879de90ab7e0f428aace7a0aa8d))
+* **operator:** set batch_size if None given ([e57b362](https://github.com/smec-ethz/tatva/commit/e57b3629a620c050fb2b886e64ed1c997dc65280))
+* **operator:** skip element bounds checks in traced context ([1b7a0a7](https://github.com/smec-ethz/tatva/commit/1b7a0a77f9245ce1d69a9f42ffac25b11588ddef))
+* **sparse:** make default for color_batch_size None but assign 0 ([071af07](https://github.com/smec-ethz/tatva/commit/071af0709470586f46ba615e6a3f2eefd9b56351))
+* **sparse:** revert the default for colored_batch_size to max color ([9ee95da](https://github.com/smec-ethz/tatva/commit/9ee95da5be03cb0a5339cd80700256dd273ab474))
+* **sparse:** set default color_batch_size=max_color ([2683d89](https://github.com/smec-ethz/tatva/commit/2683d891510cfcb9f2e7cb511d3309289ac5718a))
+
+
+### Performance Improvements
+
+* **mesh:** AABB search for interpolation in triangles ([32ff68d](https://github.com/smec-ethz/tatva/commit/32ff68d12da2b2a37e6bbc28ad1a5800c0fdc0ea))
+
 ## [0.8.1](https://github.com/smec-ethz/tatva/compare/v0.8.0...v0.8.1) (2026-03-21)
 
 
