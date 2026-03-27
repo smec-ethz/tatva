@@ -22,8 +22,9 @@ import pytest
 import scipy.sparse as sp
 from jax import Array
 from jax_autovmap import autovmap
-from tatva import Mesh, Operator, element, sparse
 from tatva_coloring import distance2_color_and_seeds
+
+from tatva import Mesh, Operator, element, sparse
 
 
 class Material(NamedTuple):
@@ -48,8 +49,7 @@ def _build_problem(
     Operator,
     Callable[[Array], Array],
     Callable[[Array, Array], Array],
-    sp.csr_matrix,
-    Array,
+    sparse.ColoredMatrix,
 ]:
     mesh = Mesh.unit_square(nx, ny)
 

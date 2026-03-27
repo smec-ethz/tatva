@@ -159,7 +159,7 @@ def _timed_first_and_mean(
     reason="Set TATVA_RUN_BENCHMARKS=1 to run performance benchmarks.",
 )
 def test_lifter_total_energy_benchmark():
-    op, energy_fn = _build_problem(20, 20)
+    op, energy_fn = _build_problem(100, 100)
     mesh = op.mesh
 
     class Solution(Compound):
@@ -207,19 +207,19 @@ def test_lifter_total_energy_benchmark():
 
     timings: dict[str, tuple[float, float, float | None, float]] = {}
 
-    print("\nBenchmarking lifter with different energy functions:\n")
+    print(f"\nBenchmarking lifter with different energy functions [n={op.mesh.coords.shape[0]*2}]:\n")
 
     # first 2, passing lifter as second arg
     for energy, name in zip(
         (energy_free_static, energy_free_static_disp_top), ("static", "static_disp_top")
     ):
-        res = jax.jacrev(energy)
-        jac = jax.jit(jax.jacfwd(res), static_argnames=("lifter",))
+        # res = jax.jacrev(energy)
+        # jac = jax.jit(jax.jacfwd(res), static_argnames=("lifter",))
 
         args = (0.5,) if "disp_top" in name else ()
 
         timings[name] = _timed_first_and_mean(
-            jac, energy, jnp.zeros(lifter.size_reduced), lifter, *args
+            energy, energy, jnp.zeros(lifter.size_reduced), lifter, *args
         )
         print(
             f"{name:>15}: first={timings[name][0]:.6f}s, mean={timings[name][1]:.6f}s, "
@@ -228,11 +228,11 @@ def test_lifter_total_energy_benchmark():
         )
 
     for energy, name in zip((energy_free_dynamic,), ("dynamic",)):
-        res = jax.jacrev(energy)
-        jac = jax.jit(jax.jacfwd(res))
+        # res = jax.jacrev(energy)
+        # jac = jax.jit(jax.jacfwd(res))
 
         timings[name] = _timed_first_and_mean(
-            jac, energy, jnp.zeros(lifter.size_reduced), lifter
+            energy, energy, jnp.zeros(lifter.size_reduced), lifter
         )
         print(
             f"{name:>15}: first={timings[name][0]:.6f}s, mean={timings[name][1]:.6f}s, "
@@ -244,11 +244,11 @@ def test_lifter_total_energy_benchmark():
         (energy_free_disp_top, energy_free_manual),
         ("disp_top", "manual"),
     ):
-        res = jax.jacrev(energy)
-        jac = jax.jit(jax.jacfwd(res))
+        # res = jax.jacrev(energy)
+        # jac = jax.jit(jax.jacfwd(res))
 
         timings[name] = _timed_first_and_mean(
-            jac, energy, jnp.zeros(lifter.size_reduced), 0.5
+            energy, energy, jnp.zeros(lifter.size_reduced), 0.5
         )
         print(
             f"{name:>15}: first={timings[name][0]:.6f}s, mean={timings[name][1]:.6f}s, "
