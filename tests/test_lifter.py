@@ -105,7 +105,7 @@ def test_lifter_lifted_as_decorator():
 def test_lifter_lifted_reduce_output():
     lifter = Lifter(4, Fixed(jnp.array([0, 3]), 0.0))
 
-    @lifted(argnums=0, reduce_output=True)
+    @lifted(argnums=0, output="primal")
     def my_fn(u_full):
         return u_full * 2
 

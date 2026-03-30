@@ -107,6 +107,10 @@ class Constraint:
         """Apply the constraint to a full vector and return the modified copy."""
         return u_full
 
+    def apply_transpose(self, r_full: Array) -> Array:
+        """Apply the transpose of the constraint to a full residual vector."""
+        return r_full
+
     def _get_runtime_specs(self) -> tuple[RuntimeValue, ...]:
         """Return a tuple of all RuntimeValue attributes in this constraint instance."""
         return self._runtime_specs
@@ -124,10 +128,12 @@ class Constraint:
         obj: RuntimeValue[T_ArrayLike],
         runtime_values: RuntimeValueMap | None = None,
     ) -> T_ArrayLike: ...
+
     @overload
     def _resolve_runtime(
         self, obj: T_ArrayLike, runtime_values: RuntimeValueMap | None = None
     ) -> T_ArrayLike: ...
+
     def _resolve_runtime(self, obj, runtime_values: RuntimeValueMap | None = None):
         """Recursively resolve any RuntimeValue attributes in obj using runtime_values."""
         if runtime_values is None:
@@ -138,7 +144,7 @@ class Constraint:
         if isinstance(obj, ArrayLike):
             return obj
         elif isinstance(obj, RuntimeValue):
-            return obj.get_value(runtime_values)  # ty:ignore[invalid-return-type]
+            return obj.get_value(runtime_values)
         elif isinstance(obj, Mapping):
             return type(obj)(
                 (k, self._resolve_runtime(v, runtime_values)) for k, v in obj.items()
@@ -163,11 +169,15 @@ class Periodic(Constraint):
         """Copy values from ``master_dofs`` into the constrained ``dofs``."""
         return u_full.at[self.dofs].set(u_full[self.master_dofs])
 
+    def apply_transpose(self, r_full: Array) -> Array:
+        """Add residuals from constrained ``dofs`` to ``master_dofs``."""
+        return r_full.at[self.master_dofs].add(r_full[self.dofs]).at[self.dofs].set(0.0)
+
 
 class Fixed(Constraint):
     dofs: Array
     """The dofs to constrain; these will be set to fixed values during lifting."""
-    values: ArrayLike | RuntimeValue[ArrayLike] | None = None
+    values: ArrayLike | RuntimeValue[ArrayLike]
     """Values to set on the constrained ``dofs`` during lifting; Defaults to 0.0 if not
     provided at init or runtime."""
 
@@ -189,3 +199,7 @@ class Fixed(Constraint):
     def apply_lift(self, u_full: Array) -> Array:
         """Set constrained ``dofs`` to ``values``."""
         return u_full.at[self.dofs].set(self._resolve_runtime(self.values))
+
+    def apply_transpose(self, r_full: Array) -> Array:
+        """Zero out residuals on fixed ``dofs``."""
+        return r_full.at[self.dofs].set(0.0)

@@ -17,7 +17,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Concatenate, ParamSpec, Self, TypeVar, overload
+from typing import (
+    Any,
+    Callable,
+    Concatenate,
+    Literal,
+    ParamSpec,
+    Self,
+    TypeVar,
+    overload,
+)
 
 import jax.numpy as jnp
 from jax import Array
@@ -196,6 +205,24 @@ class Lifter:
         """Extract the reduced vector by selecting free dofs from ``u_full``."""
         return u_full[self.free_dofs]
 
+    def reduce_adjoint(self, r_full: Array) -> Array:
+        """Extract the reduced dual (residual/gradient) vector from ``r_full``.
+
+        This applies the adjoint of each constraint in reverse order to ensure that
+        contributions from constrained dofs are correctly mapped back to the reduced
+        space (e.g., summing residuals for periodic dofs).
+
+        Args:
+            r_full: Full dual vector (e.g., residual or gradient).
+
+        Returns:
+            Reduced dual vector on free dofs.
+        """
+        for condition in reversed(self.constraints):
+            r_full = condition.apply_transpose(r_full)
+
+        return r_full[self.free_dofs]
+
     def with_values(self, updates: RuntimeValueMap) -> Self:
         """Update the internal runtime values mapping with the given updates."""
         for key in updates:
@@ -227,36 +254,41 @@ class Lifter:
 
 @overload
 def lifted(
-    *, argnums: tuple[int, ...] | int = 0, reduce_output: bool = False
+    *,
+    argnums: tuple[int, ...] | int = 0,
+    output: Literal["primal", "dual"] | None = None,
 ) -> Callable[[Callable[P, RT]], Callable[Concatenate[Lifter, P], RT]]: ...
+
+
 @overload
 def lifted(
     fn: Callable[P, RT],
     *,
     argnums: tuple[int, ...] | int = 0,
-    reduce_output: bool = False,
+    output: Literal["primal", "dual"] | None = None,
 ) -> Callable[Concatenate[Lifter, P], RT]: ...
+
+
 def lifted(
     fn: Callable[P, RT] | None = None,
     *,
     argnums: tuple[int, ...] | int = 0,
-    reduce_output: bool = False,
+    output: Literal["primal", "dual"] | None = None,
 ) -> Callable:
     """Lift a function that operates on reduced vectors to one that operates on full vectors.
 
     This is a decorator that can be used to lift a function that takes reduced vectors as
     input and/or output to one that takes full vectors. The lifter instance is passed as the
     first argument to the lifted function, and the specified arguments are lifted from reduced
-    to full vectors before being passed to the original function. If ``reduce_output`` is True,
-    the output of the original function is reduced from a full vector to a reduced vector
-    before being returned.
+    to full vectors before being passed to the original function.
 
     Args:
         fn: Function to lift; must take reduced vectors as input and/or output.
         argnums: Indices of arguments to lift from reduced to full vectors; can be an int or
             a tuple of ints. Default is 0 (lift the first argument).
-        reduce_output: Whether to reduce the output of the original function from a full vector
-            to a reduced vector. Default is False.
+        output: Whether to reduce the output of the original function. If "primal", the output
+            is reduced using `Lifter.reduce`. If "dual", the output is reduced using
+            `Lifter.reduce_adjoint` (useful for residuals or gradients). Default is None.
 
     Returns:
         A new function that takes a lifter instance as the first argument, followed by the same
@@ -266,7 +298,7 @@ def lifted(
     argnums = (argnums,) if isinstance(argnums, int) else argnums
 
     if fn is None:
-        return lambda f: lifted(f, argnums=argnums, reduce_output=reduce_output)
+        return lambda f: lifted(f, argnums=argnums, output=output)
 
     def lifted_fn(lifter: Lifter, *args: P.args, **kwargs: P.kwargs) -> RT:
         lifted_args = list(args)
@@ -284,16 +316,22 @@ def lifted(
                     f"{(lifter.size_reduced,)} for lifting"
                 )
 
-            lifted_args[i] = lifter.lift_from_zeros(arg)  # pyright: ignore
+            lifted_args[i] = lifter.lift_from_zeros(arg)
 
-        out = fn(*lifted_args, **kwargs)  # pyright: ignore[reportCallIssue]
+        out = fn(*lifted_args, **kwargs)
 
-        if reduce_output:
+        if output:
             if not isinstance(out, Array):
                 raise LifterError(
                     "Output is not an Array and cannot be reduced by the lifter"
                 )
-            return lifter.reduce(out)
+            if output == "primal":
+                return lifter.reduce(out)
+            elif output == "dual":
+                return lifter.reduce_adjoint(out)
+            else:
+                raise LifterError(f"Invalid value for output: {output}")
+
         return out
 
     return lifted_fn

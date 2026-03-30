@@ -18,6 +18,7 @@
 """Lifter module for mapping between reduced and full vectors."""
 
 from tatva.lifter.base import Lifter as Lifter
+from tatva.lifter.base import lifted as lifted
 from tatva.lifter.common import LifterError as LifterError
 from tatva.lifter.common import RuntimeValue as RuntimeValue
 from tatva.lifter.constraints import Constraint as Constraint
