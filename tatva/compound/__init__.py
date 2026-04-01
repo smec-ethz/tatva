@@ -251,22 +251,16 @@ class Compound:
     @overload
     @classmethod
     def get_sparsity(
-        cls,
-        couple_fields: tuple[Field, ...] = (),
-        block_wise: Literal[False] = False,
+        cls, couple_fields: tuple[Field, ...] = (), block_wise: Literal[False] = False
     ) -> csr_matrix: ...
     @overload
     @classmethod
     def get_sparsity(
-        cls,
-        couple_fields: tuple[Field, ...] = (),
-        block_wise: Literal[True] = True,
+        cls, couple_fields: tuple[Field, ...] = (), block_wise: Literal[True] = True
     ) -> list[list[csr_matrix]]: ...
     @classmethod
     def get_sparsity(
-        cls,
-        couple_fields: tuple[Field, ...] = (),
-        block_wise: bool = False,
+        cls, couple_fields: tuple[Field, ...] = (), block_wise: bool = False
     ) -> csr_matrix | list[list[csr_matrix]]:
         """Create a sparsity pattern automatically from this Compound class and its
         attached mesh.
@@ -289,10 +283,7 @@ class Compound:
             )
 
         return create_sparsity_pattern_from_compound(
-            cls,
-            cls._mesh,
-            couple_fields,
-            block_wise=block_wise,
+            cls, cls._mesh, couple_fields, block_wise=block_wise
         )
 
     def __init__(self, arr: Array | None = None, **kwargs) -> None:
