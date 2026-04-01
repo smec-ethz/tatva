@@ -25,9 +25,9 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Concatenate,
     Generic,
     ParamSpec,
-    Protocol,
     Self,
     TypeAlias,
     TypeVar,
@@ -54,27 +54,24 @@ ElementT = TypeVar("ElementT", bound=Element)
 Numeric: TypeAlias = float | int | jnp.number
 
 
-class MappableOverElementsAndQuads(Protocol[P, RT]):
-    """Internal protocol for functions that are mapped over elements using
-    `Operator.map`."""
-
-    @staticmethod
-    def __call__(
-        xi: jax.Array,
-        *el_values: P.args,
-        **el_kwargs: P.kwargs,
-    ) -> RT: ...
-
+MappableOverElementsAndQuads: TypeAlias = Callable[Concatenate[jax.Array, P], RT]
+"""A Callable that takes a quadrature point (xi) as the first argument, followed by any
+number of additional arguments (P.args and P.kwargs), and returns a jax.Array or a tuple.
+This is the type of function that can be mapped over elements and quadrature points using
+the `Operator.map` method.
+"""
 
 MappableOverElements: TypeAlias = Callable[P, RT]
+"""A Callable that takes any number of arguments (P.args and P.kwargs) and returns a
+jax.Array or a tuple. This is the type of function that can be mapped over elements using
+`Operator.map_over_elements` method.
+"""
 
-
-class MappedCallable(Protocol[P, RT]):
-    @staticmethod
-    def __call__(
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> RT: ...
+MappedCallable: TypeAlias = Callable[P, RT]
+"""A Callable that takes any number of arguments (P.args and P.kwargs) and returns a
+jax.Array or a tuple. This is the type of function returned by the `Operator.map` and
+`Operator.map_over_elements` methods.
+"""
 
 
 @jax.tree_util.register_dataclass
