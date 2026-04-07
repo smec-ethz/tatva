@@ -3,7 +3,7 @@ name: Mirror to GitLab (bare mirror, SSH)
 on:
   push:
     branches:
-      - '**'
+      - "**"
   workflow_dispatch:
 
 jobs:
@@ -20,8 +20,7 @@ jobs:
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-          ssh-keyscan gitlab.ethz.ch >> ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
+          # Removed ssh-keyscan to avoid intermittent CI timeouts
 
       - name: Create bare mirror of GitHub repo
         env:
@@ -53,7 +52,9 @@ jobs:
 
       - name: Push mirror to GitLab
         env:
-          GIT_SSH_COMMAND: "ssh -i ~/.ssh/id_ed25519"
+          # IdentitiesOnly=yes prevents MaxAuthTries failures by ignoring default runner keys
+          # StrictHostKeyChecking=accept-new securely replaces the flaky ssh-keyscan step
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
         run: |
           cd mirror.git
 
