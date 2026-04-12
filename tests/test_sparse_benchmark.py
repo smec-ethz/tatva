@@ -111,12 +111,14 @@ def test_sparse_benchmark(nx, ny):
         colored_matrix=colored_matrix,
         color_batch_size=10,  # Batch size for evaluating the element routine
     )
+    hessian_sparse_with_args = jax.jit(hessian_sparse_with_args)
 
     hessian_sparse = sparse.jacfwd(
         fn=jax.jacrev(total_energy, argnums=0),
         colored_matrix=colored_matrix,
         color_batch_size=10,  # Batch size for evaluating the element routine
     )
+    hessian_sparse = jax.jit(hessian_sparse)
 
     u_flat = jnp.zeros(op.mesh.coords.shape[0] * 2)  # Initial guess for displacements
     damage = jnp.ones(op.mesh.coords.shape[0])  # Dummy damage variable for testing)
