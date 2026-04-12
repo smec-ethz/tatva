@@ -10,7 +10,7 @@ from ._extraction import (
     get_bc_indices,
     reduce_sparsity_pattern,
 )
-from .base import ColoredMatrix, jacfwd
+from .base import ColoredMatrix, jacfwd, linearized_jacfwd
 
 __all__ = [
     "create_sparsity_pattern",
@@ -23,4 +23,5 @@ __all__ = [
     "largest_degree_first_distance2_colors",
     "ColoredMatrix",
     "jacfwd",
+    "linearized_jacfwd",
 ]

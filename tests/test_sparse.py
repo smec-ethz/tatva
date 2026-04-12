@@ -4,9 +4,8 @@ import numpy as np
 import pytest
 from jax import Array
 from jax_autovmap import autovmap
-from tatva_coloring import distance2_color_and_seeds
-
 from tatva import Mesh, Operator, element, sparse
+from tatva_coloring import distance2_color_and_seeds
 
 jax.config.update("jax_enable_x64", True)
 
@@ -69,4 +68,12 @@ def test_sparse_matrix(op: Operator, coloring_func):
         jax.jacrev(total_energy), colored_matrix, color_batch_size=10
     )(jnp.zeros(op.mesh.coords.shape[0] * 2))
 
+    primal, K_linearized = sparse.linearized_jacfwd(
+        jax.jacrev(total_energy), colored_matrix, color_batch_size=10
+    )(jnp.zeros(op.mesh.coords.shape[0] * 2))
+
     np.testing.assert_allclose(K, K_sparse.to_dense())
+    np.testing.assert_allclose(K, K_linearized.to_dense())
+    np.testing.assert_allclose(
+        primal, jax.grad(total_energy)(jnp.zeros(op.mesh.coords.shape[0] * 2))
+    )
