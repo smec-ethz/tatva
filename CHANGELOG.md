@@ -5,6 +5,13 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.1](https://github.com/smec-ethz/tatva/compare/v0.9.0...v0.9.1) (2026-04-12)
+
+
+### Bug Fixes
+
+* **sparse:** add linearized jacfwd with primal output ([af72244](https://github.com/smec-ethz/tatva/commit/af722445636105bf194d3fc317ecee3efa67a222))
+
 ## [0.9.0](https://github.com/smec-ethz/tatva/compare/v0.8.1...v0.9.0) (2026-03-27)
 
 
