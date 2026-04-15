@@ -57,6 +57,9 @@ class NeighborExchangePlan:
 
         self._active_dofs = active_dofs
         self._free_dofs_local: np.ndarray | None = None
+        self._partition_info: PartitionInfo | None = None
+        self._n_dofs_per_node: int | None = None
+        self._n_nodes_global: int | None = None
         self._neighbor_data = []
         self._neighbor_dof_data = []
 
@@ -140,6 +143,9 @@ class NeighborExchangePlan:
         # Store local free-DOF indices (into n_active space) so zero_ghost_values can
         # zero ghost entries in the full active DOF vector.
         instance._free_dofs_local = np.array(lifter.free_dofs)
+        instance._partition_info = partition_info
+        instance._n_dofs_per_node = n_dofs_per_node
+        instance._n_nodes_global = raw_mesh.coords.shape[0]
         return instance
 
     @property
@@ -185,7 +191,7 @@ class NeighborExchangePlan:
 
         Operates in the full active DOF space (length n_active).  Ghost free DOFs
         — nodes shared with a neighbouring rank — are set to zero so that the
-        scatter-add in mpi_gather counts each contribution exactly once.  Fixed
+        scatter-add in make_scatter_rev_add counts each contribution exactly once.  Fixed
         DOFs are left unchanged (they are already zero in typical load vectors).
 
         Use this for quantities built by summing contributions across ranks:
@@ -215,7 +221,7 @@ class NeighborExchangePlan:
     # JIT'd function factories
     # ------------------------------------------------------------------
 
-    def mpi_gather_ghost_values(self, n_active: int) -> Callable[[Array], Array]:
+    def make_scatter_fwd_set(self, n_active: int) -> Callable[[Array], Array]:
         """Return a JIT'd function: x_owned → u_active.
 
         Gathers ghost DOF values from owning ranks so every rank has the full
@@ -262,7 +268,7 @@ class NeighborExchangePlan:
 
         return fn
 
-    def mpi_gather(self, local_fn: Callable, is_hessian: bool = False) -> Callable:
+    def make_scatter_rev_add(self, local_fn: Callable, is_hessian: bool = False) -> Callable:
         """Return a JIT'd function: u_active → owned_data.
 
         Computes the local function (gradient or hessian), then gathers contributions
@@ -339,20 +345,40 @@ class NeighborExchangePlan:
 
         return fn
 
-    def gather(self, x_petsc) -> np.ndarray | None:
-        """Gather a distributed PETSc Vec to a contiguous array on rank 0.
+    def gather(self, u_active: Array, rank: int = 0) -> np.ndarray | None:
+        """Gather the full solution on rank 0 by node ownership.
 
-        Each rank contributes its owned slice [rstart, rend). Returns the full
-        array (length = total DOFs in global_sparsity) on rank 0, None elsewhere.
+        Each rank contributes the values at its owned nodes (determined by
+        element-partition ownership stored in partition_info).  Fixed-DOF
+        values reflect whatever the lifter set before calling this — typically
+        lift_from_zeros, so constrained DOFs are zero in the output.
+
+        Requires construction via from_local_problem.
+
+        Args:
+            u_active: array of length n_active (full local active DOF space,
+                      e.g. output of lifter.lift_from_zeros)
+            rank: the rank on which to gather the full solution (default 0)
+
+        Returns:
+            Full global DOF array (length n_nodes_global * n_dofs_per_node)
+            on rank 0, None elsewhere.
         """
-        n_global = int(np.asarray(self._global_sparsity.indptr).shape[0]) - 1
-        owned_vals = x_petsc.getArray(readonly=True).copy()
-        all_vals = self._comm.gather(owned_vals, root=0)
-        if self._rank == 0:
-            out = np.empty(n_global)
-            for r, arr in enumerate(all_vals):
-                rs, re = self._dof_range(n_global, self._size, r)
-                out[rs:re] = arr
+        if self._partition_info is None or self._n_dofs_per_node is None:
+            raise ValueError("gather requires construction via from_local_problem.")
+
+        n_dof = self._n_dofs_per_node
+        owned = self._partition_info.owned_nodes_mask
+        owned_vals = np.asarray(u_active).reshape(-1, n_dof)[owned]
+        owned_global_nodes = self._partition_info.active_nodes[owned]
+
+        all_vals = self._comm.gather(owned_vals, root=rank)
+        all_nodes = self._comm.gather(owned_global_nodes, root=rank)
+
+        if self._rank == rank:
+            out = np.empty(self._n_nodes_global * n_dof)
+            for vals, nodes in zip(all_vals, all_nodes):
+                out[(nodes[:, None] * n_dof + np.arange(n_dof)).ravel()] = vals.ravel()
             return out
         return None
 
