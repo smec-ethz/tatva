@@ -19,11 +19,23 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Any, Callable, Generator, Generic, Self, TypeVar, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Generator,
+    Generic,
+    Self,
+    TypeVar,
+    overload,
+)
 
 import jax.numpy as jnp
 from jax import Array
 from jax.tree_util import register_pytree_node_class
+
+if TYPE_CHECKING:
+    from tatva.lifter import Lifter
 
 __all__ = ["Compound", "field", "stack_fields"]
 
@@ -364,12 +376,44 @@ class Compound(metaclass=_CompoundMeta):
     arr: Array
     size: int = 0
 
+    lifter: Lifter | None = None  # Optional lifter for handling constrained dofs
+
     def tree_flatten(self) -> tuple[tuple[Array], Any]:
         return (self.arr,), None
 
     @classmethod
     def tree_unflatten(cls, aux_data: Any, children: tuple[Array]) -> Self:
         return cls(*children)
+
+    @classmethod
+    def attach_lifter(cls, lifter: Lifter) -> None:
+        """Attach a Lifter to the Compound class for handling constrained dofs. This is
+        optional and only needed if you want to use the lifter's functionality directly
+        from the state.
+
+        Args:
+            lifter: The Lifter instance to attach.
+        """
+        cls.lifter = lifter
+
+    @classmethod
+    def from_reduced(cls, reduced_arr: Array) -> Self:
+        """Create a Compound instance from a reduced array (e.g., containing only free
+        dofs). This requires that a Lifter has been attached to the class.
+
+        Args:
+            reduced_arr: The reduced array containing only free dofs.
+
+        Returns:
+            A Compound instance with the full array reconstructed using the attached
+            Lifter.
+        """
+        if cls.lifter is None:
+            raise RuntimeError(
+                "No Lifter attached to the class. Cannot create from reduced array."
+            )
+        full_arr = cls.lifter.lift_from_zeros(reduced_arr)
+        return cls(full_arr)
 
     def __init__(self, arr: Array | None = None, /, **kwargs) -> None:
         """Initialize the state with given keyword arguments."""
