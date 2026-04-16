@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from functools import wraps
 from typing import TYPE_CHECKING, Callable, Concatenate, ParamSpec, overload
 
@@ -31,63 +30,6 @@ if TYPE_CHECKING:
     from tatva.operator import Operator
 
 P = ParamSpec("P")
-
-
-def mpi_reduce(fn: Callable, comm: Any, *, jit: bool = False) -> Callable:
-    """Wraps ``fn`` so its output is allreduced (summed) across all MPI ranks.
-
-    This is the synchronization point for element-distributed MPI parallelism.
-    Each rank's ``fn`` computes partial contributions over its local element
-    subset; the allreduce sums them into the global result on every rank.
-
-    Args:
-        fn: Callable whose output is a JAX array representing a partial
-            contribution computed over the local element subset.
-        comm: MPI communicator (``mpi4py.MPI.Comm``), or ``None`` to run
-            as a no-op passthrough (useful for single-process execution).
-        jit: If ``True``, the returned callable is wrapped with ``jax.jit``.
-
-    Returns:
-        A callable with the same signature as ``fn`` that returns the globally
-        reduced result.
-
-    Example::
-
-        from mpi4py import MPI
-        from tatva.utils import mpi_reduce
-
-        comm = MPI.COMM_WORLD
-        op = Operator(local_mesh, Tri3())
-
-        grad_fn = jax.grad(energy_fn)
-        grad = mpi_reduce(grad_fn, comm, jit=True)(u)
-    """
-    if comm is None:
-        return jax.jit(fn) if jit else fn
-
-    try:
-        from mpi4jax import allreduce
-        from mpi4py import MPI as _MPI
-    except ImportError:
-        raise ImportError(
-            "mpi4jax is required for mpi_reduce. "
-            "Install it with: pip install mpi4py mpi4jax"
-        )
-
-    def _wrapped(*args, **kwargs):
-        from tatva.sparse import ColoredMatrix
-
-        result = fn(*args, **kwargs)
-        if isinstance(result, ColoredMatrix):
-            return replace(result, data=allreduce(result.data, op=_MPI.SUM, comm=comm))
-        if not isinstance(result, Array):
-            raise TypeError(
-                f"mpi_reduce: unsupported result type {type(result).__name__}. "
-                "Expected Array or ColoredMatrix."
-            )
-        return allreduce(result, op=_MPI.SUM, comm=comm)
-
-    return jax.jit(_wrapped) if jit else _wrapped
 
 
 @overload

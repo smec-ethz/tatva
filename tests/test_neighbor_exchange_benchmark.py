@@ -101,15 +101,15 @@ def _build_problem(nx, ny, rank, size, comm):
     local_grad = jax.grad(local_energy_free)
     local_hessian = jax.jit(sparse.jacfwd(local_grad, local_colored))
 
-    nbr_plan = NeighborExchangePlan.from_local_problem(
+    nbr_plan = NeighborExchangePlan(
         raw_mesh, partition_info, N_DOFS_PER_NODE, local_colored, lifter, comm
     )
 
-    scatter_fwd = nbr_plan.make_scatter_fwd_set(n_active=lifter.size_reduced)
+    scatter_fwd = nbr_plan.make_scatter_fwd_set(n_free_local=lifter.size_reduced)
     grad_fn = nbr_plan.make_scatter_rev_add(local_fn=local_grad)
     hessian_fn = nbr_plan.make_scatter_rev_add(local_fn=local_hessian, is_hessian=True)
 
-    n_free_global = len(nbr_plan.free_dofs_global)
+    n_free_global = nbr_plan.global_size
     n_dofs_global = raw_mesh.coords.shape[0] * N_DOFS_PER_NODE
     n_elements = raw_mesh.elements.shape[0]
 
@@ -129,7 +129,9 @@ def _build_problem(nx, ny, rank, size, comm):
     os.environ.get("TATVA_RUN_BENCHMARKS") != "1",
     reason="Set TATVA_RUN_BENCHMARKS=1 to run performance benchmarks.",
 )
-@pytest.mark.parametrize("nx, ny", [(20, 20), (40, 40), (80, 80)])
+@pytest.mark.parametrize(
+    "nx, ny", [(20, 20), (40, 40), (80, 80), (160, 160), (320, 320)]
+)
 def test_neighbor_exchange_benchmark(nx, ny):
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
