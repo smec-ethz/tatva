@@ -20,11 +20,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Literal, Self
+from typing import Any, Literal, NamedTuple, Self
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
+from numpy.typing import NDArray
 
 
 class ElementType(Enum):
@@ -215,6 +217,22 @@ class Mesh:
             coords = jnp.hstack([coords, jnp.zeros((coords.shape[0], 1))])
 
         return coords, jnp.array(elements, dtype=jnp.int32)
+
+
+class PartitionInfo(NamedTuple):
+    nodes_local_to_global: NDArray[np.int32]
+    """Local to global node mapping array, where node_l2g[i] gives the global index of the
+    local node i."""
+
+    n_owned_nodes: int
+    """Number of nodes owned by the local process. Since the local mesh sorts owned nodes
+    before ghosts, nodes 0:n_owned_nodes are owned."""
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class MeshLocal(Mesh):
+    partition_info: PartitionInfo
 
 
 @jax.jit

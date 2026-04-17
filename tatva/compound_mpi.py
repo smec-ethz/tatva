@@ -2,36 +2,32 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
+from enum import Enum, IntEnum
+from itertools import chain
+from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple, ParamSpec, cast
 
+import jax
 import numpy as np
 import scipy.sparse as sps
+from jax import Array
 from mpi4py import MPI
 from numpy.typing import NDArray
 
+from tatva import sparse
 from tatva.compound import (
     Compound,
     CompoundStackError,
+    Field,
     FieldStackedView,
     _apply_stacked_fields,
-    field,
 )
-from tatva.mesh import Mesh
-from tatva.sparse import create_sparsity_pattern, reduce_sparsity_pattern
+from tatva.compound import field as field
+from tatva.lifter import Constraint, Lifter
+from tatva.mesh import Mesh, MeshLocal
+from tatva.sparse import ColoredMatrix, create_sparsity_pattern, reduce_sparsity_pattern
 
 if TYPE_CHECKING:
     from petsc4py import PETSc
-
-__all__ = [
-    "PartitionInfo",
-    "StackedCompound",
-    "_LocalLayout",
-    "create_petsc_jacobian",
-    "create_petsc_vector",
-    "field",
-    "get_petsc_lg_map",
-]
 
 log = logging.getLogger(__name__)
 
@@ -42,16 +38,7 @@ class Space(Enum):
 
 
 SpaceLiteral = Space | Literal["full", "reduced"]
-
-
-class PartitionInfo(NamedTuple):
-    nodes_local_to_global: NDArray[np.int32]
-    """Local to global node mapping array, where node_l2g[i] gives the global index of the
-    local node i."""
-
-    n_owned_nodes: int
-    """Number of nodes owned by the local process. Since the local mesh sorts owned nodes
-    before ghosts, nodes 0:n_owned_nodes are owned."""
+P = ParamSpec("P")
 
 
 class _LocalLayout(NamedTuple):
@@ -78,10 +65,13 @@ class _LocalLayout(NamedTuple):
 class _LocalProblemContext:
     """Encapsulates MPI-related state for a StackedCompound subclass."""
 
-    mesh: Mesh
     comm: MPI.Comm
     dof_map: NDArray[np.int32]
     layouts: dict[Space, _LocalLayout | None]
+
+
+class FieldSize(IntEnum):
+    AUTO = -1
 
 
 class StackedCompound(Compound):
@@ -92,12 +82,26 @@ class StackedCompound(Compound):
     of freedom for a single node are topologically close in the flat array.
     """
 
-    mesh: Mesh
-    _mpi_context: _LocalProblemContext | None = None
+    MESH: Mesh
     _sparsity_patterns: dict[Space, sps.csr_matrix | None]
+    _comm: MPI.Comm = MPI.COMM_WORLD
+    _mpi_context: _LocalProblemContext  # remains unset if MESH is not MeshLocal
+    size_reduced: int
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
+        # check if user has assigned a mesh to the class
+        if not hasattr(cls, "MESH") or not isinstance(cls.MESH, Mesh):
+            raise TypeError(
+                f"StackedCompound subclass '{cls.__name__}' must have a 'mesh' attribute of type Mesh."
+            )
+
+        # replace FieldSize.AUTO with the number of nodes in the mesh for all fields
+        for attr_value in cls.__dict__.values():
+            if isinstance(attr_value, Field) and attr_value.shape[0] == FieldSize.AUTO:
+                attr_value.shape = (cls.MESH.coords.shape[0],) + attr_value.shape[1:]
+
         super().__init_subclass__(**kwargs)
+        cls.size_reduced = cls.size  # Initialize size_reduced to the full size; it will be updated when constraints are added.
 
         # Skip stacking for the base class itself
         if cls.__name__ == "StackedCompound":
@@ -119,61 +123,73 @@ class StackedCompound(Compound):
         # lazily created when attach_mesh is called.
         cls._sparsity_patterns = {Space.FULL: None, Space.REDUCED: None}
 
-        # check if user has assigned a mesh to the class
-        if not hasattr(cls, "mesh") or not isinstance(cls.mesh, Mesh):
-            raise TypeError(
-                f"StackedCompound subclass '{cls.__name__}' must have a 'mesh' attribute of type Mesh."
+        if isinstance(cls.MESH, MeshLocal):
+            cls._initialize_mpi_mesh()
+
+    @classmethod
+    def _initialize_mpi_mesh(cls) -> None:
+        """Internal method to initialize the MPI mesh and related data structures."""
+        mesh = cls.MESH
+        assert isinstance(mesh, MeshLocal), (
+            "MESH must be of type MeshLocal for MPI initialization."
+        )
+        n_nodes = mesh.coords.shape[0]
+        n_dofs_per_node = cls.size // n_nodes
+        log.debug(
+            f"Initializing MPI map for StackedCompound '{cls.__name__}' with {n_nodes} nodes and {n_dofs_per_node} DOFs per node."
+        )
+
+        dof_map = _dof_map_from_node_map(
+            mesh.partition_info.nodes_local_to_global, n_dofs_per_node
+        )
+        n_owned_dofs = mesh.partition_info.n_owned_nodes * n_dofs_per_node
+
+        layouts: dict[Space, _LocalLayout | None] = {
+            Space.FULL: _create_dof_layout(dof_map, n_owned_dofs, cls._comm),
+            Space.REDUCED: None,
+        }
+
+        cls._mpi_context = _LocalProblemContext(
+            comm=cls._comm, dof_map=dof_map, layouts=layouts
+        )
+
+    @classmethod
+    def add_constraints(cls, *args: Constraint) -> None:
+        """Add constraints to the internal lifter and invalidate the reduced layout and
+        sparsity pattern."""
+        existing_constraints: tuple[Constraint, ...] = ()
+        if isinstance(cls.lifter, Lifter):
+            existing_constraints = cls.lifter.constraints
+
+        cls.lifter = Lifter(cls.size, *chain(existing_constraints, args))
+        cls.size_reduced = cls.lifter.size_reduced
+
+        # if this is a parallel compound with an attached mesh, we can immediately create the reduced layout
+        if hasattr(cls, "_mpi_context"):
+            layouts = cls._mpi_context.layouts
+            layouts[Space.REDUCED] = _reduce_dof_layout(
+                layouts[Space.FULL],  # ty:ignore[invalid-argument-type]
+                np.asarray(cls.lifter.free_dofs),
+                cls._comm,
+            )
+
+    @classmethod
+    def attach_lifter(cls, lifter: Lifter) -> None:
+        cls.lifter = lifter
+        cls.size_reduced = lifter.size_reduced
+
+        if hasattr(cls, "_mpi_context"):
+            layouts = cls._mpi_context.layouts
+            layouts[Space.REDUCED] = _reduce_dof_layout(
+                layouts[Space.FULL],  # ty:ignore[invalid-argument-type]
+                np.asarray(lifter.free_dofs),
+                cls._comm,
             )
 
     @classmethod
     def n_dofs_per_node(cls) -> int:
         """Return the number of degrees of freedom per node, inferred from the shape of the first field."""
-        if not cls.fields:
-            raise RuntimeError("No fields defined in StackedCompound.")
-        _, master_field = cls.fields[0]
-        return cls.size // master_field.shape[0]
-
-    @classmethod
-    def attach_mesh(
-        cls, mesh: Mesh, mesh_l2g: PartitionInfo, comm: MPI.Comm = MPI.COMM_WORLD
-    ) -> None:
-        """Attach a mesh to the StackedCompound, creating the global DOF layout and
-        sparsity pattern.
-
-        Args:
-            mesh: The local mesh for the current process.
-            mesh_l2g: A PartitionInfo containing the node-level local-to-global mapping and ownership
-            comm: The MPI communicator
-        """
-        n_dofs_per_node = cls.n_dofs_per_node()
-
-        log.debug(
-            f"Attaching (local) mesh with {mesh.coords.shape[0]} nodes and {n_dofs_per_node} DOFs per node."
-        )
-
-        dof_map = _dof_map_from_node_map(
-            mesh_l2g.nodes_local_to_global, n_dofs_per_node
-        )
-        n_owned_dofs = mesh_l2g.n_owned_nodes * n_dofs_per_node
-
-        layouts: dict[Space, _LocalLayout | None] = {
-            Space.FULL: _create_dof_layout(dof_map, n_owned_dofs, comm),
-            Space.REDUCED: None,
-        }
-
-        if cls.lifter is not None:
-            layouts[Space.REDUCED] = _reduce_dof_layout(
-                layouts[Space.FULL],  # ty:ignore[invalid-argument-type]
-                np.asarray(cls.lifter.free_dofs),
-                comm,
-            )
-
-        cls._mpi_context = _LocalProblemContext(
-            mesh=mesh,
-            comm=comm,
-            dof_map=dof_map,
-            layouts=layouts,
-        )
+        return cls.size // cls.MESH.coords.shape[0]
 
     @classmethod
     def get_layout(cls, space: SpaceLiteral = Space.FULL) -> _LocalLayout:
@@ -183,10 +199,11 @@ class StackedCompound(Compound):
             space: If 'reduced', return the layout for the reduced free DOF space.
                 Otherwise, return the layout for all DOFs.
         """
-        if cls._mpi_context is None:
+        if not hasattr(cls, "_mpi_context"):
             raise RuntimeError(
-                "Mesh must be attached to StackedCompound before getting layout."
+                "MPI context not initialized. Ensure that the MESH is a MeshLocal and that the class is properly initialized."
             )
+
         space = Space(space)
         layout = cls._mpi_context.layouts[space]
         if layout is None:
@@ -198,16 +215,12 @@ class StackedCompound(Compound):
     @classmethod
     def get_sparsity_pattern(cls, space: SpaceLiteral = Space.FULL) -> sps.csr_matrix:
         """Get the local sparsity pattern for the Jacobian based on the attached mesh and DOF layout."""
-        if cls._mpi_context is None:
-            raise RuntimeError(
-                "Mesh must be attached to StackedCompound before getting sparsity pattern."
-            )
         space = Space(space)
 
         if cls._sparsity_patterns[space] is None:
             if cls._sparsity_patterns[Space.FULL] is None:
                 cls._sparsity_patterns[Space.FULL] = create_sparsity_pattern(
-                    cls._mpi_context.mesh, cls.n_dofs_per_node()
+                    cls.MESH, cls.n_dofs_per_node()
                 )
 
             if space == Space.REDUCED:
@@ -221,6 +234,25 @@ class StackedCompound(Compound):
                 )
 
         return cast(sps.csr_matrix, cls._sparsity_patterns[space])
+
+    @classmethod
+    def autodiff(
+        cls, fn: Callable[P, Array]
+    ) -> tuple[Callable[P, Array], Callable[P, ColoredMatrix]]:
+        """Return a tuple of (function, jacobian) where the Jacobian is represented as a ColoredMatrix."""
+        if cls.lifter is None:
+            space = Space.FULL
+        else:
+            space = Space.REDUCED
+
+        sparsity = cls.get_sparsity_pattern(space)
+        colored_matrix = sparse.ColoredMatrix.from_csr(sparsity)
+        n_colors = int(colored_matrix.colors.max() + 1)
+
+        grad_fn = jax.jacrev(fn)
+        jac_fn = sparse.jacfwd(grad_fn, colored_matrix, color_batch_size=n_colors)
+
+        return jax.jit(grad_fn), jax.jit(jac_fn)
 
 
 def get_petsc_lg_map(layout: _LocalLayout, comm: MPI.Comm) -> PETSc.LGMap:
@@ -358,3 +390,24 @@ def _reduce_dof_layout(
         n_total=free_dofs.size,
         n_global=n_global,
     )
+
+
+def gather_array_ordered(
+    arr_local: NDArray | Array,
+    all_layout: _LocalLayout,
+    dof_map: NDArray[np.int32],
+    comm: MPI.Comm,
+) -> NDArray | None:
+    """Gathers the distributed active solution into a full global array on Rank 0."""
+    # get the owned DOF indices for this rank (these are the first n_owned entries in the local DOF array)
+    dofs_owned = dof_map[: all_layout.n_owned]
+
+    # Gather to Rank 0
+    all_arr: list = comm.gather(arr_local[: all_layout.n_owned], root=0)  # ty:ignore[invalid-assignment]
+    all_ids: list = comm.gather(dofs_owned, root=0)  # ty:ignore[invalid-assignment]
+
+    if comm.rank == 0:
+        u_full = np.empty(all_layout.n_global, dtype=arr_local.dtype)
+        u_full[np.concatenate(all_ids)] = np.concatenate(all_arr)
+        return u_full
+    return None
