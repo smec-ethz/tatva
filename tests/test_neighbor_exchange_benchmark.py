@@ -101,8 +101,9 @@ def _build_problem(nx, ny, rank, size, comm):
     local_grad = jax.grad(local_energy_free)
     local_hessian = jax.jit(sparse.jacfwd(local_grad, local_colored))
 
+    global_sparsity = sparse.create_sparsity_pattern(raw_mesh, N_DOFS_PER_NODE)
     nbr_plan = NeighborExchangePlan(
-        raw_mesh, partition_info, N_DOFS_PER_NODE, local_colored, lifter, comm
+        global_sparsity, partition_info, N_DOFS_PER_NODE, local_colored, lifter, comm
     )
 
     scatter_fwd = nbr_plan.make_scatter_fwd_set(n_free_local=lifter.size_reduced)
