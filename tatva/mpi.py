@@ -52,8 +52,8 @@ class _LocalProblemContext:
     routing tables.
     """
 
-    active_dofs: np.ndarray       # global reduced DOF indices of active nodes
-    free_dofs_local: np.ndarray   # indices into active space (lifter.free_dofs)
+    active_dofs: np.ndarray  # global reduced DOF indices of active nodes
+    free_dofs_local: np.ndarray  # indices into active space (lifter.free_dofs)
     partition_info: PartitionInfo
     n_dofs_per_node: int
     n_nodes_global: int
@@ -93,6 +93,7 @@ class NeighborExchangePlan:
         self._neighbor_nnz_data = []
         self._neighbor_dof_data = []
 
+        # Compute global DOF indices of this rank's active DOFs (full space, not reduced by lifter).
         active_dofs = np.sort(
             np.concatenate(
                 [
@@ -102,9 +103,12 @@ class NeighborExchangePlan:
             )
         )
 
+        # Identify the global DOF indices of all fixed DOFs on this rank
         local_fixed_global = active_dofs[np.asarray(lifter.constrained_dofs)]
+        # gather fixed DOF indices from all ranks to identify the global set of free DOFs
         all_fixed = comm.allgather(local_fixed_global)
         global_fixed_indices = np.unique(np.concatenate(all_fixed))
+        # compute the global free dofs
         n_dofs_total = global_mesh.coords.shape[0] * n_dofs_per_node
         free_dofs_global = np.setdiff1d(
             np.arange(n_dofs_total), global_fixed_indices, assume_unique=True
@@ -114,7 +118,10 @@ class NeighborExchangePlan:
         global_free_sparsity = sparse.reduce_sparsity_pattern(
             global_sparsity, free_dofs_global
         )
+
+        # compute active and free global DOF indices corresponding to this rank's local active DOFs
         active_free_global_full = active_dofs[np.array(lifter.free_dofs)]
+        # reduced global Dofs
         active_free_global_reduced = np.searchsorted(
             np.asarray(free_dofs_global), active_free_global_full
         ).astype(np.int64)
@@ -214,7 +221,9 @@ class NeighborExchangePlan:
             same shape, ghost free-DOF entries set to zero
         """
         if self._local_context is None:
-            raise ValueError("zero_ghost_values requires construction via from_local_problem.")
+            raise ValueError(
+                "zero_ghost_values requires construction via from_local_problem."
+            )
         ctx = self._local_context
         owned_mask = np.asarray(
             (ctx.active_dofs >= self._rstart) & (ctx.active_dofs < self._rend)
@@ -387,7 +396,10 @@ class NeighborExchangePlan:
         return None
 
     def _precompute_routing_tables(
-        self, local_colored_matrix: ColoredMatrix, active_dofs_np: np.ndarray, global_sparsity
+        self,
+        local_colored_matrix: ColoredMatrix,
+        active_dofs_np: np.ndarray,
+        global_sparsity,
     ):
         """Precompute routing tables for ghost gather and assembly.
 
@@ -404,10 +416,13 @@ class NeighborExchangePlan:
         )
 
         self._n_free = int(np.asarray(global_sparsity.indptr).shape[0]) - 1
+        # compute the global DOF index ranges owned by each rank under the block distribution.
         self._rstart, self._rend = self._dof_range(self._n_free, self._size, self._rank)
+        # gather all ranks' owned DOF index ranges so we can determine which global rows/DOFs we need from each neighbor.
         all_ranges = self._comm.allgather((self._rstart, self._rend))
 
         # --- NNZ routing (hessian) ---
+        # For each neighbor, identify which local nonzeros contributes to rows owned by that neighbor → send_to,
         send_to = [
             np.where((global_row_dofs >= rs) & (global_row_dofs < re))[0].astype(
                 np.int64
@@ -416,29 +431,43 @@ class NeighborExchangePlan:
         ]
         send_counts = np.array([len(s) for s in send_to], dtype=np.int32)
         recv_counts = np.empty(self._size, dtype=np.int32)
-        self._comm.Alltoall(send_counts, recv_counts)
+        self._comm.Alltoall(
+            send_counts, recv_counts
+        )  # exchange counts so we know how many entries to expect from each neighbor
 
         owned_offset = int(np.asarray(global_sparsity.indptr)[self._rstart])
         self._owned_nnz = (
             int(np.asarray(global_sparsity.indptr)[self._rend]) - owned_offset
-        )
+        )  # number of NNZ entries owned by this rank
 
-        self._local_send_idx = send_to[self._rank]
+        self._local_send_idx = send_to[
+            self._rank
+        ]  # local nonzero indices that contribute to owned rows (to send to self)
         self._recv_local_idx = (
             local_to_global_nnz[self._local_send_idx] - owned_offset
-        ).astype(np.int64)
+        ).astype(
+            np.int64
+        )  # local indices of the received contributions from neighbors that we will add into owned rows
 
+        # neighbor_ranks are the ranks we actually need to exchange with (those with nonzero send or receive counts)
         neighbor_ranks = sorted(
             d
             for d in range(self._size)
             if d != self._rank and (send_counts[d] > 0 or recv_counts[d] > 0)
         )
+        # For each neighbor, exchange the global nonzero indices corresponding to the local send indices → recv_buf,
+        # so we know which local entries in the neighbor's output correspond to our owned rows and can add them correctly
+        # in the JIT'd function.
         for nbr in neighbor_ranks:
-            send_global_nnz = local_to_global_nnz[send_to[nbr]]
-            recv_buf = np.empty(int(recv_counts[nbr]), dtype=np.int64)
+            send_global_nnz = local_to_global_nnz[
+                send_to[nbr]
+            ]  # global nonzero indices corresponding to the local send indices for this neighbor
+            recv_buf = np.empty(
+                int(recv_counts[nbr]), dtype=np.int64
+            )  # recieve buffer for the global nonzero indices from the neighbor
             self._comm.Sendrecv(
                 sendbuf=send_global_nnz, dest=nbr, recvbuf=recv_buf, source=nbr
-            )
+            )  # exchange the global nonzero indices corresponding to the local send indices for this neighbor
             self._neighbor_nnz_data.append(
                 {
                     "rank": nbr,
@@ -450,6 +479,7 @@ class NeighborExchangePlan:
             )
 
         # --- DOF routing (gradient / ghost gather) ---
+        # For each neighbor, identify which local DOFs contribute to rows owned by that neighbor
         send_to_dof = [
             np.where((active_dofs_np >= rs) & (active_dofs_np < re))[0].astype(np.int64)
             for rs, re in all_ranges
@@ -458,16 +488,20 @@ class NeighborExchangePlan:
         recv_counts_dof = np.empty(self._size, dtype=np.int32)
         self._comm.Alltoall(send_counts_dof, recv_counts_dof)
 
-        self._send_dof = send_to_dof[self._rank]
+        self._send_dof = send_to_dof[
+            self._rank
+        ]  # local DOF indices that contribute to owned rows (to send to self in gradient assembly, or receive from self in ghost gather)
         self._recv_dof = (active_dofs_np[self._send_dof] - self._rstart).astype(
             np.int64
-        )
+        )  # local indices of the received contributions from self that we will add into owned rows (gradient) or fill from self (ghost gather)
 
         neighbor_ranks_dof = sorted(
             d
             for d in range(self._size)
             if d != self._rank and (send_counts_dof[d] > 0 or recv_counts_dof[d] > 0)
         )
+        # similar to the NNZ routing, exchange the global DOF indices corresponding to the local send DOF indices
+        # for each neighbor so we can route contributions correctly in the JIT'd function.
         for nbr in neighbor_ranks_dof:
             send_global_dofs = active_dofs_np[send_to_dof[nbr]]
             recv_buf_dof = np.empty(int(recv_counts_dof[nbr]), dtype=np.int64)
@@ -530,7 +564,9 @@ class NeighborExchangePlan:
             row_start = int(indptr_g[r])
             row_cols = indices_g[row_start : int(indptr_g[r + 1])]
             pos = np.searchsorted(row_cols, s_cols[gs:ge])
-            bad = (pos >= len(row_cols)) | (row_cols[np.minimum(pos, len(row_cols) - 1)] != s_cols[gs:ge])
+            bad = (pos >= len(row_cols)) | (
+                row_cols[np.minimum(pos, len(row_cols) - 1)] != s_cols[gs:ge]
+            )
             if np.any(bad):
                 raise ValueError(
                     f"Local NNZ entries (global row={r}, cols={s_cols[gs:ge][bad]}) "
@@ -582,7 +618,9 @@ class AllreducePlan:
         nnz_end = int(indptr[self._rend])
         self._owned_nnz = nnz_end - nnz_start
         self._owned_nnz_start = nnz_start
-        self._owned_ptr = (indptr[self._rstart : self._rend + 1] - nnz_start).astype(np.int32)
+        self._owned_ptr = (indptr[self._rstart : self._rend + 1] - nnz_start).astype(
+            np.int32
+        )
         self._owned_indices = indices[nnz_start:nnz_end].astype(np.int32)
 
     @property
