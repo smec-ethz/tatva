@@ -100,21 +100,21 @@ class _FieldBase:
     def _view(self, arr: Array) -> Array:
         if self._slice is None:
             raise RuntimeError(
-                "Field slice is not set. This should be set by the Compound metaclass."
+                "Field slice is not set. This should be set during Compound initialization."
             )
         return arr[self._slice].reshape(self.shape)
 
     def _set_in_array(self, arr: Array, value: Array) -> Array:
         if self._slice is None:
             raise RuntimeError(
-                "Field slice is not set. This should be set by the Compound metaclass."
+                "Field slice is not set. This should be set during Compound initialization."
             )
         return arr.at[self._slice].set(value.reshape(-1))
 
     def _indices_impl(self, arg: tuple[int | slice | Array, ...]) -> Array:
         if self._base_offset is None:
             raise RuntimeError(
-                "Field indexing metadata is not set. This should be set by the Compound metaclass."
+                "Field indexing metadata is not set. This should be set during Compound initialization."
             )
 
         axis_indices: list[Array] = []
@@ -212,7 +212,7 @@ class FieldStackedView(Field):
     ) -> None:
         if parent_field._slice is None:
             raise RuntimeError(
-                "Parent field slice is not set. This should be set by the Compound metaclass."
+                "Parent field slice is not set. This should be set during Compound initialization."
             )
 
         _FieldBase.__init__(self, shape=shape)
@@ -263,7 +263,7 @@ class FieldStackedView(Field):
     def _view(self, arr: Array) -> Array:
         if self._root_slice is None:
             raise RuntimeError(
-                "Field slice is not set. This should be set by the Compound metaclass."
+                "Field slice is not set. This should be set during Compound initialization."
             )
         return (
             arr[self._root_slice]
@@ -284,54 +284,7 @@ class FieldStackedView(Field):
         return self.indices(slice(None))
 
 
-class _CompoundMeta(type):
-    fields: tuple[tuple[str, Field], ...]
-    size: int
-
-    def __new__(
-        mcls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs
-    ):
-        fields: list[tuple[str, Field]] = []
-        size: int = 0
-
-        # find all fields in the namespace and compute their slices in the flat array
-        for attr_name, attr_value in namespace.items():
-            if isinstance(attr_value, Field):
-                n = int(prod(attr_value.shape))
-                s = slice(size, size + n)
-
-                # copy (reconstruct) the field with the correct slice and set it in the namespace
-                f = attr_value._copy_with_slice(s)
-
-                namespace[attr_name] = f
-                fields.append((attr_name, f))
-                size += n
-
-        cls = super().__new__(mcls, name, bases, namespace)
-        cls.fields = tuple(fields)
-        cls.size = size
-
-        if kwargs.get("stack_fields"):
-            import warnings
-
-            warnings.warn(
-                "Class keyword arguments 'stack_fields'/'stack_axis' are deprecated. "
-                "Use the @stack_fields(...) decorator instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            _apply_stacked_fields(
-                cls,  # pyright: ignore[reportArgumentType]
-                stack_fields=tuple(kwargs["stack_fields"]),
-                stack_axis=kwargs.get("stack_axis", -1),
-            )
-
-        # register as pytree node for JAX transformations
-        register_pytree_node_class(cls)
-        return cls
-
-
-class Compound(metaclass=_CompoundMeta):
+class Compound:
     """A compound array/state.
 
     A helper class to create a compound state with multiple fields. It simplifies packing
@@ -360,9 +313,57 @@ class Compound(metaclass=_CompoundMeta):
 
     """
 
-    fields: tuple[tuple[str, Field], ...]
+    fields: tuple[tuple[str, Field], ...] = ()
     arr: Array
     size: int = 0
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__()
+
+        # Collect fields from base classes first
+        all_fields: list[tuple[str, Field]] = []
+        # We find the nearest Compound base to start with its fields
+        for base in cls.__mro__[1:]:
+            if issubclass(base, Compound) and base is not Compound:
+                all_fields.extend(base.fields)
+                break
+
+        # total size so far (from inherited fields)
+        size = sum(int(prod(f.shape)) for _, f in all_fields)
+
+        # find all NEW fields in the class namespace and compute their slices
+        for attr_name, attr_value in list(cls.__dict__.items()):
+            if isinstance(attr_value, Field):
+                n = int(prod(attr_value.shape))
+                s = slice(size, size + n)
+
+                # copy (reconstruct) the field with the correct slice and set it on the class
+                f = attr_value._copy_with_slice(s)
+
+                setattr(cls, attr_name, f)
+                all_fields.append((attr_name, f))
+                size += n
+
+        cls.fields = tuple(all_fields)
+        cls.size = size
+
+        if kwargs.get("stack_fields"):
+            import warnings
+
+            warnings.warn(
+                "Class keyword arguments 'stack_fields'/'stack_axis' are deprecated. "
+                "Use the @stack_fields(...) decorator instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _apply_stacked_fields(
+                cls,  # pyright: ignore[reportArgumentType]
+                stack_fields=tuple(kwargs["stack_fields"]),
+                stack_axis=kwargs.get("stack_axis", -1),
+            )
+
+        # register as pytree node for JAX transformations
+        register_pytree_node_class(cls)
 
     def tree_flatten(self) -> tuple[tuple[Array], Any]:
         return (self.arr,), None
@@ -429,7 +430,7 @@ class _CompoundAtHelper(Generic[T_Compound]):
         self.state = state
         self.field_obj = field_obj
 
-    def set(self, value: Array | float | int) -> T_Compound:
+    def set(self, value: Array | float) -> T_Compound:
         return self.state.__class__(
             self.field_obj._set_in_array(self.state.arr, jnp.asarray(value))
         )
