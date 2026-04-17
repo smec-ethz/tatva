@@ -9,7 +9,7 @@ from jax import Array
 from mpi4py import MPI
 from scipy.sparse import csr_matrix
 
-from tatva import Mesh, sparse
+from tatva import sparse
 from tatva.lifter import Lifter
 from tatva.sparse import ColoredMatrix
 
@@ -70,7 +70,7 @@ class NeighborExchangePlan:
 
     def __init__(
         self,
-        global_mesh: Mesh,
+        global_sparsity,
         partition_info: PartitionInfo,
         n_dofs_per_node: int,
         local_colored_matrix: ColoredMatrix,
@@ -80,12 +80,16 @@ class NeighborExchangePlan:
         """Build the neighbor-exchange plan from local mesh artefacts.
 
         Args:
-            global_mesh:        full global mesh (replicated on all ranks)
-            partition_info:  partition info for this rank's local mesh
-            n_dofs_per_node: DOFs per mesh node
-            local_colored_matrix:   ColoredMatrix built from the local mesh
-            lifter:          Lifter for this rank's local problem
-            comm:            MPI communicator
+            global_sparsity:     global sparsity pattern (CSR) covering the full DOF
+                                 space before BC reduction. For pure mesh problems use
+                                 ``sparse.create_sparsity_pattern(mesh, n_dofs_per_node)``;
+                                 for problems with non-mesh coupling (interfaces, contact)
+                                 add the extra entries before passing.
+            partition_info:      partition info for this rank's local mesh
+            n_dofs_per_node:     DOFs per mesh node
+            local_colored_matrix: ColoredMatrix built from the local mesh
+            lifter:              Lifter for this rank's local problem
+            comm:                MPI communicator
         """
         self._comm = comm
         self._rank = comm.Get_rank()
@@ -109,12 +113,12 @@ class NeighborExchangePlan:
         all_fixed = comm.allgather(local_fixed_global)
         global_fixed_indices = np.unique(np.concatenate(all_fixed))
         # compute the global free dofs
-        n_dofs_total = global_mesh.coords.shape[0] * n_dofs_per_node
+        n_dofs_total = global_sparsity.shape[0]
         free_dofs_global = np.setdiff1d(
             np.arange(n_dofs_total), global_fixed_indices, assume_unique=True
         )
 
-        global_sparsity = sparse.create_sparsity_pattern(global_mesh, n_dofs_per_node)
+        # compute the reduced global sparsity pattern
         global_free_sparsity = sparse.reduce_sparsity_pattern(
             global_sparsity, free_dofs_global
         )
@@ -145,7 +149,7 @@ class NeighborExchangePlan:
             free_dofs_local=np.array(lifter.free_dofs),
             partition_info=partition_info,
             n_dofs_per_node=n_dofs_per_node,
-            n_nodes_global=global_mesh.coords.shape[0],
+            n_nodes_global=n_dofs_total // n_dofs_per_node,
         )
 
     @property
