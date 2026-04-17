@@ -254,11 +254,20 @@ class StackedCompound(Compound, metaclass=_StackedCompoundMeta):
         J.setSizes(((layout.n_owned, PETSc.DECIDE), (layout.n_owned, PETSc.DECIDE)))
         J.setType(PETSc.Mat.Type.MPIAIJ)
 
-        d_nnz, o_nnz = _compute_nnz(cls.get_sparsity_pattern(space), layout)
-        J.setPreallocationNNZ((d_nnz, o_nnz))
+        # Pre-calculate global COO indices for the Jacobian
+        layout_reduced = cls.get_layout(space)
+        local_sparsity = cls.get_sparsity_pattern(space)
+        local_rows = np.repeat(
+            np.arange(local_sparsity.shape[0], dtype=np.int32),
+            np.diff(local_sparsity.indptr),
+        )
+        local_cols = local_sparsity.indices
+        global_rows = layout_reduced.l2g[local_rows]
+        global_cols = layout_reduced.l2g[local_cols]
+        J.setPreallocationCOO(global_rows, global_cols)
+
         J.setLGMap(cls._get_petsc_lg_map(space))
         J.setUp()
-        J.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
         return J
 
     @classmethod
@@ -404,42 +413,3 @@ def _reduce_dof_layout(
         n_global=n_global,
         ownership=mask_free_owned[mask_free],
     )
-
-
-def _compute_nnz(
-    local_sparsity: sps.csr_matrix, dof_layout: DofLayout
-) -> tuple[NDArray, NDArray]:
-    """Compute the number of nonzeros per row for a distributed sparse matrix.
-
-    This preallocation misses some nonzeros in the off-diagonal part of the matrix, but it
-    is sufficient for the assembly process. Set the
-    `PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR = False` option to allow for dynamic
-    allocation of nonzeros during assembly.
-
-    Args:
-        local_sparsity: The local sparsity pattern of the matrix for the current process.
-        dof_layout: The DOF layout containing global DOF information.
-
-    Returns:
-        A tuple containing two arrays: the number of nonzeros per row for the diagonal
-        part (d_nnz) and the off-diagonal part (o_nnz) of the matrix.
-    """
-    _dtype = np.int32
-
-    g_start = dof_layout.offset
-    g_end = dof_layout.offset + dof_layout.n_owned
-    g_cols = dof_layout.l2g[local_sparsity.indices]
-
-    is_diagonal = ((g_cols >= g_start) & (g_cols < g_end)).astype(_dtype)
-    diagonal_mask = sps.csr_matrix(
-        (is_diagonal, local_sparsity.indices, local_sparsity.indptr)
-    )
-
-    d_nnz_all = diagonal_mask.sum(axis=1).A1
-    nnz_all = np.diff(local_sparsity.indptr)
-
-    mask = dof_layout.ownership
-    d_nnz = d_nnz_all[mask].astype(_dtype)
-    o_nnz = (nnz_all[mask] - d_nnz).astype(_dtype)
-
-    return d_nnz, o_nnz
