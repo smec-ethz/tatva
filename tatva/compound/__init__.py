@@ -19,13 +19,34 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Any, Generator, Generic, Self, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Generator,
+    Generic,
+    Self,
+    Sequence,
+    TypeVar,
+)
 
 import jax.numpy as jnp
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 
-from tatva.compound.field import Field, field, stack_fields
+from tatva.compound.field import (
+    CompoundStackError,
+    Field,
+    FieldSize,
+    FieldStackedView,
+    FieldType,
+    _FieldBase,
+    _FieldSpec,
+    field,
+)
+
+if TYPE_CHECKING:
+    from tatva.mesh import Mesh
 
 __all__ = ["Compound", "field", "stack_fields"]
 
@@ -66,52 +87,55 @@ class Compound:
     arr: Array
     size: int = 0
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
+    def __init_subclass__(cls, *, mesh: Mesh | None = None, **kwargs: Any) -> None:
         super().__init_subclass__()
 
         # Collect fields from base classes first
-        all_fields: list[tuple[str, Field]] = []
-        # We find the nearest Compound base to start with its fields
-        for base in cls.__mro__[1:]:
-            if issubclass(base, Compound) and base is not Compound:
-                all_fields.extend(base.fields)
-                break
+        all_fields = _get_inherited_fields(cls)
+        current_offset = sum(int(prod(f.shape)) for _, f in all_fields)
 
-        # total size so far (from inherited fields)
-        size = sum(int(prod(f.shape)) for _, f in all_fields)
+        # Collect all new field specs in order
+        new_specs = _collect_field_specs(cls.__dict__)
 
-        # find all NEW fields in the class namespace and compute their slices
-        for attr_name, attr_value in list(cls.__dict__.items()):
-            if isinstance(attr_value, Field):
-                n = int(prod(attr_value.shape))
-                s = slice(size, size + n)
+        # Separate auto-nodal and other fields for layout calculation
+        auto_nodal_specs: list[tuple[str, _FieldSpec]] = []
+        other_specs: list[tuple[str, _FieldSpec]] = []
+        for name, spec in new_specs:
+            if _is_auto_nodal(spec):
+                auto_nodal_specs.append((name, spec))
+            else:
+                if FieldSize.AUTO in spec.shape:
+                    raise ValueError(
+                        f"Field {name} has FieldSize.AUTO but is not a NODAL field."
+                    )
+                other_specs.append((name, spec))
 
-                # copy (reconstruct) the field with the correct slice and set it on the class
-                f = attr_value._copy_with_slice(s)
+        # Create descriptors for all new fields
+        name_to_descriptor: dict[str, Field] = {}
 
-                setattr(cls, attr_name, f)
-                all_fields.append((attr_name, f))
-                size += n
+        # 1. Process auto-nodal fields first for memory layout (stacked block)
+        if auto_nodal_specs:
+            descriptors, total_size = _create_stacked_descriptors(
+                auto_nodal_specs, current_offset, axis=1, mesh=mesh
+            )
+            name_to_descriptor.update(descriptors)
+            current_offset += total_size
+
+        # 2. Process other fields for memory layout
+        descriptors, total_size = _create_standard_descriptors(
+            other_specs, current_offset
+        )
+        name_to_descriptor.update(descriptors)
+        current_offset += total_size
+
+        # 3. Assemble cls.fields in the original user-defined order
+        for name, _ in new_specs:
+            f = name_to_descriptor[name]
+            setattr(cls, name, f)
+            all_fields.append((name, f))
 
         cls.fields = tuple(all_fields)
-        cls.size = size
-
-        if kwargs.get("stack_fields"):
-            import warnings
-
-            from tatva.compound.field import _apply_stacked_fields
-
-            warnings.warn(
-                "Class keyword arguments 'stack_fields'/'stack_axis' are deprecated. "
-                "Use the @stack_fields(...) decorator instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            _apply_stacked_fields(
-                cls,  # pyright: ignore[reportArgumentType]
-                stack_fields=tuple(kwargs["stack_fields"]),
-                stack_axis=kwargs.get("stack_axis", -1),
-            )
+        cls.size = current_offset
 
         # register as pytree node for JAX transformations
         register_pytree_node_class(cls)
@@ -185,3 +209,202 @@ class _CompoundAtHelper(Generic[T_Compound]):
         return self.state.__class__(
             self.field_obj._set_in_array(self.state.arr, jnp.asarray(value))
         )
+
+
+def _get_inherited_fields(cls: type[Compound]) -> list[tuple[str, Field]]:
+    """Return fields inherited from the first Compound base class found in MRO."""
+    for base in cls.__mro__[1:]:
+        if issubclass(base, Compound) and base is not Compound:
+            return list(base.fields)
+    return []
+
+
+def _collect_field_specs(cls_dict: dict[str, Any]) -> list[tuple[str, _FieldSpec]]:
+    """Collect all _FieldSpec attributes from the class dictionary."""
+    return [
+        (name, val) for name, val in cls_dict.items() if isinstance(val, _FieldSpec)
+    ]
+
+
+def _is_auto_nodal(spec: _FieldSpec) -> bool:
+    """Check if a field spec is an auto-sized nodal field."""
+    return (
+        len(spec.shape) > 0
+        and spec.shape[0] == FieldSize.AUTO
+        and spec.field_type == FieldType.NODAL
+    )
+
+
+def _reshape_shape_rank_1_if_needed(
+    shape: tuple[int, ...],
+) -> tuple[tuple[int, ...], bool]:
+    """Determine if a rank-1 shape should be promoted to rank-2 for stacking."""
+    rank = len(shape)
+    if rank == 0:
+        raise CompoundStackError("Cannot stack scalar fields.")
+    if rank == 1:
+        return (*shape, 1), True
+    return shape, False
+
+
+def _create_stacked_descriptors(
+    items: Sequence[tuple[str, _FieldSpec | Field]],
+    offset: int,
+    axis: int = -1,
+    mesh: Mesh | None = None,
+) -> tuple[dict[str, FieldStackedView], int]:
+    """Unified logic to create stacked descriptors and calculate layout."""
+    if not items:
+        return {}, 0
+
+    # 1. Resolve true shapes and promote rank if needed
+    resolved_info: list[
+        tuple[str, _FieldSpec | Field, tuple[int, ...], tuple[int, ...], bool]
+    ] = []
+    for name, item in items:
+        shape = item.shape
+        if len(shape) > 0 and shape[0] == FieldSize.AUTO:
+            if mesh is None:
+                raise ValueError(f"Mesh required for AUTO-sized field: {name}")
+            shape = (mesh.coords.shape[0], *shape[1:])
+
+        # We keep the user's requested shape (with AUTO resolved) for the final descriptor,
+        # but use a promoted shape for compatibility checks and layout.
+        actual_shape, promoted = _reshape_shape_rank_1_if_needed(shape)
+        resolved_info.append((name, item, shape, actual_shape, promoted))
+
+    # 2. Validate compatibility
+    first_actual_shape = resolved_info[0][3]
+    rank = len(first_actual_shape)
+    actual_axis = axis % rank
+    base_reduced = (
+        first_actual_shape[:actual_axis] + first_actual_shape[actual_axis + 1 :]
+    )
+
+    for name, _, _, actual_shape, _ in resolved_info:
+        if len(actual_shape) != rank:
+            raise CompoundStackError(
+                f"Field {name} rank {len(actual_shape)} is not compatible with rank {rank}."
+            )
+        if actual_shape[:actual_axis] + actual_shape[actual_axis + 1 :] != base_reduced:
+            raise CompoundStackError(
+                f"Field {name} shape {actual_shape} is not compatible with base shape along axis {actual_axis}."
+            )
+
+    # 3. Calculate layout
+    stack_layout = []
+    stack_offset = 0
+    for name, item, shape, actual_shape, _promoted in resolved_info:
+        extent = actual_shape[actual_axis]
+        start = stack_offset
+        end = stack_offset + extent
+        stack_layout.append((name, item, shape, actual_shape, start, end))
+        stack_offset += extent
+
+    stacked_shape = list(first_actual_shape)
+    stacked_shape[actual_axis] = stack_offset
+    stacked_shape_tuple = tuple(stacked_shape)
+    stacked_total_size = int(prod(stacked_shape_tuple))
+
+    stacked_field_base = _FieldBase(
+        stacked_shape_tuple, _slice=slice(offset, offset + stacked_total_size)
+    )
+
+    # 4. Create views
+    descriptors = {}
+    for name, item, shape, _actual_shape, start, end in stack_layout:
+        parent_slice = [slice(None)] * rank
+        parent_slice[actual_axis] = slice(start, end)
+
+        descriptors[name] = FieldStackedView(
+            shape=shape,  # Pass the RESOLVED user-requested shape here
+            default_factory=item.default_factory,
+            parent_field=stacked_field_base,
+            parent_slice=tuple(parent_slice),
+            field_type=item.field_type,
+            nodal_local_to_global=item.nodal_local_to_global,
+        )
+
+    return descriptors, stacked_total_size
+
+
+def _create_standard_descriptors(
+    specs: list[tuple[str, _FieldSpec]], offset: int
+) -> tuple[dict[str, Field], int]:
+    """Create descriptors for standard (non-auto-nodal) fields."""
+    descriptors = {}
+    current_offset = offset
+    for name, spec in specs:
+        n = int(prod(spec.shape))
+        s = slice(current_offset, current_offset + n)
+
+        descriptors[name] = Field(
+            shape=spec.shape,
+            default_factory=spec.default_factory,
+            field_type=spec.field_type,
+            _slice=s,
+            nodal_local_to_global=spec.nodal_local_to_global,
+        )
+        current_offset += n
+    return descriptors, current_offset - offset
+
+
+def _apply_stack_fields(
+    cls: type[T_Compound], stack_names: tuple[str, ...], axis: int = -1
+) -> type[T_Compound]:
+    """Reorder and stack specified fields in a Compound class. Modifies class in place."""
+    fields_map = {name: f for name, f in cls.fields}
+    for name in stack_names:
+        if name not in fields_map:
+            raise CompoundStackError(f"Unknown field name in stack_fields: {name}")
+
+    involved_names = set(stack_names)
+    first_idx = min(i for i, (n, _) in enumerate(cls.fields) if n in involved_names)
+    base_offset = cls.fields[first_idx][1]._base_offset
+    if base_offset is None:
+        raise RuntimeError("Base offset not set on involved fields.")
+
+    items_to_stack = [(name, fields_map[name]) for name in stack_names]
+    descriptors, stack_size = _create_stacked_descriptors(
+        items_to_stack, base_offset, axis
+    )
+
+    new_fields: list[tuple[str, Field]] = []
+    current_offset = base_offset + stack_size
+
+    # Re-build cls.fields while preserving original order
+    for i, (name, f) in enumerate(cls.fields):
+        if i < first_idx:
+            new_fields.append((name, f))
+            continue
+
+        if name in involved_names:
+            new_f = descriptors[name]
+            setattr(cls, name, new_f)
+            new_fields.append((name, new_f))
+        else:
+            # Re-slice trailing field
+            n = int(prod(f.shape))
+            new_slice = slice(current_offset, current_offset + n)
+            f._set_slice_and_strides(new_slice)
+            new_fields.append((name, f))
+            current_offset += n
+
+    cls.fields = tuple(new_fields)
+    cls.size = current_offset
+    return cls
+
+
+def stack_fields(
+    *fields: str, axis: int = -1
+) -> Callable[[type[T_Compound]], type[T_Compound]]:
+    """Class decorator to stack compatible fields into a shared contiguous layout."""
+    if not fields:
+        raise ValueError("At least one field name is required.")
+
+    names = tuple(fields)
+
+    def decorator(cls: type[T_Compound]) -> type[T_Compound]:
+        return _apply_stack_fields(cls, names, axis=axis)
+
+    return decorator
