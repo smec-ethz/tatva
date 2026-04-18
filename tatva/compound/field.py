@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import IntEnum
 from math import prod
 from typing import TYPE_CHECKING, Callable, Self, TypeVar, overload
 
@@ -33,32 +35,37 @@ class CompoundStackError(ValueError):
     pass
 
 
-def field(shape: tuple[int, ...], default_factory: Callable | None = None) -> Field:
-    """Helper function to create a FieldSpec for defining fields in the Compound class."""
-    return Field(shape=shape, default_factory=default_factory)
+class FieldType(IntEnum):
+    LOCAL = 0
+    NODAL = 1
+    SHARED = 2
 
 
-def stack_fields(
-    *fields: str, axis: int = -1
-) -> Callable[[type[T_Compound]], type[T_Compound]]:
-    """Class decorator to stack compatible fields into a shared contiguous layout.
+class FieldSize(IntEnum):
+    AUTO = -1
 
-    Args:
-        *fields: The field names to stack together. Must be compatible in shape except
-            along the stack axis.
-        axis: The axis along which to stack the fields. Negative values are supported and
-            interpreted as counting from the end of the shape. Default is -1.
-    """
 
-    if not fields:
-        raise ValueError("At least one field name is required.")
+@dataclass(frozen=True)
+class _FieldSpec:
+    """A specification for a field in a Compound class."""
 
-    field_names = tuple(fields)
+    shape: tuple[int, ...]
+    default_factory: Callable | None = None
+    field_type: FieldType = FieldType.LOCAL
+    nodal_local_to_global: Array | None = None
 
-    def decorator(cls: type[T_Compound]) -> type[T_Compound]:
-        return _apply_stacked_fields(cls, stack_fields=field_names, stack_axis=axis)
 
-    return decorator
+if TYPE_CHECKING:
+    # We lie to the type checker. We tell it field() returns a runtime Field descriptor
+    def field(
+        shape: tuple[int, ...],
+        default_factory: Callable | None = None,
+        field_type: FieldType = FieldType.LOCAL,
+        nodal_local_to_global: Array | None = None,
+    ) -> Field: ...
+
+else:
+    field = _FieldSpec
 
 
 def _normalize_index(
@@ -188,20 +195,30 @@ class Field(_FieldBase):
     """A descriptor to define fields in the State class."""
 
     default_factory: Callable | None
+    field_type: FieldType
+    nodal_local_to_global: Array | None
 
     def __init__(
         self,
         shape: tuple[int, ...],
         default_factory: Callable | None = None,
+        field_type: FieldType = FieldType.LOCAL,
         *,
         _slice: slice | None = None,
+        nodal_local_to_global: Array | None = None,
     ) -> None:
         super().__init__(shape, _slice)
         self.default_factory = default_factory
+        self.field_type = field_type
+        self.nodal_local_to_global = nodal_local_to_global
 
     def _copy_with_slice(self, _slice: slice) -> Self:
         return self.__class__(
-            shape=self.shape, default_factory=self.default_factory, _slice=_slice
+            shape=self.shape,
+            default_factory=self.default_factory,
+            field_type=self.field_type,
+            _slice=_slice,
+            nodal_local_to_global=self.nodal_local_to_global,
         )
 
     @overload
@@ -227,6 +244,8 @@ class FieldStackedView(Field):
         default_factory: Callable | None,
         parent_field: _FieldBase,
         parent_slice: tuple[slice, ...],
+        field_type: FieldType = FieldType.LOCAL,
+        nodal_local_to_global: Array | None = None,
     ) -> None:
         if parent_field._slice is None:
             raise RuntimeError(
@@ -235,6 +254,8 @@ class FieldStackedView(Field):
 
         _FieldBase.__init__(self, shape=shape)
         self.default_factory = default_factory
+        self.field_type = field_type
+        self.nodal_local_to_global = nodal_local_to_global
 
         self._root_slice = parent_field._slice
         self._root_shape = parent_field.shape
@@ -293,127 +314,3 @@ class FieldStackedView(Field):
         parent = arr[self._root_slice].reshape(self._root_shape)
         parent = parent.at[self._view_slice].set(value.reshape(self._update_shape))
         return arr.at[self._root_slice].set(parent.reshape(-1))
-
-
-def _apply_stacked_fields(
-    cls: type[T_Compound], stack_fields: tuple[str, ...], stack_axis: int = -1
-) -> type[T_Compound]:
-    """Reorder fields by stacking specified fields along an axis. Modifies class in place.
-
-    Args:
-        cls: The Compound class to modify.
-        stack_fields: The field names to stack together. Must be compatible in shape
-            except along the stack_axis.
-        stack_axis: The axis along which to stack the fields. Negative values are
-            supported and interpreted as counting from the end of the shape. Default is -1
-            (stack along the last axis).
-    """
-    if not stack_fields:
-        raise CompoundStackError("At least one field name is required.")
-    if len(set(stack_fields)) != len(stack_fields):
-        raise CompoundStackError(
-            "Duplicate field names are not allowed in stack_fields."
-        )
-
-    fields_map = {name: field_obj for name, field_obj in cls.fields}
-    missing = [name for name in stack_fields if name not in fields_map]
-    if missing:
-        raise CompoundStackError(f"Unknown field names in stack_fields: {missing}")
-
-    # the dimension in the fields to stack along must be compatible, we take the first field as reference
-    # if the field is rank 1 (a scalar per node), we reshape it to rank 2 with a singleton dimension
-    def _reshape_rank_1_if_needed(field: Field) -> tuple[Field, tuple[int, ...]]:
-        rank = len(original_shape := field.shape)
-        if rank == 0:
-            raise CompoundStackError("Cannot stack scalar fields.")
-        if rank == 1:
-            return Field(
-                shape=(*field.shape, 1),
-                default_factory=field.default_factory,
-                _slice=field._slice,
-            ), original_shape
-        return field, original_shape
-
-    base_field, _ = _reshape_rank_1_if_needed(fields_map[stack_fields[0]])
-    base_shape = base_field.shape
-    rank = len(base_shape)
-    if not (-rank <= stack_axis < rank):
-        raise CompoundStackError(
-            f"Invalid stack_axis={stack_axis} for field rank {rank}. "
-            f"Expected in [{-rank}, {rank - 1}]."
-        )
-    axis = stack_axis % rank
-    base_reduced = base_shape[:axis] + base_shape[axis + 1 :]
-
-    # Precompute per-field layout and validate compatibility in one pass.
-    # collect new fields in stack_layout as (name, shape, default_factory, start, end)
-    # tuples for the stacked fields.
-    stack_layout: list[tuple[str, tuple[int, ...], Callable | None, int, int]] = []
-    stack_size = 0
-    for name in stack_fields:
-        f, original_shape = _reshape_rank_1_if_needed(fields_map[name])
-        shape = f.shape
-        if len(shape) != rank:
-            raise CompoundStackError(
-                f"Field {name} with shape {shape} is not compatible with base rank {rank}."
-            )
-        reduced = shape[:axis] + shape[axis + 1 :]
-        if reduced != base_reduced:
-            raise CompoundStackError(
-                f"Field {name} with shape {shape} is not compatible with "
-                f"base shape {base_shape} along axis {axis}."
-            )
-        extent = shape[axis]
-        start = stack_size
-        end = start + extent
-        stack_layout.append((name, original_shape, f.default_factory, start, end))
-        stack_size = end
-
-    stacked_shape = (*base_shape[:axis], stack_size, *base_shape[axis + 1 :])
-    stacked_size = int(prod(stacked_shape))
-    # we put the stacked fields first in the global dof array
-    stacked_field = _FieldBase(stacked_shape, _slice=slice(0, stacked_size))
-
-    # create new FieldStackedView descriptors for the stacked fields, and prepare to set
-    # them on the class after validation and layout construction is complete.
-    new_fields: list[tuple[str, Field]] = []
-    pending_setattrs: list[tuple[str, FieldStackedView]] = []
-    for name, shape, default_factory, start, end in stack_layout:
-        parent_slice = tuple(
-            slice(None) if i != axis else slice(start, end) for i in range(rank)
-        )
-        new_field = FieldStackedView(
-            shape=shape,
-            default_factory=default_factory,
-            parent_field=stacked_field,
-            parent_slice=parent_slice,
-        )
-        pending_setattrs.append((name, new_field))
-        new_fields.append((name, new_field))
-
-    # now we need to reset the field descriptors for the stacked fields to point to the
-    # new layout, and update the slices of all trailing fields accordingly.
-    stack_name_set = set(stack_fields)
-    offset = stacked_size
-    trailing_updates: list[tuple[Field, slice]] = []
-    trailing_fields: list[tuple[str, Field]] = []
-    for name, field_obj in cls.fields:
-        if name in stack_name_set:
-            continue
-        n = int(prod(field_obj.shape))
-        new_slice = slice(offset, offset + n)
-        trailing_updates.append((field_obj, new_slice))
-        trailing_fields.append((name, field_obj))
-        offset += n
-
-    # Commit mutations only after all validation and layout construction passes.
-    for name, new_field in pending_setattrs:
-        setattr(cls, name, new_field)
-    for field_obj, new_slice in trailing_updates:
-        field_obj._set_slice_and_strides(new_slice)
-
-    new_fields.extend(trailing_fields)
-    cls.fields = tuple(new_fields)
-    cls.size = offset
-
-    return cls
