@@ -1,11 +1,13 @@
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from dataclasses import replace
 from mpi4py import MPI
 
 from tatva.compound import Compound, FieldSize, FieldType, field
+from tatva.lifter import Lifter
 from tatva.mpi import ExchangePlan, PartitionInfo
 
 jax.config.update("jax_enable_x64", True)
@@ -43,7 +45,8 @@ def test_exchange_plan_layout():
     # Rank 1 owned count: 1*2 (u) + 0 (s) + 1 (v) = 3
     # Total global size = 7
 
-    plan = ExchangePlan(MyState, p_info, comm)
+    lifter = Lifter(MyState.size)
+    plan = ExchangePlan(MyState, p_info, lifter, comm)
 
     if rank == 0:
         assert plan.local_size == 4
@@ -99,7 +102,8 @@ def test_exchange_plan_communication():
     class MyState(Compound):
         u = field(shape=(2, 1), field_type=FieldType.NODAL)
 
-    plan = ExchangePlan(MyState, p_info, comm)
+    lifter = Lifter(MyState.size)
+    plan = ExchangePlan(MyState, p_info, lifter, comm)
 
     # Global: [u0=0, u1=1]
     # Rank 0: owns [0], ghosts [1]
@@ -182,7 +186,8 @@ def test_exchange_plan_incomplete_nodal():
             nodal_local_to_global=subset,
         )
 
-    plan = ExchangePlan(MyState, p_info, comm)
+    lifter = Lifter(MyState.size)
+    plan = ExchangePlan(MyState, p_info, lifter, comm)
 
     # Nodal U (full):
     # Global size = 3
@@ -244,8 +249,9 @@ def test_exchange_plan_hessian():
     class MyState(Compound):
         u = field(shape=(2, 1), field_type=FieldType.NODAL)
 
-    from tatva.sparse import ColoredMatrix
     from scipy.sparse import csr_matrix
+
+    from tatva.sparse import ColoredMatrix
 
     # Each rank has its local ColoredMatrix.
     # Local mesh: 2 nodes, 1 element connecting them.
@@ -264,7 +270,8 @@ def test_exchange_plan_hessian():
     data = jnp.array([1.0, 2.0, 3.0, 4.0]) * (10.0 if rank == 0 else 100.0)
     cm = replace(cm, data=data)
 
-    plan = ExchangePlan(MyState, p_info, comm, local_colored_matrix=cm)
+    lifter = Lifter(MyState.size)
+    plan = ExchangePlan(MyState, p_info, lifter, comm, local_colored_matrix=cm)
 
     # Expected Global layout:
     # Rank 0 owns global node 0 (global index 0).
@@ -317,8 +324,65 @@ def test_exchange_plan_hessian():
         np.testing.assert_allclose(hess_assembled.data, [230.0, 140.0])
 
 
+def test_exchange_plan_with_constraints():
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    if size < 2:
+        pytest.skip("Test requires at least 2 MPI ranks")
+
+    # 2 nodes, 2 ranks.
+    if rank == 0:
+        p_info = PartitionInfo(
+            nodes_local_to_global=np.array([0, 1], dtype=np.int32), n_owned_nodes=1
+        )
+    elif rank == 1:
+        p_info = PartitionInfo(
+            nodes_local_to_global=np.array([1, 0], dtype=np.int32), n_owned_nodes=1
+        )
+    else:
+        p_info = PartitionInfo(
+            nodes_local_to_global=np.array([], dtype=np.int32), n_owned_nodes=0
+        )
+
+    class MyState(Compound):
+        u = field(shape=(2, 1), field_type=FieldType.NODAL)
+
+    # Constrain node 0.
+    from tatva.lifter import Fixed
+
+    # Find local index of global node 0
+    node0_local = np.where(p_info.nodes_local_to_global == 0)[0]
+    fixed_dofs = node0_local.astype(np.int32)
+    lifter = Lifter(MyState.size, Fixed(fixed_dofs, 0.0))
+
+    plan = ExchangePlan(MyState, p_info, lifter, comm)
+
+    # Global node 0 is fixed. Global node 1 is free.
+    # Total global size = 1 (only node 1).
+    # Rank 0: owns node 0 (fixed), ghosts node 1 (free).
+    # Rank 1: owns node 1 (free), ghosts node 0 (fixed).
+
+    assert plan.global_size == 1
+
+    if rank == 0:
+        # node 0 fixed -> -1, node 1 free ghost -> 0 (owned by rank 1)
+        np.testing.assert_array_equal(plan.layout.local_to_global, [-1, 0])
+        assert plan.local_size == 0
+        assert plan.rstart == 0
+        assert plan.rend == 0
+    elif rank == 1:
+        # node 1 free owned -> 0, node 0 fixed ghost -> -1
+        np.testing.assert_array_equal(plan.layout.local_to_global, [0, -1])
+        assert plan.local_size == 1
+        assert plan.rstart == 0
+        assert plan.rend == 1
+
+
 if __name__ == "__main__":
     test_exchange_plan_layout()
     test_exchange_plan_communication()
     test_exchange_plan_incomplete_nodal()
     test_exchange_plan_hessian()
+    test_exchange_plan_with_constraints()
