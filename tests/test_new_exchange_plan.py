@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from dataclasses import replace
 from mpi4py import MPI
 
 from tatva.compound import Compound, FieldSize, FieldType, field
@@ -218,6 +219,106 @@ def test_exchange_plan_incomplete_nodal():
         np.testing.assert_array_equal(plan.layout.owned_mask, [True, True, True])
 
 
+def test_exchange_plan_hessian():
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    if size < 2:
+        pytest.skip("Test requires at least 2 MPI ranks")
+
+    # Simple 2-rank setup, 1 node each.
+    if rank == 0:
+        p_info = PartitionInfo(
+            nodes_local_to_global=np.array([0, 1], dtype=np.int32), n_owned_nodes=1
+        )
+    elif rank == 1:
+        p_info = PartitionInfo(
+            nodes_local_to_global=np.array([1, 0], dtype=np.int32), n_owned_nodes=1
+        )
+    else:
+        p_info = PartitionInfo(
+            nodes_local_to_global=np.array([], dtype=np.int32), n_owned_nodes=0
+        )
+
+    class MyState(Compound):
+        u = field(shape=(2, 1), field_type=FieldType.NODAL)
+
+    from tatva.sparse import ColoredMatrix
+    from scipy.sparse import csr_matrix
+
+    # Each rank has its local ColoredMatrix.
+    # Local mesh: 2 nodes, 1 element connecting them.
+    # Local CSR: [[1, 2], [3, 4]] -> nonzeros (0,0), (0,1), (1,0), (1,1)
+    # Note: local indices are [0, 1].
+    # Local indptr: [0, 2, 4], indices: [0, 1, 0, 1]
+    indptr = np.array([0, 2, 4], dtype=np.int32)
+    indices = np.array([0, 1, 0, 1], dtype=np.int32)
+
+    # Colored matrix from this CSR
+    cm = ColoredMatrix.from_csr(
+        csr_matrix(([1.0, 1.0, 1.0, 1.0], indices, indptr), shape=(2, 2))
+    )
+
+    # Data values: rank 0 uses 10s, rank 1 uses 100s
+    data = jnp.array([1.0, 2.0, 3.0, 4.0]) * (10.0 if rank == 0 else 100.0)
+    cm = replace(cm, data=data)
+
+    plan = ExchangePlan(MyState, p_info, comm, local_colored_matrix=cm)
+
+    # Expected Global layout:
+    # Rank 0 owns global node 0 (global index 0).
+    # Rank 1 owns global node 1 (global index 1).
+    # Global CSR should be (2x2): [[G00, G01], [G10, G11]]
+
+    # Routing:
+    # Rank 0 local (0,0) -> global (0,0) -> owned by rank 0.
+    # Rank 0 local (0,1) -> global (0,1) -> owned by rank 0.
+    # Rank 0 local (1,0) -> global (1,0) -> owned by rank 1.
+    # Rank 0 local (1,1) -> global (1,1) -> owned by rank 1.
+
+    # Rank 1 local (0,0) -> global (1,1) -> owned by rank 1.
+    # Rank 1 local (0,1) -> global (1,0) -> owned by rank 1.
+    # Rank 1 local (1,0) -> global (0,1) -> owned by rank 0.
+    # Rank 1 local (1,1) -> global (0,0) -> owned by rank 0.
+
+    # Global Values (Summed):
+    # G00 = Rank0(0,0) + Rank1(1,1) = 10 + 400 = 410
+    # G01 = Rank0(0,1) + Rank1(1,0) = 20 + 300 = 320
+    # G10 = Rank0(1,0) + Rank1(0,1) = 30 + 200 = 230
+    # G11 = Rank0(1,1) + Rank1(0,0) = 40 + 100 = 140
+
+    def local_fn(u):
+        return cm
+
+    hessian_fn = plan.make_scatter_rev_add(local_fn, is_hessian=True)
+
+    # Dummy input
+    u_dummy = jnp.zeros(2)
+    hess_assembled = hessian_fn(u_dummy)
+
+    assert isinstance(hess_assembled, ColoredMatrix)
+
+    # Verify owned CSR content
+    # Rank 0 owns global rows 0.
+    # global_rows [0] has cols [0, 1]. indptr=[0, 2], indices=[0, 1]
+    if rank == 0:
+        assert plan.owned_nnz == 2
+        np.testing.assert_array_equal(plan.owned_csr[0], [0, 2])
+        np.testing.assert_array_equal(plan.owned_csr[1], [0, 1])
+        np.testing.assert_allclose(hess_assembled.data, [410.0, 320.0])
+
+    elif rank == 1:
+        # Rank 1 owns global row 1.
+        # global_rows [1] has cols [0, 1]. indptr=[0, 2], indices=[0, 1]
+        assert plan.owned_nnz == 2
+        np.testing.assert_array_equal(plan.owned_csr[0], [0, 2])
+        np.testing.assert_array_equal(plan.owned_csr[1], [0, 1])
+        np.testing.assert_allclose(hess_assembled.data, [230.0, 140.0])
+
+
 if __name__ == "__main__":
     test_exchange_plan_layout()
     test_exchange_plan_communication()
+    test_exchange_plan_incomplete_nodal()
+    test_exchange_plan_hessian()

@@ -54,6 +54,27 @@ class _NeighborDofRoute(NamedTuple):
     recv_size: int
 
 
+class _NeighborNnzRoute(NamedTuple):
+    """Routing information for communicating non-zero Hessian values."""
+
+    rank: int
+    local_send_idx: NDArray[np.int32]
+    recv_local_idx: NDArray[np.int32]
+    send_size: int
+    recv_size: int
+
+
+class _HessianLayout(NamedTuple):
+    """Layout and routing information for Hessian assembly on a single rank."""
+
+    owned_nnz: int
+    owned_ptr: NDArray[np.int32]
+    owned_indices: NDArray[np.int32]
+    local_send_idx: NDArray[np.int32]
+    recv_local_idx: NDArray[np.int32]
+    neighbor_data: list[_NeighborNnzRoute]
+
+
 def _dof_map_from_node_map(
     node_map: NDArray[np.int32], n_dofs_per_node: int
 ) -> NDArray[np.int32]:
@@ -231,6 +252,7 @@ class ExchangePlan:
         compound_cls: type[Compound],
         partition_info: PartitionInfo,
         comm: MPI.Comm,
+        local_colored_matrix: ColoredMatrix | None = None,
     ):
         self._comm = comm
         self._rank = comm.Get_rank()
@@ -244,6 +266,12 @@ class ExchangePlan:
         self._global_size = self.layout.n_global
 
         self._precompute_routing_tables()
+
+        self.hessian_layout: _HessianLayout | None = None
+        if local_colored_matrix is not None:
+            self.hessian_layout = self._precompute_nnz_routing_tables(
+                local_colored_matrix
+            )
 
     def _precompute_routing_tables(self):
         """Precompute the static routing tables required for JIT-compiled comm.
@@ -313,6 +341,105 @@ class ExchangePlan:
             self.layout.local_to_global[self._send_dof] - self._rstart
         ).astype(np.int32)
 
+    def _precompute_nnz_routing_tables(
+        self, local_colored: ColoredMatrix
+    ) -> _HessianLayout:
+        """Precompute routing tables for Hessian assembly without global sparsity."""
+        indptr = np.asarray(local_colored.indptr)
+        indices = np.asarray(local_colored.indices)
+
+        # 1. Local COO -> Global COO
+        l_row = np.repeat(np.arange(len(indptr) - 1, dtype=np.int32), np.diff(indptr))
+        l_col = indices
+
+        g_row = self.layout.local_to_global[l_row]
+        g_col = self.layout.local_to_global[l_col]
+
+        # 2. Filter valid nonzeros and identify owners
+        # (Negative indices represent constrained DOFs and are ignored)
+        valid = (g_row >= 0) & (g_col >= 0)
+        l_nnz_idx = np.where(valid)[0]
+        g_row_valid = g_row[valid]
+        g_col_valid = g_col[valid]
+
+        all_ranges = self._comm.allgather((self._rstart, self._rend))
+        send_to_nnz: list[NDArray[np.int32]] = []
+        for nbr in range(self._size):
+            rs, re = all_ranges[nbr]
+            in_range = (g_row_valid >= rs) & (g_row_valid < re)
+            send_to_nnz.append(l_nnz_idx[in_range].astype(np.int32))
+
+        send_counts = np.array([len(s) for s in send_to_nnz], dtype=np.int32)
+        recv_counts = np.empty(self._size, dtype=np.int32)
+        self._comm.Alltoall(send_counts, recv_counts)
+
+        neighbor_ranks = sorted(
+            d
+            for d in range(self._size)
+            if d != self._rank and (send_counts[d] > 0 or recv_counts[d] > 0)
+        )
+
+        # 3. Exchange Coordinates to build global structural directory
+        my_mask = (g_row_valid >= self._rstart) & (g_row_valid < self._rend)
+        all_received_rows = [g_row_valid[my_mask]]
+        all_received_cols = [g_col_valid[my_mask]]
+
+        for nbr in neighbor_ranks:
+            rs, re = all_ranges[nbr]
+            # Which nonzeros do we send to nbr?
+            nbr_mask = (g_row_valid >= rs) & (g_row_valid < re)
+            s_row, s_col = g_row_valid[nbr_mask], g_col_valid[nbr_mask]
+
+            r_row = np.empty(int(recv_counts[nbr]), dtype=np.int32)
+            r_col = np.empty(int(recv_counts[nbr]), dtype=np.int32)
+            self._comm.Sendrecv(sendbuf=s_row, dest=nbr, recvbuf=r_row, source=nbr)
+            self._comm.Sendrecv(sendbuf=s_col, dest=nbr, recvbuf=r_col, source=nbr)
+
+            all_received_rows.append(r_row)
+            all_received_cols.append(r_col)
+
+        # 4. Build Owned CSR and reverse mapping
+        stacked_rows = np.concatenate(all_received_rows)
+        stacked_cols = np.concatenate(all_received_cols)
+
+        # Map to unique structural nonzeros
+        pairs = np.column_stack((stacked_rows, stacked_cols))
+        unique_pairs, inverse = np.unique(pairs, axis=0, return_inverse=True)
+
+        owned_nnz = unique_pairs.shape[0]
+        local_u_rows = unique_pairs[:, 0] - self._rstart
+        counts = np.bincount(local_u_rows, minlength=self.local_size)
+        owned_ptr = np.cumsum(np.insert(counts, 0, 0)).astype(np.int32)
+        owned_indices = unique_pairs[:, 1].astype(np.int32)
+
+        # 5. Pack routing data
+        local_send_idx_nnz = send_to_nnz[self._rank]
+        recv_local_idx_nnz = inverse[: len(all_received_rows[0])].astype(np.int32)
+
+        neighbor_nnz_data: list[_NeighborNnzRoute] = []
+        curr = len(all_received_rows[0])
+        for nbr in neighbor_ranks:
+            size = int(recv_counts[nbr])
+            neighbor_nnz_data.append(
+                _NeighborNnzRoute(
+                    rank=nbr,
+                    local_send_idx=send_to_nnz[nbr],
+                    recv_local_idx=inverse[curr : curr + size].astype(np.int32),
+                    send_size=int(send_counts[nbr]),
+                    recv_size=int(recv_counts[nbr]),
+                )
+            )
+            curr += size
+
+        return _HessianLayout(
+            owned_nnz=owned_nnz,
+            owned_ptr=owned_ptr,
+            owned_indices=owned_indices,
+            local_send_idx=local_send_idx_nnz,
+            recv_local_idx=recv_local_idx_nnz,
+            neighbor_data=neighbor_nnz_data,
+        )
+
     @property
     def global_size(self) -> int:
         """Total number of free DOFs in the global linear system."""
@@ -332,6 +459,20 @@ class ExchangePlan:
     def local_size(self) -> int:
         """Number of DOFs owned by this rank."""
         return self._rend - self._rstart
+
+    @property
+    def owned_nnz(self) -> int:
+        """Number of sparse matrix entries owned by this rank."""
+        if self.hessian_layout is None:
+            raise ValueError("Hessian layout not initialized.")
+        return self.hessian_layout.owned_nnz
+
+    @property
+    def owned_csr(self) -> tuple[NDArray[np.int32], NDArray[np.int32]]:
+        """(indptr, indices) for owned rows."""
+        if self.hessian_layout is None:
+            raise ValueError("Hessian layout not initialized.")
+        return self.hessian_layout.owned_ptr, self.hessian_layout.owned_indices
 
     def zero_ghost_values(self, nodal_array: Array) -> Array:
         """Zero out ghost-DOF entries of any quantity assembled via scatter-add.
@@ -389,46 +530,108 @@ class ExchangePlan:
 
         Computes the local function, then gathers contributions from ghosts.
         """
-        if is_hessian:
-            raise NotImplementedError(
-                "NNZ routing for Hessian not yet implemented in ExchangePlan."
-            )
-
-        self_send = jnp.array(self._send_dof, dtype=jnp.int64)
-        self_recv = jnp.array(self._recv_dof, dtype=jnp.int64)
-        has_self = len(self._send_dof) > 0
-
-        output_size = self.local_size
-        nbr_send = [
-            jnp.array(d.local_send_idx, dtype=jnp.int64)
-            for d in self._neighbor_dof_data
-        ]
-        nbr_recv = [
-            jnp.array(d.recv_local_idx, dtype=jnp.int64)
-            for d in self._neighbor_dof_data
-        ]
-        neighbor_routing_data = self._neighbor_dof_data
         _comm = self._comm
 
-        @jax.jit
-        def fn(*args, **kwargs):
-            data = local_fn(*args, **kwargs)
-            owned_data = jnp.zeros(output_size, dtype=data.dtype)
+        if is_hessian:
+            if self.hessian_layout is None:
+                raise ValueError("Hessian layout not initialized.")
 
-            if has_self:
-                owned_data = owned_data.at[self_recv].add(data[self_send])
-            for i, info in enumerate(neighbor_routing_data):
-                nbr = np.int32(info.rank)
-                send_buf = data[nbr_send[i]]
-                recv_tmpl = jnp.zeros(info.recv_size, dtype=data.dtype)
-                recv_vals = mpi4jax.sendrecv(
-                    send_buf, recv_tmpl, source=nbr, dest=nbr, comm=_comm
-                )
-                if info.recv_size > 0:
-                    owned_data = owned_data.at[nbr_recv[i]].add(recv_vals)
-            return owned_data
+            self_send = jnp.array(self.hessian_layout.local_send_idx, dtype=jnp.int64)
+            self_recv = jnp.array(self.hessian_layout.recv_local_idx, dtype=jnp.int64)
+            has_self = len(self.hessian_layout.local_send_idx) > 0
+
+            output_size = self.hessian_layout.owned_nnz
+            nbr_send = [
+                jnp.array(d.local_send_idx, dtype=jnp.int64)
+                for d in self.hessian_layout.neighbor_data
+            ]
+            nbr_recv = [
+                jnp.array(d.recv_local_idx, dtype=jnp.int64)
+                for d in self.hessian_layout.neighbor_data
+            ]
+            neighbor_routing_data = self.hessian_layout.neighbor_data
+
+            @jax.jit
+            def fn(*args, **kwargs):
+                result = local_fn(*args, **kwargs)
+                data = result.data
+                owned_data = jnp.zeros(output_size, dtype=data.dtype)
+
+                if has_self:
+                    owned_data = owned_data.at[self_recv].add(data[self_send])
+                for i, info in enumerate(neighbor_routing_data):
+                    nbr = np.int32(info.rank)
+                    send_buf = data[nbr_send[i]]
+                    recv_tmpl = jnp.zeros(info.recv_size, dtype=data.dtype)
+                    recv_vals = mpi4jax.sendrecv(
+                        send_buf, recv_tmpl, source=nbr, dest=nbr, comm=_comm
+                    )
+                    if info.recv_size > 0:
+                        owned_data = owned_data.at[nbr_recv[i]].add(recv_vals)
+                return replace(result, data=owned_data)
+
+        else:
+            self_send = jnp.array(self._send_dof, dtype=jnp.int64)
+            self_recv = jnp.array(self._recv_dof, dtype=jnp.int64)
+            has_self = len(self._send_dof) > 0
+
+            output_size = self.local_size
+            nbr_send = [
+                jnp.array(d.local_send_idx, dtype=jnp.int64)
+                for d in self._neighbor_dof_data
+            ]
+            nbr_recv = [
+                jnp.array(d.recv_local_idx, dtype=jnp.int64)
+                for d in self._neighbor_dof_data
+            ]
+            neighbor_routing_data = self._neighbor_dof_data
+
+            @jax.jit
+            def fn(*args, **kwargs):
+                data = local_fn(*args, **kwargs)
+                owned_data = jnp.zeros(output_size, dtype=data.dtype)
+
+                if has_self:
+                    owned_data = owned_data.at[self_recv].add(data[self_send])
+                for i, info in enumerate(neighbor_routing_data):
+                    nbr = np.int32(info.rank)
+                    send_buf = data[nbr_send[i]]
+                    recv_tmpl = jnp.zeros(info.recv_size, dtype=data.dtype)
+                    recv_vals = mpi4jax.sendrecv(
+                        send_buf, recv_tmpl, source=nbr, dest=nbr, comm=_comm
+                    )
+                    if info.recv_size > 0:
+                        owned_data = owned_data.at[nbr_recv[i]].add(recv_vals)
+                return owned_data
 
         return fn
+
+    def global_coo_indices(
+        self, local_colored_matrix: ColoredMatrix
+    ) -> tuple[NDArray[np.int32], NDArray[np.int32]]:
+        """Compute the global COO row and column indices for a local ColoredMatrix.
+
+        This allows using PETSc's `setPreallocationCOO` and `setValuesCOO` for
+        matrix assembly, bypassing JAX-based MPI routing of Hessian data.
+        Negative indices (e.g., from constrained DOFs) are preserved and correctly
+        ignored by PETSc during assembly.
+
+        Returns:
+            global_rows: The global row index for each local nonzero.
+            global_cols: The global col index for each local nonzero.
+        """
+        indptr = np.asarray(local_colored_matrix.indptr)
+        indices = np.asarray(local_colored_matrix.indices)
+
+        local_rows = np.repeat(
+            np.arange(len(indptr) - 1, dtype=np.int32), np.diff(indptr)
+        )
+        local_cols = indices
+
+        global_rows = self.layout.local_to_global[local_rows]
+        global_cols = self.layout.local_to_global[local_cols]
+
+        return global_rows, global_cols
 
 
 @dataclass
