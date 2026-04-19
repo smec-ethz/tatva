@@ -133,12 +133,19 @@ def _create_dof_layout(
 
 
 def _layout_from_compound(
-    compound_cls: type[Compound], partition_info: PartitionInfo, comm: MPI.Comm
+    compound_cls: type[Compound],
+    partition_info: PartitionInfo,
+    lifter: Lifter,
+    comm: MPI.Comm,
 ) -> _LocalLayout:
-    """Create a DOF layout from the compound class and partition info."""
+    """Create a DOF layout from the compound class, partition info, and lifter."""
     _rank = comm.Get_rank()
     natural_dof_map = np.full(compound_cls.size, -1, dtype=np.int32)
     owned_mask = np.zeros(compound_cls.size, dtype=bool)
+
+    # identify free DOFs from the lifter
+    free_mask = np.zeros(compound_cls.size, dtype=bool)
+    free_mask[np.asarray(lifter.free_dofs)] = True
 
     # figure out the total number of nodes globally by finding the max global node
     # index across all ranks, then add 1 since node indices are zero-based
@@ -238,8 +245,9 @@ def _layout_from_compound(
 
     # from the natural DOF map and owned mask, build the global DOF layout and routing
     # tables for ghost exchange
+    # we only count DOFs as owned if they are both owned by the rank and free
     layout = _create_dof_layout(
-        natural_dof_map, owned_mask, current_natural_offset, comm
+        natural_dof_map, owned_mask & free_mask, current_natural_offset, comm
     )
     return layout
 
@@ -251,6 +259,7 @@ class ExchangePlan:
         self,
         compound_cls: type[Compound],
         partition_info: PartitionInfo,
+        lifter: Lifter,
         comm: MPI.Comm,
         local_colored_matrix: ColoredMatrix | None = None,
     ):
@@ -259,7 +268,7 @@ class ExchangePlan:
         self._size = comm.Get_size()
         self._partition_info = partition_info
 
-        self.layout = _layout_from_compound(compound_cls, partition_info, comm)
+        self.layout = _layout_from_compound(compound_cls, partition_info, lifter, comm)
 
         self._rstart = self.layout.offset
         self._rend = self.layout.offset + self.layout.n_owned
