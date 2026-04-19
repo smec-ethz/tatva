@@ -147,10 +147,16 @@ def test_neighbor_exchange_grad():
     size = comm.Get_size()
 
     raw_mesh = Mesh.unit_square(10, 10)
-    lifter_global, grad_ref_fn, _, = _build_serial_reference(raw_mesh)
+    (
+        lifter_global,
+        grad_ref_fn,
+        _,
+    ) = _build_serial_reference(raw_mesh)
     n_free_global = lifter_global.size_reduced
 
-    nbr_plan, scatter_fwd, grad_fn, _ = _build_parallel_problem(raw_mesh, rank, size, comm)
+    nbr_plan, scatter_fwd, grad_fn, _ = _build_parallel_problem(
+        raw_mesh, rank, size, comm
+    )
 
     u_free_global = jnp.arange(n_free_global, dtype=jnp.float64) * 1e-4
 
@@ -185,7 +191,9 @@ def test_neighbor_exchange_hessian():
     lifter_global, _, hess_ref_fn = _build_serial_reference(raw_mesh)
     n_free_global = lifter_global.size_reduced
 
-    nbr_plan, scatter_fwd, _, hessian_fn = _build_parallel_problem(raw_mesh, rank, size, comm)
+    nbr_plan, scatter_fwd, _, hessian_fn = _build_parallel_problem(
+        raw_mesh, rank, size, comm
+    )
 
     u_free_global = jnp.zeros(n_free_global, dtype=jnp.float64)
 
