@@ -8,7 +8,8 @@ from mpi4py import MPI
 
 from tatva.compound import Compound, FieldSize, FieldType, field
 from tatva.lifter import Lifter
-from tatva.mpi import ExchangePlan, PartitionInfo
+from tatva.mesh import PartitionInfo
+from tatva.mpi import ExchangePlan
 
 jax.config.update("jax_enable_x64", True)
 
