@@ -18,11 +18,13 @@
 
 from __future__ import annotations
 
+import logging
 from math import prod
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    ClassVar,
     Generator,
     Generic,
     Self,
@@ -44,12 +46,17 @@ from tatva.compound.field import (
     _FieldSpec,
     field,
 )
+from tatva.mesh import PartitionInfo
 
 if TYPE_CHECKING:
+    from mpi4py import MPI
+
+    from tatva.compound.mpi import GlobalView, _FieldGlobalInfo, _LocalLayout
     from tatva.mesh import Mesh
 
-__all__ = ["Compound", "field", "stack_fields"]
+__all__ = ["Compound", "PartitionInfo", "field", "stack_fields"]
 
+log = logging.getLogger(__name__)
 
 T_Compound = TypeVar("T_Compound", bound="Compound")
 
@@ -86,8 +93,18 @@ class Compound:
     fields: tuple[tuple[str, Field], ...] = ()
     arr: Array
     size: int = 0
+    _layout: ClassVar[_LocalLayout | None] = None
+    _global_field_info: ClassVar[dict[str, _FieldGlobalInfo] | None] = None
+    _comm: ClassVar[MPI.Comm | None] = None
 
-    def __init_subclass__(cls, *, mesh: Mesh | None = None, **kwargs: Any) -> None:
+    def __init_subclass__(
+        cls,
+        *,
+        mesh: Mesh | None = None,
+        partition_info: PartitionInfo | None,
+        comm: MPI.Comm | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init_subclass__()
 
         # Collect fields from base classes first
@@ -137,6 +154,21 @@ class Compound:
         cls.fields = tuple(all_fields)
         cls.size = current_offset
 
+        # if parallel context is provided, compute layout and set on class
+        if mesh is not None and partition_info is not None:
+            from tatva.compound.mpi import _layout_from_compound
+
+            if comm is None:
+                from mpi4py import MPI
+
+                comm = MPI.COMM_WORLD
+
+            layout, global_field_info = _layout_from_compound(cls, partition_info, comm)
+
+            cls._comm = comm
+            cls._layout = layout
+            cls._global_field_info = global_field_info
+
         # register as pytree node for JAX transformations
         register_pytree_node_class(cls)
 
@@ -147,7 +179,7 @@ class Compound:
     def tree_unflatten(cls, aux_data: Any, children: tuple[Array]) -> Self:
         return cls(*children)
 
-    def __init__(self, arr: Array | None = None, /, **kwargs) -> None:
+    def __init__(self, arr: Array | None = None, **kwargs) -> None:
         """Initialize the state with given keyword arguments."""
         if arr is not None:
             assert arr.size == self.size, (
@@ -168,6 +200,15 @@ class Compound:
 
     def __len__(self) -> int:
         return len(self.fields)
+
+    @property
+    def g(self) -> GlobalView[Self]:
+        """A handle to access global gathered fields."""
+        from tatva.compound.mpi import GlobalView
+
+        if self._layout is None:
+            raise ValueError("Layout not set on Compound class.")
+        return GlobalView(self)
 
     def __iter__(self) -> Generator[Array, None, None]:
         for name, _ in self.fields:
@@ -207,7 +248,7 @@ class _CompoundAtHelper(Generic[T_Compound]):
 
     def set(self, value: Array | float) -> T_Compound:
         return self.state.__class__(
-            self.field_obj._set_in_array(self.state.arr, jnp.asarray(value))
+            self.field_obj._set_in_array(self.state.arr, jnp.asarray(value)),
         )
 
 
