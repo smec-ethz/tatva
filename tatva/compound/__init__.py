@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from math import prod
 from typing import (
     TYPE_CHECKING,
@@ -120,12 +121,11 @@ class Compound:
         other_specs: list[tuple[str, _FieldSpec]] = []
         for name, spec in new_specs:
             if _is_auto_nodal(spec):
+                # if the first dimension is AUTO, we always set the field type to NODAL
+                # this allows that the default behavior of AUTO fields is to be nodal
+                spec = replace(spec, field_type=FieldType.NODAL)
                 auto_nodal_specs.append((name, spec))
             else:
-                if FieldSize.AUTO in spec.shape:
-                    raise ValueError(
-                        f"Field {name} has FieldSize.AUTO but is not a NODAL field."
-                    )
                 other_specs.append((name, spec))
 
         # Create descriptors for all new fields
@@ -276,11 +276,7 @@ def _collect_field_specs(cls_dict: dict[str, Any]) -> list[tuple[str, _FieldSpec
 
 def _is_auto_nodal(spec: _FieldSpec) -> bool:
     """Check if a field spec is an auto-sized nodal field."""
-    return (
-        len(spec.shape) > 0
-        and spec.shape[0] == FieldSize.AUTO
-        and spec.field_type == FieldType.NODAL
-    )
+    return len(spec.shape) > 0 and spec.shape[0] == FieldSize.AUTO
 
 
 def _reshape_shape_rank_1_if_needed(

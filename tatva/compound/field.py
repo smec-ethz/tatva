@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Self, TypeVar, overload
 
 import jax.numpy as jnp
 from jax import Array
+from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from tatva.compound import Compound
@@ -61,7 +62,7 @@ if TYPE_CHECKING:
         shape: tuple[int, ...],
         default_factory: Callable | None = None,
         field_type: FieldType = FieldType.LOCAL,
-        nodal_local_to_global: Array | None = None,
+        nodal_local_to_global: Array | NDArray | None = None,
     ) -> Field: ...
 
 else:
@@ -196,7 +197,7 @@ class Field(_FieldBase):
 
     default_factory: Callable | None
     field_type: FieldType
-    nodal_local_to_global: Array | None
+    nodal_local_to_global: Array | NDArray | None
 
     def __init__(
         self,
@@ -205,7 +206,7 @@ class Field(_FieldBase):
         field_type: FieldType = FieldType.LOCAL,
         *,
         _slice: slice | None = None,
-        nodal_local_to_global: Array | None = None,
+        nodal_local_to_global: Array | NDArray | None = None,
     ) -> None:
         super().__init__(shape, _slice)
         self.default_factory = default_factory
