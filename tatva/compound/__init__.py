@@ -93,6 +93,7 @@ class Compound:
     fields: tuple[tuple[str, Field], ...] = ()
     arr: Array
     size: int = 0
+
     _layout: ClassVar[_LocalLayout | None] = None
     _global_field_info: ClassVar[dict[str, _FieldGlobalInfo] | None] = None
     _comm: ClassVar[MPI.Comm | None] = None
@@ -101,7 +102,7 @@ class Compound:
         cls,
         *,
         mesh: Mesh | None = None,
-        partition_info: PartitionInfo | None,
+        partition_info: PartitionInfo | None = None,
         comm: MPI.Comm | None = None,
         **kwargs: Any,
     ) -> None:
@@ -178,6 +179,12 @@ class Compound:
     @classmethod
     def tree_unflatten(cls, aux_data: Any, children: tuple[Array]) -> Self:
         return cls(*children)
+
+    @classmethod
+    def get_layout(cls) -> _LocalLayout:
+        if cls._layout is None:
+            raise ValueError("Layout not set on Compound class.")
+        return cls._layout
 
     def __init__(self, arr: Array | None = None, **kwargs) -> None:
         """Initialize the state with given keyword arguments."""

@@ -30,6 +30,7 @@ from numpy.typing import NDArray
 
 from tatva.compound.field import FieldType
 from tatva.mesh import PartitionInfo
+from tatva.mpi import _LocalLayout
 
 if TYPE_CHECKING:
     from tatva.compound import Compound
@@ -40,18 +41,6 @@ log = logging.getLogger(__name__)
 class _FieldGlobalInfo(NamedTuple):
     global_slice: slice
     global_shape: tuple[int, ...]
-
-
-class _LocalLayout(NamedTuple):
-    """Local DOF layout information for a single rank."""
-
-    local_to_global: NDArray[np.int32]
-    offset: int
-    n_owned: int
-    n_total: int
-    n_global: int
-    owned_mask: NDArray[np.bool_]
-    natural_l2g: NDArray[np.int32]
 
 
 T_Compound = TypeVar("T_Compound", bound="Compound")

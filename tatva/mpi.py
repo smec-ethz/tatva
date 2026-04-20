@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, ParamSpec, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -29,12 +29,13 @@ from jax import Array
 from mpi4py import MPI
 from numpy.typing import NDArray
 
-from tatva.compound import Compound
 from tatva.lifter import Lifter
-from tatva.mesh import PartitionInfo
 from tatva.sparse import ColoredMatrix
 
 log = logging.getLogger(__name__)
+
+P = ParamSpec("P")
+_RT = TypeVar("_RT", bound=Array | ColoredMatrix)
 
 
 class _NeighborDofRoute(NamedTuple):
@@ -68,32 +69,83 @@ class _HessianLayout(NamedTuple):
     neighbor_data: list[_NeighborNnzRoute]
 
 
+class _LocalLayout(NamedTuple):
+    """Local DOF layout information for a single rank."""
+
+    local_to_global: NDArray[np.int32]
+    offset: int
+    n_owned: int
+    n_total: int
+    n_global: int
+    owned_mask: NDArray[np.bool_]
+    natural_l2g: NDArray[np.int32]
+
+
+def reduce_dof_layout(
+    all_layout: _LocalLayout, free_dofs: NDArray[np.int32], comm: MPI.Comm
+) -> _LocalLayout:
+    """Reduce an all-DOF layout to only include free DOFs."""
+    _dtype = np.int32
+
+    # Mask for free DOFs owned by this rank
+    mask_free = np.zeros(all_layout.n_total, dtype=bool)
+    mask_free[free_dofs] = True
+    mask_free_owned = all_layout.owned_mask[free_dofs]
+    local_to_global_free = all_layout.local_to_global[free_dofs]
+
+    n_owned = int(np.sum(mask_free_owned))
+    n_global = comm.allreduce(n_owned, op=MPI.SUM)
+
+    # New contiguous global indexing for free DOFs
+    n_per_rank = comm.allgather(n_owned)
+    offset = np.cumsum([0] + n_per_rank[:-1])[comm.rank]
+
+    l2g = np.full(free_dofs.size, -1, dtype=_dtype)
+    l2g[mask_free_owned] = offset + np.arange(n_owned, dtype=_dtype)
+
+    # Resolve ghosts using all_layout.l2g as the unique global identifier
+    local_directory = np.full(all_layout.n_global, -1, dtype=_dtype)
+    # The global ID of the owned free DOFs in the ALL-DOF layout
+    local_directory[local_to_global_free[mask_free_owned]] = l2g[mask_free_owned]
+
+    global_directory = np.empty_like(local_directory)
+    comm.Allreduce(local_directory, global_directory, op=MPI.MAX)
+
+    l2g[~mask_free_owned] = global_directory[local_to_global_free[~mask_free_owned]]
+
+    log.debug(
+        f"Rank {comm.rank}: Reduced DOF layout - n_owned={n_owned}, n_total={free_dofs.size}, n_global={n_global}, offset={offset}"
+    )
+
+    return _LocalLayout(
+        local_to_global=l2g,
+        offset=offset,
+        n_owned=n_owned,
+        n_total=free_dofs.size,
+        n_global=n_global,
+        owned_mask=mask_free_owned,
+        natural_l2g=local_to_global_free,
+    )
+
+
 class ExchangePlan:
     """An MPI communication plan for parallel FEM assembly."""
 
     def __init__(
         self,
-        compound_cls: type[Compound],
-        partition_info: PartitionInfo,
-        lifter: Lifter,
+        layout: _LocalLayout,
         comm: MPI.Comm,
         local_colored_matrix: ColoredMatrix | None = None,
     ):
-        if compound_cls._layout is None:
-            raise ValueError(
-                "Compound class must have a layout to build an ExchangePlan."
-            )
-
         self._comm = comm
         self._rank = comm.Get_rank()
         self._size = comm.Get_size()
-        self._partition_info = partition_info
 
-        self.layout = compound_cls._layout
+        self.layout = layout
 
-        self._rstart = self.layout.offset
-        self._rend = self.layout.offset + self.layout.n_owned
-        self._global_size = self.layout.n_global
+        self._rstart = layout.offset
+        self._rend = layout.offset + layout.n_owned
+        self._global_size = layout.n_global
 
         self._precompute_routing_tables()
 
@@ -357,8 +409,8 @@ class ExchangePlan:
         return fn
 
     def make_scatter_rev_add(
-        self, local_fn: Callable, is_hessian: bool = False
-    ) -> Callable:
+        self, local_fn: Callable[P, _RT], is_hessian: bool = False
+    ) -> Callable[P, _RT]:
         """Return a JIT'd function: u_local → owned_data.
 
         Computes the local function, then gathers contributions from ghosts.
