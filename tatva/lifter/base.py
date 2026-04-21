@@ -17,7 +17,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Concatenate, ParamSpec, Self, TypeVar, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Concatenate,
+    Literal,
+    ParamSpec,
+    Self,
+    TypeVar,
+    overload,
+)
 
 import jax.numpy as jnp
 from jax import Array
@@ -30,6 +40,9 @@ from tatva.lifter.common import (
     _runtime_value_map_is_equal,
 )
 from tatva.lifter.constraints import Constraint
+
+if TYPE_CHECKING:
+    import scipy.sparse as sps
 
 __all__ = ["Lifter"]
 
@@ -223,6 +236,19 @@ class Lifter:
         constrained = jnp.unique(constrained)
         free = jnp.setdiff1d(all_dofs, constrained, assume_unique=True)
         return free, constrained, free.size
+
+    def augment_sparsity(self, sparsity: sps.csr_matrix) -> sps.csr_matrix:
+        """Augment the sparsity pattern to account for all constraints.
+
+        Args:
+            sparsity: Sparsity pattern in SciPy CSR format.
+
+        Returns:
+            Augmented sparsity pattern in SciPy CSR format.
+        """
+        for cond in self.constraints:
+            sparsity = cond.augment_sparsity(sparsity)
+        return sparsity
 
 
 @overload
