@@ -4,6 +4,7 @@ from ._coloring import (
     smallest_last_distance2_colors,
 )
 from ._extraction import (
+    augment_sparsity_with_lifter,
     create_sparsity_pattern,
     create_sparsity_pattern_KKT,
     create_sparsity_pattern_master_slave,
@@ -15,6 +16,7 @@ from .base import ColoredMatrix, jacfwd, linearized_jacfwd
 __all__ = [
     "create_sparsity_pattern",
     "reduce_sparsity_pattern",
+    "augment_sparsity_with_lifter",
     "get_bc_indices",
     "create_sparsity_pattern_KKT",
     "create_sparsity_pattern_master_slave",

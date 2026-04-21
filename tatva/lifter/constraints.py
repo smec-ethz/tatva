@@ -29,6 +29,9 @@ from typing import (
 )
 from uuid import uuid4
 
+import jax.numpy as jnp
+import numpy as np
+import scipy.sparse as sps
 from jax import Array
 from jax.typing import ArrayLike
 
@@ -42,7 +45,7 @@ from tatva.lifter.common import (
 if TYPE_CHECKING:
     from tatva.lifter.base import Lifter
 
-__all__ = ["Constraint", "Periodic", "Fixed"]
+__all__ = ["Constraint", "Fixed", "Periodic"]
 
 T = TypeVar("T")
 T_ArrayLike = TypeVar("T_ArrayLike", bound=ArrayLike)
@@ -103,6 +106,17 @@ class Constraint:
         # have potentially different runtime values.
         return hash((type(self), self._constraint_id))
 
+    def augment_sparsity(self, sparsity: sps.csr_matrix) -> sps.csr_matrix:
+        """Augment the sparsity pattern to account for this constraint.
+
+        Args:
+            sparsity: Sparsity pattern in SciPy CSR format.
+
+        Returns:
+            Augmented sparsity pattern in SciPy CSR format.
+        """
+        return sparsity
+
     def apply_lift(self, u_full: Array) -> Array:
         """Apply the constraint to a full vector and return the modified copy."""
         return u_full
@@ -158,6 +172,26 @@ class Periodic(Constraint):
     def __init__(self, dofs: Array, master_dofs: Array):
         super().__init__(dofs)
         self.master_dofs = master_dofs
+
+    def augment_sparsity(self, sparsity: sps.csr_matrix) -> sps.csr_matrix:
+        n_full = sparsity.shape[0]
+        dofs = np.asarray(self.dofs, dtype=np.int64)
+        master_dofs = np.asarray(self.master_dofs, dtype=np.int64)
+
+        # M is the operator such that u_full = M @ u_reduced_with_slaves_zeroed
+        # M_ij = 1 if i == j OR (i is slave and j is its master)
+        rows = np.concatenate([np.arange(n_full), dofs])
+        cols = np.concatenate([np.arange(n_full), master_dofs])
+        data = np.ones(rows.shape[0], dtype=np.int8)
+        M = sps.csr_matrix((data, (rows, cols)), shape=(n_full, n_full))
+
+        # Triple product to propagate connectivity: S_aug = M.T @ S @ M
+        # This makes master rows/cols inherit from slave rows/cols.
+        S_aug = M.T @ (sparsity.astype(np.int8) @ M)
+
+        # Ensure it's a binary pattern (data=1)
+        S_aug.data = np.ones_like(S_aug.data, dtype=np.int8)
+        return S_aug.tocsr()
 
     def apply_lift(self, u_full: Array) -> Array:
         """Copy values from ``master_dofs`` into the constrained ``dofs``."""

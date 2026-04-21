@@ -15,6 +15,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 import scipy.sparse as sps
 from jax import Array
@@ -22,6 +26,9 @@ from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
 from tatva import Mesh
+
+if TYPE_CHECKING:
+    from tatva.lifter import Lifter
 
 
 def _create_sparse_structure(
@@ -267,3 +274,15 @@ def create_sparsity_pattern_master_slave(
         (data, (Iu, Ju)),
         shape=(n_red, n_red),
     )
+
+
+def augment_sparsity_with_lifter(
+    sparsity: sps.csr_matrix, lifter: Lifter
+) -> sps.csr_matrix:
+    """Augment the sparsity pattern with constraints from a lifter.
+
+    Args:
+        sparsity: Sparsity pattern in SciPy CSR format.
+        lifter: Lifter containing constraints.
+    """
+    return lifter.augment_sparsity(sparsity)
