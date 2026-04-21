@@ -255,26 +255,24 @@ class PeriodicMPI(Periodic):
         dofs_np = np.asarray(dofs, dtype=np.int32)
         master_dofs_np = np.asarray(master_dofs, dtype=np.int32)
 
-        # find which of 'dofs' are owned by us
+        # find which of 'dofs' are in our local layout
         lookup = create_g2l(layout.natural_l2g)
         local_idx = lookup(dofs_np)
 
         valid = local_idx >= 0
-        owned_mask = np.zeros_like(local_idx, dtype=bool)
-        owned_mask[valid] = layout.owned_mask[local_idx[valid]]
 
-        # store natural global indices for slaves we own and their corresponding masters
-        self._slave_natural_g = dofs_np[owned_mask]
-        self._master_natural_g = master_dofs_np[owned_mask]
+        # store natural global indices for slaves we have locally and their corresponding masters
+        self._slave_natural_g = dofs_np[valid]
+        self._master_natural_g = master_dofs_np[valid]
 
-        # extra ghosts: masters of owned slaves that are NOT in our current layout
+        # extra ghosts: masters of local slaves that are NOT in our current layout
         master_local = lookup(self._master_natural_g)
         self._extra_ghost_dofs = self._master_natural_g[master_local < 0]
 
-        # initialize as Periodic with owned slaves; masters will be resolved later
+        # initialize as Periodic with local slaves; masters will be resolved later
         super().__init__(
-            jnp.asarray(local_idx[owned_mask]),
-            jnp.zeros(np.sum(owned_mask), dtype=jnp.int32),
+            jnp.asarray(local_idx[valid]),
+            jnp.zeros(np.sum(valid), dtype=jnp.int32),
         )
 
     def _resolve_indices(self, layout: _LocalLayout) -> Self:
