@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from math import prod
-from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar, cast, overload
 
 import jax.numpy as jnp
 import numpy as np
@@ -28,7 +28,7 @@ from jax import Array
 from mpi4py import MPI
 from numpy.typing import NDArray
 
-from tatva.compound.field import FieldType
+from tatva.compound.field import FieldType, _normalize_index, _row_major_strides
 from tatva.mesh import PartitionInfo
 from tatva.mpi import _LocalLayout
 
@@ -41,20 +41,157 @@ log = logging.getLogger(__name__)
 class _FieldGlobalInfo(NamedTuple):
     global_slice: slice
     global_shape: tuple[int, ...]
+    global_subset: NDArray[np.int32] | None = None
 
 
 T_Compound = TypeVar("T_Compound", bound="Compound")
 
 
-class GlobalView(Generic[T_Compound]):
-    """A lazy view of the global fields of a Compound state."""
+class GlobalView:
+    """Descriptor for the `.g` attribute on Compound instances and classes, providing
+    access to global fields and indices."""
 
-    def __init__(self, compound: T_Compound):
+    @overload
+    def __get__(
+        self, instance: None, owner: type[T_Compound]
+    ) -> GlobalIndicesView[T_Compound]: ...
+    @overload
+    def __get__(
+        self, instance: T_Compound, owner: type[T_Compound]
+    ) -> GlobalDataView[T_Compound]: ...
+    def __get__(
+        self, instance: None | T_Compound, owner: type[T_Compound]
+    ) -> GlobalIndicesView[T_Compound] | GlobalDataView[T_Compound]:
+        if owner._layout is None:
+            raise ValueError(
+                f"Compound class '{owner.__name__}' is missing a DOF layout. "
+                "Global view requires a complete MPI layout."
+            )
+
+        if instance is None:
+            return GlobalIndicesView(owner)
+
+        return GlobalDataView(instance)
+
+
+class GlobalIndicesView(Generic[T_Compound]):
+    """Provides global indexing accessors for fields."""
+
+    def __init__(self, compound: type[T_Compound]):
+        self._compound = compound
+
+    def __getattr__(self, name: str) -> _GlobalFieldIndices:
+        field_info = self._compound._global_field_info
+        if field_info is None or name not in field_info:
+            raise AttributeError(
+                f"'{self._compound.__class__.__name__}' has no field '{name}' "
+                "or layout not initialized."
+            )
+
+        info = field_info[name]
+        return _GlobalFieldIndices(
+            info.global_shape, info.global_slice.start, info.global_subset
+        )
+
+
+class _GlobalFieldIndices:
+    """Indexing logic for natural global DOF IDs of a field."""
+
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        base_offset: int,
+        global_subset: NDArray[np.int32] | None = None,
+    ):
+        self.shape = shape
+        self._base_offset = base_offset
+        self._strides = _row_major_strides(shape)
+        self.global_subset = global_subset
+
+    def __getitem__(self, arg) -> Array:
+        arg = _normalize_index(arg, self.shape)
+
+        # If global_subset is present, the first index is assumed to be global node IDs.
+        # We must translate them to subset indices.
+        if self.global_subset is not None:
+            first_idx = arg[0]
+            if isinstance(first_idx, (int, np.integer)):
+                # Scalar lookup
+                pos = np.searchsorted(self.global_subset, first_idx)
+                if (
+                    pos >= len(self.global_subset)
+                    or self.global_subset[pos] != first_idx
+                ):
+                    raise IndexError(f"Global node ID {first_idx} not in field subset.")
+                arg = (int(pos),) + arg[1:]
+            elif isinstance(first_idx, slice):
+                raise NotImplementedError("Slicing on global subset not supported yet.")
+            else:
+                # Array lookup
+                first_idx_arr = np.asarray(first_idx)
+                pos = np.searchsorted(self.global_subset, first_idx_arr)
+                # Verify all matches
+                valid = (pos < len(self.global_subset)) & (
+                    self.global_subset[np.minimum(pos, len(self.global_subset) - 1)]
+                    == first_idx_arr
+                )
+                if not np.all(valid):
+                    missing = first_idx_arr[~valid]
+                    raise IndexError(
+                        f"Global node IDs {missing} not found in field subset."
+                    )
+                arg = (pos.astype(np.int32),) + arg[1:]
+
+        # Perform standard multi-dimensional indexing math
+        axis_indices: list[Array] = []
+        for sub, extent in zip(arg, self.shape, strict=True):
+            if isinstance(sub, (int, np.integer)):
+                idx = sub if sub >= 0 else sub + extent
+                axis_indices.append(jnp.asarray([idx], dtype=int))
+            elif isinstance(sub, slice):
+                start, stop, step = sub.indices(extent)
+                axis_indices.append(jnp.arange(start, stop, step, dtype=int))
+            else:
+                values = jnp.asarray(sub, dtype=int).reshape(-1)
+                axis_indices.append(jnp.where(values < 0, values + extent, values))
+
+        if not axis_indices:
+            return jnp.asarray([self._base_offset], dtype=int)
+
+        grid_shape = tuple(len(values) for values in axis_indices)
+        index = jnp.full(grid_shape, self._base_offset, dtype=int)
+        for axis, (stride, values) in enumerate(
+            zip(self._strides, axis_indices, strict=True)
+        ):
+            broadcast_shape = tuple(
+                len(values) if i == axis else 1 for i in range(len(axis_indices))
+            )
+            index = index + jnp.reshape(
+                values * stride,
+                broadcast_shape,
+            )
+        return index.reshape(-1)
+
+
+class GlobalDataView(Generic[T_Compound]):
+    """A handle to access global fields and natural DOF indices.
+
+    If accessed from a Compound instance, it can gather and return the full global
+    state array. If accessed from a Compound class, it only provides access to
+    global natural DOF indices via the `.indices` property.
+    """
+
+    def __init__(self, compound: T_Compound | type[T_Compound]):
         self._compound = compound
         self._cache: dict[str, Array] = {}
 
     def _gather(self) -> Array:
         """Gather the full natural global state array."""
+        if isinstance(self._compound, type):
+            raise TypeError(
+                "Gathering global data requires a Compound instance, not the class."
+            )
+
         if "full" not in self._cache:
             import mpi4jax
             from mpi4py import MPI
@@ -94,7 +231,7 @@ class GlobalView(Generic[T_Compound]):
             if layout is None or field_info is None:
                 raise ValueError("Field global info not available in layout.")
 
-            g_slice, g_shape = field_info[name]
+            g_slice, g_shape, _ = field_info[name]
             return g_arr[g_slice].reshape(g_shape)
 
         raise AttributeError(
@@ -196,6 +333,7 @@ def _layout_from_compound(
         # Calculate global shape and natural offset for this field
         # We do this for every field, even if it shares a root slice
         root_shape = getattr(f, "_root_shape", f.shape)
+        g_subset = None
         if f.field_type == FieldType.LOCAL:
             f_size_local = f_slice.stop - f_slice.start
             f_size_global = comm.allreduce(f_size_local, op=MPI.SUM)
@@ -208,6 +346,7 @@ def _layout_from_compound(
                 all_subset = comm.allgather(subset_global_nodes)
                 global_subset = np.unique(np.concatenate(all_subset))
                 n_items_global = len(global_subset)
+                g_subset = global_subset
             else:
                 n_items_global = n_nodes_global
             f_size_global = n_items_global * int(prod(root_shape[1:]))
@@ -220,6 +359,7 @@ def _layout_from_compound(
                 current_natural_offset, current_natural_offset + f_size_global
             ),
             global_shape=(n_items_global, *f.shape[1:]),
+            global_subset=g_subset,
         )
 
         if f_slice in processed_slices:
