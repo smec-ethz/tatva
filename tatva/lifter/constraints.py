@@ -22,6 +22,7 @@ from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Hashable,
     Self,
     TypeVar,
@@ -34,6 +35,7 @@ import numpy as np
 import scipy.sparse as sps
 from jax import Array
 from jax.typing import ArrayLike
+from numpy.typing import NDArray
 
 from tatva.lifter.common import (
     LifterError,
@@ -41,9 +43,13 @@ from tatva.lifter.common import (
     RuntimeValueMap,
     _iter_runtime_values,
 )
+from tatva.mesh import PartitionInfo
 
 if TYPE_CHECKING:
+    from mpi4py import MPI
+
     from tatva.lifter.base import Lifter
+    from tatva.mpi import _LocalLayout
 
 __all__ = ["Constraint", "Fixed", "Periodic"]
 
@@ -125,6 +131,12 @@ class Constraint:
         """Return a tuple of all RuntimeValue attributes in this constraint instance."""
         return self._runtime_specs
 
+    def _resolve_indices(self, layout: _LocalLayout) -> Self:
+        """Resolve local indices for this constraint against the given layout.
+        Base implementation returns self. Override in subclasses that need resolution
+        against a specific MPI layout."""
+        return self
+
     def _bind(self, lifter: Lifter) -> Self:
         """Return a shallow bound copy of this constraint for the given lifter."""
         bound = self.__class__.__new__(self.__class__)
@@ -196,6 +208,93 @@ class Periodic(Constraint):
     def apply_lift(self, u_full: Array) -> Array:
         """Copy values from ``master_dofs`` into the constrained ``dofs``."""
         return u_full.at[self.dofs].set(u_full[self.master_dofs])
+
+
+def create_g2l(l2g: NDArray) -> Callable[[NDArray], NDArray]:
+    # this method may not be optimal
+    # it works for now
+    sort_idx = np.argsort(l2g)
+    sorted_l2g = l2g[sort_idx]
+
+    def lookup(global_indices: NDArray) -> NDArray:
+        pos = np.searchsorted(sorted_l2g, global_indices)
+        valid = (pos < len(sorted_l2g)) & (
+            sorted_l2g[np.minimum(pos, len(sorted_l2g) - 1)] == global_indices
+        )
+        local_indices = np.full_like(global_indices, -1)
+        local_indices[valid] = sort_idx[pos[valid]]
+        return local_indices
+
+    return lookup
+
+
+class PeriodicMPI(Periodic):
+    """Periodicity based on nodal mapping, for use in MPI parallel computations where dofs
+    on different processes may be constrained together.
+
+    This is a global constraint that is synchronized across all processes. It requests the
+    global dof indices of the slaves and masters.
+    You can access these with CompoundCls.g.field_name[global_node, slice, ...].
+    """
+
+    def __init__(
+        self,
+        dofs: Array,
+        master_dofs: Array,
+        layout: _LocalLayout,
+        *,
+        comm: MPI.Comm | None = None,
+    ):
+        if comm is None:
+            from mpi4py import MPI
+
+            comm = MPI.COMM_WORLD
+
+        self._comm = comm
+
+        dofs_np = np.asarray(dofs, dtype=np.int32)
+        master_dofs_np = np.asarray(master_dofs, dtype=np.int32)
+
+        # find which of 'dofs' are owned by us
+        lookup = create_g2l(layout.natural_l2g)
+        local_idx = lookup(dofs_np)
+
+        valid = local_idx >= 0
+        owned_mask = np.zeros_like(local_idx, dtype=bool)
+        owned_mask[valid] = layout.owned_mask[local_idx[valid]]
+
+        # store natural global indices for slaves we own and their corresponding masters
+        self._slave_natural_g = dofs_np[owned_mask]
+        self._master_natural_g = master_dofs_np[owned_mask]
+
+        # extra ghosts: masters of owned slaves that are NOT in our current layout
+        master_local = lookup(self._master_natural_g)
+        self._extra_ghost_dofs = self._master_natural_g[master_local < 0]
+
+        # initialize as Periodic with owned slaves; masters will be resolved later
+        super().__init__(
+            jnp.asarray(local_idx[owned_mask]),
+            jnp.zeros(np.sum(owned_mask), dtype=jnp.int32),
+        )
+
+    def _resolve_indices(self, layout: _LocalLayout) -> Self:
+        lookup = create_g2l(layout.natural_l2g)
+        local_slaves = lookup(self._slave_natural_g)
+        local_masters = lookup(self._master_natural_g)
+
+        if np.any(local_slaves < 0) or np.any(local_masters < 0):
+            raise LifterError(
+                f"PeriodicMPI rank {self._comm.Get_rank()}: Failed to resolve local "
+                "indices for periodic DOFs. Ensure all required masters were added "
+                "as ghosts to the layout."
+            )
+
+        # Create a new resolved instance
+        resolved = self.__class__.__new__(self.__class__)
+        resolved.__dict__ = dict(self.__dict__)
+        resolved.dofs = jnp.asarray(local_slaves)
+        resolved.master_dofs = jnp.asarray(local_masters)
+        return resolved
 
 
 class Fixed(Constraint):

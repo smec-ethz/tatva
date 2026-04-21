@@ -23,6 +23,7 @@ from tatva.lifter.common import RuntimeValue as RuntimeValue
 from tatva.lifter.constraints import Constraint as Constraint
 from tatva.lifter.constraints import Fixed as Fixed
 from tatva.lifter.constraints import Periodic as Periodic
+from tatva.lifter.constraints import PeriodicMPI as PeriodicMPI
 
 
 def __getattr__(name: str):
