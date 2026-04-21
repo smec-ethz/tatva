@@ -47,6 +47,7 @@ from tatva.compound.field import (
     _FieldSpec,
     field,
 )
+from tatva.compound.mpi import GlobalView
 from tatva.mesh import PartitionInfo
 
 if TYPE_CHECKING:
@@ -94,6 +95,8 @@ class Compound:
     fields: tuple[tuple[str, Field], ...] = ()
     arr: Array
     size: int = 0
+
+    g: GlobalView = GlobalView()
 
     _layout: ClassVar[_LocalLayout | None] = None
     _global_field_info: ClassVar[dict[str, _FieldGlobalInfo] | None] = None
@@ -207,15 +210,6 @@ class Compound:
 
     def __len__(self) -> int:
         return len(self.fields)
-
-    @property
-    def g(self) -> GlobalView[Self]:
-        """A handle to access global gathered fields."""
-        from tatva.compound.mpi import GlobalView
-
-        if self._layout is None:
-            raise ValueError("Layout not set on Compound class.")
-        return GlobalView(self)
 
     def __iter__(self) -> Generator[Array, None, None]:
         for name, _ in self.fields:
