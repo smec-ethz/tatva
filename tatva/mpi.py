@@ -128,6 +128,56 @@ def reduce_dof_layout(
     )
 
 
+def _create_dof_layout(
+    natural_dof_map: NDArray[np.int32],
+    owned_mask: NDArray[np.bool_],
+    n_natural_global: int,
+    comm: MPI.Comm,
+) -> _LocalLayout:
+    """Create a global DOF layout for all DOFs across all processes."""
+    _dtype = np.int32
+    n_owned = int(np.sum(owned_mask))
+    n_global = comm.allreduce(n_owned, op=MPI.SUM)
+
+    n_per_rank = comm.allgather(n_owned)
+    offset = (
+        np.cumsum([0] + n_per_rank[: comm.rank], dtype=_dtype)[-1]
+        if comm.rank > 0
+        else 0
+    )
+
+    # Assign global indices to owned DOFs
+    l2g = np.full(natural_dof_map.size, -1, dtype=_dtype)
+    owned_indices = np.where(owned_mask)[0]
+    l2g[owned_indices] = offset + np.arange(n_owned, dtype=_dtype)
+
+    # Resolve ghosts using the original global IDs (natural_dof_map)
+    local_directory = np.full(n_natural_global, -1, dtype=_dtype)
+    local_directory[natural_dof_map[owned_indices]] = l2g[owned_indices]
+
+    global_directory = np.empty_like(local_directory)
+    comm.Allreduce(local_directory, global_directory, op=MPI.MAX)
+
+    ghost_indices = np.where(~owned_mask)[0]
+    if ghost_indices.size > 0:
+        l2g[ghost_indices] = global_directory[natural_dof_map[ghost_indices]]
+
+    log.debug(
+        f"Rank {comm.rank}: DOF layout - n_owned={n_owned}, "
+        f"n_total={natural_dof_map.size}, n_global={n_global}, offset={offset}"
+    )
+
+    return _LocalLayout(
+        local_to_global=l2g,
+        offset=offset,
+        n_owned=n_owned,
+        n_total=natural_dof_map.size,
+        n_global=n_global,
+        owned_mask=owned_mask,
+        natural_l2g=natural_dof_map,
+    )
+
+
 class ExchangePlan:
     """An MPI communication plan for parallel FEM assembly."""
 

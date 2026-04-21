@@ -30,6 +30,8 @@ from typing import (
 )
 
 import jax.numpy as jnp
+import numpy as np
+import scipy.sparse as sps
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 from jax.typing import ArrayLike
@@ -42,7 +44,9 @@ from tatva.lifter.common import (
 from tatva.lifter.constraints import Constraint
 
 if TYPE_CHECKING:
-    import scipy.sparse as sps
+    from mpi4py import MPI
+
+    from tatva.mpi import _LocalLayout
 
 __all__ = ["Lifter"]
 
@@ -93,13 +97,24 @@ class Lifter:
     _runtime_values: RuntimeValueMap
     """Mapping of runtime values for dynamic constraints; keys are RuntimeValue keys."""
 
+    _nb_extra_ghost_dofs: int | None = None
+    """For MPI only: extra ghost dofs that are added to the local layout to account for
+    constraints like PeriodicMPI. lifter.lift(...) will not include them in the lifted
+    full vector."""
+
     def tree_flatten(self) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         # We want to be able to use lifters as static args in jax transformations, but they contain
         # runtime values that are not hashable. By treating the runtime values as non-static
         # children, we can keep the lifter itself as a static arg while still allowing the
         # runtime values to be passed in and used during lifting.
         children = (self._runtime_values, self.free_dofs, self.constrained_dofs)
-        aux_data = (self.size, self.constraints, self.size_reduced, self._runtime_keys)
+        aux_data = (
+            self.size,
+            self.constraints,
+            self.size_reduced,
+            self._runtime_keys,
+            self._nb_extra_ghost_dofs,
+        )
         return children, aux_data
 
     @classmethod
@@ -111,7 +126,7 @@ class Lifter:
         # This is a bit hacky, but it allows us to reconstruct the lifter with the correct
         # runtime values without having to go through the normal initialization process,
         # which would require us to recompute the sizes and runtime pairs.
-        size, constraints, size_reduced, _runtime_keys = aux_data
+        size, constraints, size_reduced, _runtime_keys, _nb_extra_ghost_dofs = aux_data
         _runtime_values, free_dofs, constrained_dofs = children
 
         lifter = cls.__new__(cls)
@@ -122,6 +137,7 @@ class Lifter:
             "constrained_dofs": constrained_dofs,
             "size_reduced": size_reduced,
             "_runtime_keys": _runtime_keys,
+            "_nb_extra_ghost_dofs": _nb_extra_ghost_dofs,
         }
         lifter._runtime_values = _runtime_values
         return lifter
@@ -157,7 +173,7 @@ class Lifter:
         self.free_dofs, self.constrained_dofs, self.size_reduced = self._compute_sizes()
 
     def __hash__(self):
-        return hash((self.size, self.constraints))
+        return hash((self.size, self.constraints, self._nb_extra_ghost_dofs))
 
     def __eq__(self, other) -> bool:
         """Check equality based on size, constraints, and runtime values. If a lifter is a
@@ -169,7 +185,16 @@ class Lifter:
             and self.size == other.size
             and self.constraints == other.constraints
             and _runtime_value_map_is_equal(self._runtime_values, other._runtime_values)
+            and self._nb_extra_ghost_dofs == other._nb_extra_ghost_dofs
         )
+
+    @property
+    def _local_size(self) -> int:
+        """The size of the local vector from the problem definition, which does not
+        include any extra ghost dofs added by constraints like PeriodicMPI. This is the
+        size that lifter.lift(...) will return, and the size that lifter.reduce(...)
+        expects as input."""
+        return self.size - (self._nb_extra_ghost_dofs or 0)
 
     def add(self, condition: Constraint) -> Self:
         """Return a new lifter with ``condition`` appended to constraints."""
@@ -195,7 +220,7 @@ class Lifter:
         for condition in self.constraints:
             u_full = condition.apply_lift(u_full)
 
-        return u_full
+        return u_full[: self._local_size]  # in case constraints added extra dofs
 
     def lift_from_zeros(
         self,
@@ -246,9 +271,124 @@ class Lifter:
         Returns:
             Augmented sparsity pattern in SciPy CSR format.
         """
+        if sparsity.shape[0] < self.size:
+            n_orig = sparsity.shape[0]
+            extra_ptr = np.full(
+                self.size - n_orig, sparsity.indptr[-1], dtype=sparsity.indptr.dtype
+            )
+            new_indptr = np.concatenate([sparsity.indptr, extra_ptr])
+            sparsity = sps.csr_matrix(
+                (sparsity.data, sparsity.indices, new_indptr),
+                shape=(self.size, self.size),
+            )
+
         for cond in self.constraints:
             sparsity = cond.augment_sparsity(sparsity)
         return sparsity
+
+    def reduce_sparsity(self, sparsity: sps.csr_matrix) -> sps.csr_matrix:
+        """Reduce the sparsity pattern to the free DOF layout.
+
+        Args:
+            sparsity: Full sparsity pattern in SciPy CSR format.
+
+        Returns:
+            Reduced sparsity pattern in SciPy CSR format.
+        """
+        return sparsity[self.free_dofs][:, self.free_dofs]
+
+    def augment_layout(
+        self, layout: _LocalLayout, comm: MPI.Comm
+    ) -> tuple[_LocalLayout, Lifter]:
+        """MPI only. Augment the local layout to account for all constraints.
+
+        This may add extra ghost dofs to the local array to account for periodic
+        constraints, for example.
+
+        Args:
+            layout: Local layout to augment.
+
+        Returns:
+            A tuple of (augmented_reduced_layout, augmented_lifter).
+        """
+        from mpi4py import MPI
+
+        from tatva.mpi import _create_dof_layout, _LocalLayout
+
+        _dtype = np.int32
+
+        # gather all extra ghost dofs from constraints that need to be included
+        extra_ghosts = []
+        for cond in self.constraints:
+            if hasattr(cond, "_extra_ghost_dofs"):
+                extra_ghosts.append(cond._extra_ghost_dofs)
+
+        if extra_ghosts:
+            # unique extra ghosts for this rank
+            local_extra_g = np.unique(np.concatenate(extra_ghosts))
+
+            # re-create the layout with these extra ghosts.
+            # natural global indices stay within system bounds, so n_global is unchanged.
+            new_natural_l2g = np.concatenate([layout.natural_l2g, local_extra_g])
+            new_owned_mask = np.concatenate(
+                [layout.owned_mask, np.zeros(len(local_extra_g), dtype=bool)]
+            )
+
+            full_layout = _create_dof_layout(
+                new_natural_l2g, new_owned_mask, layout.n_global, comm
+            )
+        else:
+            full_layout = layout
+
+        # resolve lifter against the (potentially augmented) full layout.
+        # This ensures constraints like PeriodicMPI have correct local indices
+        # for masters.
+        new_constraints = tuple(
+            cond._resolve_indices(full_layout) for cond in self.constraints
+        )
+        lifter = self.__class__(full_layout.n_total, *new_constraints)
+        lifter = lifter.with_values(self._runtime_values)
+        if extra_ghosts:
+            lifter._nb_extra_ghost_dofs = len(local_extra_g)
+
+        # 3. Reduce the full layout to the free-DOF layout
+        free_dofs = lifter.free_dofs
+        mask_free = np.zeros(full_layout.n_total, dtype=bool)
+        mask_free[free_dofs] = True
+        mask_free_owned = full_layout.owned_mask[free_dofs]
+        local_to_global_free = full_layout.local_to_global[free_dofs]
+
+        n_owned = int(np.sum(mask_free_owned))
+        n_global = comm.allreduce(n_owned, op=MPI.SUM)
+
+        # New contiguous global indexing for free DOFs
+        n_per_rank = comm.allgather(n_owned)
+        offset = np.cumsum([0] + n_per_rank[:-1])[comm.rank]
+
+        l2g = np.full(free_dofs.size, -1, dtype=_dtype)
+        l2g[mask_free_owned] = offset + np.arange(n_owned, dtype=_dtype)
+
+        # Resolve ghosts using full_layout.l2g as the unique global identifier
+        local_directory = np.full(full_layout.n_global, -1, dtype=_dtype)
+        # The global ID of the owned free DOFs in the ALL-DOF layout
+        local_directory[local_to_global_free[mask_free_owned]] = l2g[mask_free_owned]
+
+        global_directory = np.empty_like(local_directory)
+        comm.Allreduce(local_directory, global_directory, op=MPI.MAX)
+
+        l2g[~mask_free_owned] = global_directory[local_to_global_free[~mask_free_owned]]
+
+        reduced_layout = _LocalLayout(
+            local_to_global=l2g,
+            offset=offset,
+            n_owned=n_owned,
+            n_total=free_dofs.size,
+            n_global=n_global,
+            owned_mask=mask_free_owned,
+            natural_l2g=local_to_global_free,
+        )
+
+        return reduced_layout, lifter
 
 
 @overload
