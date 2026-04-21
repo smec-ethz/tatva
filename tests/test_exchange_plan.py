@@ -5,10 +5,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from mpi4py import MPI
+from scipy.sparse import csr_matrix
 
 from tatva.compound import Compound, FieldSize, FieldType, field
 from tatva.lifter import Lifter
-from tatva.mesh import PartitionInfo
+from tatva.mesh import Mesh, PartitionInfo
 from tatva.mpi import ExchangePlan
 
 jax.config.update("jax_enable_x64", True)
@@ -37,7 +38,11 @@ def test_exchange_plan_layout():
 
     p_info = PartitionInfo(nodes_local_to_global=l2g, n_owned_nodes=n_owned_nodes)
 
-    class MyState(Compound):
+    mock_mesh = Mesh(
+        coords=jnp.zeros((len(l2g), 1)), elements=jnp.zeros((0, 2), dtype=int)
+    )
+
+    class MyState(Compound, mesh=mock_mesh, partition_info=p_info, comm=comm):
         u = field(shape=(2, 2), field_type=FieldType.NODAL)  # 2 nodes, 2 DOFs per node
         s = field(shape=(1,), field_type=FieldType.SHARED)  # 1 shared scalar
         v = field(shape=(1,), field_type=FieldType.LOCAL)  # 1 local scalar
@@ -47,7 +52,8 @@ def test_exchange_plan_layout():
     # Total global size = 7
 
     lifter = Lifter(MyState.size)
-    plan = ExchangePlan(MyState, p_info, lifter, comm)
+    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    plan = ExchangePlan(layout_reduced, comm)
 
     if rank == 0:
         assert plan.local_size == 4
@@ -100,11 +106,17 @@ def test_exchange_plan_communication():
             nodes_local_to_global=np.array([], dtype=np.int32), n_owned_nodes=0
         )
 
-    class MyState(Compound):
+    mock_mesh = Mesh(
+        coords=jnp.zeros((len(p_info.nodes_local_to_global), 1)),
+        elements=jnp.zeros((0, 2), dtype=int),
+    )
+
+    class MyState(Compound, mesh=mock_mesh, partition_info=p_info, comm=comm):
         u = field(shape=(2, 1), field_type=FieldType.NODAL)
 
     lifter = Lifter(MyState.size)
-    plan = ExchangePlan(MyState, p_info, lifter, comm)
+    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    plan = ExchangePlan(layout_reduced, comm)
 
     # Global: [u0=0, u1=1]
     # Rank 0: owns [0], ghosts [1]
@@ -172,14 +184,12 @@ def test_exchange_plan_incomplete_nodal():
         )
         subset = np.array([], dtype=np.int32)
 
-    from tatva import Mesh
-
     mock_mesh = Mesh(
         coords=jnp.zeros((len(p_info.nodes_local_to_global), 1)),
         elements=jnp.zeros((0, 2), dtype=int),
     )
 
-    class MyState(Compound, mesh=mock_mesh):
+    class MyState(Compound, mesh=mock_mesh, partition_info=p_info, comm=comm):
         u = field(shape=(FieldSize.AUTO, 1), field_type=FieldType.NODAL)
         l = field(
             shape=(len(subset), 1),
@@ -188,7 +198,8 @@ def test_exchange_plan_incomplete_nodal():
         )
 
     lifter = Lifter(MyState.size)
-    plan = ExchangePlan(MyState, p_info, lifter, comm)
+    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    plan = ExchangePlan(layout_reduced, comm)
 
     # Nodal U (full):
     # Global size = 3
@@ -247,10 +258,13 @@ def test_exchange_plan_hessian():
             nodes_local_to_global=np.array([], dtype=np.int32), n_owned_nodes=0
         )
 
-    class MyState(Compound):
-        u = field(shape=(2, 1), field_type=FieldType.NODAL)
+    mock_mesh = Mesh(
+        coords=jnp.zeros((len(p_info.nodes_local_to_global), 1)),
+        elements=jnp.zeros((0, 2), dtype=int),
+    )
 
-    from scipy.sparse import csr_matrix
+    class MyState(Compound, mesh=mock_mesh, partition_info=p_info, comm=comm):
+        u = field(shape=(2, 1), field_type=FieldType.NODAL)
 
     from tatva.sparse import ColoredMatrix
 
@@ -272,7 +286,8 @@ def test_exchange_plan_hessian():
     cm = replace(cm, data=data)
 
     lifter = Lifter(MyState.size)
-    plan = ExchangePlan(MyState, p_info, lifter, comm, local_colored_matrix=cm)
+    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    plan = ExchangePlan(layout_reduced, comm, local_colored_matrix=cm)
 
     # Expected Global layout:
     # Rank 0 owns global node 0 (global index 0).
@@ -347,7 +362,12 @@ def test_exchange_plan_with_constraints():
             nodes_local_to_global=np.array([], dtype=np.int32), n_owned_nodes=0
         )
 
-    class MyState(Compound):
+    mock_mesh = Mesh(
+        coords=jnp.zeros((len(p_info.nodes_local_to_global), 1)),
+        elements=jnp.zeros((0, 2), dtype=int),
+    )
+
+    class MyState(Compound, mesh=mock_mesh, partition_info=p_info, comm=comm):
         u = field(shape=(2, 1), field_type=FieldType.NODAL)
 
     # Constrain node 0.
@@ -358,7 +378,8 @@ def test_exchange_plan_with_constraints():
     fixed_dofs = node0_local.astype(np.int32)
     lifter = Lifter(MyState.size, Fixed(fixed_dofs, 0.0))
 
-    plan = ExchangePlan(MyState, p_info, lifter, comm)
+    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    plan = ExchangePlan(layout_reduced, comm)
 
     # Global node 0 is fixed. Global node 1 is free.
     # Total global size = 1 (only node 1).
@@ -368,14 +389,14 @@ def test_exchange_plan_with_constraints():
     assert plan.global_size == 1
 
     if rank == 0:
-        # node 0 fixed -> -1, node 1 free ghost -> 0 (owned by rank 1)
-        np.testing.assert_array_equal(plan.layout.local_to_global, [-1, 0])
+        # node 0 fixed (not in reduced), node 1 free ghost -> 0 (owned by rank 1)
+        np.testing.assert_array_equal(plan.layout.local_to_global, [0])
         assert plan.local_size == 0
         assert plan.rstart == 0
         assert plan.rend == 0
     elif rank == 1:
-        # node 1 free owned -> 0, node 0 fixed ghost -> -1
-        np.testing.assert_array_equal(plan.layout.local_to_global, [0, -1])
+        # node 1 free owned -> 0, node 0 fixed (not in reduced)
+        np.testing.assert_array_equal(plan.layout.local_to_global, [0])
         assert plan.local_size == 1
         assert plan.rstart == 0
         assert plan.rend == 1
