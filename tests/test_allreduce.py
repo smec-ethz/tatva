@@ -20,13 +20,14 @@ try:
     import mpi4jax  # noqa: F401
     from mpi4py import MPI
 
+    from tatva.mpi import AllreducePlan
+
     HAS_MPI = True
 except ImportError:
     HAS_MPI = False
 
 from tatva import Mesh, Operator, element, sparse
 from tatva.lifter import Fixed, Lifter
-from tatva.mpi import AllreducePlan
 
 pytestmark = pytest.mark.skipif(not HAS_MPI, reason="mpi4py and mpi4jax required")
 
@@ -157,7 +158,9 @@ def test_allreduce_hessian():
     lifter_global, _, hess_ref_fn = _build_serial_reference(raw_mesh)
     n_free_global = lifter_global.size_reduced
 
-    plan, allgather, _, hessian_fn, _ = _build_parallel_problem(raw_mesh, rank, size, comm)
+    plan, allgather, _, hessian_fn, _ = _build_parallel_problem(
+        raw_mesh, rank, size, comm
+    )
 
     u_free_global = jnp.zeros(n_free_global, dtype=jnp.float64)
 

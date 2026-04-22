@@ -4,13 +4,23 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from mpi4py import MPI
 from scipy.sparse import csr_matrix
 
-from tatva.compound import Compound, FieldSize, FieldType, field
+from tatva.compound import Compound, FieldSize, field
+from tatva.compound.field_types import FieldType, Nodal
 from tatva.lifter import Lifter
 from tatva.mesh import Mesh, PartitionInfo
-from tatva.mpi import ExchangePlan
+
+try:
+    from mpi4py import MPI
+
+    from tatva.mpi import ExchangePlan
+
+    HAS_MPI = True
+except ImportError:
+    HAS_MPI = False
+
+pytestmark = pytest.mark.skipif(not HAS_MPI, reason="mpi4py and mpi4jax required")
 
 jax.config.update("jax_enable_x64", True)
 
@@ -52,7 +62,7 @@ def test_exchange_plan_layout():
     # Total global size = 7
 
     lifter = Lifter(MyState.size)
-    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
     plan = ExchangePlan(layout_reduced, comm)
 
     if rank == 0:
@@ -115,7 +125,7 @@ def test_exchange_plan_communication():
         u = field(shape=(2, 1), field_type=FieldType.NODAL)
 
     lifter = Lifter(MyState.size)
-    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
     plan = ExchangePlan(layout_reduced, comm)
 
     # Global: [u0=0, u1=1]
@@ -193,12 +203,11 @@ def test_exchange_plan_incomplete_nodal():
         u = field(shape=(FieldSize.AUTO, 1), field_type=FieldType.NODAL)
         l = field(
             shape=(len(subset), 1),
-            field_type=FieldType.NODAL,
-            nodal_local_to_global=subset,
+            field_type=Nodal(node_ids=subset),
         )
 
     lifter = Lifter(MyState.size)
-    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
     plan = ExchangePlan(layout_reduced, comm)
 
     # Nodal U (full):
@@ -286,7 +295,7 @@ def test_exchange_plan_hessian():
     cm = replace(cm, data=data)
 
     lifter = Lifter(MyState.size)
-    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
     plan = ExchangePlan(layout_reduced, comm, local_colored_matrix=cm)
 
     # Expected Global layout:
@@ -378,7 +387,7 @@ def test_exchange_plan_with_constraints():
     fixed_dofs = node0_local.astype(np.int32)
     lifter = Lifter(MyState.size, Fixed(fixed_dofs, 0.0))
 
-    layout_reduced, lifter_aug = lifter.augment_layout(MyState.get_layout(), comm)
+    layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
     plan = ExchangePlan(layout_reduced, comm)
 
     # Global node 0 is fixed. Global node 1 is free.

@@ -4,8 +4,9 @@ import numpy as np
 import pytest
 from jax import Array
 from jax_autovmap import autovmap
-from tatva import Mesh, Operator, element, sparse
 from tatva_coloring import distance2_color_and_seeds
+
+from tatva import Mesh, Operator, element, sparse
 
 jax.config.update("jax_enable_x64", True)
 
