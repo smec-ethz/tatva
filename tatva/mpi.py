@@ -28,8 +28,8 @@ import numpy as np
 from jax import Array
 from mpi4py import MPI
 from numpy.typing import NDArray
+from scipy.sparse import csr_matrix
 
-from tatva.lifter import Lifter
 from tatva.sparse import ColoredMatrix
 
 log = logging.getLogger(__name__)
@@ -516,31 +516,29 @@ class AllreducePlan:
     sums them into the global result on every rank. Each rank then assembles
     only its owned rows into the distributed solver.
 
-    Use when DOF coupling is non-nearest-neighbor (cohesive interfaces, contact,
-    periodic BCs) or as a simpler starting point before switching to
-    NeighborExchangePlan for better weak scaling.
+    Use when DOF coupling is non-nearest-neighbor (cohesive interfaces, contact)
+    or as a simpler starting point before switching to ExchangePlan for better weak scaling.
 
     Args:
-        global_colored_matrix: ColoredMatrix for the global (full) free-DOF sparsity
-        lifter:                Lifter for the global problem
+        global_sparsity_pattern: reduced sprasity pattern of the global Hessian
         comm:                  MPI communicator
     """
 
     def __init__(
         self,
-        global_colored_matrix: ColoredMatrix,
-        lifter: Lifter,
+        global_sparsity_pattern: csr_matrix,
         comm: MPI.Comm,
     ):
         self._comm = comm
         self._rank = comm.Get_rank()
         self._size = comm.Get_size()
 
-        self._n_free = lifter.size_reduced
-        self._rstart, self._rend = _dof_range(self._n_free, self._size, self._rank)
+        self._global_size = global_sparsity_pattern.indptr.size - 1
 
-        indptr = np.asarray(global_colored_matrix.indptr)
-        indices = np.asarray(global_colored_matrix.indices)
+        self._rstart, self._rend = _dof_range(self._global_size, self._size, self._rank)
+
+        indptr = np.asarray(global_sparsity_pattern.indptr)
+        indices = np.asarray(global_sparsity_pattern.indices)
         nnz_start = int(indptr[self._rstart])
         nnz_end = int(indptr[self._rend])
         self._owned_nnz = nnz_end - nnz_start
@@ -553,7 +551,7 @@ class AllreducePlan:
     @property
     def global_size(self) -> int:
         """Total number of free DOFs in the global linear system."""
-        return self._n_free
+        return self._global_size
 
     @property
     def rstart(self) -> int:
@@ -572,8 +570,7 @@ class AllreducePlan:
         Pass this as the explicit local size when creating distributed solver
         objects so their row distribution matches this plan.
         """
-        rstart, rend = _dof_range(self._n_free, self._size, self._rank)
-        return rend - rstart
+        return self._rend - self._rstart
 
     @property
     def owned_nnz(self) -> int:
@@ -584,23 +581,6 @@ class AllreducePlan:
     def owned_csr(self) -> tuple[np.ndarray, np.ndarray]:
         """(indptr, indices) for owned rows — pass directly to solver preallocation."""
         return self._owned_ptr, self._owned_indices
-
-    @property
-    def owned_free_mask(self) -> np.ndarray:
-        """Boolean mask of length n_free_global; True for DOFs owned by this rank.
-
-        Use this when applying nodal point loads: set the load only at owned DOFs
-        so that after the allreduce sum each DOF receives exactly one rank's
-        contribution — regardless of how many ranks can see the boundary nodes.
-
-        Example:
-            top_free_reduced = np.searchsorted(free_dofs_np, top_dofs)
-            owned_top = top_free_reduced[plan.owned_free_mask[top_free_reduced]]
-            f_ext_local = jnp.zeros(lifter.size_reduced).at[owned_top].set(load)
-        """
-        mask = np.zeros(self._n_free, dtype=bool)
-        mask[self._rstart : self._rend] = True
-        return mask
 
     def make_allgather(self) -> Callable[[Array], Array]:
         """Return a function: x_owned → u_free_global via Allgatherv.
@@ -613,7 +593,7 @@ class AllreducePlan:
         """
         all_ranges = self._comm.allgather((self._rstart, self._rend))
         counts = [re - rs for rs, re in all_ranges]
-        n_free = self._n_free
+        n_free = self._global_size
         _comm = self._comm
 
         def fn(x_owned: Array) -> Array:
@@ -629,7 +609,7 @@ class AllreducePlan:
 
         return fn
 
-    def make_allreduce(self, local_fn: Callable, is_hessian: bool = False) -> Callable:
+    def make_allreduce_owned(self, local_fn: Callable) -> Callable:
         """Return a JIT'd function that allreduces local_fn output → owned rows.
 
         Computes the local function (gradient or hessian) over the full replicated
@@ -659,7 +639,9 @@ class AllreducePlan:
 
 
 def _dof_range(n: int, size: int, rank: int) -> tuple[int, int]:
-    """Calculate the [start, end) range of DOFs owned by a rank."""
+    """Calculate the [start, end) range of DOFs owned by a rank. Blocks are distributed as
+    evenly as possible, with the first `rem` ranks owning one extra DOF if `n` is not divisible by `size`.
+    """
     base = n // size
     rem = n % size
     if rank < rem:
