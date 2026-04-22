@@ -1,5 +1,3 @@
-# Copyright (C) 2025 ETH Zurich (SMEC)
-#
 # This file is part of tatva.
 #
 # tatva is free software: you can redistribute it and/or modify
@@ -48,15 +46,15 @@ from tatva.compound.field import (
     field,
 )
 from tatva.compound.mpi import GlobalView
-from tatva.mesh import PartitionInfo
 
 if TYPE_CHECKING:
+    import scipy.sparse as sps
     from mpi4py import MPI
 
-    from tatva.compound.mpi import GlobalView, _FieldGlobalInfo, _LocalLayout
-    from tatva.mesh import Mesh
+    from tatva.compound.mpi import _FieldGlobalInfo, _LocalLayout
+    from tatva.mesh import Mesh, PartitionInfo
 
-__all__ = ["Compound", "PartitionInfo", "field", "stack_fields"]
+__all__ = ["Compound", "field", "stack_fields"]
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +99,7 @@ class Compound:
     _layout: ClassVar[_LocalLayout | None] = None
     _global_field_info: ClassVar[dict[str, _FieldGlobalInfo] | None] = None
     _comm: ClassVar[MPI.Comm | None] = None
+    _mesh: ClassVar[Mesh | None] = None
 
     def __init_subclass__(
         cls,
@@ -120,14 +119,22 @@ class Compound:
         new_specs = _collect_field_specs(cls.__dict__)
 
         # Separate auto-nodal and other fields for layout calculation
-        auto_nodal_specs: list[tuple[str, _FieldSpec]] = []
+        full_cg_specs: list[tuple[str, _FieldSpec]] = []
+        # full nodal means that field_type is Nodal with node_ids=None, i.e. the
+        # field is defined on all nodes of the mesh and can be stacked together
         other_specs: list[tuple[str, _FieldSpec]] = []
+
+        from tatva.compound.field_types import Nodal
+
         for name, spec in new_specs:
             if _is_auto_nodal(spec):
-                # if the first dimension is AUTO, we always set the field type to NODAL
+                # if the first dimension is AUTO, we always set the space to CG
                 # this allows that the default behavior of AUTO fields is to be nodal
                 spec = replace(spec, field_type=FieldType.NODAL)
-                auto_nodal_specs.append((name, spec))
+
+            space_obj = spec.field_type.get()
+            if isinstance(space_obj, Nodal) and space_obj.node_ids is None:
+                full_cg_specs.append((name, spec))
             else:
                 other_specs.append((name, spec))
 
@@ -135,9 +142,9 @@ class Compound:
         name_to_descriptor: dict[str, Field] = {}
 
         # 1. Process auto-nodal fields first for memory layout (stacked block)
-        if auto_nodal_specs:
+        if full_cg_specs:
             descriptors, total_size = _create_stacked_descriptors(
-                auto_nodal_specs, current_offset, axis=1, mesh=mesh
+                full_cg_specs, current_offset, axis=1, mesh=mesh
             )
             name_to_descriptor.update(descriptors)
             current_offset += total_size
@@ -157,6 +164,7 @@ class Compound:
 
         cls.fields = tuple(all_fields)
         cls.size = current_offset
+        cls._mesh = mesh
 
         # if parallel context is provided, compute layout and set on class
         if mesh is not None and partition_info is not None:
@@ -188,6 +196,21 @@ class Compound:
         if cls._layout is None:
             raise ValueError("Layout not set on Compound class.")
         return cls._layout
+
+    @classmethod
+    def get_sparsity(cls) -> sps.csr_matrix:
+        """Get the sparsity pattern of the compound state as a sparse matrix. Nodal fields
+        are correctly handled to reflect the shared nodes. All other field types are not
+        supported for sparsity extraction yet. For these, only diagonal entries are
+        included. You are expected to modify the sparsity pattern manually to add the
+        correct off-diagonal entries for non-Nodal fields.
+        """
+        from tatva.sparse import create_sparsity_pattern_from_compound
+
+        if cls._mesh is None:
+            raise ValueError("Mesh not set on Compound class, cannot compute sparsity.")
+
+        return create_sparsity_pattern_from_compound(cls, cls._mesh)
 
     def __init__(self, arr: Array | None = None, **kwargs) -> None:
         """Initialize the state with given keyword arguments."""
@@ -330,8 +353,10 @@ def _create_stacked_descriptors(
             )
 
     # 3. Calculate layout
-    stack_layout = []
-    stack_offset = 0
+    stack_layout: list[
+        tuple[str, _FieldSpec | Field, tuple[int, ...], tuple[int, ...], int, int]
+    ] = []
+    stack_offset: int = 0
     for name, item, shape, actual_shape, _promoted in resolved_info:
         extent = actual_shape[actual_axis]
         start = stack_offset
@@ -360,7 +385,6 @@ def _create_stacked_descriptors(
             parent_field=stacked_field_base,
             parent_slice=tuple(parent_slice),
             field_type=item.field_type,
-            nodal_local_to_global=item.nodal_local_to_global,
         )
 
     return descriptors, stacked_total_size
@@ -381,7 +405,6 @@ def _create_standard_descriptors(
             default_factory=spec.default_factory,
             field_type=spec.field_type,
             _slice=s,
-            nodal_local_to_global=spec.nodal_local_to_global,
         )
         current_offset += n
     return descriptors, current_offset - offset
