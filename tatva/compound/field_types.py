@@ -33,6 +33,7 @@ class _FieldType:
 @dataclass
 class Nodal(_FieldType):
     node_ids: Array | NDArray | None = None
+    stack: bool = True
 
 
 @dataclass

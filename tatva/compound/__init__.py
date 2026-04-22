@@ -36,7 +36,6 @@ from jax import Array
 from jax.tree_util import register_pytree_node_class
 
 from tatva.compound.field import (
-    CompoundStackError,
     Field,
     FieldSize,
     FieldStackedView,
@@ -48,7 +47,6 @@ from tatva.compound.field import (
 from tatva.compound.mpi import GlobalView
 
 if TYPE_CHECKING:
-    import scipy.sparse as sps
     from mpi4py import MPI
 
     from tatva.compound.mpi import _FieldGlobalInfo, _LocalLayout
@@ -59,6 +57,14 @@ __all__ = ["Compound", "field", "stack_fields"]
 log = logging.getLogger(__name__)
 
 T_Compound = TypeVar("T_Compound", bound="Compound")
+
+
+class CompoundError(ValueError):
+    """Base error class for Compound-related errors."""
+
+
+class CompoundStackError(CompoundError):
+    pass
 
 
 class Compound:
@@ -94,7 +100,8 @@ class Compound:
     arr: Array
     size: int = 0
 
-    g: GlobalView = GlobalView()
+    _global: GlobalView = GlobalView()
+    _g = _global
 
     _layout: ClassVar[_LocalLayout | None] = None
     _global_field_info: ClassVar[dict[str, _FieldGlobalInfo] | None] = None
@@ -118,8 +125,19 @@ class Compound:
         # Collect all new field specs in order
         new_specs = _collect_field_specs(cls.__dict__)
 
+        # validate all specs have valid names
+        # we cannot allow field names to conflict with existing attributes/methods of the
+        # base Compound class
+        reserved_names = set(dir(Compound))
+        reserved_names.add("arr")
+        for name, _ in new_specs:
+            if name in reserved_names:
+                raise CompoundError(
+                    f"Field name '{name}' is reserved and cannot be used in Compound class."
+                )
+
         # Separate auto-nodal and other fields for layout calculation
-        full_cg_specs: list[tuple[str, _FieldSpec]] = []
+        full_nodal_specs: list[tuple[str, _FieldSpec]] = []
         # full nodal means that field_type is Nodal with node_ids=None, i.e. the
         # field is defined on all nodes of the mesh and can be stacked together
         other_specs: list[tuple[str, _FieldSpec]] = []
@@ -132,9 +150,13 @@ class Compound:
                 # this allows that the default behavior of AUTO fields is to be nodal
                 spec = replace(spec, field_type=FieldType.NODAL)
 
-            space_obj = spec.field_type.get()
-            if isinstance(space_obj, Nodal) and space_obj.node_ids is None:
-                full_cg_specs.append((name, spec))
+            field_type_obj = spec.field_type.get()
+            if (
+                isinstance(field_type_obj, Nodal)
+                and (field_type_obj.node_ids is None)
+                and field_type_obj.stack
+            ):
+                full_nodal_specs.append((name, spec))
             else:
                 other_specs.append((name, spec))
 
@@ -142,9 +164,9 @@ class Compound:
         name_to_descriptor: dict[str, Field] = {}
 
         # 1. Process auto-nodal fields first for memory layout (stacked block)
-        if full_cg_specs:
+        if full_nodal_specs:
             descriptors, total_size = _create_stacked_descriptors(
-                full_cg_specs, current_offset, axis=1, mesh=mesh
+                full_nodal_specs, current_offset, axis=1, mesh=mesh
             )
             name_to_descriptor.update(descriptors)
             current_offset += total_size
@@ -166,20 +188,8 @@ class Compound:
         cls.size = current_offset
         cls._mesh = mesh
 
-        # if parallel context is provided, compute layout and set on class
-        if mesh is not None and partition_info is not None:
-            from tatva.compound.mpi import _layout_from_compound
-
-            if comm is None:
-                from mpi4py import MPI
-
-                comm = MPI.COMM_WORLD
-
-            layout, global_field_info = _layout_from_compound(cls, partition_info, comm)
-
-            cls._comm = comm
-            cls._layout = layout
-            cls._global_field_info = global_field_info
+        if (partition_info is not None) and (comm is not None):
+            cls._set_mpi_context(partition_info, comm)
 
         # register as pytree node for JAX transformations
         register_pytree_node_class(cls)
@@ -192,25 +202,26 @@ class Compound:
         return cls(*children)
 
     @classmethod
-    def get_layout(cls) -> _LocalLayout:
-        if cls._layout is None:
-            raise ValueError("Layout not set on Compound class.")
-        return cls._layout
+    def _set_mpi_context(cls, partition_info: PartitionInfo, comm: MPI.Comm) -> None:
+        if cls._mesh is None:
+            raise CompoundError("Mesh must be set on Compound class to set mpi layout.")
+
+        from tatva.compound.mpi import _layout_from_compound
+
+        layout, global_field_info = _layout_from_compound(cls, partition_info, comm)
+
+        cls._comm = comm
+        cls._layout = layout
+        cls._global_field_info = global_field_info
 
     @classmethod
-    def get_sparsity(cls) -> sps.csr_matrix:
-        """Get the sparsity pattern of the compound state as a sparse matrix. Nodal fields
-        are correctly handled to reflect the shared nodes. All other field types are not
-        supported for sparsity extraction yet. For these, only diagonal entries are
-        included. You are expected to modify the sparsity pattern manually to add the
-        correct off-diagonal entries for non-Nodal fields.
-        """
-        from tatva.sparse import create_sparsity_pattern_from_compound
-
-        if cls._mesh is None:
-            raise ValueError("Mesh not set on Compound class, cannot compute sparsity.")
-
-        return create_sparsity_pattern_from_compound(cls, cls._mesh)
+    def get_layout(cls) -> _LocalLayout:
+        """MPI only. Get the local layout information for this compound state. Requires
+        that the class has been initialized with MPI context (mesh, partition_info,
+        comm)."""
+        if cls._layout is None:
+            raise CompoundError("Layout not set on Compound class.")
+        return cls._layout
 
     def __init__(self, arr: Array | None = None, **kwargs) -> None:
         """Initialize the state with given keyword arguments."""
@@ -326,7 +337,7 @@ def _create_stacked_descriptors(
         shape = item.shape
         if len(shape) > 0 and shape[0] == FieldSize.AUTO:
             if mesh is None:
-                raise ValueError(f"Mesh required for AUTO-sized field: {name}")
+                raise CompoundError(f"Mesh required for AUTO-sized field: {name}")
             shape = (mesh.coords.shape[0], *shape[1:])
 
         # We keep the user's requested shape (with AUTO resolved) for the final descriptor,
@@ -461,7 +472,7 @@ def stack_fields(
 ) -> Callable[[type[T_Compound]], type[T_Compound]]:
     """Class decorator to stack compatible fields into a shared contiguous layout."""
     if not fields:
-        raise ValueError("At least one field name is required.")
+        raise CompoundError("At least one field name is required.")
 
     names = tuple(fields)
 

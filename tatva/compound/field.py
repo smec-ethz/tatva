@@ -34,10 +34,6 @@ if TYPE_CHECKING:
 T_Compound = TypeVar("T_Compound", bound="Compound")
 
 
-class CompoundStackError(ValueError):
-    pass
-
-
 class FieldSize(IntEnum):
     AUTO = -1
 
