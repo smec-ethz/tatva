@@ -25,7 +25,6 @@ from typing import (
     Literal,
     ParamSpec,
     Self,
-    TypeVar,
     overload,
 )
 
@@ -51,7 +50,6 @@ if TYPE_CHECKING:
 __all__ = ["Lifter"]
 
 P = ParamSpec("P")
-RT = TypeVar("RT")
 
 
 @register_pytree_node_class
@@ -414,20 +412,20 @@ def lifted(
     *,
     argnums: tuple[int, ...] | int = 0,
     output: Literal["primal", "dual"] | None = None,
-) -> Callable[[Callable[P, RT]], Callable[Concatenate[Lifter, P], RT]]: ...
+) -> Callable[[Callable[P, Array]], Callable[Concatenate[Lifter, P], Array]]: ...
 
 
 @overload
 def lifted(
-    fn: Callable[P, RT],
+    fn: Callable[P, Array],
     *,
     argnums: tuple[int, ...] | int = 0,
     output: Literal["primal", "dual"] | None = None,
-) -> Callable[Concatenate[Lifter, P], RT]: ...
+) -> Callable[Concatenate[Lifter, P], Array]: ...
 
 
 def lifted(
-    fn: Callable[P, RT] | None = None,
+    fn: Callable[P, Array] | None = None,
     *,
     argnums: tuple[int, ...] | int = 0,
     output: Literal["primal", "dual"] | None = None,
@@ -457,7 +455,7 @@ def lifted(
     if fn is None:
         return lambda f: lifted(f, argnums=argnums, output=output)
 
-    def lifted_fn(lifter: Lifter, *args: P.args, **kwargs: P.kwargs) -> RT:
+    def lifted_fn(lifter: Lifter, *args: P.args, **kwargs: P.kwargs) -> Array:
         lifted_args = list(args)
         for i, arg in enumerate(args):
             if i not in argnums:

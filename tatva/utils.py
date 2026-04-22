@@ -28,6 +28,7 @@ from jax.typing import ArrayLike
 if TYPE_CHECKING:
     from tatva.lifter import Lifter
     from tatva.operator import Operator
+    from tatva.sparse import ColoredMatrix
 
 P = ParamSpec("P")
 
@@ -107,7 +108,7 @@ def virtual_work_to_residual(
         return dwork_dtest(test_arr, *args, **kwargs)
 
     if jit:
-        wrapper = jax.jit(wrapper)  # pyright: ignore[reportAssignmentType]
+        wrapper = jax.jit(wrapper)  # ty:ignore[invalid-assignment]
 
     return wrapper
 
