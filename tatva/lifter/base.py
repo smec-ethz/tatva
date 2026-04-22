@@ -315,7 +315,7 @@ class Lifter:
         """
         return sparsity[self.free_dofs][:, self.free_dofs]
 
-    def augment_layout(
+    def adapt_layout(
         self, layout: _LocalLayout, comm: MPI.Comm
     ) -> tuple[_LocalLayout, Lifter]:
         """MPI only. Augment the local layout to account for all constraints.
