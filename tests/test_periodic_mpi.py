@@ -3,10 +3,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.sparse as sps
+
+from tatva.compound import Compound, field
+from tatva.compound.field_types import FieldType
 from tatva.lifter import Lifter, PeriodicMPI
-from tatva.mpi import _LocalLayout
-from tatva.compound import Compound, field, FieldType
-from tatva.mesh import PartitionInfo, Mesh
+from tatva.mesh import Mesh, PartitionInfo
 
 jax.config.update("jax_enable_x64", True)
 
@@ -62,7 +63,7 @@ def test_periodic_mpi_augment_sparsity_ghost_slave():
     lifter = Lifter(MyState.size, cond)
 
     # Augment layout
-    layout_aug, lifter_aug = lifter.augment_layout(layout, comm)
+    layout_aug, lifter_aug = lifter.adapt_layout(layout, comm)
 
     # Create a local sparsity pattern on Rank 0 connecting node 0 and node 1
     # On Rank 0, local index 0 (global 0) and local index 1 (global 1) are connected.

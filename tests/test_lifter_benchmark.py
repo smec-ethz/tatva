@@ -207,7 +207,9 @@ def test_lifter_total_energy_benchmark():
 
     timings: dict[str, tuple[float, float, float | None, float]] = {}
 
-    print(f"\nBenchmarking lifter with different energy functions [n={op.mesh.coords.shape[0]*2}]:\n")
+    print(
+        f"\nBenchmarking lifter with different energy functions [n={op.mesh.coords.shape[0] * 2}]:\n"
+    )
 
     # first 2, passing lifter as second arg
     for energy, name in zip(

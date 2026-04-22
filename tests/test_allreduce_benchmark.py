@@ -22,13 +22,14 @@ try:
     import mpi4jax  # noqa: F401
     from mpi4py import MPI
 
+    from tatva.mpi import AllreducePlan
+
     HAS_MPI = True
 except ImportError:
     HAS_MPI = False
 
 from tatva import Mesh, Operator, element, sparse
 from tatva.lifter import Fixed, Lifter
-from tatva.mpi import AllreducePlan
 
 pytestmark = pytest.mark.skipif(not HAS_MPI, reason="mpi4py and mpi4jax required")
 
