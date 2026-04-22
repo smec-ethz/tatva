@@ -29,7 +29,9 @@ from numpy.typing import NDArray
 
 from tatva.compound import field_types
 from tatva.compound.field import (
+    FieldStackedView,
     _normalize_index,
+    _reshape_affine_metadata,
     _row_major_strides,
 )
 from tatva.mesh import PartitionInfo
@@ -44,8 +46,9 @@ log = logging.getLogger(__name__)
 
 
 class _FieldGlobalInfo(NamedTuple):
-    global_slice: slice
     global_shape: tuple[int, ...]
+    global_base_offset: int
+    global_strides: tuple[int, ...]
     global_subset: NDArray[np.int32] | None = None
 
 
@@ -95,7 +98,10 @@ class GlobalIndicesView(Generic[T_Compound]):
 
         info = field_info[name]
         return _GlobalFieldIndices(
-            info.global_shape, info.global_slice.start, info.global_subset
+            info.global_shape,
+            info.global_base_offset,
+            info.global_strides,
+            info.global_subset,
         )
 
 
@@ -106,11 +112,12 @@ class _GlobalFieldIndices:
         self,
         shape: tuple[int, ...],
         base_offset: int,
+        strides: tuple[int, ...],
         global_subset: NDArray[np.int32] | None = None,
     ):
         self.shape = shape
         self._base_offset = base_offset
-        self._strides = _row_major_strides(shape)
+        self._strides = strides
         self.global_subset = global_subset
 
     def __getitem__(self, arg) -> Array:
@@ -236,8 +243,17 @@ class GlobalDataView(Generic[T_Compound]):
             if layout is None or field_info is None:
                 raise ValueError("Field global info not available in layout.")
 
-            g_slice, g_shape, _ = field_info[name]
-            return g_arr[g_slice].reshape(g_shape)
+            info = field_info[name]
+            # Use advanced indexing to get the correct view of the global array
+            indices = _GlobalFieldIndices(
+                info.global_shape,
+                info.global_base_offset,
+                info.global_strides,
+                info.global_subset,
+            )
+            # return g_arr[indices[:]].reshape(info.global_shape)
+            # wait, g_arr is flat. indices[:] gives flat indices.
+            return g_arr[indices[:]].reshape(info.global_shape)
 
         raise AttributeError(
             f"'{self._compound.__class__.__name__}' has no field '{name}'"
@@ -257,7 +273,12 @@ def _layout_from_compound(
     partition_info: PartitionInfo,
     comm: MPI.Comm,
 ) -> tuple[_LocalLayout, dict[str, _FieldGlobalInfo]]:
-    """Create a DOF layout from the compound class, partition info, and lifter."""
+    """Create a DOF layout from the compound class and mesh partition info.
+
+    This function performs a collective initialization of the MPI layout for a Compound
+    class. It determines how each field is distributed across ranks, computes global
+    natural DOF indices, and identifies which DOFs are owned by each process.
+    """
     from mpi4py import MPI
 
     from tatva.mpi import _create_dof_layout
@@ -266,8 +287,8 @@ def _layout_from_compound(
     natural_dof_map = np.full(compound_cls.size, -1, dtype=np.int32)
     owned_mask = np.zeros(compound_cls.size, dtype=bool)
 
-    # figure out the total number of nodes globally by finding the max global node
-    # index across all ranks, then add 1 since node indices are zero-based
+    # STEP 1: Determine total global nodes
+    # We find the maximum global node index across all ranks to compute the total count.
     local_max_node = (
         np.max(partition_info.nodes_local_to_global)
         if partition_info.nodes_local_to_global.size > 0
@@ -275,63 +296,118 @@ def _layout_from_compound(
     )
     n_nodes_global = comm.allreduce(local_max_node, op=MPI.MAX) + 1
 
-    # loop over fields in the compound, assigning global DOF indices to owned DOFs and
-    # building the natural DOF map for ghost resolution
+    # Initialization of tracking state for natural global offsets
     current_natural_offset: int = 0
     processed_slices: set[slice] = set()
+    # Cache for global metadata of root fields (base of stacked layouts)
+    # root_slice -> (natural_offset, n_items_global, root_strides)
+    root_global_info: dict[slice, tuple[int, int, tuple[int, ...]]] = {}
     field_global_info: dict[str, _FieldGlobalInfo] = {}
 
+    # STEP 2: Iterate over each field to establish global metadata and DOF mappings
     for name, f in compound_cls.fields:
-        # if stacked fields: they have a _root_slice that identifies the original
-        # slice of the base field; use that for DOF mapping
-        # the cache processed_slices ensures, further fields stacked on the same base
-        # field are skipped
+        # Resolve the root slice. For stacked fields, multiple fields share the same root.
         f_slice = getattr(f, "_root_slice", f._slice)
         f_slice = cast(slice, f_slice)
 
-        space_obj = f.field_type.get()
-
-        # Calculate global shape and natural offset for this field
-        # We do this for every field, even if it shares a root slice
+        field_type_obj = f.field_type.get()
         root_shape = getattr(f, "_root_shape", f.shape)
-        g_subset = None
-        if isinstance(space_obj, field_types.Local):
-            f_size_local = f_slice.stop - f_slice.start
-            f_size_global = comm.allreduce(f_size_local, op=MPI.SUM)
-            n_items_global = f_size_global // int(prod(root_shape[1:]))
-        elif isinstance(space_obj, field_types.Nodal):
-            # For incomplete fields, global size is more complex.
-            # We need to know the total unique nodes in this subset across all ranks.
-            if space_obj.node_ids is not None:
-                subset_global_nodes = np.asarray(space_obj.node_ids)
-                all_subset = comm.allgather(subset_global_nodes)
-                global_subset = np.unique(np.concatenate(all_subset))
-                n_items_global = len(global_subset)
-                g_subset = global_subset
+
+        # STEP 2a: Initialize global metadata for the root field if not already done
+        if f_slice not in root_global_info:
+            if isinstance(field_type_obj, field_types.Local):
+                # Local fields: sum total size across all ranks
+                f_size_local = f_slice.stop - f_slice.start
+                f_size_global = comm.allreduce(f_size_local, op=MPI.SUM)
+                n_items_global = f_size_global // int(prod(root_shape[1:]))
+            elif isinstance(field_type_obj, field_types.Nodal):
+                # Nodal fields: items correspond to unique global nodes
+                if field_type_obj.node_ids is not None:
+                    # Incomplete nodal subset: collective gathering of unique global node IDs
+                    subset_global_nodes = np.asarray(field_type_obj.node_ids)
+                    all_subset = comm.allgather(subset_global_nodes)
+                    global_subset = np.unique(np.concatenate(all_subset))
+                    n_items_global = len(global_subset)
+                else:
+                    n_items_global = n_nodes_global
+            elif isinstance(field_type_obj, field_types.Shared):
+                # Shared fields: replicated size, one owner (rank 0)
+                f_size_global = f_slice.stop - f_slice.start
+                n_items_global = f_size_global // int(prod(root_shape[1:]))
             else:
-                n_items_global = n_nodes_global
-            f_size_global = n_items_global * int(prod(root_shape[1:]))
-        elif isinstance(space_obj, field_types.Shared):
-            f_size_global = f_slice.stop - f_slice.start
-            n_items_global = f_size_global // int(prod(root_shape[1:]))
+                raise TypeError(f"Unsupported field type: {type(field_type_obj)}")
+
+            # Store the global natural start, item count, and row-major strides for the root field
+            root_global_info[f_slice] = (
+                current_natural_offset,
+                n_items_global,
+                _row_major_strides((n_items_global, *root_shape[1:])),
+            )
+
+        root_start, n_items_global, root_strides = root_global_info[f_slice]
+
+        # STEP 2b: Calculate specific global metadata for this field (handles stacked views)
+        # Nodal subset for incomplete fields
+        g_subset = None
+        if (
+            isinstance(field_type_obj, field_types.Nodal)
+            and field_type_obj.node_ids is not None
+        ):
+            subset_global_nodes = np.asarray(field_type_obj.node_ids)
+            all_subset = comm.allgather(subset_global_nodes)
+            g_subset = np.unique(np.concatenate(all_subset))
+
+        if hasattr(f, "_view_slice"):
+            # If the field is a view into a stacked layout, derive its global affine metadata
+            # if it has _view_slice, it must be FieldStackedView
+            f = cast(FieldStackedView, f)
+            g_base_offset = root_start
+            g_root_shape = (n_items_global, *root_shape[1:])
+            g_view_shape = list(g_root_shape)
+            g_strides = list(root_strides)
+
+            # Map the local view slice to global coordinates
+            for axis, sub in enumerate(f._view_slice):
+                if isinstance(sub, int):
+                    idx = sub % g_root_shape[axis]
+                    g_base_offset += idx * g_strides[axis]
+                    g_view_shape[axis] = 1
+                else:  # sub is a slice
+                    start, stop, step = sub.indices(g_root_shape[axis])
+                    g_base_offset += start * g_strides[axis]
+                    g_strides[axis] *= step
+                    g_view_shape[axis] = len(range(start, stop, step))
+
+            # Reshape affine metadata to match the user's requested field shape
+            _, reshaped_strides = _reshape_affine_metadata(
+                tuple(g_view_shape), tuple(g_strides), (n_items_global, *f.shape[1:])
+            )
+            field_global_info[name] = _FieldGlobalInfo(
+                global_shape=(n_items_global, *f.shape[1:]),
+                global_base_offset=g_base_offset,
+                global_strides=reshaped_strides,
+                global_subset=g_subset,
+            )
         else:
-            raise TypeError(f"Unsupported space type: {type(space_obj)}")
+            # Standard field: uses root global metadata directly
+            field_global_info[name] = _FieldGlobalInfo(
+                global_shape=(n_items_global, *f.shape[1:]),
+                global_base_offset=root_start,
+                global_strides=root_strides,
+                global_subset=g_subset,
+            )
 
-        field_global_info[name] = _FieldGlobalInfo(
-            global_slice=slice(
-                current_natural_offset, current_natural_offset + f_size_global
-            ),
-            global_shape=(n_items_global, *f.shape[1:]),
-            global_subset=g_subset,
-        )
-
+        # STEP 2c: Assign local-to-global mappings (Natural DOF map)
+        # Only process each root slice once to avoid redundant work in stacked fields.
         if f_slice in processed_slices:
             continue
         processed_slices.add(f_slice)
 
         f_size_local = f_slice.stop - f_slice.start
+        f_size_global = n_items_global * int(prod(root_shape[1:]))
 
-        if isinstance(space_obj, field_types.Local):
+        if isinstance(field_type_obj, field_types.Local):
+            # Local: assign natural indices using an exclusive scan for contiguous allocation
             rank_offset = comm.exscan(f_size_local, op=MPI.SUM)  # ty:ignore[unresolved-attribute]
             if _rank == 0:
                 rank_offset = 0
@@ -341,22 +417,16 @@ def _layout_from_compound(
             )
             owned_mask[f_slice] = True
 
-        elif isinstance(space_obj, field_types.Nodal):
+        elif isinstance(field_type_obj, field_types.Nodal):
+            # Nodal: map local node IDs to global IDs using partition information
             root_shape = getattr(f, "_root_shape", f.shape)
             n_dofs_per_node = int(np.prod(root_shape[1:]))
 
-            if space_obj.node_ids is not None:
-                # Note: incomplete nodal fields could be lagrange multipliers attached
-                # to a subset of nodes
-                # incomplete subset of nodes, possibly different across ranks. Use the
-                # provided local_to_global mapping to identify the global nodes in
-                # this subset, then build the DOF map from that.
-                subset_global_nodes = np.asarray(space_obj.node_ids)
-                field_dof_map = _dof_map_from_node_map(
-                    subset_global_nodes, n_dofs_per_node
-                )
-                natural_dof_map[f_slice] = current_natural_offset + field_dof_map
+            if field_type_obj.node_ids is not None:
+                # Incomplete Nodal: subset mapping
+                subset_global_nodes = np.asarray(field_type_obj.node_ids)
 
+                # Identify owned nodes within this subset
                 owned_global_nodes = partition_info.nodes_local_to_global[
                     : partition_info.n_owned_nodes
                 ]
@@ -364,18 +434,16 @@ def _layout_from_compound(
                 field_owned_mask = np.repeat(is_owned_node, n_dofs_per_node)
                 owned_mask[f_slice.start : f_slice.stop] = field_owned_mask
 
-                # Re-map natural indices to be contiguous within this field's global space
-                # to avoid massive gaps in the directory array.
-                subset_node_indices = np.searchsorted(
-                    global_subset, subset_global_nodes
-                )
+                # Map subset node IDs to a contiguous global space to minimize directory fragmentation
+                # if we reach this branch, we have set g_subset above. It is a ndarray at this point!
+                subset_node_indices = np.searchsorted(g_subset, subset_global_nodes)  # ty:ignore[no-matching-overload]
                 natural_dof_map[f_slice] = (
                     current_natural_offset
                     + np.repeat(subset_node_indices, n_dofs_per_node) * n_dofs_per_node
                     + np.tile(np.arange(n_dofs_per_node), len(subset_global_nodes))
                 )
             else:
-                # Full nodal field
+                # Full Nodal: map all local nodes
                 field_dof_map = _dof_map_from_node_map(
                     partition_info.nodes_local_to_global, n_dofs_per_node
                 )
@@ -384,16 +452,17 @@ def _layout_from_compound(
                 n_owned_in_field = partition_info.n_owned_nodes * n_dofs_per_node
                 owned_mask[f_slice.start : f_slice.start + n_owned_in_field] = True
 
-        elif isinstance(space_obj, field_types.Shared):
+        elif isinstance(field_type_obj, field_types.Shared):
+            # Shared: replicated across all ranks, owned by Rank 0
             natural_dof_map[f_slice] = current_natural_offset + np.arange(f_size_local)
             if _rank == 0:
                 owned_mask[f_slice] = True
 
+        # Advance global natural offset for the next root field
         current_natural_offset += f_size_global
 
-    # from the natural DOF map and owned mask, build the global DOF layout and routing
-    # tables for ghost exchange
-    # we only count DOFs as owned if they are both owned by the rank and free
+    # STEP 3: Finalize the distributed DOF layout
+    # Construct the global layout, determining routing tables for ghost exchange.
     layout = _create_dof_layout(
         natural_dof_map, owned_mask, current_natural_offset, comm
     )
