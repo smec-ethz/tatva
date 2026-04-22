@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import Callable, NamedTuple, ParamSpec, TypeVar
+from typing import Callable, NamedTuple, ParamSpec, overload
 
 import jax
 import jax.numpy as jnp
@@ -35,7 +35,6 @@ from tatva.sparse import ColoredMatrix
 log = logging.getLogger(__name__)
 
 P = ParamSpec("P")
-_RT = TypeVar("_RT", bound=Array | ColoredMatrix)
 
 
 class _NeighborDofRoute(NamedTuple):
@@ -79,53 +78,6 @@ class _LocalLayout(NamedTuple):
     n_global: int
     owned_mask: NDArray[np.bool_]
     natural_l2g: NDArray[np.int32]
-
-
-def reduce_dof_layout(
-    all_layout: _LocalLayout, free_dofs: NDArray[np.int32], comm: MPI.Comm
-) -> _LocalLayout:
-    """Reduce an all-DOF layout to only include free DOFs."""
-    _dtype = np.int32
-
-    # Mask for free DOFs owned by this rank
-    mask_free = np.zeros(all_layout.n_total, dtype=bool)
-    mask_free[free_dofs] = True
-    mask_free_owned = all_layout.owned_mask[free_dofs]
-    local_to_global_free = all_layout.local_to_global[free_dofs]
-
-    n_owned = int(np.sum(mask_free_owned))
-    n_global = comm.allreduce(n_owned, op=MPI.SUM)
-
-    # New contiguous global indexing for free DOFs
-    n_per_rank = comm.allgather(n_owned)
-    offset = np.cumsum([0] + n_per_rank[:-1])[comm.rank]
-
-    l2g = np.full(free_dofs.size, -1, dtype=_dtype)
-    l2g[mask_free_owned] = offset + np.arange(n_owned, dtype=_dtype)
-
-    # Resolve ghosts using all_layout.l2g as the unique global identifier
-    local_directory = np.full(all_layout.n_global, -1, dtype=_dtype)
-    # The global ID of the owned free DOFs in the ALL-DOF layout
-    local_directory[local_to_global_free[mask_free_owned]] = l2g[mask_free_owned]
-
-    global_directory = np.empty_like(local_directory)
-    comm.Allreduce(local_directory, global_directory, op=MPI.MAX)
-
-    l2g[~mask_free_owned] = global_directory[local_to_global_free[~mask_free_owned]]
-
-    log.debug(
-        f"Rank {comm.rank}: Reduced DOF layout - n_owned={n_owned}, n_total={free_dofs.size}, n_global={n_global}, offset={offset}"
-    )
-
-    return _LocalLayout(
-        local_to_global=l2g,
-        offset=offset,
-        n_owned=n_owned,
-        n_total=free_dofs.size,
-        n_global=n_global,
-        owned_mask=mask_free_owned,
-        natural_l2g=local_to_global_free,
-    )
 
 
 def _create_dof_layout(
@@ -409,15 +361,6 @@ class ExchangePlan:
             raise ValueError("Hessian layout not initialized.")
         return self.hessian_layout.owned_ptr, self.hessian_layout.owned_indices
 
-    def zero_ghost_values(self, nodal_array: Array) -> Array:
-        """Zero out ghost-DOF entries of any quantity assembled via scatter-add.
-
-        Args:
-            nodal_array: array of length compound_cls.size
-        """
-        ghost_indices = jnp.where(~self.layout.owned_mask)[0]
-        return jnp.asarray(nodal_array).at[ghost_indices].set(0.0)
-
     def make_scatter_fwd_set(self) -> Callable[[Array], Array]:
         """Return a JIT'd function: x_owned → u_local.
 
@@ -458,116 +401,111 @@ class ExchangePlan:
 
         return fn
 
+    @overload
     def make_scatter_rev_add(
-        self, local_fn: Callable[P, _RT], is_hessian: bool = False
-    ) -> Callable[P, _RT]:
+        self, local_fn: Callable[P, Array], is_hessian: bool = False
+    ) -> Callable[P, Array]: ...
+
+    @overload
+    def make_scatter_rev_add(
+        self, local_fn: Callable[P, ColoredMatrix], is_hessian: bool = True
+    ) -> Callable[P, ColoredMatrix]: ...
+
+    def make_scatter_rev_add(self, local_fn, is_hessian=False):
         """Return a JIT'd function: u_local → owned_data.
 
-        Computes the local function, then gathers contributions from ghosts.
+        Computes the local function, then gathers contributions from ghosts. If
+        `is_hessian=True`, the local function must return a ColoredMatrix.
         """
-        _comm = self._comm
-
         if is_hessian:
-            if self.hessian_layout is None:
-                raise ValueError("Hessian layout not initialized.")
-
-            self_send = jnp.array(self.hessian_layout.local_send_idx, dtype=jnp.int64)
-            self_recv = jnp.array(self.hessian_layout.recv_local_idx, dtype=jnp.int64)
-            has_self = len(self.hessian_layout.local_send_idx) > 0
-
-            output_size = self.hessian_layout.owned_nnz
-            nbr_send = [
-                jnp.array(d.local_send_idx, dtype=jnp.int64)
-                for d in self.hessian_layout.neighbor_data
-            ]
-            nbr_recv = [
-                jnp.array(d.recv_local_idx, dtype=jnp.int64)
-                for d in self.hessian_layout.neighbor_data
-            ]
-            neighbor_routing_data = self.hessian_layout.neighbor_data
-
-            @jax.jit
-            def fn(*args, **kwargs):
-                result = local_fn(*args, **kwargs)
-                data = result.data
-                owned_data = jnp.zeros(output_size, dtype=data.dtype)
-
-                if has_self:
-                    owned_data = owned_data.at[self_recv].add(data[self_send])
-                for i, info in enumerate(neighbor_routing_data):
-                    nbr = np.int32(info.rank)
-                    send_buf = data[nbr_send[i]]
-                    recv_tmpl = jnp.zeros(info.recv_size, dtype=data.dtype)
-                    recv_vals = mpi4jax.sendrecv(
-                        send_buf, recv_tmpl, source=nbr, dest=nbr, comm=_comm
-                    )
-                    if info.recv_size > 0:
-                        owned_data = owned_data.at[nbr_recv[i]].add(recv_vals)
-                return replace(result, data=owned_data)
-
+            return self._make_scatter_rev_add_hessian(local_fn)
         else:
-            self_send = jnp.array(self._send_dof, dtype=jnp.int64)
-            self_recv = jnp.array(self._recv_dof, dtype=jnp.int64)
-            has_self = len(self._send_dof) > 0
+            return self._make_scatter_rev_add_gradient(local_fn)
 
-            output_size = self.local_size
-            nbr_send = [
-                jnp.array(d.local_send_idx, dtype=jnp.int64)
-                for d in self._neighbor_dof_data
-            ]
-            nbr_recv = [
-                jnp.array(d.recv_local_idx, dtype=jnp.int64)
-                for d in self._neighbor_dof_data
-            ]
-            neighbor_routing_data = self._neighbor_dof_data
+    def _make_scatter_rev_add_hessian(
+        self, local_fn: Callable[P, ColoredMatrix]
+    ) -> Callable[P, ColoredMatrix]:
+        """Return a JIT'd function: local_fn output → owned_data for Hessian case."""
+        if self.hessian_layout is None:
+            raise ValueError("Hessian layout not initialized.")
 
-            @jax.jit
-            def fn(*args, **kwargs):
-                data = local_fn(*args, **kwargs)
-                owned_data = jnp.zeros(output_size, dtype=data.dtype)
+        self_send = jnp.array(self.hessian_layout.local_send_idx, dtype=jnp.int64)
+        self_recv = jnp.array(self.hessian_layout.recv_local_idx, dtype=jnp.int64)
+        has_self = len(self.hessian_layout.local_send_idx) > 0
 
-                if has_self:
-                    owned_data = owned_data.at[self_recv].add(data[self_send])
-                for i, info in enumerate(neighbor_routing_data):
-                    nbr = np.int32(info.rank)
-                    send_buf = data[nbr_send[i]]
-                    recv_tmpl = jnp.zeros(info.recv_size, dtype=data.dtype)
-                    recv_vals = mpi4jax.sendrecv(
-                        send_buf, recv_tmpl, source=nbr, dest=nbr, comm=_comm
-                    )
-                    if info.recv_size > 0:
-                        owned_data = owned_data.at[nbr_recv[i]].add(recv_vals)
-                return owned_data
+        output_size = self.hessian_layout.owned_nnz
+        nbr_send = [
+            jnp.array(d.local_send_idx, dtype=jnp.int64)
+            for d in self.hessian_layout.neighbor_data
+        ]
+        nbr_recv = [
+            jnp.array(d.recv_local_idx, dtype=jnp.int64)
+            for d in self.hessian_layout.neighbor_data
+        ]
+        neighbor_routing_data = self.hessian_layout.neighbor_data
+
+        @jax.jit
+        def fn(*args, **kwargs):
+            result = local_fn(*args, **kwargs)
+            data = result.data
+            owned_data = jnp.zeros(output_size, dtype=data.dtype)
+
+            if has_self:
+                owned_data = owned_data.at[self_recv].add(data[self_send])
+            for i, info in enumerate(neighbor_routing_data):
+                nbr = np.int32(info.rank)
+                send_buf = data[nbr_send[i]]
+                recv_tmpl = jnp.zeros(info.recv_size, dtype=data.dtype)
+                recv_vals = mpi4jax.sendrecv(
+                    send_buf, recv_tmpl, source=nbr, dest=nbr, comm=self._comm
+                )
+                if info.recv_size > 0:
+                    owned_data = owned_data.at[nbr_recv[i]].add(recv_vals)
+
+            # in the Hessian case, it is assumed local_fn returns a ColoredMatrix
+            # which is a dataclass. That's why it is safe to use replace here.
+            return replace(result, data=owned_data)
 
         return fn
 
-    def global_coo_indices(
-        self, local_colored_matrix: ColoredMatrix
-    ) -> tuple[NDArray[np.int32], NDArray[np.int32]]:
-        """Compute the global COO row and column indices for a local ColoredMatrix.
+    def _make_scatter_rev_add_gradient(
+        self, local_fn: Callable[P, Array]
+    ) -> Callable[P, Array]:
+        """Return a JIT'd function: local_fn output → owned_data for gradient case."""
+        self_send = jnp.array(self._send_dof, dtype=jnp.int64)
+        self_recv = jnp.array(self._recv_dof, dtype=jnp.int64)
+        has_self = len(self._send_dof) > 0
 
-        This allows using PETSc's `setPreallocationCOO` and `setValuesCOO` for
-        matrix assembly, bypassing JAX-based MPI routing of Hessian data.
-        Negative indices (e.g., from constrained DOFs) are preserved and correctly
-        ignored by PETSc during assembly.
+        output_size = self.local_size
+        nbr_send = [
+            jnp.array(d.local_send_idx, dtype=jnp.int64)
+            for d in self._neighbor_dof_data
+        ]
+        nbr_recv = [
+            jnp.array(d.recv_local_idx, dtype=jnp.int64)
+            for d in self._neighbor_dof_data
+        ]
+        neighbor_routing_data = self._neighbor_dof_data
 
-        Returns:
-            global_rows: The global row index for each local nonzero.
-            global_cols: The global col index for each local nonzero.
-        """
-        indptr = np.asarray(local_colored_matrix.indptr)
-        indices = np.asarray(local_colored_matrix.indices)
+        @jax.jit
+        def fn(*args, **kwargs):
+            data = local_fn(*args, **kwargs)
+            owned_data = jnp.zeros(output_size, dtype=data.dtype)
 
-        local_rows = np.repeat(
-            np.arange(len(indptr) - 1, dtype=np.int32), np.diff(indptr)
-        )
-        local_cols = indices
+            if has_self:
+                owned_data = owned_data.at[self_recv].add(data[self_send])
+            for i, info in enumerate(neighbor_routing_data):
+                nbr = np.int32(info.rank)
+                send_buf = data[nbr_send[i]]
+                recv_tmpl = jnp.zeros(info.recv_size, dtype=data.dtype)
+                recv_vals = mpi4jax.sendrecv(
+                    send_buf, recv_tmpl, source=nbr, dest=nbr, comm=self._comm
+                )
+                if info.recv_size > 0:
+                    owned_data = owned_data.at[nbr_recv[i]].add(recv_vals)
+            return owned_data
 
-        l2g = np.asarray(self.layout.local_to_global)
-        global_rows = l2g[local_rows]
-        global_cols = l2g[local_cols]
-
-        return global_rows, global_cols
+        return fn
 
 
 class AllreducePlan:
