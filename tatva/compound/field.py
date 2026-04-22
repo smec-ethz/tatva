@@ -24,22 +24,18 @@ from typing import TYPE_CHECKING, Callable, Self, TypeVar, overload
 
 import jax.numpy as jnp
 from jax import Array
-from numpy.typing import NDArray
+
+from tatva.compound.field_types import FieldType, _FieldType
 
 if TYPE_CHECKING:
     from tatva.compound import Compound
+
 
 T_Compound = TypeVar("T_Compound", bound="Compound")
 
 
 class CompoundStackError(ValueError):
     pass
-
-
-class FieldType(IntEnum):
-    LOCAL = 0
-    NODAL = 1
-    SHARED = 2
 
 
 class FieldSize(IntEnum):
@@ -52,8 +48,7 @@ class _FieldSpec:
 
     shape: tuple[int, ...]
     default_factory: Callable | None = None
-    field_type: FieldType = FieldType.LOCAL
-    nodal_local_to_global: Array | None = None
+    field_type: FieldType | _FieldType = FieldType.LOCAL
 
 
 if TYPE_CHECKING:
@@ -61,8 +56,7 @@ if TYPE_CHECKING:
     def field(
         shape: tuple[int, ...],
         default_factory: Callable | None = None,
-        field_type: FieldType = FieldType.LOCAL,
-        nodal_local_to_global: Array | NDArray | None = None,
+        field_type: FieldType | _FieldType = FieldType.LOCAL,
     ) -> Field: ...
 
 else:
@@ -76,8 +70,8 @@ def _normalize_index(
     if not isinstance(arg, tuple):
         arg = (arg,)
     if len(arg) < len(shape):
-        arg = arg + (slice(None),) * (len(shape) - len(arg))
-    return arg
+        arg = arg + (slice(None),) * (len(shape) - len(arg))  # ty:ignore[invalid-assignment]
+    return arg  # ty:ignore[invalid-return-type]
 
 
 def _row_major_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -196,22 +190,19 @@ class Field(_FieldBase):
     """A descriptor to define fields in the State class."""
 
     default_factory: Callable | None
-    field_type: FieldType
-    nodal_local_to_global: Array | NDArray | None
+    field_type: _FieldType | FieldType
 
     def __init__(
         self,
         shape: tuple[int, ...],
         default_factory: Callable | None = None,
-        field_type: FieldType = FieldType.LOCAL,
+        field_type: _FieldType | FieldType = FieldType.LOCAL,
         *,
         _slice: slice | None = None,
-        nodal_local_to_global: Array | NDArray | None = None,
     ) -> None:
         super().__init__(shape, _slice)
         self.default_factory = default_factory
         self.field_type = field_type
-        self.nodal_local_to_global = nodal_local_to_global
 
     def _copy_with_slice(self, _slice: slice) -> Self:
         return self.__class__(
@@ -219,7 +210,6 @@ class Field(_FieldBase):
             default_factory=self.default_factory,
             field_type=self.field_type,
             _slice=_slice,
-            nodal_local_to_global=self.nodal_local_to_global,
         )
 
     @overload
@@ -245,8 +235,7 @@ class FieldStackedView(Field):
         default_factory: Callable | None,
         parent_field: _FieldBase,
         parent_slice: tuple[slice, ...],
-        field_type: FieldType = FieldType.LOCAL,
-        nodal_local_to_global: Array | None = None,
+        field_type: _FieldType | FieldType = FieldType.LOCAL,
     ) -> None:
         if parent_field._slice is None:
             raise RuntimeError(
@@ -256,7 +245,6 @@ class FieldStackedView(Field):
         _FieldBase.__init__(self, shape=shape)
         self.default_factory = default_factory
         self.field_type = field_type
-        self.nodal_local_to_global = nodal_local_to_global
 
         self._root_slice = parent_field._slice
         self._root_shape = parent_field.shape

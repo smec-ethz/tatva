@@ -25,15 +25,20 @@ from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar, cast, overload
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
-from mpi4py import MPI
 from numpy.typing import NDArray
 
-from tatva.compound.field import FieldType, _normalize_index, _row_major_strides
+from tatva.compound import field_types
+from tatva.compound.field import (
+    _normalize_index,
+    _row_major_strides,
+)
 from tatva.mesh import PartitionInfo
-from tatva.mpi import _LocalLayout
 
 if TYPE_CHECKING:
+    from mpi4py import MPI
+
     from tatva.compound import Compound
+    from tatva.mpi import _LocalLayout
 
 log = logging.getLogger(__name__)
 
@@ -253,6 +258,10 @@ def _layout_from_compound(
     comm: MPI.Comm,
 ) -> tuple[_LocalLayout, dict[str, _FieldGlobalInfo]]:
     """Create a DOF layout from the compound class, partition info, and lifter."""
+    from mpi4py import MPI
+
+    from tatva.mpi import _create_dof_layout
+
     _rank = comm.Get_rank()
     natural_dof_map = np.full(compound_cls.size, -1, dtype=np.int32)
     owned_mask = np.zeros(compound_cls.size, dtype=bool)
@@ -280,19 +289,21 @@ def _layout_from_compound(
         f_slice = getattr(f, "_root_slice", f._slice)
         f_slice = cast(slice, f_slice)
 
+        space_obj = f.field_type.get()
+
         # Calculate global shape and natural offset for this field
         # We do this for every field, even if it shares a root slice
         root_shape = getattr(f, "_root_shape", f.shape)
         g_subset = None
-        if f.field_type == FieldType.LOCAL:
+        if isinstance(space_obj, field_types.Local):
             f_size_local = f_slice.stop - f_slice.start
             f_size_global = comm.allreduce(f_size_local, op=MPI.SUM)
             n_items_global = f_size_global // int(prod(root_shape[1:]))
-        elif f.field_type == FieldType.NODAL:
+        elif isinstance(space_obj, field_types.Nodal):
             # For incomplete fields, global size is more complex.
             # We need to know the total unique nodes in this subset across all ranks.
-            if f.nodal_local_to_global is not None:
-                subset_global_nodes = np.asarray(f.nodal_local_to_global)
+            if space_obj.node_ids is not None:
+                subset_global_nodes = np.asarray(space_obj.node_ids)
                 all_subset = comm.allgather(subset_global_nodes)
                 global_subset = np.unique(np.concatenate(all_subset))
                 n_items_global = len(global_subset)
@@ -300,9 +311,11 @@ def _layout_from_compound(
             else:
                 n_items_global = n_nodes_global
             f_size_global = n_items_global * int(prod(root_shape[1:]))
-        elif f.field_type == FieldType.SHARED:
+        elif isinstance(space_obj, field_types.Shared):
             f_size_global = f_slice.stop - f_slice.start
             n_items_global = f_size_global // int(prod(root_shape[1:]))
+        else:
+            raise TypeError(f"Unsupported space type: {type(space_obj)}")
 
         field_global_info[name] = _FieldGlobalInfo(
             global_slice=slice(
@@ -318,7 +331,7 @@ def _layout_from_compound(
 
         f_size_local = f_slice.stop - f_slice.start
 
-        if f.field_type == FieldType.LOCAL:
+        if isinstance(space_obj, field_types.Local):
             rank_offset = comm.exscan(f_size_local, op=MPI.SUM)  # ty:ignore[unresolved-attribute]
             if _rank == 0:
                 rank_offset = 0
@@ -328,17 +341,17 @@ def _layout_from_compound(
             )
             owned_mask[f_slice] = True
 
-        elif f.field_type == FieldType.NODAL:
+        elif isinstance(space_obj, field_types.Nodal):
             root_shape = getattr(f, "_root_shape", f.shape)
             n_dofs_per_node = int(np.prod(root_shape[1:]))
 
-            if f.nodal_local_to_global is not None:
+            if space_obj.node_ids is not None:
                 # Note: incomplete nodal fields could be lagrange multipliers attached
                 # to a subset of nodes
                 # incomplete subset of nodes, possibly different across ranks. Use the
                 # provided local_to_global mapping to identify the global nodes in
                 # this subset, then build the DOF map from that.
-                subset_global_nodes = np.asarray(f.nodal_local_to_global)
+                subset_global_nodes = np.asarray(space_obj.node_ids)
                 field_dof_map = _dof_map_from_node_map(
                     subset_global_nodes, n_dofs_per_node
                 )
@@ -371,7 +384,7 @@ def _layout_from_compound(
                 n_owned_in_field = partition_info.n_owned_nodes * n_dofs_per_node
                 owned_mask[f_slice.start : f_slice.start + n_owned_in_field] = True
 
-        elif f.field_type == FieldType.SHARED:
+        elif isinstance(space_obj, field_types.Shared):
             natural_dof_map[f_slice] = current_natural_offset + np.arange(f_size_local)
             if _rank == 0:
                 owned_mask[f_slice] = True
