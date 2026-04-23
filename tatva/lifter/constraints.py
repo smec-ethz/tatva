@@ -43,7 +43,6 @@ from tatva.lifter.common import (
     RuntimeValueMap,
     _iter_runtime_values,
 )
-from tatva.mesh import PartitionInfo
 
 if TYPE_CHECKING:
     from mpi4py import MPI
@@ -167,7 +166,9 @@ class Constraint:
                 raise LifterError("Constraint is not bound to a lifter")
             runtime_values = self._lifter._runtime_values
 
-        if isinstance(obj, ArrayLike):
+        if isinstance(
+            obj, (Array, np.ndarray, np.bool_, np.number, bool, int, float, complex)
+        ):
             return obj
         elif isinstance(obj, RuntimeValue):
             return obj.get_value(runtime_values)
@@ -244,7 +245,7 @@ class PeriodicMPI(Periodic):
 
     This is a global constraint that is synchronized across all processes. It requests the
     global dof indices of the slaves and masters.
-    You can access these with CompoundCls.g.field_name[global_node, slice, ...].
+    You can access these with `CompoundCls._g.field_name[global_node, slice, ...]`.
     """
 
     def __init__(
