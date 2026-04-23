@@ -135,9 +135,9 @@ class ExchangePlan:
     exchanges of ghost DOF values.
 
     Args:
-    layout:                local DOF layout information for this rank
-    comm:                  MPI communicator
-    local_sparsity_pattern: optional local sparsity pattern for Hessian assembly.
+        layout: local DOF layout information for this rank
+        local_sparsity_pattern: optional local sparsity pattern for Hessian assembly.
+        comm: MPI communicator
     """
 
     def __init__(
@@ -528,10 +528,10 @@ class AllreducePlan:
     or as a simpler starting point before switching to ExchangePlan for better weak scaling.
 
     Args:
-        global_size:             total number of free DOFs in the global linear system
-        global_sparsity_pattern: reduced sprasity pattern of the global Hessian (only needed for
-                                 Hessian assembly; pass None for gradient-only use)
-        comm:                    MPI communicator
+        global_size: total number of free DOFs in the global linear system
+        global_sparsity_pattern: reduced sprasity pattern of the global Hessian (only
+            needed for Hessian assembly; pass None for gradient-only use)
+        comm: MPI communicator
     """
 
     def __init__(

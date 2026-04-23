@@ -56,7 +56,7 @@ T_Compound = TypeVar("T_Compound", bound="Compound")
 
 
 class GlobalView:
-    """Descriptor for the `.g` attribute on Compound instances and classes, providing
+    """Descriptor for the `._g` attribute on Compound instances and classes, providing
     access to global fields and indices."""
 
     @overload
@@ -92,7 +92,7 @@ class GlobalIndicesView(Generic[T_Compound]):
         field_info = self._compound._global_field_info
         if field_info is None or name not in field_info:
             raise AttributeError(
-                f"'{self._compound.__class__.__name__}' has no field '{name}' "
+                f"'{self._compound.__name__}' has no field '{name}' "
                 "or layout not initialized."
             )
 
