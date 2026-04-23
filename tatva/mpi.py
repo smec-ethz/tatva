@@ -27,6 +27,7 @@ import mpi4jax
 import numpy as np
 from jax import Array
 from mpi4py import MPI
+from numpy.ma import indices
 from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 
@@ -131,13 +132,20 @@ def _create_dof_layout(
 
 
 class ExchangePlan:
-    """An MPI communication plan for parallel FEM assembly."""
+    """An MPI communication plan for parallel FEM assembly based on point-to-point
+    exchanges of ghost DOF values.
+
+    Args:
+    layout:                local DOF layout information for this rank
+    comm:                  MPI communicator
+    local_sparsity_pattern: optional local sparsity pattern for Hessian assembly.
+    """
 
     def __init__(
         self,
         layout: _LocalLayout,
         comm: MPI.Comm,
-        local_colored_matrix: ColoredMatrix | None = None,
+        local_sparsity_pattern: csr_matrix | None = None,
     ):
         self._comm = comm
         self._rank = comm.Get_rank()
@@ -152,9 +160,9 @@ class ExchangePlan:
         self._precompute_routing_tables()
 
         self.hessian_layout: _HessianLayout | None = None
-        if local_colored_matrix is not None:
+        if local_sparsity_pattern is not None:
             self.hessian_layout = self._precompute_nnz_routing_tables(
-                local_colored_matrix
+                local_sparsity_pattern
             )
 
     def _precompute_routing_tables(self):
@@ -609,7 +617,17 @@ class AllreducePlan:
 
         return fn
 
-    def make_allreduce_owned(self, local_fn: Callable) -> Callable:
+    @overload
+    def make_allreduce_owned(
+        self, local_fn: Callable[P, Array]
+    ) -> Callable[P, Array]: ...
+
+    @overload
+    def make_allreduce_owned(
+        self, local_fn: Callable[P, ColoredMatrix]
+    ) -> Callable[P, ColoredMatrix]: ...
+
+    def make_allreduce_owned(self, local_fn):
         """Return a JIT'd function that allreduces local_fn output → owned rows.
 
         Computes the local function (gradient or hessian) over the full replicated
@@ -617,20 +635,28 @@ class AllreducePlan:
 
         Args:
             local_fn:   function returning a vector (gradient) or ColoredMatrix (hessian)
-            is_hessian: whether local_fn returns a ColoredMatrix
         """
         _comm = self._comm
         rstart = self._rstart
         rend = self._rend
         nnz_start = self._owned_nnz_start
         nnz_end = self._owned_nnz_start + self._owned_nnz
+        owned_indices = self._owned_indices
+        owned_ptr = self._owned_ptr
+        owned_shape = (rend - rstart, self._global_size)
 
         @jax.jit
         def fn(*args, **kwargs):
             result = local_fn(*args, **kwargs)
             if isinstance(result, ColoredMatrix):
                 data_reduced = mpi4jax.allreduce(result.data, op=MPI.SUM, comm=_comm)
-                return replace(result, data=data_reduced[nnz_start:nnz_end])
+                return replace(
+                    result,
+                    data=data_reduced[nnz_start:nnz_end],
+                    indices=owned_indices,
+                    indptr=owned_ptr,
+                    shape=owned_shape,
+                )
             else:
                 data_reduced = mpi4jax.allreduce(result, op=MPI.SUM, comm=_comm)
                 return data_reduced[rstart:rend]
