@@ -30,8 +30,8 @@ from numpy.typing import NDArray
 from tatva.compound import field_types
 from tatva.compound.field import (
     FieldStackedView,
-    _normalize_index,
     _compute_reshaped_strides,
+    _normalize_index,
     _row_major_strides,
 )
 from tatva.mesh import PartitionInfo
@@ -324,7 +324,10 @@ def _layout_from_compound(
                 # Nodal fields: items correspond to unique global nodes
                 if field_type_obj.node_ids is not None:
                     # Incomplete nodal subset: collective gathering of unique global node IDs
-                    subset_global_nodes = np.asarray(field_type_obj.node_ids)
+                    node_ids_local = np.asarray(field_type_obj.node_ids)
+                    subset_global_nodes = partition_info.nodes_local_to_global[
+                        node_ids_local
+                    ]
                     all_subset = comm.allgather(subset_global_nodes)
                     global_subset = np.unique(np.concatenate(all_subset))
                     n_items_global = len(global_subset)
@@ -353,7 +356,8 @@ def _layout_from_compound(
             isinstance(field_type_obj, field_types.Nodal)
             and field_type_obj.node_ids is not None
         ):
-            subset_global_nodes = np.asarray(field_type_obj.node_ids)
+            node_ids_local = np.asarray(field_type_obj.node_ids)
+            subset_global_nodes = partition_info.nodes_local_to_global[node_ids_local]
             all_subset = comm.allgather(subset_global_nodes)
             g_subset = np.unique(np.concatenate(all_subset))
 
@@ -424,7 +428,10 @@ def _layout_from_compound(
 
             if field_type_obj.node_ids is not None:
                 # Incomplete Nodal: subset mapping
-                subset_global_nodes = np.asarray(field_type_obj.node_ids)
+                node_ids_local = np.asarray(field_type_obj.node_ids)
+                subset_global_nodes = partition_info.nodes_local_to_global[
+                    node_ids_local
+                ]
 
                 # Identify owned nodes within this subset
                 owned_global_nodes = partition_info.nodes_local_to_global[

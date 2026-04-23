@@ -30,12 +30,15 @@ def test_global_indices():
     if rank == 0:
         l2g = np.array([0, 1, 2], dtype=np.int32)
         n_owned = 2
+        local_l_nodes = jnp.array([1])  # global 1 is local 1
     elif rank == 1:
         l2g = np.array([2, 3, 1], dtype=np.int32)
         n_owned = 2
+        local_l_nodes = jnp.array([2, 1])  # global 1 is local 2, global 3 is local 1
     else:
         l2g = np.array([], dtype=np.int32)
         n_owned = 0
+        local_l_nodes = jnp.array([], dtype=int)
 
     p_info = PartitionInfo(nodes_local_to_global=l2g, n_owned_nodes=n_owned)
     mock_mesh = Mesh(
@@ -45,8 +48,8 @@ def test_global_indices():
     class MyState(Compound, mesh=mock_mesh, partition_info=p_info, comm=comm):
         u = field(shape=(FieldSize.AUTO, 2))
         l = field(
-            shape=(2, 1),
-            field_type=Nodal(node_ids=jnp.array([1, 3])),
+            shape=(FieldSize.AUTO, 1),
+            field_type=Nodal(node_ids=local_l_nodes),
         )
 
     # Full field u (global shape 4x2)

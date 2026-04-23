@@ -34,6 +34,7 @@ from typing import (
 )
 
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 
@@ -148,18 +149,23 @@ class Compound:
         from tatva.compound.field_types import Nodal
 
         for name, spec in new_specs:
+            ft_obj = spec.field_type.get()
+
             if _is_auto_nodal(spec):
-                if mesh is None:
-                    raise CompoundError(
-                        f"Mesh must be provided to resolve AUTO size for field '{name}'."
-                    )
                 # if the first dimension is AUTO, we set it to Nodal, and resolve the
-                # shape to be (num_nodes, *rest). this allows that the default behavior of
-                # AUTO fields is to be nodal
-                ft_obj = spec.field_type.get()
+                # shape to be (num_items, *rest).
+                if isinstance(ft_obj, Nodal) and ft_obj.node_ids is not None:
+                    n_items_field = len(ft_obj.node_ids)
+                else:
+                    if mesh is None:
+                        raise CompoundError(
+                            f"Mesh must be provided to resolve AUTO size for field '{name}'."
+                        )
+                    n_items_field = mesh.coords.shape[0]
+
                 spec = replace(
                     spec,
-                    shape=(mesh.coords.shape[0], *spec.shape[1:]),
+                    shape=(n_items_field, *spec.shape[1:]),
                     field_type=ft_obj if isinstance(ft_obj, Nodal) else FieldType.NODAL,
                 )
 
@@ -245,16 +251,22 @@ class Compound:
     @overload
     @classmethod
     def get_sparsity(
-        cls, couple_fields: tuple[Field, ...] = (), block_wise: Literal[False] = False
+        cls,
+        couple_fields: tuple[Field, ...] = (),
+        block_wise: Literal[False] = False,
     ) -> csr_matrix: ...
     @overload
     @classmethod
     def get_sparsity(
-        cls, couple_fields: tuple[Field, ...] = (), block_wise: Literal[True] = True
+        cls,
+        couple_fields: tuple[Field, ...] = (),
+        block_wise: Literal[True] = True,
     ) -> list[list[csr_matrix]]: ...
     @classmethod
     def get_sparsity(
-        cls, couple_fields: tuple[Field, ...] = (), block_wise: bool = False
+        cls,
+        couple_fields: tuple[Field, ...] = (),
+        block_wise: bool = False,
     ) -> csr_matrix | list[list[csr_matrix]]:
         """Create a sparsity pattern automatically from this Compound class and its
         attached mesh.
@@ -271,8 +283,16 @@ class Compound:
         """
         from tatva.sparse._extraction import create_sparsity_pattern_from_compound
 
+        if cls._mesh is None:
+            raise CompoundError(
+                "Mesh must be set on Compound class to create sparsity pattern."
+            )
+
         return create_sparsity_pattern_from_compound(
-            cls, couple_fields, block_wise=block_wise
+            cls,
+            cls._mesh,
+            couple_fields,
+            block_wise=block_wise,
         )
 
     def __init__(self, arr: Array | None = None, **kwargs) -> None:

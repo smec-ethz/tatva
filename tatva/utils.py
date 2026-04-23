@@ -22,8 +22,10 @@ from typing import TYPE_CHECKING, Callable, Concatenate, ParamSpec, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
+from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from tatva.lifter import Lifter
@@ -258,3 +260,21 @@ def _make_projection(
     lhs = jacfwd(_lhs, colored_matrix, color_batch_size=None)
 
     return lhs, _rhs
+
+
+def create_g2l(l2g: NDArray) -> Callable[[NDArray], NDArray]:
+    # this method may not be optimal
+    # it works for now
+    sort_idx = np.argsort(l2g)
+    sorted_l2g = l2g[sort_idx]
+
+    def lookup(global_indices: NDArray) -> NDArray:
+        pos = np.searchsorted(sorted_l2g, global_indices)
+        valid = (pos < len(sorted_l2g)) & (
+            sorted_l2g[np.minimum(pos, len(sorted_l2g) - 1)] == global_indices
+        )
+        local_indices = np.full_like(global_indices, -1)
+        local_indices[valid] = sort_idx[pos[valid]]
+        return local_indices
+
+    return lookup
