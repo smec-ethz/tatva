@@ -5,6 +5,34 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.10.0](https://github.com/smec-ethz/tatva/compare/v0.9.1...v0.10.0) (2026-04-23)
+
+
+### Features
+
+* **constraint:** parallel periodic constraint ([f29ac8b](https://github.com/smec-ethz/tatva/commit/f29ac8b8a757fd2625ab08ff233fc5a2d9aa0e46))
+* **lifter:** add reduce_adjoint to reduce a dual vector ([deead9c](https://github.com/smec-ethz/tatva/commit/deead9c0b4470a9f54bf07de8fcbab5b8a8405fb))
+* **mesh:** add utility function to extract local mesh from global mesh ([0673b38](https://github.com/smec-ethz/tatva/commit/0673b38e34e08c2f456107d502affa40a29efa6b))
+* **mpi:** add a communication plan for partitioned meshes based on Compound layouts ([4e98892](https://github.com/smec-ethz/tatva/commit/4e98892d3653c19c8e8afd194c41605aac03428f))
+* **mpi:** add all reduce plan for parallelization ([79fc638](https://github.com/smec-ethz/tatva/commit/79fc63898ef7437481e78ecfc42c88ebe746d326))
+* **sparse:** add sparsity pattern augmentation with lifter constraints ([54daf22](https://github.com/smec-ethz/tatva/commit/54daf228e22f405635dbf2231ac9e5d776be00e0))
+
+
+### Bug Fixes
+
+* **compound:** add helper to return global dof indices for Compound fields ([e4abd97](https://github.com/smec-ethz/tatva/commit/e4abd97f67c7e6eebdd09f7184029a1024d4cdfd))
+* **compound:** allow inheritance of Compound subclasses ([1dc9e51](https://github.com/smec-ethz/tatva/commit/1dc9e5126a1d6545d1df50a68dc843f9522bdad2))
+* **compound:** clarify stacking logic & introduce AUTO sizing ([3a3168a](https://github.com/smec-ethz/tatva/commit/3a3168af7ed61b27294f6d2b9db89502d1f2139b))
+* **compound:** correct global indexing into stacked fields ([8bae34d](https://github.com/smec-ethz/tatva/commit/8bae34d1faee2072c3e2dd6ce99090dad1bd26bb))
+* **compound:** prevent fields with reserved names, prevent stacking with stack=False ([5e4947e](https://github.com/smec-ethz/tatva/commit/5e4947ea92adced601d7ae0a40f67414438b1528))
+* **compound:** remove metaclass and move initialization to init_subclass ([1dc9e51](https://github.com/smec-ethz/tatva/commit/1dc9e5126a1d6545d1df50a68dc843f9522bdad2))
+* **compound:** type of fields with AUTO in shape are NODAL by default ([356b4a0](https://github.com/smec-ethz/tatva/commit/356b4a032cd3b74b99b8f48b21fcb7f7cecfa2e0))
+* **constraint:** bug in sparsity pattern for periodic constraint ([e1069f8](https://github.com/smec-ethz/tatva/commit/e1069f846250b9ea581a71d2f50d01ff84b7f8a9))
+* **mpi:** add function to reduce a dof layout (for lifter) ([32173d0](https://github.com/smec-ethz/tatva/commit/32173d09cf7dfd761125cc4b6c278bffdd1e47fa))
+* **mpi:** exchange plan accepts sparsity pattern, allreduce also replace indptr, indices ([3dcd509](https://github.com/smec-ethz/tatva/commit/3dcd50927593ce53d8a5762187aa77ea1413dae2))
+* **mpi:** makes hessian sparsity as optional arg in allreduce ([a1d4b6b](https://github.com/smec-ethz/tatva/commit/a1d4b6b5a33a160172518a016782986a0c01036b))
+* **test:** update test ([79fc638](https://github.com/smec-ethz/tatva/commit/79fc63898ef7437481e78ecfc42c88ebe746d326))
+
 ## [0.9.1](https://github.com/smec-ethz/tatva/compare/v0.9.0...v0.9.1) (2026-04-12)
 
 
