@@ -27,6 +27,8 @@ from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
 from tatva import Mesh
+from tatva.mesh import PartitionInfo
+from tatva.utils import create_g2l
 
 if TYPE_CHECKING:
     from tatva.compound import Compound, Field
@@ -292,6 +294,7 @@ def augment_sparsity_with_lifter(
 
 def create_sparsity_pattern_from_compound(
     compound_cls: type[Compound],
+    mesh: Mesh,
     couple_fields: tuple[Field, ...] = (),
     block_wise: bool = False,
 ) -> sps.csr_matrix | list[list[sps.csr_matrix]]:
@@ -304,18 +307,13 @@ def create_sparsity_pattern_from_compound(
 
     Args:
         compound_cls: The Compound class defining the state layout.
+        mesh: The Mesh object attached to the Compound.
         couple_fields: Tuple of fields to fully couple. Only nodal fields are supported.
         block_wise: If True, return the pattern as a list of lists of sparse matrices
             corresponding to the compound fields/blocks. Stacked fields are one block.
     """
     from tatva.compound import FieldStackedView
     from tatva.compound.field_types import Nodal
-
-    mesh = compound_cls._mesh
-    if mesh is None:
-        raise ValueError(
-            "Compound class must have a mesh to create a sparsity pattern."
-        )
 
     n_nodes = mesh.coords.shape[0]
     num_elements = mesh.elements.shape[0]
@@ -343,9 +341,11 @@ def create_sparsity_pattern_from_compound(
                 if field_type_obj.node_ids is None:
                     node_dofs[:] = indices.reshape(n_nodes, dofs_per_item)
                 else:
-                    node_dofs[field_type_obj.node_ids] = indices.reshape(
+                    node_ids = np.asarray(field_type_obj.node_ids, dtype=np.int32)
+                    valid_nodes = (node_ids >= 0) & (node_ids < n_nodes)
+                    node_dofs[node_ids[valid_nodes]] = indices.reshape(
                         -1, dofs_per_item
-                    )
+                    )[valid_nodes]
 
                 # Map nodes to elements
                 f_element_dofs = node_dofs[mesh.elements].reshape(num_elements, -1)

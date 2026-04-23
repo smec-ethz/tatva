@@ -22,7 +22,6 @@ from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Hashable,
     Self,
     TypeVar,
@@ -35,7 +34,6 @@ import numpy as np
 import scipy.sparse as sps
 from jax import Array
 from jax.typing import ArrayLike
-from numpy.typing import NDArray
 
 from tatva.lifter.common import (
     LifterError,
@@ -43,6 +41,7 @@ from tatva.lifter.common import (
     RuntimeValueMap,
     _iter_runtime_values,
 )
+from tatva.utils import create_g2l
 
 if TYPE_CHECKING:
     from mpi4py import MPI
@@ -219,24 +218,6 @@ class Periodic(Constraint):
     def apply_transpose(self, r_full: Array) -> Array:
         """Add residuals from constrained ``dofs`` to ``master_dofs``."""
         return r_full.at[self.master_dofs].add(r_full[self.dofs]).at[self.dofs].set(0.0)
-
-
-def create_g2l(l2g: NDArray) -> Callable[[NDArray], NDArray]:
-    # this method may not be optimal
-    # it works for now
-    sort_idx = np.argsort(l2g)
-    sorted_l2g = l2g[sort_idx]
-
-    def lookup(global_indices: NDArray) -> NDArray:
-        pos = np.searchsorted(sorted_l2g, global_indices)
-        valid = (pos < len(sorted_l2g)) & (
-            sorted_l2g[np.minimum(pos, len(sorted_l2g) - 1)] == global_indices
-        )
-        local_indices = np.full_like(global_indices, -1)
-        local_indices[valid] = sort_idx[pos[valid]]
-        return local_indices
-
-    return lookup
 
 
 class PeriodicMPI(Periodic):

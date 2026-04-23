@@ -182,17 +182,17 @@ def test_exchange_plan_incomplete_nodal():
         p_info = PartitionInfo(
             nodes_local_to_global=np.array([0, 1], dtype=np.int32), n_owned_nodes=1
         )
-        subset = np.array([0], dtype=np.int32)
+        subset_local = np.array([0], dtype=np.int32)
     elif rank == 1:
         p_info = PartitionInfo(
             nodes_local_to_global=np.array([1, 2], dtype=np.int32), n_owned_nodes=2
         )
-        subset = np.array([2], dtype=np.int32)
+        subset_local = np.array([1], dtype=np.int32)  # global 2 is local index 1
     else:
         p_info = PartitionInfo(
             nodes_local_to_global=np.array([], dtype=np.int32), n_owned_nodes=0
         )
-        subset = np.array([], dtype=np.int32)
+        subset_local = np.array([], dtype=np.int32)
 
     mock_mesh = Mesh(
         coords=jnp.zeros((len(p_info.nodes_local_to_global), 1)),
@@ -202,8 +202,8 @@ def test_exchange_plan_incomplete_nodal():
     class MyState(Compound, mesh=mock_mesh, partition_info=p_info, comm=comm):
         u = field(shape=(FieldSize.AUTO, 1), field_type=FieldType.NODAL)
         l = field(
-            shape=(len(subset), 1),
-            field_type=Nodal(node_ids=subset),
+            shape=(FieldSize.AUTO, 1),
+            field_type=Nodal(node_ids=subset_local),
         )
 
     lifter = Lifter(MyState.size)
