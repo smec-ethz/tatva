@@ -2,22 +2,22 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from scipy.sparse import csr_matrix
+
+from tatva import sparse
+from tatva.mesh import Mesh
 
 jax.config.update("jax_enable_x64", True)
 
 try:
-    import mpi4jax  # noqa: F401
     from mpi4py import MPI
+
+    from tatva.mpi import AllreducePlan
 
     HAS_MPI = True
 except ImportError:
     HAS_MPI = False
 
-from tatva import sparse
-from tatva.mesh import Mesh
-from tatva.mpi import (
-    AllreducePlan,
-)
 
 pytestmark = pytest.mark.skipif(not HAS_MPI, reason="mpi4py and mpi4jax required")
 
@@ -42,10 +42,8 @@ def test_allreduce_plan_allgather():
     allgather = plan.make_allgather()
 
     if rank == 0:
-        print(f"Rank 0 {plan.local_size}, {plan.global_size}")
         x_owned = jnp.ones(plan.local_size)
     else:
-        print(f"Rank 1 {plan.local_size}, {plan.global_size}")
         x_owned = jnp.ones(plan.local_size) * 40.0
 
     u_full = allgather(x_owned)
@@ -82,8 +80,6 @@ def test_allreduce_plan_grad():
     if rank == 1:
         u_full = jnp.array([0.0, 0.0, 0.25, 0.25, 4.0, 5.0])
     result = grad_fn(u_full)
-    print(f"Rank {rank} local_fn output: {local_fn(u_full)}")
-    print(f"Rank {rank} result: {result}")
 
     expected_full = jnp.array([0.0, 1.0, 2.25, 3.25, 4.0, 5.0])
     if rank == 0:
@@ -94,6 +90,11 @@ def test_allreduce_plan_grad():
 
 def test_allreduce_plan_hessian():
     """make_allreduce sums local contributions and returns the owned slice."""
+
+    from jax import Array
+
+    from tatva.sparse import ColoredMatrix
+
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     if comm.Get_size() < 2:
@@ -107,30 +108,49 @@ def test_allreduce_plan_hessian():
         mesh, n_dofs_per_node=N_DOFS_PER_NODE
     )
 
+    indptr = np.array([0, 1, 2, 3, 4, 5])
+    indices = np.array([0, 1, 2, 3, 4])
+    sparsity_pattern = csr_matrix(
+        (np.ones_like(indices), indices, indptr), shape=(5, 5)
+    )
+
+    cm = None
+    if rank == 0:
+        cm = ColoredMatrix.from_csr(
+            csr_matrix(
+                ([1.0, 1.0, 1.0, 1.0, 0.0], indices, indptr),
+                shape=sparsity_pattern.shape,
+            )
+        )
+    elif rank == 1:
+        cm = ColoredMatrix.from_csr(
+            csr_matrix(
+                ([0.0, 0.0, 0.0, 1.0, 1.0], indices, indptr),
+                shape=sparsity_pattern.shape,
+            )
+        )
+    else:
+        pytest.skip("only 2 ranks supported for this test")
+
     plan = AllreducePlan(global_sparsity_pattern=sparsity_pattern, comm=comm)
 
-    def local_fn(K_full):
-        return K_full
+    def local_fn(u: Array) -> ColoredMatrix:
+        return cm
 
     hessian_fn = plan.make_allreduce_owned(local_fn)
-    K_full = jnp.zeros((6, 6))
-    if rank == 0:
-        K_full = K_full.at[:3, :3].set(jnp.eye(3))
-    if rank == 1:
-        K_full = K_full.at[-3:, -3:].set(jnp.eye(3) * 0.25)
-    result = hessian_fn(K_full)
-    print(f"Rank {rank} local_fn output: {local_fn(K_full)}")
-    print(f"Rank {rank} result: {result.shape}")
 
-    expected_full = jnp.zeros((6, 6))
-    expected_full_0 = expected_full.at[:3, :3].set(jnp.eye(3))
-    expected_full_1 = expected_full.at[-3:, -3:].set(jnp.eye(3) * 0.25)
-    expected_full = expected_full_0 + expected_full_1
+    result = hessian_fn(jnp.zeros(6))
+
+    assert isinstance(result, ColoredMatrix)
 
     if rank == 0:
-        np.testing.assert_allclose(result, expected_full[:3, :])
+        np.testing.assert_allclose(result.data, [1.0, 1.0, 1.0])
+        np.testing.assert_allclose(result.indices, [0, 1, 2])
+        np.testing.assert_allclose(result.indptr, [0, 1, 2, 3])
     elif rank == 1:
-        np.testing.assert_allclose(result, expected_full[-3:, :])
+        np.testing.assert_allclose(result.data, [2.0, 1.0])
+        np.testing.assert_allclose(result.indices, [3, 4])
+        np.testing.assert_allclose(result.indptr, [0, 1, 2])
 
 
 if __name__ == "__main__":
