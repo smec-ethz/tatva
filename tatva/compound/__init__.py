@@ -26,9 +26,11 @@ from typing import (
     ClassVar,
     Generator,
     Generic,
+    Literal,
     Self,
     Sequence,
     TypeVar,
+    overload,
 )
 
 import jax.numpy as jnp
@@ -48,6 +50,7 @@ from tatva.compound.mpi import GlobalView
 
 if TYPE_CHECKING:
     from mpi4py import MPI
+    from scipy.sparse import csr_matrix
 
     from tatva.compound.mpi import _FieldGlobalInfo, _LocalLayout
     from tatva.mesh import Mesh, PartitionInfo
@@ -222,6 +225,39 @@ class Compound:
         if cls._layout is None:
             raise CompoundError("Layout not set on Compound class.")
         return cls._layout
+
+    @overload
+    @classmethod
+    def get_sparsity(
+        cls, couple_fields: tuple[Field, ...] = (), block_wise: Literal[False] = False
+    ) -> csr_matrix: ...
+    @overload
+    @classmethod
+    def get_sparsity(
+        cls, couple_fields: tuple[Field, ...] = (), block_wise: Literal[True] = True
+    ) -> list[list[csr_matrix]]: ...
+    @classmethod
+    def get_sparsity(
+        cls, couple_fields: tuple[Field, ...] = (), block_wise: bool = False
+    ) -> csr_matrix | list[list[csr_matrix]]:
+        """Create a sparsity pattern automatically from this Compound class and its
+        attached mesh.
+
+        Stacked nodal fields are fully coupled within elements. Other nodal fields can be
+        coupled if wanted. All other fields (Local, Shared) are only connected to themselves
+        (diagonal entries). For non-trivial couplings, you must create the sparsity
+        pattern manually.
+
+        Args:
+            couple_fields: Tuple of fields to fully couple. Only nodal fields are supported.
+            block_wise: If True, return the pattern as a list of lists of sparse matrices
+                corresponding to the compound fields/blocks. Stacked fields are one block.
+        """
+        from tatva.sparse._extraction import create_sparsity_pattern_from_compound
+
+        return create_sparsity_pattern_from_compound(
+            cls, couple_fields, block_wise=block_wise
+        )
 
     def __init__(self, arr: Array | None = None, **kwargs) -> None:
         """Initialize the state with given keyword arguments."""

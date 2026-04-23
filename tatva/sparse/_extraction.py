@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -28,6 +29,7 @@ from numpy.typing import NDArray
 from tatva import Mesh
 
 if TYPE_CHECKING:
+    from tatva.compound import Compound, Field
     from tatva.lifter import Lifter
 
 
@@ -286,3 +288,144 @@ def augment_sparsity_with_lifter(
         lifter: Lifter containing constraints.
     """
     return lifter.augment_sparsity(sparsity)
+
+
+def create_sparsity_pattern_from_compound(
+    compound_cls: type[Compound],
+    couple_fields: tuple[Field, ...] = (),
+    block_wise: bool = False,
+) -> sps.csr_matrix | list[list[sps.csr_matrix]]:
+    """Create a sparsity pattern automatically from a Compound class and its attached
+    mesh.
+
+    Stacked nodal fields are fully coupled within elements. Other nodal fields can be
+    coupled if wanted. All other fields (Local, Shared) are only connected to themselves
+    (diagonal entries).
+
+    Args:
+        compound_cls: The Compound class defining the state layout.
+        couple_fields: Tuple of fields to fully couple. Only nodal fields are supported.
+        block_wise: If True, return the pattern as a list of lists of sparse matrices
+            corresponding to the compound fields/blocks. Stacked fields are one block.
+    """
+    from tatva.compound import FieldStackedView
+    from tatva.compound.field_types import Nodal
+
+    mesh = compound_cls._mesh
+    if mesh is None:
+        raise ValueError(
+            "Compound class must have a mesh to create a sparsity pattern."
+        )
+
+    n_nodes = mesh.coords.shape[0]
+    num_elements = mesh.elements.shape[0]
+
+    couple_fields_set = set(couple_fields)
+    main_coupling_list: list[NDArray[np.int32]] = []
+    independent_nodal_list: list[NDArray[np.int32]] = []
+    diagonal_dofs_list: list[NDArray[np.int32]] = []
+
+    for name, f in compound_cls.fields:
+        field_type_obj = f.field_type.get()
+        if isinstance(field_type_obj, Nodal):
+            # Map field DOFs to nodes
+            indices = np.asarray(f.indices(slice(None)))
+            n_items = (
+                len(field_type_obj.node_ids)
+                if field_type_obj.node_ids is not None
+                else n_nodes
+            )
+
+            if n_items > 0:
+                dofs_per_item = indices.size // n_items
+
+                node_dofs = np.full((n_nodes, dofs_per_item), -1, dtype=np.int32)
+                if field_type_obj.node_ids is None:
+                    node_dofs[:] = indices.reshape(n_nodes, dofs_per_item)
+                else:
+                    node_dofs[field_type_obj.node_ids] = indices.reshape(
+                        -1, dofs_per_item
+                    )
+
+                # Map nodes to elements
+                f_element_dofs = node_dofs[mesh.elements].reshape(num_elements, -1)
+
+                is_stacked = isinstance(f, FieldStackedView)
+                is_in_couple = f in couple_fields_set
+
+                if is_stacked or is_in_couple:
+                    main_coupling_list.append(f_element_dofs)
+                else:
+                    independent_nodal_list.append(f_element_dofs)
+        else:
+            warnings.warn(
+                f"Custom space detected for field '{name}'. Only diagonal entries added "
+                "to the sparsity pattern. Please provide your own sparsity pattern if "
+                "cross-coupling is required.",
+                UserWarning,
+            )
+            diagonal_dofs_list.append(np.asarray(f.indices(slice(None))).flatten())
+
+    K_shape = (compound_cls.size, compound_cls.size)
+    all_rows = []
+    all_cols = []
+
+    if main_coupling_list:
+        cg_element_dofs = np.concatenate(main_coupling_list, axis=1)
+        num_elements, num_dofs_per_element = cg_element_dofs.shape
+
+        row_indices = np.repeat(cg_element_dofs, num_dofs_per_element, axis=1).flatten()
+        col_indices = np.tile(cg_element_dofs, (1, num_dofs_per_element)).flatten()
+
+        # Filter out -1 (from incomplete Nodal fields)
+        valid = (row_indices >= 0) & (col_indices >= 0)
+        all_rows.append(row_indices[valid])
+        all_cols.append(col_indices[valid])
+
+    for indep_dofs in independent_nodal_list:
+        num_elements, num_dofs_per_element = indep_dofs.shape
+        row_indices = np.repeat(indep_dofs, num_dofs_per_element, axis=1).flatten()
+        col_indices = np.tile(indep_dofs, (1, num_dofs_per_element)).flatten()
+
+        valid = (row_indices >= 0) & (col_indices >= 0)
+        all_rows.append(row_indices[valid])
+        all_cols.append(col_indices[valid])
+
+    if diagonal_dofs_list:
+        diag_dofs = np.concatenate(diagonal_dofs_list)
+        all_rows.append(diag_dofs)
+        all_cols.append(diag_dofs)
+
+    if not all_rows:
+        full_matrix = sps.csr_matrix(K_shape, dtype=np.int8)
+    else:
+        rows = np.concatenate(all_rows)
+        cols = np.concatenate(all_cols)
+
+        # Fast deduplication using linearized indices
+        num_cols = K_shape[1]
+        linear_indices = rows.astype(np.int64) * num_cols + cols.astype(np.int64)
+        sorted_unique_linear = np.unique(linear_indices)
+
+        sorted_rows = sorted_unique_linear // num_cols
+        sorted_cols = sorted_unique_linear % num_cols
+
+        full_matrix = sps.csr_matrix(
+            (np.ones(sorted_rows.shape[0], dtype=np.int8), (sorted_rows, sorted_cols)),
+            shape=K_shape,
+        )
+
+    if not block_wise:
+        return full_matrix
+
+    # Identify blocks (unique root slices)
+    root_slices = []
+    seen = set()
+    for _, f in compound_cls.fields:
+        s = getattr(f, "_root_slice", getattr(f, "_slice", None))
+        if s is not None and s not in seen:
+            root_slices.append(s)
+            seen.add(s)
+    root_slices.sort(key=lambda s: s.start)
+
+    return [[full_matrix[s1, s2] for s2 in root_slices] for s1 in root_slices]
