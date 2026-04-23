@@ -231,6 +231,66 @@ class Mesh:
         return coords, jnp.array(elements, dtype=jnp.int32)
 
 
+def extract_local_mesh(
+    mesh_global: Mesh, element_partition: NDArray, part: int
+) -> tuple[Mesh, PartitionInfo]:
+    """Return the local mesh, and node-ownership mask.
+
+    Nodes are ordered such that OWNED nodes come first, followed by GHOST nodes.
+    This "Owned-First" ordering aligns with PETSc's VecGhost convention and
+    allows for zero-copy local access.
+
+    Args:
+        mesh_global: the global mesh
+        element_partition: int array of shape (n_elements,) mapping each element to its
+            owning partition
+        part: this partition index. Usually, you would pass the MPI rank here.
+
+    Returns:
+        A tuple of (local_mesh, partition_info) where: local_mesh is a Mesh object
+        containing only the elements and nodes relevant to this partition; partition_info
+        contains metadata about node ownership and global indexing.
+    """
+    elements = mesh_global.elements
+    coords = mesh_global.coords
+
+    local_elements_global = elements[element_partition == part]
+    all_local_nodes_global = np.unique(local_elements_global.ravel())
+
+    # Determine ownership for all global nodes
+    # A node is owned by the rank with the minimum partition index among
+    # all ranks whose elements touch it.
+    node_owner = np.full(len(coords), element_partition.max() + 1, dtype=np.int32)
+    for col in range(elements.shape[1]):
+        np.minimum.at(node_owner, elements[:, col], element_partition)
+
+    # Separate owned and ghost nodes among those present in this partition
+    is_owned_global = node_owner[all_local_nodes_global] == part
+    owned_nodes_global = all_local_nodes_global[is_owned_global]
+    ghost_nodes_global = all_local_nodes_global[~is_owned_global]
+
+    # Reorder local nodes: Owned nodes FIRST, then Ghost nodes
+    local_nodes_global = np.concatenate([owned_nodes_global, ghost_nodes_global])
+
+    # Map global to local indices
+    node_g2l = np.full(len(coords), -1, dtype=np.int32)
+    node_g2l[local_nodes_global] = np.arange(len(local_nodes_global), dtype=np.int32)
+
+    coords_local = coords[local_nodes_global]
+    elements_local = node_g2l[local_elements_global]
+
+    return (
+        Mesh(
+            coords=coords_local,
+            elements=elements_local,
+        ),
+        PartitionInfo(
+            nodes_local_to_global=local_nodes_global,
+            n_owned_nodes=len(owned_nodes_global),
+        ),
+    )
+
+
 @jax.jit
 def find_containing_polygons(points: Array, polygons: Array) -> Array:
     """
