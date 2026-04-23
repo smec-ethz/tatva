@@ -4,9 +4,6 @@ import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
 
-from tatva import sparse
-from tatva.mesh import Mesh
-
 jax.config.update("jax_enable_x64", True)
 
 try:
@@ -31,14 +28,7 @@ def test_allreduce_plan_allgather():
     if comm.Get_size() < 2:
         pytest.skip("requires at least 2 MPI ranks")
 
-    coords = jnp.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
-    elements = jnp.array([[0, 1], [1, 2]])  # 2 elements: (0-1) and (1-2)
-    mesh = Mesh(coords=coords, elements=elements)
-    sparsity_pattern = sparse.create_sparsity_pattern(
-        mesh, n_dofs_per_node=N_DOFS_PER_NODE
-    )
-
-    plan = AllreducePlan(global_sparsity_pattern=sparsity_pattern, comm=comm)
+    plan = AllreducePlan(global_size=6, comm=comm)
     allgather = plan.make_allgather()
 
     if rank == 0:
@@ -57,15 +47,7 @@ def test_allreduce_plan_grad():
     if comm.Get_size() < 2:
         pytest.skip("requires at least 2 MPI ranks")
 
-    coords = jnp.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
-    elements = jnp.array([[0, 1], [1, 2]])  # 2 elements: (0-1) and (1-2)
-    mesh = Mesh(coords=coords, elements=elements)
-
-    sparsity_pattern = sparse.create_sparsity_pattern(
-        mesh, n_dofs_per_node=N_DOFS_PER_NODE
-    )
-
-    plan = AllreducePlan(global_sparsity_pattern=sparsity_pattern, comm=comm)
+    plan = AllreducePlan(global_size=6, comm=comm)
 
     # local_fn returns u_full * (rank+1): rank 0 contributes *1, rank 1 *2
     # allreduce sum → u_full * 3, then each rank slices its owned rows
@@ -100,14 +82,6 @@ def test_allreduce_plan_hessian():
     if comm.Get_size() < 2:
         pytest.skip("requires at least 2 MPI ranks")
 
-    coords = jnp.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
-    elements = jnp.array([[0, 1], [1, 2]])  # 2 elements: (0-1) and (1-2)
-    mesh = Mesh(coords=coords, elements=elements)
-
-    sparsity_pattern = sparse.create_sparsity_pattern(
-        mesh, n_dofs_per_node=N_DOFS_PER_NODE
-    )
-
     indptr = np.array([0, 1, 2, 3, 4, 5])
     indices = np.array([0, 1, 2, 3, 4])
     sparsity_pattern = csr_matrix(
@@ -132,12 +106,14 @@ def test_allreduce_plan_hessian():
     else:
         pytest.skip("only 2 ranks supported for this test")
 
-    plan = AllreducePlan(global_sparsity_pattern=sparsity_pattern, comm=comm)
+    plan = AllreducePlan(
+        global_size=5, global_sparsity_pattern=sparsity_pattern, comm=comm
+    )
 
     def local_fn(u: Array) -> ColoredMatrix:
         return cm
 
-    hessian_fn = plan.make_allreduce_owned(local_fn)
+    hessian_fn = plan.make_allreduce_owned(local_fn, is_hessian=True)
 
     result = hessian_fn(jnp.zeros(6))
 

@@ -143,8 +143,9 @@ class ExchangePlan:
     def __init__(
         self,
         layout: _LocalLayout,
-        comm: MPI.Comm,
         local_sparsity_pattern: csr_matrix | None = None,
+        *,
+        comm: MPI.Comm,
     ):
         self._comm = comm
         self._rank = comm.Get_rank()
@@ -233,7 +234,7 @@ class ExchangePlan:
         self._recv_dof = (l2g[self._send_dof] - self._rstart).astype(np.int32)
 
     def _precompute_nnz_routing_tables(
-        self, local_colored: ColoredMatrix
+        self, local_colored: csr_matrix
     ) -> _HessianLayout:
         """Precompute routing tables for Hessian assembly without global sparsity."""
         indptr = np.asarray(local_colored.indptr)
@@ -527,33 +528,49 @@ class AllreducePlan:
     or as a simpler starting point before switching to ExchangePlan for better weak scaling.
 
     Args:
-        global_sparsity_pattern: reduced sprasity pattern of the global Hessian
-        comm:                  MPI communicator
+        global_size:             total number of free DOFs in the global linear system
+        global_sparsity_pattern: reduced sprasity pattern of the global Hessian (only needed for
+                                 Hessian assembly; pass None for gradient-only use)
+        comm:                    MPI communicator
     """
 
     def __init__(
         self,
-        global_sparsity_pattern: csr_matrix,
+        global_size: int,
+        global_sparsity_pattern: csr_matrix | None = None,
+        *,
         comm: MPI.Comm,
     ):
         self._comm = comm
         self._rank = comm.Get_rank()
         self._size = comm.Get_size()
 
-        self._global_size = global_sparsity_pattern.indptr.size - 1
+        if global_sparsity_pattern is not None:
+            assert global_sparsity_pattern.indptr.size - 1 == global_size, (
+                "global_sparsity_pattern shape does not match provided global_size"
+            )
+
+        self._global_size = global_size
 
         self._rstart, self._rend = _dof_range(self._global_size, self._size, self._rank)
-
-        indptr = np.asarray(global_sparsity_pattern.indptr)
-        indices = np.asarray(global_sparsity_pattern.indices)
-        nnz_start = int(indptr[self._rstart])
-        nnz_end = int(indptr[self._rend])
-        self._owned_nnz = nnz_end - nnz_start
-        self._owned_nnz_start = nnz_start
-        self._owned_ptr = (indptr[self._rstart : self._rend + 1] - nnz_start).astype(
-            np.int32
-        )
-        self._owned_indices = indices[nnz_start:nnz_end].astype(np.int32)
+        if global_sparsity_pattern is not None:
+            indptr = np.asarray(global_sparsity_pattern.indptr)
+            indices = np.asarray(global_sparsity_pattern.indices)
+            nnz_start = int(indptr[self._rstart])
+            nnz_end = int(indptr[self._rend])
+            self._owned_nnz = nnz_end - nnz_start
+            self._owned_nnz_start = nnz_start
+            self._owned_ptr = (
+                indptr[self._rstart : self._rend + 1] - nnz_start
+            ).astype(np.int32)
+            self._owned_indices = indices[nnz_start:nnz_end].astype(np.int32)
+            self._plan_hessian = True
+        else:
+            self._owned_nnz = 0
+            self._owned_nnz_start = 0
+            self._owned_ptr = np.array([0], dtype=np.int32)
+            self._owned_indices = np.array([], dtype=np.int32)
+            self._plan_hessian = False
 
     @property
     def global_size(self) -> int:
@@ -618,15 +635,15 @@ class AllreducePlan:
 
     @overload
     def make_allreduce_owned(
-        self, local_fn: Callable[P, Array]
+        self, local_fn: Callable[P, Array], is_hessian: bool = False
     ) -> Callable[P, Array]: ...
 
     @overload
     def make_allreduce_owned(
-        self, local_fn: Callable[P, ColoredMatrix]
+        self, local_fn: Callable[P, ColoredMatrix], is_hessian: bool = True
     ) -> Callable[P, ColoredMatrix]: ...
 
-    def make_allreduce_owned(self, local_fn):
+    def make_allreduce_owned(self, local_fn, is_hessian=False):
         """Return a JIT'd function that allreduces local_fn output → owned rows.
 
         Computes the local function (gradient or hessian) over the full replicated
@@ -634,10 +651,40 @@ class AllreducePlan:
 
         Args:
             local_fn:   function returning a vector (gradient) or ColoredMatrix (hessian)
+            is_hessian: whether the local_fn returns a ColoredMatrix (True) or a dense vector (False).
         """
+        if is_hessian:
+            if not self._plan_hessian:
+                raise ValueError(
+                    "AllreducePlan not initialized with Hessian sparsity pattern."
+                )
+            return self._make_allreduce_owned_hessian(local_fn)
+        else:
+            return self._make_allreduce_owned_gradient(local_fn)
+
+    def _make_allreduce_owned_gradient(
+        self, local_fn: Callable[P, Array]
+    ) -> Callable[P, Array]:
+
         _comm = self._comm
         rstart = self._rstart
         rend = self._rend
+
+        @jax.jit
+        def fn(*args, **kwargs):
+            result = local_fn(*args, **kwargs)
+            data_reduced = mpi4jax.allreduce(result, op=MPI.SUM, comm=_comm)
+            return data_reduced[rstart:rend]
+
+        return fn
+
+    def _make_allreduce_owned_hessian(
+        self, local_fn: Callable[P, ColoredMatrix]
+    ) -> Callable[P, ColoredMatrix]:
+        _comm = self._comm
+        rstart = self._rstart
+        rend = self._rend
+
         nnz_start = self._owned_nnz_start
         nnz_end = self._owned_nnz_start + self._owned_nnz
         owned_indices = self._owned_indices
@@ -657,8 +704,9 @@ class AllreducePlan:
                     shape=owned_shape,
                 )
             else:
-                data_reduced = mpi4jax.allreduce(result, op=MPI.SUM, comm=_comm)
-                return data_reduced[rstart:rend]
+                raise TypeError(
+                    "local_fn must return a ColoredMatrix when is_hessian=True."
+                )
 
         return fn
 

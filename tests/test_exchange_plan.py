@@ -63,7 +63,7 @@ def test_exchange_plan_layout():
 
     lifter = Lifter(MyState.size)
     layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
-    plan = ExchangePlan(layout_reduced, comm)
+    plan = ExchangePlan(layout_reduced, comm=comm)
 
     if rank == 0:
         assert plan.local_size == 4
@@ -126,7 +126,7 @@ def test_exchange_plan_communication():
 
     lifter = Lifter(MyState.size)
     layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
-    plan = ExchangePlan(layout_reduced, comm)
+    plan = ExchangePlan(layout_reduced, comm=comm)
 
     # Global: [u0=0, u1=1]
     # Rank 0: owns [0], ghosts [1]
@@ -208,7 +208,7 @@ def test_exchange_plan_incomplete_nodal():
 
     lifter = Lifter(MyState.size)
     layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
-    plan = ExchangePlan(layout_reduced, comm)
+    plan = ExchangePlan(layout_reduced, comm=comm)
 
     # Nodal U (full):
     # Global size = 3
@@ -301,7 +301,7 @@ def test_exchange_plan_hessian():
     lifter = Lifter(MyState.size)
     layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
     plan = ExchangePlan(
-        layout_reduced, comm, local_sparsity_pattern=local_sparsity_pattern
+        layout_reduced, local_sparsity_pattern=local_sparsity_pattern, comm=comm
     )
 
     # Expected Global layout:
@@ -394,7 +394,7 @@ def test_exchange_plan_with_constraints():
     lifter = Lifter(MyState.size, Fixed(fixed_dofs, 0.0))
 
     layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
-    plan = ExchangePlan(layout_reduced, comm)
+    plan = ExchangePlan(layout_reduced, comm=comm)
 
     # Global node 0 is fixed. Global node 1 is free.
     # Total global size = 1 (only node 1).
