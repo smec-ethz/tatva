@@ -27,7 +27,6 @@ import mpi4jax
 import numpy as np
 from jax import Array
 from mpi4py import MPI
-from numpy.ma import indices
 from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 

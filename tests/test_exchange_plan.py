@@ -285,6 +285,10 @@ def test_exchange_plan_hessian():
     indptr = np.array([0, 2, 4], dtype=np.int32)
     indices = np.array([0, 1, 0, 1], dtype=np.int32)
 
+    local_sparsity_pattern = csr_matrix(
+        ([0.0, 0.0, 0.0, 0.0], indices, indptr), shape=(2, 2)
+    )
+
     # Colored matrix from this CSR
     cm = ColoredMatrix.from_csr(
         csr_matrix(([1.0, 1.0, 1.0, 1.0], indices, indptr), shape=(2, 2))
@@ -296,7 +300,9 @@ def test_exchange_plan_hessian():
 
     lifter = Lifter(MyState.size)
     layout_reduced, lifter_aug = lifter.adapt_layout(MyState.get_layout(), comm)
-    plan = ExchangePlan(layout_reduced, comm, local_colored_matrix=cm)
+    plan = ExchangePlan(
+        layout_reduced, comm, local_sparsity_pattern=local_sparsity_pattern
+    )
 
     # Expected Global layout:
     # Rank 0 owns global node 0 (global index 0).
