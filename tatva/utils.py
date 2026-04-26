@@ -28,7 +28,9 @@ from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
+    from tatva.element import Element
     from tatva.lifter import Lifter
+    from tatva.mesh import Mesh
     from tatva.operator import Operator
     from tatva.sparse import ColoredMatrix
 
@@ -278,3 +280,85 @@ def create_g2l(l2g: NDArray) -> Callable[[NDArray], NDArray]:
         return local_indices
 
     return lookup
+
+
+def make_gradient_trace(
+    mesh: Mesh,
+    trace_elements: Array,
+    elem_type: Element,
+    trace_elem_type: Element,
+) -> Callable[[Array], Array]:
+    """Creates a function that computes the gradient on the trace elements of a mesh.
+    Useful for gradient-base averaging at interface such as flux avergaing, stress averaging.
+
+    Args:
+        mesh: The bulk mesh containing the full domain.
+        trace_mesh: The submesh representing the trace elements.
+        elem_type: The element type used in the bulk mesh (e.g., Tri3).
+        trace_elem_type: The element type used in the submesh (e.g., Line2).
+    """
+
+    if len(elem_type._reference_nodes()) != mesh.elements.shape[1]:
+        raise ValueError(
+            f"{type(elem_type).__name__} has {len(elem_type._reference_nodes())} nodes "
+            f"but mesh has {mesh.elements.shape[1]} nodes per element."
+        )
+
+    if len(trace_elem_type._reference_nodes()) != trace_elements.shape[1]:
+        raise ValueError(
+            f"{type(trace_elem_type).__name__} has {len(trace_elem_type._reference_nodes())} nodes "
+            f"but trace_elements has {trace_elements.shape[1]} nodes per element."
+        )
+
+    if int(trace_elements.max()) >= mesh.coords.shape[0]:
+        raise ValueError(
+            f"trace_elements references node {int(trace_elements.max())} "
+            f"but mesh has only {mesh.coords.shape[0]} nodes."
+        )
+
+    contains = (
+        (trace_elements[:, None, :, None] == mesh.elements[None, :, None, :])
+        .any(axis=-1)
+        .all(axis=-1)
+    )  # shape (n_trace_elements, n_elements)
+
+    if not bool(contains.any(axis=1).all()):
+        n_missing = int((~contains.any(axis=1)).sum())
+        raise ValueError(
+            f"{n_missing} trace element(s) have no parent in the bulk mesh. "
+            "Ensure all trace_elements are faces of bulk mesh elements."
+        )
+    parent_indices = jnp.asarray(contains.argmax(axis=1))
+    parent_connectivity = mesh.elements[parent_indices]
+
+    face_matches = trace_elements[:, :, None] == parent_connectivity[:, None, :]
+    local_face_node_ids = jnp.asarray(face_matches.argmax(axis=-1))
+
+    bulk_ref_nodes = elem_type._reference_nodes()
+    face_ref_nodes = bulk_ref_nodes[local_face_node_ids]
+
+    n_sub_qp = len(trace_elem_type.quad_points)
+    N_sub = jax.vmap(trace_elem_type.shape_function)(trace_elem_type.quad_points)
+    sub_qp_xi = jnp.einsum("qa,eac->eqc", N_sub, face_ref_nodes).reshape(
+        -1, bulk_ref_nodes.shape[1]
+    )
+
+    sub_bulk_connectivity_flat = jnp.repeat(parent_connectivity, n_sub_qp, axis=0)
+
+    sub_coords = mesh.coords[sub_bulk_connectivity_flat]
+
+    n_nodes = mesh.coords.shape[0]
+    mapped_fn = jax.vmap(elem_type.gradient)
+
+    @jax.jit
+    def _fn(field: Array) -> Array:
+        return mapped_fn(sub_qp_xi, field[sub_bulk_connectivity_flat], sub_coords)
+
+    def wrapper(field: Array) -> Array:
+        if field.shape[0] != n_nodes:
+            raise ValueError(
+                f"Field has {field.shape[0]} nodes but mesh has {n_nodes} nodes."
+            )
+        return _fn(field)
+
+    return wrapper
