@@ -54,6 +54,11 @@ class Element(ABC):
             self.quad_points, self.quad_weights = self._default_quadrature()
 
     @abstractmethod
+    def _reference_nodes(self) -> Array:
+        """Returns reference nodes for this element"""
+        raise NotImplementedError
+
+    @abstractmethod
     def _default_quadrature(self) -> tuple[Array, Array]:
         """Returns the default quadrature points and weights for this element."""
         raise NotImplementedError
@@ -81,7 +86,7 @@ class Element(ABC):
         dNdr = self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdX = jnp.linalg.inv(J) @ dNdr
-        return dNdX @ nodal_values
+        return (dNdX @ nodal_values).T
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -96,18 +101,22 @@ class Element(ABC):
         Returns:
             A tuple containing:
                 - Interpolated value at the local coordinates (shape: (n_values,)).
-                - Gradient of the nodal values at the local coordinates (shape: (n_dim, n_values)).
+                - Gradient of the nodal values at the local coordinates (shape: (n_values, n_dim)).
                 - Determinant of the Jacobian (scalar).
         """
         N = self.shape_function(xi)
         dNdr = self.shape_function_derivative(xi)
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = jnp.linalg.inv(J) @ dNdr
-        return N @ nodal_values, dNdX @ nodal_values, detJ
+        return N @ nodal_values, (dNdX @ nodal_values).T, detJ
 
 
 class Line2(Element):
     """A 2-node linear interval element."""
+
+    def _reference_nodes(self) -> Array:
+        ref_nodes = jnp.array([[-1.0], [1.0]])
+        return ref_nodes
 
     def _default_quadrature(self):
         quad_points = jnp.array([[0.0]])
@@ -145,6 +154,10 @@ class Line2(Element):
 
 class Line3(Element):
     """3-node quadratic line element."""
+
+    def _reference_nodes(self) -> Array:
+        ref_nodes = jnp.array([[-1.0], [1.0], [0.0]])
+        return ref_nodes
 
     def _default_quadrature(self):
         quad_points = jnp.array([[-jnp.sqrt(3.0 / 5.0)], [0.0], [jnp.sqrt(3.0 / 5.0)]])
@@ -194,6 +207,10 @@ class Line3(Element):
 class Tri3(Element):
     """A 3-node linear triangular element."""
 
+    def _reference_nodes(self) -> Array:
+        ref_nodes = jnp.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        return ref_nodes
+
     def _default_quadrature(self) -> tuple[Array, Array]:
         quad_points = jnp.array([[1.0 / 3, 1.0 / 3]])
         quad_weights = jnp.array([1.0 / 2])
@@ -215,6 +232,12 @@ class Tri6(Element):
     A 6-node quadratic triangular element Node ordering: 3 vertices then 3 edge midpoints.
     0:(0,0), 1:(1,0), 2:(0,1), 3:(0.5,0), 4:(0.5,0.5), 5:(0,0.5)
     """
+
+    def _reference_nodes(self) -> Array:
+        ref_nodes = jnp.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5]]
+        )
+        return ref_nodes
 
     def _default_quadrature(self) -> tuple[Array, Array]:
         quad_points = jnp.array(
@@ -272,6 +295,10 @@ class Tri6(Element):
 class Quad4(Element):
     """A 4-node bilinear quadrilateral element."""
 
+    def _reference_nodes(self) -> Array:
+        ref_nodes = jnp.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
+        return ref_nodes
+
     def _default_quadrature(self) -> tuple[Array, Array]:
         xi_vals = jnp.array([-1.0 / jnp.sqrt(3), 1.0 / jnp.sqrt(3)])
         w_vals = jnp.array([1.0, 1.0])
@@ -304,6 +331,21 @@ class Quad4(Element):
 
 class Quad8(Element):
     """An 8-node biquadratic quadrilateral element."""
+
+    def _reference_nodes(self) -> Array:
+        ref_nodes = jnp.array(
+            [
+                [-1.0, -1.0],
+                [1.0, -1.0],
+                [1.0, 1.0],
+                [-1.0, 1.0],
+                [0.0, -1.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [-1.0, 0.0],
+            ]
+        )
+        return ref_nodes
 
     def _default_quadrature(self) -> tuple[Array, Array]:
         xi_1d = jnp.array([-jnp.sqrt(3.0 / 5.0), 0.0, jnp.sqrt(3.0 / 5.0)])
@@ -368,6 +410,12 @@ class Quad8(Element):
 class Tetrahedron4(Element):
     """A 4-node linear tetrahedral element."""
 
+    def _reference_nodes(self) -> Array:
+        ref_nodes = jnp.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        return ref_nodes
+
     def _default_quadrature(self) -> tuple[Array, Array]:
         quad_points = jnp.array([[1.0 / 4, 1.0 / 4, 1.0 / 4]])
         quad_weights = jnp.array([1.0 / 6])
@@ -388,6 +436,21 @@ class Tetrahedron4(Element):
 
 class Hexahedron8(Element):
     """A 8-node linear hexahedral element."""
+
+    def _reference_nodes(self) -> Array:
+        ref_nodes = jnp.array(
+            [
+                [-1.0, -1.0, -1.0],
+                [1.0, -1.0, -1.0],
+                [1.0, 1.0, -1.0],
+                [-1.0, 1.0, -1.0],
+                [-1.0, -1.0, 1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [-1.0, 1.0, 1.0],
+            ]
+        )
+        return ref_nodes
 
     def _default_quadrature(self) -> tuple[Array, Array]:
         a = 1 / jnp.sqrt(3)
