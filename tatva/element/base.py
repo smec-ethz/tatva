@@ -19,6 +19,7 @@
 from abc import ABC, abstractmethod
 
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 
@@ -28,10 +29,6 @@ class Element(ABC):
 
     Elements are to be used as static objects only in jax transformations! Considered
     immutable. Do not mutate.
-
-    Currently, equality and hash are based on object identity, meaning two elements are
-    only equal if they are the same object in memory. Even if two elements have the same
-    type and quad rule.
     """
 
     quad_points: Array
@@ -52,6 +49,23 @@ class Element(ABC):
             self.quad_weights = quad_weights
         else:
             self.quad_points, self.quad_weights = self._default_quadrature()
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not type(other):
+            return False
+        assert isinstance(other, Element)
+        return np.array_equal(self.quad_points, other.quad_points) and np.array_equal(
+            self.quad_weights, other.quad_weights
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                type(self),
+                np.array(self.quad_points).tobytes(),
+                np.array(self.quad_weights).tobytes(),
+            )
+        )
 
     @abstractmethod
     def _reference_nodes(self) -> Array:
