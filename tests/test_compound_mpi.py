@@ -64,6 +64,16 @@ def test_global_indices():
     np.testing.assert_array_equal(MyState._g.l[1], [8])
     np.testing.assert_array_equal(MyState._g.l[3], [9])
 
+    # Check slicing
+    np.testing.assert_array_equal(MyState._g.l[:], [8, 9])
+    np.testing.assert_array_equal(MyState._g.l[1:2], [8])
+    np.testing.assert_array_equal(MyState._g.l[2:4], [9])
+    np.testing.assert_array_equal(MyState._g.l[:2], [8])
+    np.testing.assert_array_equal(MyState._g.l[2:], [9])
+
+    with pytest.raises(NotImplementedError):
+        MyState._g.l[::2]
+
     with pytest.raises(IndexError):
         MyState._g.l[0]
 

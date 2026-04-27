@@ -27,11 +27,9 @@ from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
 from tatva import Mesh
-from tatva.mesh import PartitionInfo
-from tatva.utils import create_g2l
 
 if TYPE_CHECKING:
-    from tatva.compound import Compound, Field
+    from tatva.compound import Compound
     from tatva.lifter import Lifter
 
 
@@ -295,32 +293,26 @@ def augment_sparsity_with_lifter(
 def create_sparsity_pattern_from_compound(
     compound_cls: type[Compound],
     mesh: Mesh,
-    couple_fields: tuple[Field, ...] = (),
     block_wise: bool = False,
 ) -> sps.csr_matrix | list[list[sps.csr_matrix]]:
     """Create a sparsity pattern automatically from a Compound class and its attached
     mesh.
 
-    Stacked nodal fields are fully coupled within elements. Other nodal fields can be
-    coupled if wanted. All other fields (Local, Shared) are only connected to themselves
-    (diagonal entries).
+    Nodal fields are fully coupled within elements. All other fields (Local, Shared)
+    are only connected to themselves (diagonal entries).
 
     Args:
         compound_cls: The Compound class defining the state layout.
         mesh: The Mesh object attached to the Compound.
-        couple_fields: Tuple of fields to fully couple. Only nodal fields are supported.
         block_wise: If True, return the pattern as a list of lists of sparse matrices
             corresponding to the compound fields/blocks. Stacked fields are one block.
     """
-    from tatva.compound import FieldStackedView
     from tatva.compound.field_types import Nodal
 
     n_nodes = mesh.coords.shape[0]
     num_elements = mesh.elements.shape[0]
 
-    couple_fields_set = set(couple_fields)
     main_coupling_list: list[NDArray[np.int32]] = []
-    independent_nodal_list: list[NDArray[np.int32]] = []
     diagonal_dofs_list: list[NDArray[np.int32]] = []
 
     for name, f in compound_cls.fields:
@@ -349,14 +341,7 @@ def create_sparsity_pattern_from_compound(
 
                 # Map nodes to elements
                 f_element_dofs = node_dofs[mesh.elements].reshape(num_elements, -1)
-
-                is_stacked = isinstance(f, FieldStackedView)
-                is_in_couple = f in couple_fields_set
-
-                if is_stacked or is_in_couple:
-                    main_coupling_list.append(f_element_dofs)
-                else:
-                    independent_nodal_list.append(f_element_dofs)
+                main_coupling_list.append(f_element_dofs)
         else:
             warnings.warn(
                 f"Custom space detected for field '{name}'. Only diagonal entries added "
@@ -378,15 +363,6 @@ def create_sparsity_pattern_from_compound(
         col_indices = np.tile(cg_element_dofs, (1, num_dofs_per_element)).flatten()
 
         # Filter out -1 (from incomplete Nodal fields)
-        valid = (row_indices >= 0) & (col_indices >= 0)
-        all_rows.append(row_indices[valid])
-        all_cols.append(col_indices[valid])
-
-    for indep_dofs in independent_nodal_list:
-        num_elements, num_dofs_per_element = indep_dofs.shape
-        row_indices = np.repeat(indep_dofs, num_dofs_per_element, axis=1).flatten()
-        col_indices = np.tile(indep_dofs, (1, num_dofs_per_element)).flatten()
-
         valid = (row_indices >= 0) & (col_indices >= 0)
         all_rows.append(row_indices[valid])
         all_cols.append(col_indices[valid])
