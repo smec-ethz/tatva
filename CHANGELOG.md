@@ -5,6 +5,19 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.10.1](https://github.com/smec-ethz/tatva/compare/v0.10.0...v0.10.1) (2026-04-27)
+
+
+### Bug Fixes
+
+* **compound:** create basic sparsity pattern from compound classes ([9d959d6](https://github.com/smec-ethz/tatva/commit/9d959d651403a4850e13dfd813e0d8bd94a96aaf))
+* **compound:** incomplete nodal fields takes the local node ids now ([a939beb](https://github.com/smec-ethz/tatva/commit/a939beb5d9b9b3145d544197560b46fa184465d9))
+* **compound:** stack fields with any dims if prefix is same & respect stack=False ([cd64646](https://github.com/smec-ethz/tatva/commit/cd646469439f91fb646a7501d6b9dddbc4c2bce9))
+* **element:** add value based equality for elements ([ab784c5](https://github.com/smec-ethz/tatva/commit/ab784c5cb2266670220737f08980c7d1c57a27da))
+* **element:** corrects the gradient enteries ([91aef4c](https://github.com/smec-ethz/tatva/commit/91aef4c7de157acecbd10d49d15a12212ff2f143))
+* **element:** use einsum to support scalar, vector, and tensor fields ([19cf253](https://github.com/smec-ethz/tatva/commit/19cf2536ccca7f9c37f4d110c1292362dcd58a49))
+* **lifter:** add adapt_sparsity which combines augment & reduce ([af6db56](https://github.com/smec-ethz/tatva/commit/af6db56100c24d4824566cef5f07d58ae3eb4de3))
+
 ## [0.10.0](https://github.com/smec-ethz/tatva/compare/v0.9.1...v0.10.0) (2026-04-23)
 
 
