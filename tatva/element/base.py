@@ -55,7 +55,7 @@ class Element(ABC):
 
     @abstractmethod
     def _reference_nodes(self) -> Array:
-        """Returns reference nodes for this element"""
+        """Returns the nodal positions in natural coordinates for this element"""
         raise NotImplementedError
 
     @abstractmethod
@@ -80,13 +80,25 @@ class Element(ABC):
 
     def interpolate(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         N = self.shape_function(xi)
-        return N @ nodal_values
+        return jnp.einsum("n,n...->...", N, nodal_values)
 
     def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
-        dNdr = self.shape_function_derivative(xi)
-        J, _ = self.get_jacobian(xi, nodal_coords)
-        dNdX = jnp.linalg.inv(J) @ dNdr
-        return (dNdX @ nodal_values).T
+        """Returns the gradient of the nodal values at the local coordinates xi.
+
+        Args:
+            xi: Local coordinates (shape: (n_dim,)).
+            nodal_values: Values at the nodes of the element (shape: (n_nodes, n_values)).
+            nodal_coords: Coordinates of the nodes of the element (shape: (n_nodes, n_dim)).
+
+        Returns:
+            Gradient of the nodal values at the local coordinates (shape: (n_values, n_dim)).
+        """
+        # 'd': spatial dimension, 'n': number of nodes,
+        # '...': any additional dimensions (e.g., values per node)
+        dNdr = self.shape_function_derivative(xi)  # (d, n)
+        J = dNdr @ nodal_coords  # (d, n) x (n, d) -> (d, d)
+        dNdX = jnp.linalg.inv(J) @ dNdr  # (d, d) x (d, n) -> (d, n)
+        return jnp.einsum("dn,n...->...d", dNdX, nodal_values)  # (..., d)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -108,7 +120,11 @@ class Element(ABC):
         dNdr = self.shape_function_derivative(xi)
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = jnp.linalg.inv(J) @ dNdr
-        return N @ nodal_values, (dNdX @ nodal_values).T, detJ
+        return (
+            jnp.einsum("n,n...->...", N, nodal_values),
+            jnp.einsum("dn,n...->...d", dNdX, nodal_values),
+            detJ,
+        )
 
 
 class Line2(Element):
@@ -141,7 +157,7 @@ class Line2(Element):
         _N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
-        return dNdX @ nodal_values
+        return jnp.einsum("n,n...->...", dNdX, nodal_values)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -149,7 +165,11 @@ class Line2(Element):
         N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
-        return N @ nodal_values, dNdX @ nodal_values, detJ
+        return (
+            jnp.einsum("n,n...->...", N, nodal_values),
+            jnp.einsum("n,n...->...", dNdX, nodal_values),
+            detJ,
+        )
 
 
 class Line3(Element):
@@ -191,7 +211,7 @@ class Line3(Element):
         dNdr = self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdS = dNdr / J
-        return dNdS @ nodal_values
+        return jnp.einsum("n,n...->...", dNdS, nodal_values)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -201,7 +221,11 @@ class Line3(Element):
         dNdr = self.shape_function_derivative(xi)
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdS = dNdr / J
-        return N @ nodal_values, dNdS @ nodal_values, detJ
+        return (
+            jnp.einsum("n,n...->...", N, nodal_values),
+            jnp.einsum("n,n...->...", dNdS, nodal_values),
+            detJ,
+        )
 
 
 class Tri3(Element):
