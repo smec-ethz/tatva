@@ -278,6 +278,23 @@ class Lifter:
         free = jnp.setdiff1d(all_dofs, constrained, assume_unique=True)
         return free, constrained, free.size
 
+    def adapt_sparsity(self, sparsity: sps.csr_matrix) -> sps.csr_matrix:
+        """Augment and reduce the sparsity pattern to account for all constraints. From
+        the built-in constraints, only Periodic and PeriodicMPI have non-trivial
+        implementations of this method, which add entries to the sparsity pattern to
+        account for the coupling between master and slave dofs.
+        Returns the reduced sparsity pattern for the free DOFs.
+
+        Args:
+            sparsity: Sparsity pattern in SciPy CSR format.
+
+        Returns:
+            Augmented and reduced sparsity pattern in SciPy CSR format.
+        """
+        augmented = self.augment_sparsity(sparsity)
+        reduced = self.reduce_sparsity(augmented)
+        return reduced
+
     def augment_sparsity(self, sparsity: sps.csr_matrix) -> sps.csr_matrix:
         """Augment the sparsity pattern to account for all constraints.
 
