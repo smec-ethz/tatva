@@ -149,9 +149,19 @@ class Compound:
 
         for name, spec in new_specs:
             if _is_auto_nodal(spec):
-                # if the first dimension is AUTO, we always set the space to CG
-                # this allows that the default behavior of AUTO fields is to be nodal
-                spec = replace(spec, field_type=FieldType.NODAL)
+                if mesh is None:
+                    raise CompoundError(
+                        f"Mesh must be provided to resolve AUTO size for field '{name}'."
+                    )
+                # if the first dimension is AUTO, we set it to Nodal, and resolve the
+                # shape to be (num_nodes, *rest). this allows that the default behavior of
+                # AUTO fields is to be nodal
+                ft_obj = spec.field_type.get()
+                spec = replace(
+                    spec,
+                    shape=(mesh.coords.shape[0], *spec.shape[1:]),
+                    field_type=ft_obj if isinstance(ft_obj, Nodal) else FieldType.NODAL,
+                )
 
             field_type_obj = spec.field_type.get()
             if (
@@ -166,10 +176,16 @@ class Compound:
         # Create descriptors for all new fields
         name_to_descriptor: dict[str, Field] = {}
 
+        # Optimization: If only one field is planned for stacking, don't stack it.
+        # This avoids the overhead of FieldStackedView (reshaping/slicing on every access).
+        if len(full_nodal_specs) == 1:
+            other_specs = full_nodal_specs + other_specs
+            full_nodal_specs = []
+
         # 1. Process auto-nodal fields first for memory layout (stacked block)
         if full_nodal_specs:
             descriptors, total_size = _create_stacked_descriptors(
-                full_nodal_specs, current_offset, axis=1, mesh=mesh
+                full_nodal_specs, current_offset, axis=1
             )
             name_to_descriptor.update(descriptors)
             current_offset += total_size
@@ -343,91 +359,55 @@ def _is_auto_nodal(spec: _FieldSpec) -> bool:
     return len(spec.shape) > 0 and spec.shape[0] == FieldSize.AUTO
 
 
-def _reshape_shape_rank_1_if_needed(
-    shape: tuple[int, ...],
-) -> tuple[tuple[int, ...], bool]:
-    """Determine if a rank-1 shape should be promoted to rank-2 for stacking."""
-    rank = len(shape)
-    if rank == 0:
-        raise CompoundStackError("Cannot stack scalar fields.")
-    if rank == 1:
-        return (*shape, 1), True
-    return shape, False
-
-
 def _create_stacked_descriptors(
     items: Sequence[tuple[str, _FieldSpec | Field]],
     offset: int,
     axis: int = -1,
-    mesh: Mesh | None = None,
 ) -> tuple[dict[str, FieldStackedView], int]:
     """Unified logic to create stacked descriptors and calculate layout."""
     if not items:
         return {}, 0
 
-    # 1. Resolve true shapes and promote rank if needed
-    resolved_info: list[
-        tuple[str, _FieldSpec | Field, tuple[int, ...], tuple[int, ...], bool]
-    ] = []
+    # 1. Find stacking dimension and prefix
+    first_shape = items[0][1].shape
+    actual_axis = axis % len(first_shape) if len(first_shape) > 0 else 0
+    base_prefix = first_shape[:actual_axis]
+
+    # 2. Validate prefix compatibility and calculate layout
+    stack_layout: list[tuple[str, _FieldSpec | Field, int, int]] = []
+    stack_offset: int = 0
     for name, item in items:
         shape = item.shape
-        if len(shape) > 0 and shape[0] == FieldSize.AUTO:
-            if mesh is None:
-                raise CompoundError(f"Mesh required for AUTO-sized field: {name}")
-            shape = (mesh.coords.shape[0], *shape[1:])
-
-        # We keep the user's requested shape (with AUTO resolved) for the final descriptor,
-        # but use a promoted shape for compatibility checks and layout.
-        actual_shape, promoted = _reshape_shape_rank_1_if_needed(shape)
-        resolved_info.append((name, item, shape, actual_shape, promoted))
-
-    # 2. Validate compatibility
-    first_actual_shape = resolved_info[0][3]
-    rank = len(first_actual_shape)
-    actual_axis = axis % rank
-    base_reduced = (
-        first_actual_shape[:actual_axis] + first_actual_shape[actual_axis + 1 :]
-    )
-
-    for name, _, _, actual_shape, _ in resolved_info:
-        if len(actual_shape) != rank:
+        if len(shape) < actual_axis:
             raise CompoundStackError(
-                f"Field {name} rank {len(actual_shape)} is not compatible with rank {rank}."
+                f"Field {name} rank {len(shape)} is not compatible with stacking axis {actual_axis}."
             )
-        if actual_shape[:actual_axis] + actual_shape[actual_axis + 1 :] != base_reduced:
+        if shape[:actual_axis] != base_prefix:
             raise CompoundStackError(
-                f"Field {name} shape {actual_shape} is not compatible with base shape along axis {actual_axis}."
+                f"Field {name} shape {shape} prefix does not match base shape along axis {actual_axis}."
             )
 
-    # 3. Calculate layout
-    stack_layout: list[
-        tuple[str, _FieldSpec | Field, tuple[int, ...], tuple[int, ...], int, int]
-    ] = []
-    stack_offset: int = 0
-    for name, item, shape, actual_shape, _promoted in resolved_info:
-        extent = actual_shape[actual_axis]
+        suffix = shape[actual_axis:]
+        extent = int(prod(suffix)) if suffix else 1
         start = stack_offset
         end = stack_offset + extent
-        stack_layout.append((name, item, shape, actual_shape, start, end))
+        stack_layout.append((name, item, start, end))
         stack_offset += extent
 
-    stacked_shape = list(first_actual_shape)
-    stacked_shape[actual_axis] = stack_offset
-    stacked_shape_tuple = tuple(stacked_shape)
+    stacked_shape_tuple = base_prefix + (stack_offset,)
     stacked_total_size = int(prod(stacked_shape_tuple))
 
     stacked_field_base = _FieldBase(
         stacked_shape_tuple, _slice=slice(offset, offset + stacked_total_size)
     )
 
-    # 4. Create views
+    # 3. Create views
     descriptors = {}
-    for name, item, shape, _actual_shape, start, end in stack_layout:
-        parent_slice = [slice(None)] * rank
-        parent_slice[actual_axis] = slice(start, end)
+    for name, item, start, end in stack_layout:
+        parent_slice = [slice(None)] * len(base_prefix) + [slice(start, end)]
 
         descriptors[name] = FieldStackedView(
-            shape=shape,  # Pass the RESOLVED user-requested shape here
+            shape=item.shape,
             default_factory=item.default_factory,
             parent_field=stacked_field_base,
             parent_slice=tuple(parent_slice),

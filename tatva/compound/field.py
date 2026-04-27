@@ -79,24 +79,42 @@ def _row_major_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(reversed(strides_rev))
 
 
-def _reshape_affine_metadata(
+def _compute_reshaped_strides(
     shape: tuple[int, ...],
     strides: tuple[int, ...],
     target_shape: tuple[int, ...],
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
+) -> tuple[int, ...]:
     if shape == target_shape:
-        return shape, strides
+        return strides
 
-    compact_shape = tuple(extent for extent in shape if extent != 1)
-    if compact_shape != target_shape:
-        raise ValueError(
-            f"Cannot reshape affine metadata from shape {shape} to {target_shape}."
+    # Find common prefix
+    prefix_len = 0
+    for s1, s2 in zip(shape, target_shape):
+        if s1 == s2:
+            prefix_len += 1
+        else:
+            break
+
+    if (prefix_len < len(shape)) and (len(shape) - prefix_len == 1):
+        # We expect the rest of shape to be exactly 1 dimension (the flattened suffix)
+        extent = shape[prefix_len]
+        suffix = target_shape[prefix_len:]
+        if extent == int(prod(suffix)):
+            extent_stride = strides[prefix_len]
+            suffix_strides = _row_major_strides(suffix)
+            scaled_suffix_strides = tuple(s * extent_stride for s in suffix_strides)
+            return strides[:prefix_len] + scaled_suffix_strides
+
+    # Fallback for dropping 1s
+    compact_shape = tuple(e for e in shape if e != 1)
+    if compact_shape == target_shape:
+        return tuple(
+            stride for extent, stride in zip(shape, strides, strict=True) if extent != 1
         )
 
-    compact_strides = tuple(
-        stride for extent, stride in zip(shape, strides, strict=True) if extent != 1
+    raise ValueError(
+        f"Cannot reshape affine metadata from shape {shape} to {target_shape}."
     )
-    return compact_shape, compact_strides
 
 
 class _FieldBase:
@@ -263,7 +281,7 @@ class FieldStackedView(Field):
                 strides[axis] *= step
                 view_shape[axis] = len(range(start, stop, step))
 
-        _, reshaped_strides = _reshape_affine_metadata(
+        reshaped_strides = _compute_reshaped_strides(
             tuple(view_shape), tuple(strides), self.shape
         )
         self._base_offset = base_offset

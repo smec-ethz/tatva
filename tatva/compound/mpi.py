@@ -31,7 +31,7 @@ from tatva.compound import field_types
 from tatva.compound.field import (
     FieldStackedView,
     _normalize_index,
-    _reshape_affine_metadata,
+    _compute_reshaped_strides,
     _row_major_strides,
 )
 from tatva.mesh import PartitionInfo
@@ -379,7 +379,7 @@ def _layout_from_compound(
                     g_view_shape[axis] = len(range(start, stop, step))
 
             # Reshape affine metadata to match the user's requested field shape
-            _, reshaped_strides = _reshape_affine_metadata(
+            reshaped_strides = _compute_reshaped_strides(
                 tuple(g_view_shape), tuple(g_strides), (n_items_global, *f.shape[1:])
             )
             field_global_info[name] = _FieldGlobalInfo(
