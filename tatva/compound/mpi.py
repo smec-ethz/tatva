@@ -137,7 +137,24 @@ class _GlobalFieldIndices:
                     raise IndexError(f"Global node ID {first_idx} not in field subset.")
                 arg = (int(pos),) + arg[1:]
             elif isinstance(first_idx, slice):
-                raise NotImplementedError("Slicing on global subset not supported yet.")
+                # Translate global node ID slice to subset indices
+                start, stop, step = first_idx.start, first_idx.stop, first_idx.step
+                if step is not None and step != 1:
+                    raise NotImplementedError(
+                        "Slicing with step on global subset not supported yet."
+                    )
+
+                idx_start = (
+                    np.searchsorted(self.global_subset, start)
+                    if start is not None
+                    else 0
+                )
+                idx_stop = (
+                    np.searchsorted(self.global_subset, stop)
+                    if stop is not None
+                    else len(self.global_subset)
+                )
+                arg = (slice(idx_start, idx_stop),) + arg[1:]
             else:
                 # Array lookup
                 first_idx_arr = np.asarray(first_idx)

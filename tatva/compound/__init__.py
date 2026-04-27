@@ -34,7 +34,6 @@ from typing import (
 )
 
 import jax.numpy as jnp
-import numpy as np
 from jax import Array
 from jax.tree_util import register_pytree_node_class
 
@@ -250,28 +249,28 @@ class Compound:
 
     @overload
     @classmethod
-    def get_sparsity(
-        cls, couple_fields: tuple[Field, ...] = (), block_wise: Literal[False] = False
-    ) -> csr_matrix: ...
+    def get_sparsity(cls, block_wise: Literal[False] = False) -> csr_matrix: ...
     @overload
     @classmethod
     def get_sparsity(
-        cls, couple_fields: tuple[Field, ...] = (), block_wise: Literal[True] = True
+        cls, block_wise: Literal[True] = True
     ) -> list[list[csr_matrix]]: ...
     @classmethod
     def get_sparsity(
-        cls, couple_fields: tuple[Field, ...] = (), block_wise: bool = False
+        cls, block_wise: bool = False
     ) -> csr_matrix | list[list[csr_matrix]]:
-        """Create a sparsity pattern automatically from this Compound class and its
+        """TODO: Currently, only correct for full nodal fields. Incomplete fields are
+        missing in-element couplings. Other fields are only connected to themselves
+        (diagonal entries)! Do not use blindly for mixed meshes.
+
+        Create a sparsity pattern automatically from this Compound class and its
         attached mesh.
 
-        Stacked nodal fields are fully coupled within elements. Other nodal fields can be
-        coupled if wanted. All other fields (Local, Shared) are only connected to themselves
-        (diagonal entries). For non-trivial couplings, you must create the sparsity
-        pattern manually.
+        Nodal fields are fully coupled within elements. All other fields (Local, Shared)
+        are only connected to themselves (diagonal entries). For non-trivial couplings,
+        you must create the sparsity pattern manually.
 
         Args:
-            couple_fields: Tuple of fields to fully couple. Only nodal fields are supported.
             block_wise: If True, return the pattern as a list of lists of sparse matrices
                 corresponding to the compound fields/blocks. Stacked fields are one block.
         """
@@ -283,7 +282,7 @@ class Compound:
             )
 
         return create_sparsity_pattern_from_compound(
-            cls, cls._mesh, couple_fields, block_wise=block_wise
+            cls, cls._mesh, block_wise=block_wise
         )
 
     def __init__(self, arr: Array | None = None, **kwargs) -> None:
