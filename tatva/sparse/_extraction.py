@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -298,8 +297,9 @@ def create_sparsity_pattern_from_compound(
     """Create a sparsity pattern automatically from a Compound class and its attached
     mesh.
 
-    Nodal fields are fully coupled within elements. All other fields (Local, Shared)
-    are only connected to themselves (diagonal entries).
+    Fields that provide element DOFs (via field_type.get_element_dofs) are fully coupled
+    within elements. All other fields (Local, Shared) are only connected to themselves
+    (diagonal entries).
 
     Args:
         compound_cls: The Compound class defining the state layout.
@@ -307,49 +307,19 @@ def create_sparsity_pattern_from_compound(
         block_wise: If True, return the pattern as a list of lists of sparse matrices
             corresponding to the compound fields/blocks. Stacked fields are one block.
     """
-    from tatva.compound.field_types import Nodal
-
-    n_nodes = mesh.coords.shape[0]
-    num_elements = mesh.elements.shape[0]
-
     main_coupling_list: list[NDArray[np.int32]] = []
     diagonal_dofs_list: list[NDArray[np.int32]] = []
 
     for name, f in compound_cls.fields:
         field_type_obj = f.field_type.get()
-        if isinstance(field_type_obj, Nodal):
-            # Map field DOFs to nodes
-            indices = np.asarray(f.indices(slice(None)))
-            n_items = (
-                len(field_type_obj.node_ids)
-                if field_type_obj.node_ids is not None
-                else n_nodes
-            )
 
-            if n_items > 0:
-                dofs_per_item = indices.size // n_items
+        edofs = field_type_obj.get_element_dofs(f, mesh)
+        if edofs is not None:
+            main_coupling_list.append(edofs)
 
-                node_dofs = np.full((n_nodes, dofs_per_item), -1, dtype=np.int32)
-                if field_type_obj.node_ids is None:
-                    node_dofs[:] = indices.reshape(n_nodes, dofs_per_item)
-                else:
-                    node_ids = np.asarray(field_type_obj.node_ids, dtype=np.int32)
-                    valid_nodes = (node_ids >= 0) & (node_ids < n_nodes)
-                    node_dofs[node_ids[valid_nodes]] = indices.reshape(
-                        -1, dofs_per_item
-                    )[valid_nodes]
-
-                # Map nodes to elements
-                f_element_dofs = node_dofs[mesh.elements].reshape(num_elements, -1)
-                main_coupling_list.append(f_element_dofs)
-        else:
-            warnings.warn(
-                f"Custom space detected for field '{name}'. Only diagonal entries added "
-                "to the sparsity pattern. Please provide your own sparsity pattern if "
-                "cross-coupling is required.",
-                UserWarning,
-            )
-            diagonal_dofs_list.append(np.asarray(f.indices(slice(None))).flatten())
+        ddofs = field_type_obj.get_diagonal_dofs(f, mesh)
+        if ddofs is not None:
+            diagonal_dofs_list.append(ddofs)
 
     K_shape = (compound_cls.size, compound_cls.size)
     all_rows = []
