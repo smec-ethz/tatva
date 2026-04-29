@@ -108,6 +108,9 @@ class Operator(Generic[ElementT]):
     element: ElementT = field(metadata=dict(static=True))
     batch_size: int | None = field(metadata=dict(static=True), default=None)
     cache_weights: bool = field(metadata=dict(static=True), default=False)
+    _det_J_elements_weights: jax.Array | None = field(
+        repr=False, compare=False, default=None, kw_only=True
+    )
 
     def __post_init__(self) -> None:
         # run initialization checks to ensure mesh/element compatibility and basic
@@ -178,10 +181,10 @@ class Operator(Generic[ElementT]):
             A `jax.Array` with the integration weights at each quadrature point of each
             element (shape: (n_elements, n_quad_points)).
         """
-        if self.cache_weights:
+        if self.cache_weights and self._det_J_elements_weights is not None:
             # if cache_weights is True, we have computed the integration weights in
             # __post_init__ and stored them in _det_J_elements_weights
-            return self._det_J_elements_weights  # pyright: ignore[reportAttributeAccessIssue]
+            return self._det_J_elements_weights
         else:
 
             def _get_det_J(xi: jax.Array, el_nodal_coords: jax.Array) -> jax.Array:
@@ -395,6 +398,25 @@ class Operator(Generic[ElementT]):
             return u_grad
 
         return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
+
+    def div(self, nodal_values: jax.Array) -> jax.Array:
+        """Computes the divergence of the nodal values at the quad points.
+
+        Args:
+            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+
+        Returns:
+            A `jax.Array` with the divergence of the nodal values at each quadrature point
+            of each element (shape: (n_elements, n_quad_points, n_values)).
+        """
+        if nodal_values.ndim < 2 or nodal_values.shape[1] <= 1:
+            raise ValueError(
+                "Cannot compute divergence for a scalar field. "
+                "Nodal values must have at least 2 dimensions to compute divergence. "
+                f"Got shape: {nodal_values.shape}; Expected shape (n_nodes, *n_values)."
+            )
+        grad = self.grad(nodal_values)
+        return jnp.einsum("n...ii->n...", grad)
 
     def interpolate(self, arg: jax.Array, points: jax.Array) -> jax.Array:
         """Interpolates nodal values to a set of points in the physical space.
