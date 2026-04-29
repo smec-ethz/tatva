@@ -18,24 +18,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
 from math import prod
 from typing import TYPE_CHECKING, Callable, Self, TypeVar, overload
 
 import jax.numpy as jnp
 from jax import Array
 
-from tatva.compound.field_types import FieldType, _FieldType
+from tatva.compound.field_types import FieldSize, FieldType, _FieldType
 
 if TYPE_CHECKING:
     from tatva.compound import Compound
 
 
 T_Compound = TypeVar("T_Compound", bound="Compound")
-
-
-class FieldSize(IntEnum):
-    AUTO = -1
 
 
 @dataclass(frozen=True)

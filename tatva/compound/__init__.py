@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 from math import prod
 from typing import (
     TYPE_CHECKING,
@@ -41,7 +40,6 @@ from tatva.compound.field import (
     Field,
     FieldSize,
     FieldStackedView,
-    FieldType,
     _FieldBase,
     _FieldSpec,
     field,
@@ -145,35 +143,11 @@ class Compound:
         # field is defined on all nodes of the mesh and can be stacked together
         other_specs: list[tuple[str, _FieldSpec]] = []
 
-        from tatva.compound.field_types import Nodal
-
         for name, spec in new_specs:
             ft_obj = spec.field_type.get()
+            spec, should_stack = ft_obj.resolve_spec(spec, mesh)
 
-            if _is_auto_nodal(spec):
-                # if the first dimension is AUTO, we set it to Nodal, and resolve the
-                # shape to be (num_items, *rest).
-                if isinstance(ft_obj, Nodal) and ft_obj.node_ids is not None:
-                    n_items_field = len(ft_obj.node_ids)
-                else:
-                    if mesh is None:
-                        raise CompoundError(
-                            f"Mesh must be provided to resolve AUTO size for field '{name}'."
-                        )
-                    n_items_field = mesh.coords.shape[0]
-
-                spec = replace(
-                    spec,
-                    shape=(n_items_field, *spec.shape[1:]),
-                    field_type=ft_obj if isinstance(ft_obj, Nodal) else FieldType.NODAL,
-                )
-
-            field_type_obj = spec.field_type.get()
-            if (
-                isinstance(field_type_obj, Nodal)
-                and (field_type_obj.node_ids is None)
-                and field_type_obj.stack
-            ):
+            if should_stack:
                 full_nodal_specs.append((name, spec))
             else:
                 other_specs.append((name, spec))
