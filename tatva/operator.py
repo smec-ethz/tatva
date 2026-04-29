@@ -399,6 +399,25 @@ class Operator(Generic[ElementT]):
 
         return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
 
+    def div(self, nodal_values: jax.Array) -> jax.Array:
+        """Computes the divergence of the nodal values at the quad points.
+
+        Args:
+            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+
+        Returns:
+            A `jax.Array` with the divergence of the nodal values at each quadrature point
+            of each element (shape: (n_elements, n_quad_points, n_values)).
+        """
+        if nodal_values.ndim < 2 or nodal_values.shape[1] <= 1:
+            raise ValueError(
+                "Cannot compute divergence for a scalar field. "
+                "Nodal values must have at least 2 dimensions to compute divergence. "
+                f"Got shape: {nodal_values.shape}; Expected shape (n_nodes, *n_values)."
+            )
+        grad = self.grad(nodal_values)
+        return jnp.einsum("n...ii->n...", grad)
+
     def interpolate(self, arg: jax.Array, points: jax.Array) -> jax.Array:
         """Interpolates nodal values to a set of points in the physical space.
 
