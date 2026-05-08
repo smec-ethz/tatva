@@ -2,14 +2,29 @@
 
 <img src="assets/logo-small.png" alt="drawing" width="400"/>
 
-<h3 align="center">Tatva (टत्तव) : Lego-like building blocks for differentiable FEM</h3>
+<h3 align="center">Tatva (तत्त्व) : Lego-like building blocks for differentiable FEM</h3>
 
 `tatva` (is a Sanskrit word which means principle or elements of reality). True to its name, `tatva` provide fundamental Lego-like building blocks (elements) which can be used to construct complex finite element method (FEM) simulations. `tatva` is purely written in Python library for FEM simulations and is built on top of JAX ecosystem, making it easy to use FEM in a differentiable way.
 
 </div>
 
+<div align="center">
+
 [![Documentation](https://github.com/smec-ethz/tatva-docs/actions/workflows/pages/pages-build-deployment/badge.svg)](https://github.com/smec-ethz/tatva-docs/actions/workflows/pages/pages-build-deployment)
 [![Tests](https://github.com/smec-ethz/tatva/actions/workflows/run_tests.yml/badge.svg)](https://github.com/smec-ethz/tatva/actions/workflows/run_tests.yml)
+![PyPI](https://img.shields.io/pypi/v/tatva)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/smec-ethz/tatva)
+
+</div>
+
+
+<div align="center">
+
+[**Documentation**](https://smec-ethz.github.io/tatva-docs/)
+| [**Usage & Examples**](https://smec-ethz.github.io/tatva-docs/examples/linear_elasticity/)
+
+</div>
+
 
 ## License
 
@@ -22,6 +37,7 @@
 - Element library covering line, surface, and volume primitives (Line2, Tri3, Quad4, Tet4, Hex8) with consistent JAX-compatible APIs.
 - Mesh and Operator abstractions that map, integrate, differentiate, and interpolate fields on arbitrary meshes.
 - Automatic handling of stacked multi-field variables through the `tatva.compound` utilities while preserving sparsity patterns.
+- MPI parallelism support.
 
 ## Installation
 
