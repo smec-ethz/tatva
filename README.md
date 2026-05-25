@@ -22,6 +22,7 @@
 
 [**Documentation**](https://smec-ethz.github.io/tatva-docs/)
 | [**Usage & Examples**](https://smec-ethz.github.io/tatva-docs/examples/linear_elasticity/)
+| [**Contributing**](CONTRIBUTING.md)
 
 </div>
 
@@ -97,12 +98,18 @@ A unique aspect of `tatva` is that it can handle construct dense matrices, spars
 To know more about `tatva` and how it works please check: ([arXiv link](https://arxiv.org/abs/2602.12365v1))
 
 
-## 👉 Where to contribute
+## 👉 How to contribute
 
-If you have a suggestion that would make this better, please fork the repo and create a pull request on [**github.com/smec-ethz/tatva**](https://github.com/smec-ethz/tatva). Please use that repository to open issues or submit merge requests. You can also simply open an issue with the tag "enhancement". Don't forget to give the project a star! Thanks again!
+We welcome your help to improve tatva. To prevent wasted effort, you must discuss your idea with the team before you write any code. Please read our full [Contributing Guide](CONTRIBUTING.md) for complete details.
 
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+Follow this exact workflow to contribute:
+
+1. **Discuss First:** Open an Issue to explain the problem and propose your numerical approach.
+2. **Wait for Approval:** Do not start coding until a maintainer approves your Issue.
+3. **Fork the Project:** Create a personal copy of the repository to test your ideas.
+4. **Create a Branch:** (`git checkout -b feature/your-feature-name`)
+5. **Commit your Changes:** (`git commit -m 'Add your feature'`)
+6. **Push to the Branch:** (`git push origin feature/your-feature-name`)
+7. **Open a Pull Request:** Submit your PR and link it to the approved Issue.
+
+Don't forget to give the project a star. Thank you!
