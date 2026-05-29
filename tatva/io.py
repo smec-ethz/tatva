@@ -88,8 +88,8 @@ def extract_mesh(
     if model_name is not None:
         gmsh.model.setCurrent(model_name)
 
-    coords = extract_coordinates()
-    topology, physical_groups = extract_topology()
+    node_tags, coords = extract_coordinates()
+    topology, physical_groups = extract_topology(node_tags)
     all_elements = extract_global_elements(topology)
     element_partition = extract_element_partition(topology)
     num_partitions = gmsh.model.getNumberOfPartitions()
@@ -133,23 +133,22 @@ RankwiseTopologyData = dict[int, dict[int, TopologyData]]
 PhysicalGroupsData = dict[str, PhysicalGroup]
 
 
-def extract_coordinates() -> NDArray[np.float64]:
+def extract_coordinates() -> tuple[NDArray[np.int_], NDArray[np.float64]]:
     """Extract the mesh coordinates from a gmsh model."""
     dim = model.getDimension()
-    indices, coords, _ = model.mesh.getNodes()
+    node_tags, coords, _ = model.mesh.getNodes()
 
-    # coords is a flat array of length num_nodes * dim, we need to reshape it to
-    # (num_nodes, dim)
-    coords = coords.reshape(-1, dim)
+    # coords is a flat array of length num_nodes * 3, we reshape to (-1, 3)
+    # and slice to dim
+    coords = coords.reshape(-1, 3)[:, :dim]
 
-    # gmsh indices start at 1, so we need to shift them to start at 0
-    indices -= 1
-
-    sorted_indices = np.argsort(indices)
-    return coords[sorted_indices]
+    sorted_indices = np.argsort(node_tags)
+    return node_tags[sorted_indices], coords[sorted_indices]
 
 
-def extract_topology() -> tuple[RankwiseTopologyData, PhysicalGroupsData]:
+def extract_topology(
+    node_tags: NDArray[np.int_],
+) -> tuple[RankwiseTopologyData, PhysicalGroupsData]:
     """Extract the topology of the mesh from the gmsh model."""
     topologies: RankwiseTopologyData = {}
     physical_groups: PhysicalGroupsData = {}
@@ -201,7 +200,7 @@ def extract_topology() -> tuple[RankwiseTopologyData, PhysicalGroupsData]:
                 el_type
             )
             conn = np.asarray(conn).reshape(-1, n_nodes_per_element)
-            conn -= 1  # Shift from 1-based to 0-based indexing
+            conn = np.searchsorted(node_tags, conn)
 
             marker = np.full_like(el_tag, tag)
 
