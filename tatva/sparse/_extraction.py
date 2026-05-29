@@ -369,9 +369,11 @@ def create_sparsity_pattern_from_compound(
     seen = set()
     for _, f in compound_cls.fields:
         s = getattr(f, "_root_slice", getattr(f, "_slice", None))
-        if s is not None and s not in seen:
-            root_slices.append(s)
-            seen.add(s)
+        if s is not None:
+            s_key = (s.start, s.stop, s.step)
+            if s_key not in seen:
+                root_slices.append(s)
+                seen.add(s_key)
     root_slices.sort(key=lambda s: s.start)
 
     return [[full_matrix[s1, s2] for s2 in root_slices] for s1 in root_slices]
