@@ -1,10 +1,19 @@
-"""
-Determine the Hessian sparsity pattern of a scalar JAX function E(u)
-by propagating ancestor-DOF sets through the *forward* computational graph.
-This is implemented as a custom JAX tracer that tracks the dependency of each
-intermediate variable on the input DOFs, and records pairs of DOFs that interact nonlinearly in the graph.
-
-"""
+# Copyright (C) 2025 ETH Zurich (SMEC)
+#
+# This file is part of tatva.
+#
+# tatva is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# tatva is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 import inspect
 from typing import (
@@ -366,6 +375,22 @@ def _analyze_and_resolve_jaxpr(
                 for pv, sv in zip(eqn.outvars, sub_closed.jaxpr.outvars):
                     tags[id(pv)] = tags.get(id(sv), 0)
                     mask |= tags[id(pv)]
+            elif p == "cond":
+                # cond carries one jaxpr per branch; invars[0] is the predicate and
+                # invars[1:] are the operands passed to every branch.
+                operands = eqn.invars[1:]
+                sub_res = []
+                mask = 0
+                for branch in eqn.params["branches"]:
+                    bj = branch.jaxpr
+                    for pv, sv in zip(operands, bj.invars):
+                        tags[id(sv)] = tags.get(id(pv), 0)
+                    sub_eqns, sub_active = _analyze_and_resolve_jaxpr(
+                        bj, trial_test_split, tags, None, sub_info
+                    )
+                    sub_res.append((sub_active, sub_eqns))
+                    for sv in bj.outvars:
+                        mask |= tags.get(id(sv), 0)
             else:
                 mask = 0
                 for v in eqn.invars:
@@ -384,6 +409,13 @@ def _analyze_and_resolve_jaxpr(
                     sub_info,
                 )
                 sub_res = (sub_active, sub_eqns)
+            elif p == "cond":
+                sub_res = []
+                for branch in eqn.params["branches"]:
+                    sub_eqns, sub_active = _analyze_and_resolve_jaxpr(
+                        branch.jaxpr, None, tags, None, sub_info
+                    )
+                    sub_res.append((sub_active, sub_eqns))
 
         # check if the equation is a nonlinear primitive
         is_nonlinear = False
@@ -441,7 +473,7 @@ def _analyze_and_resolve_jaxpr(
                 eqn,
                 handler,
                 is_nonlinear,
-                sub_res if p in ("pjit", "jit", "scan", "map") else None,
+                sub_res if p in ("pjit", "jit", "scan", "map", "cond") else None,
             )
         )
 
@@ -494,6 +526,33 @@ def _propagate_active_backward(
 
                 # Store sub-info for this jit equation
                 sub_info[id(eqn)] = (sub_active_set, sub_eqns_pruned)
+        elif p == "cond":
+            if any(id(v) in active_set for v in eqn.outvars):
+                is_active = True
+                operands = eqn.invars[1:]
+                pruned_branches = []
+                for (sub_active_set, sub_eqns), branch in zip(
+                    sub_res, eqn.params["branches"]
+                ):
+                    sub = branch.jaxpr
+
+                    # Map active outvars to each branch's outvars
+                    for pv, sv in zip(eqn.outvars, sub.outvars):
+                        if id(pv) in active_set:
+                            sub_active_set.add(id(sv))
+
+                    sub_eqns_pruned = _propagate_active_backward(
+                        sub_eqns, sub_active_set, sub_info
+                    )
+
+                    # Map active branch invars back to the cond operands (invars[1:])
+                    for pv, sv in zip(operands, sub.invars):
+                        if id(sv) in sub_active_set:
+                            active_set.add(id(pv))
+
+                    pruned_branches.append((sub_active_set, sub_eqns_pruned))
+
+                sub_info[id(eqn)] = pruned_branches
         else:
             if is_nonlinear or (
                 eqn.outvars and any(id(v) in active_set for v in eqn.outvars)
@@ -1762,3 +1821,79 @@ class Handlers:
 
         for pv, sv in zip(eqn.outvars, sub.outvars):
             state.set(pv, sub_state.get(sv))
+
+    @staticmethod
+    @TRACER_REGISTRY.register("cond")
+    def cond(
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: "CouplingAccumulator",
+        trial_test_split: int | None,
+    ) -> None:
+        """Trace each branch of a ``cond``/``switch`` and union the outputs.
+
+        Unlike the conservative ``control_flow`` fallback, this traverses every branch
+        jaxpr — recording the couplings created *inside* a branch into the shared
+        accumulator — and propagates the OR of all branches' output dependency sets. A
+        piecewise function's derivative is one branch's, so unioning the branches is an
+        AD-safe superset. The predicate (``invars[0]``) only selects and contributes no
+        couplings, so it is ignored.
+        """
+        operands = eqn.invars[1:]
+        in_d = [state.get(v) for v in operands]
+        n_dofs = state.n_dofs
+        branch_sub_list = state.sub_info[id(eqn)]
+
+        out_deps: Dict[int, SparseDepSet | None] = {id(ov): None for ov in eqn.outvars}
+        for (sub_active, sub_bound_eqns), branch in zip(
+            branch_sub_list, eqn.params["branches"]
+        ):
+            sub = branch.jaxpr
+            sub_consts = branch.consts
+            sub_state = TraceState(n_dofs, sub_active, state.tags, state.sub_info)
+
+            # Seed branch invars with operand dep-sets and concrete values (the latter
+            # are needed to route any gather/scatter indices inside the branch).
+            for sv, d, ov in zip(sub.invars, in_d, operands):
+                sub_state.set(sv, d)
+                val = state.get_val(ov)
+                if val is not None:
+                    sub_state.val_of[id(sv)] = val
+            for v, c in zip(sub.constvars, sub_consts):
+                sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
+                sub_state.val_of[id(v)] = np.asarray(c)
+
+            for sub_eqn, sub_handler, sub_is_active in sub_bound_eqns:
+                ovars = sub_eqn.outvars
+                if ovars and not sub_is_active:
+                    for v in ovars:
+                        sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
+                    in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
+                    cv = _try_concrete(sub_eqn.primitive.name, in_vals, sub_eqn.params)
+                    if cv is not None:
+                        sub_state.val_of[id(ovars[0])] = cv
+                    continue
+
+                sub_handler(sub_eqn, sub_state, acc, trial_test_split)
+
+                if ovars:
+                    in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
+                    cv = _try_concrete(sub_eqn.primitive.name, in_vals, sub_eqn.params)
+                    if cv is not None:
+                        sub_state.val_of[id(ovars[0])] = cv
+
+            for ov, sv in zip(eqn.outvars, sub.outvars):
+                d = sub_state.get(sv)
+                prev = out_deps[id(ov)]
+                if prev is None:
+                    out_deps[id(ov)] = d
+                else:
+                    merged = (prev.dep + d.dep).tocsr()
+                    merged.data[:] = 1
+                    out_deps[id(ov)] = SparseDepSet(merged, d.shape)
+
+        for ov in eqn.outvars:
+            d = out_deps[id(ov)]
+            state.set(
+                ov, d if d is not None else SparseDepSet.empty(_get_shape(ov), n_dofs)
+            )
