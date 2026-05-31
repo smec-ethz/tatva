@@ -108,15 +108,22 @@ class CouplingAccumulator:
         if fp in self._seen_fingerprints:
             return
         self._seen_fingerprints.add(fp)
-        P = (dep.T @ dep).tocsr()
-        r, c = P.nonzero()
         if trial_test_split is not None:
-            mask = ((r < trial_test_split) & (c >= trial_test_split)) | (
-                (r >= trial_test_split) & (c < trial_test_split)
-            )
-            r = r[mask]
-            c = c[mask]
-        self.add_coords(r, c)
+            # Only trial<->test cross couplings survive, so compute just that block
+            # (trial_part.T @ test_part) instead of the full dep.T @ dep over all
+            # columns followed by masking — avoids the discarded self-blocks.
+            s = trial_test_split
+            trial_part = dep[:, :s]
+            test_part = dep[:, s:]
+            cross = (trial_part.T @ test_part).tocsr()
+            r, c = cross.nonzero()
+            c = c + s
+            self.add_coords(r, c)
+            self.add_coords(c, r)
+        else:
+            P = (dep.T @ dep).tocsr()
+            r, c = P.nonzero()
+            self.add_coords(r, c)
 
     def finalize(self) -> sps.csr_matrix:
         """Build the final binary CSR sparsity pattern from the accumulated chunks."""
@@ -1574,16 +1581,17 @@ class Handlers:
                 # build (batch_size * sz, n_local_dofs) by tiling rows
                 tiled_indices = np.tile(local_indices, batch_size)
                 tiled_data = np.tile(local_data, batch_size)
-                # Each tile has same row-nnz layout; total rows = batch_size * sz
-                base_indptr = local_indptr.copy()
-                base_step = base_indptr[-1]
-                tile_indptrs = [
-                    base_indptr[:-1] + i * base_step for i in range(batch_size)
-                ]
+                # Each tile has the same row-nnz layout; total rows = batch_size * sz.
+                # Vectorized tiled indptr: row r of tile i -> local_indptr[r] + i*base_step
+                # (avoids an O(batch_size) Python comprehension).
+                base_step = local_indptr[-1]
+                base = local_indptr[:-1]
+                tiled_indptr = (
+                    base[None, :] + (np.arange(batch_size) * base_step)[:, None]
+                ).ravel()
                 tiled_indptr = np.concatenate(
-                    tile_indptrs
-                    + [np.array([batch_size * base_step], dtype=base_indptr.dtype)]
-                )
+                    [tiled_indptr, np.array([batch_size * base_step])]
+                ).astype(local_indptr.dtype)
                 sub_dep = sps.csr_matrix(
                     (tiled_data, tiled_indices, tiled_indptr),
                     shape=(batch_size * sz, n_local_dofs),
@@ -1623,78 +1631,77 @@ class Handlers:
                 if cv is not None:
                     sub_state.val_of[id(sub_ovars[0])] = cv
 
-        # Extract unique local couplings from the sub-accumulator
+        # Extract unique local couplings from the sub-accumulator. sub_pat.nonzero()
+        # already yields unique (r, c); canonicalize to (lo, hi) and dedup via a scipy
+        # sparse round-trip (np.unique is slow on Python >= 3.13).
         sub_pat = sub_acc.finalize()
         sub_r, sub_c = sub_pat.nonzero()
-        unique_couplings = set()
-        for la, lb in zip(sub_r, sub_c):
-            unique_couplings.add((min(int(la), int(lb)), max(int(la), int(lb))))
+        if sub_r.size:
+            lo = np.minimum(sub_r, sub_c)
+            hi = np.maximum(sub_r, sub_c)
+            canon = sps.csr_matrix(
+                (np.ones(lo.size, dtype=bool), (lo, hi)),
+                shape=(n_local_dofs, n_local_dofs),
+            )
+            lo_arr, hi_arr = canon.nonzero()
+        else:
+            lo_arr = hi_arr = np.empty(0, dtype=np.intp)
 
-        # Build local sparse matrices
-        # We group unique_couplings by (k_idx, m_idx)
-        for la, lb in unique_couplings:
-            offset_k = 0
-            k_idx = -1
-            for k in range(num_xs):
-                if offset_k <= la < offset_k + local_size_slices[k]:
-                    k_idx = k
-                    break
-                offset_k += local_size_slices[k]
+        # Cumulative offsets to locate which mapped input owns a local index, plus a
+        # per-local-index cache of strided column slices (the same local index recurs
+        # across many coupling pairs, so slicing once avoids redundant CSR fancy-indexing).
+        offsets = np.concatenate(([0], np.cumsum(local_size_slices)))
+        slice_cache: Dict[int, Tuple[sps.csr_matrix, np.ndarray]] = {}
 
-            offset_m = 0
-            m_idx = -1
-            for m in range(num_xs):
-                if offset_m <= lb < offset_m + local_size_slices[m]:
-                    m_idx = m
-                    break
-                offset_m += local_size_slices[m]
+        def _get_col(local_idx: int) -> Tuple[sps.csr_matrix, np.ndarray]:
+            cached = slice_cache.get(local_idx)
+            if cached is not None:
+                return cached
+            k_idx = int(np.searchsorted(offsets, local_idx, side="right")) - 1
+            idx_in = local_idx - int(offsets[k_idx])
+            n_k = local_size_slices[k_idx]
+            dep_x = state.get(eqn.invars[num_const + num_carry + k_idx]).dep
+            col = dep_x[idx_in::n_k]
+            nnz_per_row = col.indptr[1:] - col.indptr[:-1]
+            cached = (col, nnz_per_row)
+            slice_cache[local_idx] = cached
+            return cached
 
-            if k_idx != -1 and m_idx != -1:
-                idx_a = la - offset_k
-                idx_b = lb - offset_m
+        # Build local sparse matrices for each unique (canonicalized) coupling pair
+        for la, lb in zip(lo_arr.tolist(), hi_arr.tolist()):
+            col_a, nnz_per_row_a = _get_col(la)
+            col_b, nnz_per_row_b = _get_col(lb)
 
-                dep_x = state.get(eqn.invars[num_const + num_carry + k_idx]).dep
-                dep_y = state.get(eqn.invars[num_const + num_carry + m_idx]).dep
+            # Check if we can use the fast direct index mapping (at most 1 nnz per row)
+            if np.all(nnz_per_row_a <= 1) and np.all(nnz_per_row_b <= 1):
+                # Direct index mapping (lightning fast, 0 ms!)
+                active_a = nnz_per_row_a == 1
+                active_b = nnz_per_row_b == 1
+                active = active_a & active_b
 
-                n_k = local_size_slices[k_idx]
-                n_m = local_size_slices[m_idx]
+                if np.any(active):
+                    c_a = col_a.indices[col_a.indptr[:-1][active]]
+                    c_b = col_b.indices[col_b.indptr[:-1][active]]
 
-                col_a = dep_x[idx_a::n_k]
-                col_b = dep_y[idx_b::n_m]
-
-                # Check if we can use the fast direct index mapping (at most 1 nnz per row)
-                nnz_per_row_a = col_a.indptr[1:] - col_a.indptr[:-1]
-                nnz_per_row_b = col_b.indptr[1:] - col_b.indptr[:-1]
-
-                if np.all(nnz_per_row_a <= 1) and np.all(nnz_per_row_b <= 1):
-                    # Direct index mapping (lightning fast, 0 ms!)
-                    active_a = nnz_per_row_a == 1
-                    active_b = nnz_per_row_b == 1
-                    active = active_a & active_b
-
-                    if np.any(active):
-                        c_a = col_a.indices[col_a.indptr[:-1][active]]
-                        c_b = col_b.indices[col_b.indptr[:-1][active]]
-
-                        if trial_test_split is not None:
-                            mask = (c_a < trial_test_split) & (c_b >= trial_test_split)
-                            mask |= (c_a >= trial_test_split) & (c_b < trial_test_split)
-                            c_a = c_a[mask]
-                            c_b = c_b[mask]
-
-                        acc.add_coords(c_a, c_b)
-                        acc.add_coords(c_b, c_a)
-                else:
-                    # Fallback to general sparse matrix multiplication
-                    couplings = (col_a.T @ col_b).tocsr()
-                    r, c = couplings.nonzero()
                     if trial_test_split is not None:
-                        mask = (r < trial_test_split) & (c >= trial_test_split)
-                        mask |= (r >= trial_test_split) & (c < trial_test_split)
-                        r = r[mask]
-                        c = c[mask]
-                    acc.add_coords(r, c)
-                    acc.add_coords(c, r)
+                        mask = (c_a < trial_test_split) & (c_b >= trial_test_split)
+                        mask |= (c_a >= trial_test_split) & (c_b < trial_test_split)
+                        c_a = c_a[mask]
+                        c_b = c_b[mask]
+
+                    acc.add_coords(c_a, c_b)
+                    acc.add_coords(c_b, c_a)
+            else:
+                # Fallback to general sparse matrix multiplication
+                couplings = (col_a.T @ col_b).tocsr()
+                r, c = couplings.nonzero()
+                if trial_test_split is not None:
+                    mask = (r < trial_test_split) & (c >= trial_test_split)
+                    mask |= (r >= trial_test_split) & (c < trial_test_split)
+                    r = r[mask]
+                    c = c[mask]
+                acc.add_coords(r, c)
+                acc.add_coords(c, r)
 
         total_length = length * batch_size
 
