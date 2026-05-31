@@ -12,6 +12,7 @@ from ._extraction import (
     reduce_sparsity_pattern,
 )
 from .base import ColoredMatrix, jacfwd, linearized_jacfwd
+from .tracer import trace_energy_sparsity, trace_virtual_work_sparsity
 
 __all__ = [
     "ColoredMatrix",
@@ -26,4 +27,6 @@ __all__ = [
     "linearized_jacfwd",
     "reduce_sparsity_pattern",
     "smallest_last_distance2_colors",
+    "trace_energy_sparsity",
+    "trace_virtual_work_sparsity",
 ]
