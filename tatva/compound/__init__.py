@@ -51,7 +51,9 @@ if TYPE_CHECKING:
     from scipy.sparse import csr_matrix
 
     from tatva.compound.mpi import _FieldGlobalInfo, _LocalLayout
+    from tatva.lifter import Lifter
     from tatva.mesh import Mesh, PartitionInfo
+    from tatva.sparse import ColoredMatrix
 
 __all__ = ["Compound", "field", "stack_fields"]
 
@@ -223,15 +225,17 @@ class Compound:
 
     @overload
     @classmethod
-    def get_sparsity(cls, block_wise: Literal[False] = False) -> csr_matrix: ...
+    def get_sparsity(
+        cls, lifter: Lifter | None = None, block_wise: Literal[False] = False
+    ) -> csr_matrix: ...
     @overload
     @classmethod
     def get_sparsity(
-        cls, block_wise: Literal[True] = True
+        cls, lifter: Lifter | None = None, block_wise: Literal[True] = True
     ) -> list[list[csr_matrix]]: ...
     @classmethod
     def get_sparsity(
-        cls, block_wise: bool = False
+        cls, lifter: Lifter | None = None, block_wise: bool = False
     ) -> csr_matrix | list[list[csr_matrix]]:
         """TODO: Currently, only correct for full nodal fields. Incomplete fields are
         missing in-element couplings. Other fields are only connected to themselves
@@ -245,6 +249,7 @@ class Compound:
         you must create the sparsity pattern manually.
 
         Args:
+            lifter: Optional Lifter to adapt the sparsity pattern for lifted variables.
             block_wise: If True, return the pattern as a list of lists of sparse matrices
                 corresponding to the compound fields/blocks. Stacked fields are one block.
         """
@@ -255,9 +260,30 @@ class Compound:
                 "Mesh must be set on Compound class to create sparsity pattern."
             )
 
-        return create_sparsity_pattern_from_compound(
+        sparsity = create_sparsity_pattern_from_compound(
             cls, cls._mesh, block_wise=block_wise
         )
+        if lifter is not None:
+            if block_wise:
+                raise NotImplementedError(
+                    "Lifter adaptation not implemented for block-wise sparsity."
+                )
+            sparsity = lifter.adapt_sparsity(sparsity)  # ty:ignore[invalid-argument-type]
+
+        return sparsity
+
+    @classmethod
+    def get_colored_matrix(cls, lifter: Lifter | None = None) -> ColoredMatrix:
+        """Create a ColoredMatrix object for this Compound class and its attached mesh. Uses
+        the sparsity pattern from `get_sparsity()`.
+
+        Args:
+            lifter: Optional Lifter to adapt the sparsity pattern for lifted variables.
+        """
+        from tatva.sparse import ColoredMatrix
+
+        sparsity = cls.get_sparsity(lifter=lifter, block_wise=False)
+        return ColoredMatrix.from_csr(sparsity)
 
     def __init__(self, arr: Array | None = None, **kwargs) -> None:
         """Initialize the state with given keyword arguments."""
