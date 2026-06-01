@@ -291,6 +291,55 @@ def extract_local_mesh(
     )
 
 
+def concatenate_elements(
+    elements: NDArray[np.int32],
+    p_info: "PartitionInfo",
+    comm,
+) -> NDArray[np.int32]:
+    """Maps local element connectivity (referencing local nodes) to the new global node indices
+    in the concatenated rank-by-rank layout.
+
+    This function:
+      1. Computes the node rank offset for owned nodes.
+      2. Resolves ghost nodes to their new global indices using MPI.
+
+    Args:
+        elements: Local elements connectivity array (shape (n_elements, nodes_per_element)).
+        p_info: PartitionInfo from extract_local_mesh.
+        comm: The MPI communicator.
+
+    Returns:
+        Array of the same shape as elements, referencing the concatenated global node indices.
+    """
+    from mpi4py import MPI
+
+    n_owned = p_info.n_owned_nodes
+    n_total = len(p_info.nodes_local_to_global)
+
+    # 1. Determine the global number of nodes and the offset for each rank
+    n_per_rank = comm.allgather(n_owned)
+    n_global_nodes = sum(n_per_rank)
+    node_offset = np.cumsum([0] + n_per_rank[:-1])[comm.rank]
+
+    # 2. Build local to global mapping for nodes in the concatenated layout
+    l2g = np.full(n_total, -1, dtype=np.int32)
+    l2g[:n_owned] = node_offset + np.arange(n_owned, dtype=np.int32)
+
+    # 3. Share local mappings across all ranks to resolve ghost node indices
+    local_directory = np.full(n_global_nodes, -1, dtype=np.int32)
+    # Map the original global node IDs of our owned nodes to their new contiguous global indices
+    local_directory[p_info.nodes_local_to_global[:n_owned]] = l2g[:n_owned]
+
+    global_directory = np.empty_like(local_directory)
+    comm.Allreduce(local_directory, global_directory, op=MPI.MAX)
+
+    # Fill in the new global indices for the ghost nodes
+    l2g[n_owned:] = global_directory[p_info.nodes_local_to_global[n_owned:]]
+
+    # 4. Map the local element connectivity using the resolved node indices
+    return l2g[elements]
+
+
 @jax.jit
 def find_containing_polygons(points: Array, polygons: Array) -> Array:
     """
