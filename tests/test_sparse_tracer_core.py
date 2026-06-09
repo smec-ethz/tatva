@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sps
 
-from tatva.sparse import trace_energy_sparsity, trace_virtual_work_sparsity
+from tatva.sparse import pattern_from_energy, pattern_from_virtual_work
 from tatva.sparse.tracer import (
     CouplingAccumulator,
     SparseDepSet,
@@ -120,7 +120,12 @@ ENERGY_CASES = [
         6,
         True,
     ),
-    ("concatenate_duplicate", lambda u: jnp.sum(jnp.sin(jnp.concatenate([u, u]))), 6, True),
+    (
+        "concatenate_duplicate",
+        lambda u: jnp.sum(jnp.sin(jnp.concatenate([u, u]))),
+        6,
+        True,
+    ),
     ("squeeze", lambda u: jnp.sum(jnp.sin(u[:, None]).squeeze(-1)), 6, True),
     ("slice_product", lambda u: jnp.sum(u[:3] * u[3:]), 6, False),
     # --- gather / scatter ---
@@ -164,14 +169,14 @@ _ENERGY_IDS = [c[0] for c in ENERGY_CASES]
 @pytest.mark.parametrize("fn,n,exact", [c[1:] for c in ENERGY_CASES], ids=_ENERGY_IDS)
 def test_energy_no_false_negatives(fn, n, exact):
     """The traced Hessian pattern must contain every entry of the true pattern."""
-    pat = trace_energy_sparsity(fn, n)
+    pat = pattern_from_energy(fn, n)
     assert dense_hessian_pattern(fn, n) <= nz_set(pat)
 
 
 @pytest.mark.parametrize("fn,n,exact", [c[1:] for c in ENERGY_CASES], ids=_ENERGY_IDS)
 def test_energy_hessian_structurally_symmetric(fn, n, exact):
     """An energy Hessian pattern is symmetric: the tracer records both (i,j) and (j,i)."""
-    pat = trace_energy_sparsity(fn, n)
+    pat = pattern_from_energy(fn, n)
     assert nz_set(pat) == nz_set(pat.T)
 
 
@@ -182,7 +187,7 @@ def test_energy_hessian_structurally_symmetric(fn, n, exact):
 )
 def test_energy_exact_pattern(fn, n):
     """For tight cases the traced pattern equals the true structural pattern exactly."""
-    pat = trace_energy_sparsity(fn, n)
+    pat = pattern_from_energy(fn, n)
     assert nz_set(pat) == dense_hessian_pattern(fn, n)
 
 
@@ -204,7 +209,7 @@ def test_energy_exact_pattern(fn, n):
 def test_zero_hessian_returns_identity(fn):
     """When nothing couples, ``_trace_hessian_sparsity`` falls back to the identity."""
     n = 4
-    pat = trace_energy_sparsity(fn, n)
+    pat = pattern_from_energy(fn, n)
     assert nz_set(pat) == nz_set(sps.eye(n))
 
 
@@ -221,7 +226,7 @@ def test_integer_pow_exponent_classification(exponent, records):
     """``integer_pow`` only records couplings for exponents >= 2 or <= -1."""
     # the +2.0 offset keeps the base away from 0 so the reciprocal (y=-1) is well defined
     fn = lambda u: jnp.sum((u + 2.0) ** exponent)
-    pat = trace_energy_sparsity(fn, 4)
+    pat = pattern_from_energy(fn, 4)
     if records:
         # y in {-1, 2, 3}: genuine diagonal curvature is recorded
         assert nz_set(pat) == {(i, i) for i in range(4)}
@@ -242,20 +247,20 @@ def test_integer_pow_exponent_classification(exponent, records):
 )
 def test_linear_scaling_not_recorded(fn):
     """``mul``/``div`` by a constant is linear and must record no couplings."""
-    pat = trace_energy_sparsity(fn, 5)
+    pat = pattern_from_energy(fn, 5)
     assert nz_set(pat) == nz_set(sps.eye(5))
 
 
 def test_unary_nonlinear_is_separable_diagonal():
     """An element-wise unary nonlinearity yields a purely diagonal Hessian pattern."""
-    pat = trace_energy_sparsity(lambda u: jnp.sum(jnp.sin(u)), 5)
+    pat = pattern_from_energy(lambda u: jnp.sum(jnp.sin(u)), 5)
     assert nz_set(pat) == {(i, i) for i in range(5)}
 
 
 def test_binary_product_couples_operands():
     """``u[:-1] * u[1:]`` couples adjacent DOFs (a superset of the off-diagonal pattern)."""
     n = 5
-    pat = trace_energy_sparsity(lambda u: jnp.sum(u[:-1] * u[1:]), n)
+    pat = pattern_from_energy(lambda u: jnp.sum(u[:-1] * u[1:]), n)
     # every true adjacency must be captured
     expected_adjacent = {(i, i + 1) for i in range(n - 1)} | {
         (i + 1, i) for i in range(n - 1)
@@ -271,9 +276,9 @@ def test_binary_product_couples_operands():
 def test_nested_jit_matches_unjitted():
     """``@jax.jit`` (and nesting) must not change the traced pattern."""
     e = lambda u: jnp.sum(u[:-1] * u[1:]) + jnp.sum(jnp.sin(u))
-    base = nz_set(trace_energy_sparsity(e, 6))
-    assert nz_set(trace_energy_sparsity(jax.jit(e), 6)) == base
-    assert nz_set(trace_energy_sparsity(jax.jit(jax.jit(e)), 6)) == base
+    base = nz_set(pattern_from_energy(e, 6))
+    assert nz_set(pattern_from_energy(jax.jit(e), 6)) == base
+    assert nz_set(pattern_from_energy(jax.jit(jax.jit(e)), 6)) == base
 
 
 def test_cond_internal_nonlinearity_captured():
@@ -286,7 +291,7 @@ def test_cond_internal_nonlinearity_captured():
         lambda v: jnp.sum(v**2),  # diagonal
         u,
     )
-    pat = trace_energy_sparsity(fn, n)
+    pat = pattern_from_energy(fn, n)
     assert dense_hessian_pattern(fn, n) <= nz_set(pat)
     # union of a tridiagonal and a diagonal branch is exactly the tridiagonal pattern
     assert nz_set(pat) == dense_hessian_pattern(fn, n)
@@ -298,7 +303,7 @@ def test_cond_nonlinearity_after_branch_is_sound():
     fn = lambda u: jnp.sum(
         jax.lax.cond(u[0] > 0, lambda v: v * 2.0, lambda v: v[::-1] * 3.0, u) ** 2
     )
-    assert dense_hessian_pattern(fn, n) <= nz_set(trace_energy_sparsity(fn, n))
+    assert dense_hessian_pattern(fn, n) <= nz_set(pattern_from_energy(fn, n))
 
 
 def test_switch_multibranch_captured():
@@ -313,7 +318,7 @@ def test_switch_multibranch_captured():
         ],
         u,
     )
-    assert dense_hessian_pattern(fn, n) <= nz_set(trace_energy_sparsity(fn, n))
+    assert dense_hessian_pattern(fn, n) <= nz_set(pattern_from_energy(fn, n))
 
 
 @pytest.mark.xfail(
@@ -325,7 +330,7 @@ def test_scan_carry_coupling_is_unsound():
     """Documents a soundness boundary: cross-iteration coupling via a scan carry."""
     n = 6
     fn = lambda u: jnp.sum(jax.lax.scan(lambda c, x: (x, c * x), 1.0, u)[1])
-    assert dense_hessian_pattern(fn, n) <= nz_set(trace_energy_sparsity(fn, n))
+    assert dense_hessian_pattern(fn, n) <= nz_set(pattern_from_energy(fn, n))
 
 
 # ---------------------------------------------------------------------------
@@ -337,9 +342,9 @@ def test_virtual_work_bad_argument_name_raises():
     """An unknown ``trial_arg`` / ``test_arg`` name is rejected up front."""
     g = lambda w, u: jnp.sum(w * u)
     with pytest.raises(ValueError, match="Trial argument 'x' not found"):
-        trace_virtual_work_sparsity(g, 3, trial_arg="x", test_arg="w")
+        pattern_from_virtual_work(g, 3, trial_arg="x", test_arg="w")
     with pytest.raises(ValueError, match="Test argument 'y' not found"):
-        trace_virtual_work_sparsity(g, 3, trial_arg="u", test_arg="y")
+        pattern_from_virtual_work(g, 3, trial_arg="u", test_arg="y")
 
 
 def test_virtual_work_excludes_trial_only_term():
@@ -347,7 +352,7 @@ def test_virtual_work_excludes_trial_only_term():
     n = 4
     # cross term w*u (→ diagonal K) plus a trial-only nonlinearity u**2 that must be masked
     g = lambda w, u: jnp.sum(w * u) + jnp.sum(u**2)
-    K = trace_virtual_work_sparsity(g, n, trial_arg="u", test_arg="w")
+    K = pattern_from_virtual_work(g, n, trial_arg="u", test_arg="w")
     assert nz_set(K) == {(i, i) for i in range(n)}
 
 
@@ -355,7 +360,7 @@ def test_virtual_work_static_arg_forwarded():
     """Extra ``*static_args`` are forwarded positionally to the virtual-work function."""
     n = 4
     g = lambda w, u, kappa: jnp.sum(kappa * w[:-1] * u[1:])
-    K = trace_virtual_work_sparsity(g, n, "u", "w", 2.0)
+    K = pattern_from_virtual_work(g, n, "u", "w", 2.0)
     assert dense_vw_pattern(lambda w, u: g(w, u, 2.0), n) <= nz_set(K)
     assert K.nnz > 0  # the static coefficient does not zero-out the coupling
 
@@ -364,7 +369,7 @@ def test_virtual_work_default_arg_used():
     """A parameter with a default is filled from the signature when not supplied."""
     n = 4
     g = lambda w, u, kappa=3.0: jnp.sum(kappa * w[:-1] * u[1:])
-    K = trace_virtual_work_sparsity(g, n, "u", "w")
+    K = pattern_from_virtual_work(g, n, "u", "w")
     assert dense_vw_pattern(lambda w, u: g(w, u), n) <= nz_set(K)
 
 
@@ -373,7 +378,7 @@ def test_virtual_work_missing_static_arg_raises():
     n = 3
     g = lambda w, u, kappa: jnp.sum(kappa * w * u)
     with pytest.raises(ValueError, match="Missing static argument"):
-        trace_virtual_work_sparsity(g, n, "u", "w")
+        pattern_from_virtual_work(g, n, "u", "w")
 
 
 def test_virtual_work_unsymmetric_pattern_captured():
@@ -382,7 +387,7 @@ def test_virtual_work_unsymmetric_pattern_captured():
     n = 4
     # w_i couples to u_{i+1} but not the reverse → strictly upper off-diagonal block
     g = lambda w, u: jnp.sum(w[:-1] * u[1:])
-    K = trace_virtual_work_sparsity(g, n, trial_arg="u", test_arg="w")
+    K = pattern_from_virtual_work(g, n, trial_arg="u", test_arg="w")
     ref = dense_vw_pattern(g, n)
     assert ref <= nz_set(K)
     assert nz_set(K) != {(c, r) for (r, c) in nz_set(K)}  # not symmetric

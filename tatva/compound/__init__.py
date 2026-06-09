@@ -247,44 +247,6 @@ class Compound:
             raise CompoundError("Layout not set on Compound class.")
         return cls._layout
 
-    @overload
-    @classmethod
-    def get_sparsity(cls, block_wise: Literal[False] = False) -> csr_matrix: ...
-    @overload
-    @classmethod
-    def get_sparsity(
-        cls, block_wise: Literal[True] = True
-    ) -> list[list[csr_matrix]]: ...
-    @classmethod
-    def get_sparsity(
-        cls, block_wise: bool = False
-    ) -> csr_matrix | list[list[csr_matrix]]:
-        """TODO: Currently, only correct for full nodal fields. Incomplete fields are
-        missing in-element couplings. Other fields are only connected to themselves
-        (diagonal entries)! Do not use blindly for mixed meshes.
-
-        Create a sparsity pattern automatically from this Compound class and its
-        attached mesh.
-
-        Nodal fields are fully coupled within elements. All other fields (Local, Shared)
-        are only connected to themselves (diagonal entries). For non-trivial couplings,
-        you must create the sparsity pattern manually.
-
-        Args:
-            block_wise: If True, return the pattern as a list of lists of sparse matrices
-                corresponding to the compound fields/blocks. Stacked fields are one block.
-        """
-        from tatva.sparse._extraction import create_sparsity_pattern_from_compound
-
-        if cls._mesh is None:
-            raise CompoundError(
-                "Mesh must be set on Compound class to create sparsity pattern."
-            )
-
-        return create_sparsity_pattern_from_compound(
-            cls, cls._mesh, block_wise=block_wise
-        )
-
     def __init__(self, arr: Array | None = None, **kwargs) -> None:
         """Initialize the state with given keyword arguments."""
         if arr is not None:

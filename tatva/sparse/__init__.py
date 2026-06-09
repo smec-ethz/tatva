@@ -1,32 +1,34 @@
-from ._coloring import (
-    distance2_colors,
-    largest_degree_first_distance2_colors,
-    smallest_last_distance2_colors,
-)
 from ._extraction import (
-    augment_sparsity_with_lifter,
-    create_sparsity_pattern,
-    create_sparsity_pattern_KKT,
-    create_sparsity_pattern_master_slave,
-    get_bc_indices,
-    reduce_sparsity_pattern,
+    pattern_from_compound,
+    pattern_from_mesh,
 )
 from .base import ColoredMatrix, jacfwd, linearized_jacfwd
-from .tracer import trace_energy_sparsity, trace_virtual_work_sparsity
+from .tracer import pattern_from_energy, pattern_from_virtual_work
+
+
+def __getattr__(name):
+    deprecated_fn = (
+        "create_sparsity_pattern",
+        "reduce_sparsity_pattern",
+        "create_sparsity_pattern_KKT",
+        "create_sparsity_pattern_master_slave",
+        "get_bc_indices",
+    )
+    if name in deprecated_fn:
+        raise ImportError(
+            f"The function {name!r} is deprecated and does not exist anymore. "
+            "Please use the new sparsity functions. "
+            "Check the documentation for more information. "
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "ColoredMatrix",
-    "augment_sparsity_with_lifter",
-    "create_sparsity_pattern",
-    "create_sparsity_pattern_KKT",
-    "create_sparsity_pattern_master_slave",
-    "distance2_colors",
-    "get_bc_indices",
     "jacfwd",
-    "largest_degree_first_distance2_colors",
     "linearized_jacfwd",
-    "reduce_sparsity_pattern",
-    "smallest_last_distance2_colors",
-    "trace_energy_sparsity",
-    "trace_virtual_work_sparsity",
+    "pattern_from_energy",
+    "pattern_from_virtual_work",
+    "pattern_from_compound",
+    "pattern_from_mesh",
 ]

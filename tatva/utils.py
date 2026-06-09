@@ -140,8 +140,8 @@ def make_project_function(
     """
     from tatva.sparse import ColoredMatrix
     from tatva.sparse._extraction import (
+        _adapt_sparsity_with_lifter,
         _create_sparse_structure,
-        reduce_sparsity_pattern,
     )
 
     if colored_matrix is None:
@@ -152,7 +152,7 @@ def make_project_function(
         n = nnodes * dim
         sp = _create_sparse_structure(elements, dim, (n, n))
         if lifter is not None:
-            sp = reduce_sparsity_pattern(sp, lifter.free_dofs)
+            sp = _adapt_sparsity_with_lifter(sp, lifter)
         colored_matrix = ColoredMatrix.from_csr(sp)
     else:
         dim = colored_matrix.shape[0] // nnodes

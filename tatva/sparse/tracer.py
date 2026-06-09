@@ -657,7 +657,7 @@ def _trace_hessian_sparsity(
     return pat
 
 
-def trace_energy_sparsity(
+def pattern_from_energy(
     energy_fn: Callable[Concatenate[Array, P], Array],
     n_dofs: int,
     *static_args,
@@ -667,20 +667,19 @@ def trace_energy_sparsity(
     where u has n_dofs degrees of freedom.
 
     Args:
-        energy_fn   : scalar JAX array energy function E(u, *static_args) as a function of input variable u and optional static arguments
-        n_dofs      : number of DOFs (integer size of flattened input array u)
-        static_args : extra args passed to energy_fn, treated as constants
+        energy_fn: scalar JAX array energy function E(u, *static_args) as a function of input variable u and optional static arguments
+        n_dofs: number of DOFs (integer size of flattened input array u)
+        static_args: extra args passed to energy_fn, treated as constants
 
     Returns:
         A symmetric CSR matrix of shape (n_dofs, n_dofs) with binary entries indicating the sparsity pattern of the Hessian d²E/du².
-
     """
     return _trace_hessian_sparsity(
         energy_fn, n_dofs, *static_args, trial_test_split=None
     )
 
 
-def trace_virtual_work_sparsity(
+def pattern_from_virtual_work(
     virtual_work_fn: Callable[Concatenate[Array, P], Array],
     n_dofs: int,
     trial_arg: str,

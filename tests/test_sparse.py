@@ -58,7 +58,7 @@ def test_sparse_matrix(op: Operator, coloring_func):
 
     K = jax.jacfwd(jax.jacrev(total_energy))(jnp.zeros(op.mesh.coords.shape[0] * 2))
 
-    sparsity_pattern_csr = sparse.create_sparsity_pattern(op.mesh, n_dofs_per_node=2)
+    sparsity_pattern_csr = sparse.pattern_from_mesh(op.mesh, n_dofs_per_node=2)
     indptr = sparsity_pattern_csr.indptr
     indices = sparsity_pattern_csr.indices
 

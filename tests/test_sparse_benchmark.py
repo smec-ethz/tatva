@@ -81,7 +81,7 @@ def _build_problem(
     def total_energy_with_args(u_flat: Array, damage: Array) -> Array:
         return total_energy(u_flat) * jnp.mean(damage)
 
-    sparsity_pattern_csr = sparse.create_sparsity_pattern(mesh, n_dofs_per_node=2)
+    sparsity_pattern_csr = sparse.pattern_from_mesh(mesh, n_dofs_per_node=2)
 
     colors = distance2_color_and_seeds(
         row_ptr=sparsity_pattern_csr.indptr,
