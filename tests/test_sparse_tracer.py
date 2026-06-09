@@ -11,7 +11,11 @@ from jax_autovmap import autovmap
 
 from tatva import Mesh, Operator, compound, element, lifter, sparse
 from tatva.compound import FieldSize
-from tatva.sparse import trace_energy_sparsity, trace_virtual_work_sparsity
+from tatva.sparse import (
+    pattern_from_compound,
+    pattern_from_energy,
+    pattern_from_virtual_work,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -144,12 +148,10 @@ def test_3d_vector_field_sparsity():
         sol = Solution(lf.lift_from_zeros(u_free))
         return total_energy(sol)
 
-    sparsity_pattern = sparse.create_sparsity_pattern(mesh, n_dofs_per_node=3)
-    reduced_sparsity = sparse.reduce_sparsity_pattern(
-        sparsity_pattern, lifter_.free_dofs
-    )
+    sparsity_pattern = sparse.pattern_from_mesh(mesh, n_dofs_per_node=3)
+    reduced_sparsity = lifter_.adapt_sparsity(sparsity_pattern)
 
-    traced_sparsity = trace_energy_sparsity(
+    traced_sparsity = pattern_from_energy(
         total_energy_free, lifter_.size_reduced, lifter_
     )
 
@@ -183,7 +185,7 @@ def test_periodic_constraint_sparsity():
         lifter.Periodic(Solution.u[left_nodes, :], Solution.u[right_nodes, :]),
     )
 
-    sparsity_full = Solution.get_sparsity()
+    sparsity_full = pattern_from_compound(Solution)
     sparsity_augmented = my_lifter.augment_sparsity(sparsity_full)
     pat_reduced_expected = my_lifter.reduce_sparsity(sparsity_augmented)
 
@@ -207,7 +209,7 @@ def test_periodic_constraint_sparsity():
         sol = Solution(lf.lift_from_zeros(u_free))
         return local_energy_fn(sol)
 
-    pat_reduced_actual = trace_energy_sparsity(
+    pat_reduced_actual = pattern_from_energy(
         local_energy_free, my_lifter.size_reduced, my_lifter
     )
 
@@ -306,7 +308,7 @@ def test_lagrangian_multiplier_sparsity():
     h_dense = jax.hessian(energy_fn)(z_dummy)
     ref_sparsity = np.abs(h_dense) > 1e-12
 
-    pat_traced = trace_energy_sparsity(energy_fn, n_dofs=Solution.size)
+    pat_traced = pattern_from_energy(energy_fn, n_dofs=Solution.size)
     traced_sparsity = pat_traced.toarray() > 0
 
     fn_mask = ref_sparsity & (~traced_sparsity)
@@ -375,7 +377,7 @@ def test_advection_diffusion_virtual_work_sparsity(line_operator):
 
     my_lifter = lifter.Lifter(Field.size, lifter.Fixed(Field.u[jnp.array([0]), :]))
 
-    pat = trace_virtual_work_sparsity(g_fn, Field.size, trial_arg="u", test_arg="w")
+    pat = pattern_from_virtual_work(g_fn, Field.size, trial_arg="u", test_arg="w")
     u_dummy = jnp.arange(Field.size, dtype=jnp.float64)
     K_pat = _virtual_work_reference(g_fn, Field.size, u_dummy)
 
@@ -402,7 +404,7 @@ def test_nonlinear_coupling_virtual_work_sparsity(line_operator):
 
     my_lifter = lifter.Lifter(Field.size, lifter.Fixed(Field.u[jnp.array([0]), :]))
 
-    pat = trace_virtual_work_sparsity(g_fn, Field.size, trial_arg="u", test_arg="w")
+    pat = pattern_from_virtual_work(g_fn, Field.size, trial_arg="u", test_arg="w")
     # Avoid the trivial derivative of u**3 at zero.
     u_dummy = jnp.arange(N, dtype=jnp.float64) + 1.0
     K_pat = _virtual_work_reference(g_fn, Field.size, u_dummy)
@@ -434,7 +436,7 @@ def test_mixed_nodal_virtual_work_sparsity(line_operator):
 
     my_lifter = lifter.Lifter(Mixed.size, lifter.Fixed(Mixed.v[jnp.array([0]), :]))
 
-    pat = trace_virtual_work_sparsity(
+    pat = pattern_from_virtual_work(
         g_fn, Mixed.size, trial_arg="trial", test_arg="test"
     )
     u_dummy = jnp.arange(Mixed.size, dtype=jnp.float64)
@@ -462,12 +464,16 @@ def test_unsymmetric_sparsity(line_operator):
         wa, wb = TwoField(test)
         diffusion = op.integrate(op.grad(wa) * op.grad(a)).sum()
         diffusion += op.integrate(op.grad(wb) * op.grad(b)).sum()
-        one_way = op.integrate(op.eval(wa) * op.grad(b)).sum()  # a-residual depends on b
+        one_way = op.integrate(
+            op.eval(wa) * op.grad(b)
+        ).sum()  # a-residual depends on b
         return diffusion + one_way
 
-    my_lifter = lifter.Lifter(TwoField.size, lifter.Fixed(TwoField.a[jnp.array([0]), :]))
+    my_lifter = lifter.Lifter(
+        TwoField.size, lifter.Fixed(TwoField.a[jnp.array([0]), :])
+    )
 
-    pat = trace_virtual_work_sparsity(
+    pat = pattern_from_virtual_work(
         g_fn, TwoField.size, trial_arg="trial", test_arg="test"
     )
     u_dummy = jnp.arange(TwoField.size, dtype=jnp.float64)

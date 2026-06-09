@@ -66,9 +66,8 @@ def _build_problem(nx, ny, rank, size, comm):
     )
     lifter = Lifter(n_dofs, Fixed(fixed_dofs, 0.0))
 
-    free_sparsity = sparse.reduce_sparsity_pattern(
-        sparse.create_sparsity_pattern(raw_mesh, N_DOFS_PER_NODE),
-        lifter.free_dofs,
+    free_sparsity = lifter.adapt_sparsity(
+        sparse.pattern_from_mesh(raw_mesh, N_DOFS_PER_NODE)
     )
     global_colored = sparse.ColoredMatrix.from_csr(free_sparsity)
 

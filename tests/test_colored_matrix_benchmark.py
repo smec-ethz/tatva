@@ -24,8 +24,9 @@ import pytest
 import scipy.sparse as sp
 from jax import Array
 from jax_autovmap import autovmap
+
 from tatva import Mesh, Operator, element
-from tatva.sparse import ColoredMatrix, create_sparsity_pattern, jacfwd
+from tatva.sparse import ColoredMatrix, jacfwd, pattern_from_mesh
 
 jax.config.update("jax_enable_x64", True)
 
@@ -75,7 +76,7 @@ def _build_problem(
 
     grad_fn = jax.grad(energy_fn)
 
-    sparsity = create_sparsity_pattern(mesh, 2)
+    sparsity = pattern_from_mesh(mesh, 2)
 
     return op, energy_fn, grad_fn, sparsity, n_dofs
 

@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from tatva import Mesh, Operator, element, sparse
 
 jax.config.update("jax_enable_x64", True)
@@ -23,7 +24,7 @@ def test_project_scalar_field(op, mesh):
     field = quad_points[:, :, 0] + quad_points[:, :, 1]
 
     # Project with scalar matrix
-    sp = sparse.create_sparsity_pattern(mesh, 1)
+    sp = sparse.pattern_from_mesh(mesh, 1)
     cm = sparse.ColoredMatrix.from_csr(sp)
 
     projected = op.project(field, cm)
@@ -39,7 +40,7 @@ def test_project_vector_field(op, mesh):
     field = quad_points  # (E, Q, 2)
 
     # Project with scalar matrix (Multiple RHS solve)
-    sp_scalar = sparse.create_sparsity_pattern(mesh, 1)
+    sp_scalar = sparse.pattern_from_mesh(mesh, 1)
     cm_scalar = sparse.ColoredMatrix.from_csr(sp_scalar)
     projected_scalar = op.project(field, cm_scalar)
 
@@ -47,7 +48,7 @@ def test_project_vector_field(op, mesh):
     np.testing.assert_allclose(projected_scalar, mesh.coords, atol=1e-7)
 
     # Project with vector matrix (Coupled solve)
-    sp_vector = sparse.create_sparsity_pattern(mesh, 2)
+    sp_vector = sparse.pattern_from_mesh(mesh, 2)
     cm_vector = sparse.ColoredMatrix.from_csr(sp_vector)
     projected_vector = op.project(field, cm_vector)
 
@@ -64,7 +65,7 @@ def test_project_tensor_field(op, mesh):
     field = field.at[:, :, 1, 1].set(quad_points[:, :, 1])
 
     # Project with scalar matrix (4 independent RHS)
-    sp = sparse.create_sparsity_pattern(mesh, 1)
+    sp = sparse.pattern_from_mesh(mesh, 1)
     cm = sparse.ColoredMatrix.from_csr(sp)
 
     projected = op.project(field, cm)

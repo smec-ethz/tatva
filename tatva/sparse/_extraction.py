@@ -18,18 +18,19 @@
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, overload
 
 import numpy as np
 import scipy.sparse as sps
-from jax import Array
 from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
 from tatva import Mesh
 
 if TYPE_CHECKING:
-    from tatva.compound import Compound
+    from scipy.sparse import csr_matrix
+
+    from tatva.compound import Compound, CompoundError
     from tatva.lifter import Lifter
 
 
@@ -86,7 +87,7 @@ def _create_sparse_structure(
     )
 
 
-def create_sparsity_pattern(mesh: Mesh, n_dofs_per_node: int) -> sps.csr_matrix:
+def pattern_from_mesh(mesh: Mesh, n_dofs_per_node: int) -> sps.csr_matrix:
     """Create a sparsity pattern using SciPy's COO format for efficient setup on CPU.
 
     Args:
@@ -101,184 +102,7 @@ def create_sparsity_pattern(mesh: Mesh, n_dofs_per_node: int) -> sps.csr_matrix:
     return _create_sparse_structure(elements, n_dofs_per_node, K_shape)
 
 
-def get_bc_indices(
-    sparsity_pattern: sps.csr_matrix, fixed_dofs: Array | NDArray
-) -> tuple[NDArray, NDArray]:
-    """Get the indices of the fixed degrees of freedom.
-
-    Args:
-        sparsity_pattern: scipy.sparse.csr_matrix
-        fixed_dofs: (num_fixed_dofs,)
-
-    Returns:
-        zero_indices: (num_zero_indices,)
-        one_indices: (num_one_indices,)
-    """
-
-    row_indices, col_indices = sparsity_pattern.nonzero()
-    zero_indices = []
-    one_indices = []
-
-    for dof in fixed_dofs:
-        indexes = np.where(row_indices == dof)[0]
-        for idx in indexes:
-            zero_indices.append(int(idx))
-
-        idx = np.where((row_indices == dof) & (col_indices == dof))[0][0]
-        one_indices.append(int(idx))
-
-    return np.array(zero_indices), np.array(one_indices)
-
-
-def create_sparsity_pattern_KKT(
-    mesh: Mesh, n_dofs_per_node: int, B: ArrayLike
-) -> sps.csr_matrix:
-    """Create KKT sparsity pattern in SciPy CSR format.
-
-    Block structure:
-        [ K   B^T ]
-        [ B    C  ]
-    where C is identity (matching your current implementation).
-    """
-    B_np = np.asarray(B)
-    nb_cons = B_np.shape[0]
-
-    # K pattern (convert to CSR)
-    K = create_sparsity_pattern(mesh, n_dofs_per_node)
-
-    # B pattern from dense B (keep only structure)
-    B_pattern = sps.csr_matrix((B_np != 0).astype(np.int8))
-    BT_pattern = B_pattern.T
-
-    # TODO: decide if we want the true saddle-point structure with zero C block, or if we
-    # want to keep the identity
-    C = sps.eye(nb_cons, format="csr", dtype=np.int8)
-
-    KKT = sps.block_array(
-        [[K, BT_pattern], [B_pattern, C]],
-        format="csr",
-    )
-    return KKT
-
-
-def reduce_sparsity_pattern(
-    pattern: sps.csr_matrix, free_dofs: ArrayLike
-) -> sps.csr_matrix:
-    """Reduce a sparse matrix pattern in CSR format to only the free dofs.
-
-    Args:
-        pattern (sps.csr_matrix): Sparse matrix pattern in CSR format on the full
-            set of dofs.
-        free_dofs: Array of free dofs as integer indices.
-    """
-    free_dofs = np.asarray(free_dofs, dtype=np.int64)
-    return pattern[free_dofs][:, free_dofs]
-
-
-def create_sparsity_pattern_master_slave(
-    mesh: Mesh,
-    n_dofs_per_node: int,
-    master_slave_map: ArrayLike,
-) -> sps.csr_matrix:
-    """Create a sparsity pattern for a system with master–slave DOF mapping, e.g.,
-    periodic BCs.
-
-    The returned sparsity corresponds to the reduced system defined on master DOFs only.
-
-    Args:
-        mesh: Mesh object.
-        n_dofs_per_node: Number of degrees of freedom per node.
-        master_slave_map: Array of shape (n_full_dofs,) where each entry maps a full DOF
-            index to its master DOF index (masters map to themselves). Optionally, an
-            array of shape (n_nodes,) mapping nodes to master nodes; this will be expanded
-            to DOF-level by preserving the per-node DOF offset. Entries can be set -1 to
-            indicate Dirichlet BCs (removal from system).
-
-    Returns:
-        jax.experimental.sparse.BCOO: Sparsity pattern of the reduced (master-only)
-        system.
-    """
-
-    n_nodes = int(mesh.coords.shape[0])
-    n_full = int(n_nodes * n_dofs_per_node)
-
-    arr = np.asarray(master_slave_map, dtype=np.int64)
-
-    if arr.ndim != 1:
-        raise ValueError("master_slave_map array must be 1D.")
-    if arr.size == n_nodes:
-        # Node-level mapping: expand to DOF-level preserving component offsets
-        map_arr = np.full(n_full, -1, dtype=np.int64)
-        for node in range(n_nodes):
-            base_s = node * n_dofs_per_node
-            master_node = int(arr[node])
-            if master_node < 0:
-                continue
-            base_m = master_node * n_dofs_per_node
-            for k in range(n_dofs_per_node):
-                map_arr[base_s + k] = base_m + k
-    elif arr.size == n_full:
-        map_arr = arr
-    else:
-        raise ValueError(
-            "master_slave_map array must have length n_nodes or n_full_dofs."
-        )
-
-    # Normalize to final masters in case of chaining
-    # (map may already be idempotent; this is safe either way)
-    while True:
-        valid = map_arr >= 0
-        if not np.any(valid):
-            break
-        new_map = map_arr.copy()
-        new_map[valid] = map_arr[map_arr[valid]]
-        new_map[~valid] = -1
-        if np.array_equal(new_map, map_arr):
-            break
-        map_arr = new_map
-
-    # Create full-system sparsity from connectivity, then project via mapping
-    full_pattern_csr = _create_sparse_structure(
-        mesh.elements, n_dofs_per_node, K_shape=(n_full, n_full)
-    )
-    full_pattern = full_pattern_csr.tocoo()  # COO for easy access to indices
-
-    I_full = full_pattern.row.astype(np.int64)
-    J_full = full_pattern.col.astype(np.int64)
-
-    # Unique masters and compaction to 0..n_red-1
-    masters = np.unique(map_arr)
-    # Handle -1 in dofmap (dirichlet BCs)
-    masters_reduced = masters[masters >= 0]
-    n_red = int(masters_reduced.size)
-    # Map master DOF id in [0, n_full) -> compact id in [0, n_red)
-    master_to_compact = -np.ones(n_full, dtype=np.int64)
-    master_to_compact[masters_reduced] = np.arange(n_red, dtype=np.int64)
-
-    mapped_I = map_arr[I_full]
-    mapped_J = map_arr[J_full]
-    valid_entries = (mapped_I >= 0) & (mapped_J >= 0)
-
-    mapped_I = mapped_I[valid_entries]
-    mapped_J = mapped_J[valid_entries]
-
-    I_red = master_to_compact[mapped_I]
-    J_red = master_to_compact[mapped_J]
-
-    # Deduplicate pairs and set data to 1 (pattern only)
-    keys = I_red * n_red + J_red
-    uniq, _ = np.unique(keys, return_inverse=False), None
-    Iu = (uniq // n_red).astype(np.int32)
-    Ju = (uniq % n_red).astype(np.int32)
-    data = np.ones(Iu.shape[0], dtype=np.int32)
-
-    return sps.csr_matrix(
-        (data, (Iu, Ju)),
-        shape=(n_red, n_red),
-    )
-
-
-def augment_sparsity_with_lifter(
+def _adapt_sparsity_with_lifter(
     sparsity: sps.csr_matrix, lifter: Lifter
 ) -> sps.csr_matrix:
     """Augment the sparsity pattern with constraints from a lifter.
@@ -287,12 +111,19 @@ def augment_sparsity_with_lifter(
         sparsity: Sparsity pattern in SciPy CSR format.
         lifter: Lifter containing constraints.
     """
-    return lifter.augment_sparsity(sparsity)
+    return lifter.adapt_sparsity(sparsity)
 
 
-def create_sparsity_pattern_from_compound(
+@overload
+def pattern_from_compound(
+    compound_cls: type[Compound], block_wise: Literal[False] = False
+) -> csr_matrix: ...
+@overload
+def pattern_from_compound(
+    compound_cls: type[Compound], block_wise: Literal[True] = True
+) -> list[list[csr_matrix]]: ...
+def pattern_from_compound(
     compound_cls: type[Compound],
-    mesh: Mesh,
     block_wise: bool = False,
 ) -> sps.csr_matrix | list[list[sps.csr_matrix]]:
     """Create a sparsity pattern automatically from a Compound class and its attached
@@ -303,14 +134,18 @@ def create_sparsity_pattern_from_compound(
 
     Args:
         compound_cls: The Compound class defining the state layout.
-        mesh: The Mesh object attached to the Compound.
         block_wise: If True, return the pattern as a list of lists of sparse matrices
             corresponding to the compound fields/blocks. Stacked fields are one block.
     """
     from tatva.compound.field_types import Nodal
 
-    n_nodes = mesh.coords.shape[0]
-    num_elements = mesh.elements.shape[0]
+    if compound_cls._mesh is None:
+        raise CompoundError(
+            "Mesh must be set on Compound class to create sparsity pattern."
+        )
+
+    n_nodes = compound_cls._mesh.coords.shape[0]
+    num_elements = compound_cls._mesh.elements.shape[0]
 
     main_coupling_list: list[NDArray[np.int32]] = []
     diagonal_dofs_list: list[NDArray[np.int32]] = []
@@ -340,7 +175,9 @@ def create_sparsity_pattern_from_compound(
                     )[valid_nodes]
 
                 # Map nodes to elements
-                f_element_dofs = node_dofs[mesh.elements].reshape(num_elements, -1)
+                f_element_dofs = node_dofs[compound_cls._mesh.elements].reshape(
+                    num_elements, -1
+                )
                 main_coupling_list.append(f_element_dofs)
         else:
             warnings.warn(
