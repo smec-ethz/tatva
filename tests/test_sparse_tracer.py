@@ -526,3 +526,107 @@ def test_unsymmetric_sparsity(line_operator):
 
     # Two interleaved nodal fields are traced conservatively, so require no false negatives.
     _assert_traced_matches(pat, K_pat, my_lifter, exact=False)
+
+
+# ---------------------------------------------------------------------------
+# external (opaque) constitutive leaves: custom_jvp + lax.map, and ffi_call + vmap
+# ---------------------------------------------------------------------------
+
+
+def test_custom_jvp_leaf_virtual_work_matches_connectivity(line_operator):
+    """An external constitutive leaf wrapped in ``custom_jvp`` and mapped per quad point
+    with ``lax.map`` (a scan the tracer descends into) keeps the correct sparse tangent
+    pattern -- identical to the pure-JAX linear-elastic connectivity."""
+    N = 6
+    op = line_operator(N)
+
+    class Field(compound.Compound, mesh=op.mesh):
+        u = compound.field((FieldSize.AUTO, 1))
+
+    @jax.custom_jvp
+    def stress_qp(strain):  # per quad point: (n_dim,) -> (n_dim,)
+        return 2.0 * strain
+
+    @stress_qp.defjvp
+    def stress_qp_jvp(primals, tangents):
+        (s,), (ds,) = primals, tangents
+        return stress_qp(s), 2.0 * ds
+
+    def stress(strain):
+        nd = strain.shape[-1]
+        return jax.lax.map(stress_qp, strain.reshape(-1, nd)).reshape(strain.shape)
+
+    def g_leaf(w, u):
+        (u_n,) = Field(u)
+        (w_n,) = Field(w)
+        return op.integrate(
+            jnp.einsum("eqd,eqd->eq", stress(op.grad(u_n)), op.grad(w_n))
+        ).sum()
+
+    def g_elastic(w, u):
+        (u_n,) = Field(u)
+        (w_n,) = Field(w)
+        return op.integrate(
+            jnp.einsum("eqd,eqd->eq", 2.0 * op.grad(u_n), op.grad(w_n))
+        ).sum()
+
+    ref = pattern_from_virtual_work(g_elastic, Field.size, trial_arg="u", test_arg="w")
+    pat = pattern_from_virtual_work(g_leaf, Field.size, trial_arg="u", test_arg="w")
+    assert nz_set(pat) == nz_set(ref)
+
+
+def test_ffi_leaf_virtual_work_register_elementwise(line_operator):
+    """A vmapped ``ffi_call`` constitutive leaf is global-dense by default; declaring the
+    target with ``register_elementwise_ffi`` recovers the elastic-connectivity pattern.
+    Pattern-only: the FFI is never executed during tracing."""
+    import jax.ffi as jffi
+
+    from tatva.sparse import register_elementwise_ffi
+    from tatva.sparse.tracer import _ELEMENTWISE_FFI_TARGETS
+
+    N = 6
+    op = line_operator(N)
+
+    class Field(compound.Compound, mesh=op.mesh):
+        u = compound.field((FieldSize.AUTO, 1))
+
+    target = "tatva_fem_test_rve"
+
+    def stress_qp(s):  # (n_dim,) -> (n_dim,)
+        return jffi.ffi_call(
+            target, jax.ShapeDtypeStruct(s.shape, s.dtype), vmap_method="broadcast_all"
+        )(s)
+
+    def stress(strain):
+        nd = strain.shape[-1]
+        return jax.vmap(stress_qp)(strain.reshape(-1, nd)).reshape(strain.shape)
+
+    def g_leaf(w, u):
+        (u_n,) = Field(u)
+        (w_n,) = Field(w)
+        return op.integrate(
+            jnp.einsum("eqd,eqd->eq", stress(op.grad(u_n)), op.grad(w_n))
+        ).sum()
+
+    def g_elastic(w, u):
+        (u_n,) = Field(u)
+        (w_n,) = Field(w)
+        return op.integrate(
+            jnp.einsum("eqd,eqd->eq", op.grad(u_n), op.grad(w_n))
+        ).sum()
+
+    ref = pattern_from_virtual_work(g_elastic, Field.size, trial_arg="u", test_arg="w")
+    try:
+        assert target not in _ELEMENTWISE_FFI_TARGETS
+        dense = pattern_from_virtual_work(
+            g_leaf, Field.size, trial_arg="u", test_arg="w"
+        )
+        # default: opaque batched call -> strictly denser than (a superset of) the truth
+        assert nz_set(ref) <= nz_set(dense)
+        assert dense.nnz > ref.nnz
+
+        register_elementwise_ffi(target)
+        pat = pattern_from_virtual_work(g_leaf, Field.size, trial_arg="u", test_arg="w")
+        assert nz_set(pat) == nz_set(ref)
+    finally:
+        _ELEMENTWISE_FFI_TARGETS.discard(target)

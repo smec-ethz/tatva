@@ -3,7 +3,11 @@ from ._extraction import (
     pattern_from_mesh,
 )
 from .base import ColoredMatrix, jacfwd, linearized_jacfwd
-from .tracer import pattern_from_energy, pattern_from_virtual_work
+from .tracer import (
+    pattern_from_energy,
+    pattern_from_virtual_work,
+    register_elementwise_ffi,
+)
 
 
 def __getattr__(name):
@@ -31,4 +35,5 @@ __all__ = [
     "pattern_from_virtual_work",
     "pattern_from_compound",
     "pattern_from_mesh",
+    "register_elementwise_ffi",
 ]
