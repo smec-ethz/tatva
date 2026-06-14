@@ -228,6 +228,34 @@ class TracerRegistry:
 TRACER_REGISTRY = TracerRegistry()
 
 
+# FFI targets whose vmapped (batched) call is elementwise along the leading (vmap) axis,
+# i.e. output[i] depends only on input[i] -- e.g. a per-quad-point external constitutive
+# solver vmapped over quad points. Declaring a target here lets the tracer recover the
+# sparse (block-diagonal) coupling from the single batched ``ffi_call`` instead of the
+# conservative dense couple-all. See ``register_elementwise_ffi``.
+_ELEMENTWISE_FFI_TARGETS: Set[str] = set()
+
+
+def register_elementwise_ffi(*target_names: str) -> None:
+    """Declare one or more ``jax.ffi`` target names as elementwise along the vmap axis.
+
+    A vmapped ``ffi_call`` is a *single* batched custom-call over the whole leading axis,
+    so by default the tracer must treat it as a dense opaque block (it cannot tell the
+    batch axis is independent). Registering the target tells the tracer that the call is a
+    per-element map (output[i] depends only on input[i]) -- as it is for a per-quad-point
+    external solver vmapped over quad points -- so it records conservative coupling *per
+    slice* (block-diagonal across the leading axis), recovering the sparse pattern.
+
+    Register by the FFI target name (the string passed to ``jax.ffi.ffi_call``) -- anyone
+    building or using a ``jax.ffi`` solver knows this name. Then a per-quad-point external
+    solver vmapped over quad points, ``jax.vmap(solver)(strain_field)``, traces sparse.
+
+    Only register a target if this independence genuinely holds; otherwise real
+    cross-element couplings would be silently missed.
+    """
+    _ELEMENTWISE_FFI_TARGETS.update(target_names)
+
+
 class SparseDepSet:
     def __init__(self, dep: sps.csr_matrix, shape: tuple):
         """
@@ -460,6 +488,9 @@ def _analyze_and_resolve_jaxpr(
                 "scatter-mul",
                 "custom_vjp_call",
                 "custom_jvp_call",
+                "pure_callback",
+                "io_callback",
+                "ffi_call",
             ):
                 combined_mask = 0
                 for v in eqn.invars:
@@ -482,6 +513,9 @@ def _analyze_and_resolve_jaxpr(
                 "scatter-mul",
                 "custom_vjp_call",
                 "custom_jvp_call",
+                "pure_callback",
+                "io_callback",
+                "ffi_call",
             ):
                 is_nonlinear = True
 
@@ -885,6 +919,10 @@ class Handlers:
         trial_test_split: int | None,
     ) -> None:
         """Fallback handler for unrecognized primitives."""
+        if not eqn.outvars:
+            # Effect-only primitive (no array outputs), e.g. a debug/print callback.
+            # Nothing to propagate and nothing couples through it.
+            return
         in_d = [state.get(v) for v in eqn.invars]
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
 
@@ -901,6 +939,22 @@ class Handlers:
             total = SparseDepSet(reduced, ())
         stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
+
+    @staticmethod
+    @TRACER_REGISTRY.register("debug_print", "debug_callback")
+    def no_op(
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: "CouplingAccumulator",
+        trial_test_split: int | None,
+    ) -> None:
+        """Effect-only debug primitives (``jax.debug.print`` / ``jax.debug.callback``).
+
+        They have no array outputs and contribute nothing to the Hessian, so the tracer
+        simply skips them -- letting you sprinkle ``jax.debug.print`` into an energy or
+        virtual-work form for debugging without breaking sparsity tracing.
+        """
+        return
 
     @staticmethod
     @TRACER_REGISTRY.register("add", "add_any", "sub", "max", "min")
@@ -1946,19 +2000,30 @@ class Handlers:
             )
 
     @staticmethod
-    @TRACER_REGISTRY.register("custom_vjp_call", "custom_jvp_call")
+    @TRACER_REGISTRY.register(
+        "custom_vjp_call",
+        "custom_jvp_call",
+        "pure_callback",
+        "io_callback",
+    )
     def custom_vjp_jvp_call(
         eqn: JaxprEqn,
         state: TraceState,
         acc: "CouplingAccumulator",
         trial_test_split: int | None,
     ) -> None:
-        """Handler for JAX custom_vjp and custom_jvp calls.
-        These represent general nonlinear black-box functions.
-        We propagate the union of input dependencies to each output element,
-        and record the self-couplings of the inputs (since they are nonlinear).
-        Since the internal structure of the custom call is opaque, we couple all inputs
-        together even if internals are linear.
+        """Handler for JAX custom_vjp/custom_jvp calls and host callbacks
+        (``pure_callback`` / ``io_callback``).
+
+        These all represent general nonlinear black-box functions whose internals are
+        opaque to the tracer (a host callback has no traceable jaxpr at all; an external
+        RVE solver typically lives inside one wrapped in ``custom_jvp``). We therefore
+        propagate the union of input dependencies to each output element and record the
+        self-couplings of the active inputs, coupling all inputs together even if the
+        internals happen to be linear. This is conservative (over-approximate): it can
+        never miss a coupling, which is the correct failure mode for an unseen black box.
+        Note the plain ``fallback`` handler does NOT record couplings, so an external
+        callback that landed there would silently drop them.
         """
         in_d = [state.get(v) for v in eqn.invars]
 
@@ -1983,3 +2048,66 @@ class Handlers:
             oshp = _get_shape(ovar)
             stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
             state.set(ovar, SparseDepSet(stacked_dep, oshp))
+
+    @staticmethod
+    @TRACER_REGISTRY.register("ffi_call")
+    def ffi_call(
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: "CouplingAccumulator",
+        trial_test_split: int | None,
+    ) -> None:
+        """Handler for ``jax.ffi.ffi_call`` (external XLA custom-call solvers).
+
+        Default: an opaque black box -> couple all active inputs (same conservative rule
+        as ``custom_vjp_jvp_call``). Note a *vmapped* ffi_call is a SINGLE batched call
+        over the whole leading axis, so this default over-approximates it to a dense block.
+
+        Opt-in (``register_elementwise_ffi(target)``): treat the call as elementwise along
+        the leading (vmap) axis -- couple inputs *per slice* (block-diagonal across that
+        axis) so a per-quad-point external solver vmapped over quad points keeps its sparse
+        pattern, exactly as it would via ``lax.map``/``scan``.
+        """
+        in_d = [state.get(v) for v in eqn.invars]
+        target = eqn.params.get("target_name")
+
+        # Decide whether the block-diagonal (elementwise) rule applies: the target must be
+        # registered AND every operand must share a common leading (batch) axis.
+        lead = None
+        if target in _ELEMENTWISE_FFI_TARGETS:
+            shapes = [d.shape for d in in_d] + [_get_shape(ov) for ov in eqn.outvars]
+            if shapes and all(len(s) >= 1 for s in shapes):
+                leads = {s[0] for s in shapes}
+                if len(leads) == 1:
+                    lead = leads.pop()
+
+        if not lead:
+            # Conservative default: opaque couple-all over every active input.
+            Handlers.custom_vjp_jvp_call(eqn, state, acc, trial_test_split)
+            return
+
+        B = lead
+        # Per-slice union of input columns, recorded as an independent coupling block.
+        slice_rows: list[sps.csr_matrix] = []
+        for b in range(B):
+            cols_active = np.zeros(state.n_dofs, dtype=bool)
+            for d in in_d:
+                nrows = d.dep.shape[0]
+                if nrows == 0:
+                    continue
+                core = nrows // B
+                blk = d.dep[b * core : (b + 1) * core]
+                if blk.nnz:
+                    cols_active[blk.indices] = True
+            row = sps.csr_matrix(cols_active.reshape(1, -1))
+            if row.nnz:
+                acc.record_dep(row, trial_test_split)
+            slice_rows.append(row)
+
+        # Assign each output: slice b broadcast over its core (per-slice) elements.
+        for ovar in eqn.outvars:
+            oshp = _get_shape(ovar)
+            core_o = int(np.prod(oshp)) // B
+            blocks = [_broadcast_single_row(slice_rows[b], core_o) for b in range(B)]
+            stacked = sps.vstack(blocks).tocsr()
+            state.set(ovar, SparseDepSet(stacked, oshp))

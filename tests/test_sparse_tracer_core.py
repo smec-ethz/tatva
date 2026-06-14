@@ -471,3 +471,150 @@ def test_coupling_accumulator_empty_finalize():
     assert pat.shape == (3, 3)
     assert pat.nnz == 0
     assert pat.dtype == np.int8
+
+
+# ---------------------------------------------------------------------------
+# G. opaque-leaf handlers: custom_vjp/jvp, host callbacks, debug, ffi_call
+# ---------------------------------------------------------------------------
+#
+# These leaves are opaque to the tracer (no traceable jaxpr / no host-side rule).
+# The contract: couple all *active inputs of the call* conservatively -- which, when each
+# call sees only one element's local DOFs, is exactly the per-element pattern. The shared
+# adjacent-difference energy below makes every call's input {i, i+1}, so the conservative
+# coupling is the (tight) tridiagonal pattern.
+
+
+def _adjacent_energy(leaf, M):
+    """``sum_i leaf(U[i] - U[i+1])`` -- each opaque call's input is the local pair {i,i+1}."""
+
+    def energy(U):
+        e = 0.0
+        for i in range(M - 1):
+            e = e + leaf(U[i] - U[i + 1])
+        return jnp.sum(e)
+
+    return energy
+
+
+def _tridiagonal(M) -> set[tuple[int, int]]:
+    s = {(i, i) for i in range(M)}
+    s |= {(i, i + 1) for i in range(M - 1)}
+    s |= {(i + 1, i) for i in range(M - 1)}
+    return s
+
+
+def test_custom_jvp_leaf_conservative_and_tight():
+    """A ``custom_jvp`` leaf is treated as an opaque nonlinear box: it couples its input
+    DOFs, giving the tridiagonal pattern with no false negatives vs the true Hessian."""
+    M = 6
+
+    @jax.custom_jvp
+    def leaf(x):
+        return 0.5 * x**2
+
+    @leaf.defjvp
+    def leaf_jvp(primals, tangents):
+        (x,), (dx,) = primals, tangents
+        return leaf(x), x * dx
+
+    fn = _adjacent_energy(leaf, M)
+    pat = pattern_from_energy(fn, M)
+    assert nz_set(pat) == _tridiagonal(M)
+    assert dense_hessian_pattern(fn, M) <= nz_set(pat)  # no false negatives
+
+
+def test_custom_vjp_leaf_hides_iteration_but_couples_inputs():
+    """A ``custom_vjp`` leaf hiding an iterative solve is opaque to the tracer; it still
+    records the conservative coupling of its inputs (tridiagonal)."""
+    M = 6
+
+    @jax.custom_vjp
+    def leaf(x):
+        y = x
+        for _ in range(5):  # hidden Newton iteration, invisible to the tracer
+            y = y - (y**3 + y - x) / (3 * y**2 + 1.0)
+        return 0.5 * y**2
+
+    def leaf_fwd(x):
+        y = x
+        for _ in range(5):
+            y = y - (y**3 + y - x) / (3 * y**2 + 1.0)
+        return 0.5 * y**2, y
+
+    def leaf_bwd(res, g):
+        y = res
+        return (g * y / (3 * y**2 + 1.0),)
+
+    leaf.defvjp(leaf_fwd, leaf_bwd)
+
+    fn = _adjacent_energy(leaf, M)
+    # The tracer must not descend into the loop: a custom_vjp_call jaxpr is present.
+    prims = {e.primitive.name for e in jax.make_jaxpr(fn)(np.zeros(M)).jaxpr.eqns}
+    assert "custom_vjp_call" in prims
+    assert nz_set(pattern_from_energy(fn, M)) == _tridiagonal(M)
+
+
+@pytest.mark.parametrize("ordered_kind", ["pure", "io"])
+def test_host_callback_leaf_records_couplings(ordered_kind):
+    """``pure_callback`` / ``io_callback`` get the dedicated opaque handler, so couplings
+    are RECORDED (the plain fallback would silently drop them, leaving only the diagonal)."""
+    from jax.experimental import io_callback
+
+    M = 6
+
+    def leaf(x):
+        sds = jax.ShapeDtypeStruct(x.shape, x.dtype)
+        if ordered_kind == "pure":
+            return jax.pure_callback(lambda v: 0.5 * v**2, sds, x)
+        return io_callback(lambda v: 0.5 * v**2, sds, x, ordered=True)
+
+    pat = pattern_from_energy(_adjacent_energy(leaf, M), M)
+    assert nz_set(pat) == _tridiagonal(M)
+    assert pat.nnz > M  # off-diagonals present -> couplings were NOT silently dropped
+
+
+def test_debug_print_is_noop():
+    """``jax.debug.print`` is an effect-only (no-output) primitive: it must neither change
+    the pattern nor break tracing."""
+    M = 6
+    base = lambda U: jnp.sum(U[:-1] * U[1:])
+
+    def with_print(U):
+        jax.debug.print("tracing U with shape {}", U.shape)
+        return jnp.sum(U[:-1] * U[1:])
+
+    assert nz_set(pattern_from_energy(with_print, M)) == nz_set(pattern_from_energy(base, M))
+
+
+def test_ffi_call_default_dense_registered_block_diagonal():
+    """A vmapped ``ffi_call`` is a single batched opaque call -> global dense by default;
+    after ``register_elementwise_ffi`` it is treated as elementwise along the vmap axis
+    -> the sparse (tridiagonal) per-element pattern. (The FFI is never executed during
+    tracing, so no compiled target is needed.)"""
+    import jax.ffi as jffi
+
+    from tatva.sparse import register_elementwise_ffi
+    from tatva.sparse.tracer import _ELEMENTWISE_FFI_TARGETS
+
+    M = 6
+    target = "tatva_unittest_rve"
+
+    def leaf(s):  # per quad point: (n_dim,) -> (n_dim,)
+        return jffi.ffi_call(
+            target, jax.ShapeDtypeStruct(s.shape, s.dtype), vmap_method="broadcast_all"
+        )(s)
+
+    def energy(U):
+        strain = (U[:-1] - U[1:]).reshape(-1, 1)  # (M-1, n_dim=1)
+        return jnp.sum(jax.vmap(leaf)(strain) * strain)
+
+    try:
+        assert target not in _ELEMENTWISE_FFI_TARGETS
+        pat_dense = pattern_from_energy(energy, M)
+        assert pat_dense.nnz == M * M  # conservative global dense
+
+        register_elementwise_ffi(target)
+        pat_sparse = pattern_from_energy(energy, M)
+        assert nz_set(pat_sparse) == _tridiagonal(M)
+    finally:
+        _ELEMENTWISE_FFI_TARGETS.discard(target)
