@@ -42,6 +42,20 @@ def _get_shape(var: Var | Literal) -> Tuple[int, ...]:
     return getattr(var.aval, "shape", ())
 
 
+def _subjaxpr_and_consts(eqn) -> Tuple[Jaxpr, Sequence]:
+    """Normalize the ``jaxpr`` param of a single-subgraph higher-order primitive.
+
+    ``pjit``/``jit``/``scan``/``map`` store a ``ClosedJaxpr`` (``.jaxpr`` + ``.consts``),
+    whereas ``remat2`` (``jax.checkpoint``) stores a bare ``Jaxpr`` with no consts.
+    Both expose the same 1:1 invar/outvar correspondence with the parent equation, so
+    this returns ``(jaxpr, consts)`` for either form.
+    """
+    sub = eqn.params["jaxpr"]
+    if hasattr(sub, "jaxpr"):  # ClosedJaxpr
+        return sub.jaxpr, sub.consts
+    return sub, ()
+
+
 def _unwrap_jit(fn):
     """Recursively unwrap `@jax.jit` / `@pjit` decorators only.
 
@@ -361,15 +375,15 @@ def _analyze_and_resolve_jaxpr(
                     mask = 2
                 else:
                     mask = 3
-            elif p in ("pjit", "jit", "scan", "map"):
-                sub_closed = eqn.params["jaxpr"]
+            elif p in ("pjit", "jit", "scan", "map", "remat2"):
+                sub_jaxpr, _ = _subjaxpr_and_consts(eqn)
                 # Map input tags to sub invars
-                for pv, sv in zip(eqn.invars, sub_closed.jaxpr.invars):
+                for pv, sv in zip(eqn.invars, sub_jaxpr.invars):
                     tags[id(sv)] = tags.get(id(pv), 0)
 
                 # Recursively analyze sub-jaxpr
                 sub_eqns, sub_active = _analyze_and_resolve_jaxpr(
-                    sub_closed.jaxpr,
+                    sub_jaxpr,
                     trial_test_split,
                     tags,
                     None,
@@ -379,7 +393,7 @@ def _analyze_and_resolve_jaxpr(
 
                 # Map output tags back
                 mask = 0
-                for pv, sv in zip(eqn.outvars, sub_closed.jaxpr.outvars):
+                for pv, sv in zip(eqn.outvars, sub_jaxpr.outvars):
                     tags[id(pv)] = tags.get(id(sv), 0)
                     mask |= tags[id(pv)]
             elif p == "cond":
@@ -406,10 +420,10 @@ def _analyze_and_resolve_jaxpr(
             for v in eqn.outvars:
                 tags[id(v)] = mask
         else:
-            if p in ("pjit", "jit", "scan", "map"):
-                sub_closed = eqn.params["jaxpr"]
+            if p in ("pjit", "jit", "scan", "map", "remat2"):
+                sub_jaxpr, _ = _subjaxpr_and_consts(eqn)
                 sub_eqns, sub_active = _analyze_and_resolve_jaxpr(
-                    sub_closed.jaxpr,
+                    sub_jaxpr,
                     None,
                     tags,
                     None,
@@ -441,13 +455,12 @@ def _analyze_and_resolve_jaxpr(
                 if exponent >= 2 or exponent <= -1:
                     if tags.get(id(eqn.invars[0]), 0) == 3:
                         is_nonlinear = True
-            elif p == "dot_general":
-                combined_mask = 0
-                for v in eqn.invars:
-                    combined_mask |= tags.get(id(v), 0)
-                if combined_mask == 3:
-                    is_nonlinear = True
-            elif p in ("scatter-mul", "scatter_mul"):
+            elif p in (
+                "dot_general",
+                "scatter-mul",
+                "custom_vjp_call",
+                "custom_jvp_call",
+            ):
                 combined_mask = 0
                 for v in eqn.invars:
                     combined_mask |= tags.get(id(v), 0)
@@ -464,7 +477,12 @@ def _analyze_and_resolve_jaxpr(
                 exponent = eqn.params.get("y", 0)
                 if exponent >= 2 or exponent <= -1:
                     is_nonlinear = True
-            elif p in ("dot_general", "scatter-mul", "scatter_mul"):
+            elif p in (
+                "dot_general",
+                "scatter-mul",
+                "custom_vjp_call",
+                "custom_jvp_call",
+            ):
                 is_nonlinear = True
 
         # Seed active variables if it is a nonlinear primitive
@@ -480,7 +498,9 @@ def _analyze_and_resolve_jaxpr(
                 eqn,
                 handler,
                 is_nonlinear,
-                sub_res if p in ("pjit", "jit", "scan", "map", "cond") else None,
+                sub_res
+                if p in ("pjit", "jit", "scan", "map", "remat2", "cond")
+                else None,
             )
         )
 
@@ -509,12 +529,11 @@ def _propagate_active_backward(
         p = eqn.primitive.name
         is_active = False
 
-        if p in ("pjit", "jit", "scan", "map"):
+        if p in ("pjit", "jit", "scan", "map", "remat2"):
             if any(id(v) in active_set for v in eqn.outvars):
                 is_active = True
                 sub_active_set, sub_eqns = sub_res
-                sub_closed = eqn.params["jaxpr"]
-                sub = sub_closed.jaxpr
+                sub, _ = _subjaxpr_and_consts(eqn)
 
                 # Map active outvars to sub outvars
                 for pv, sv in zip(eqn.outvars, sub.outvars):
@@ -901,7 +920,13 @@ class Handlers:
 
     @staticmethod
     @TRACER_REGISTRY.register(
-        "neg", "abs", "convert_element_type", "copy", "stop_gradient", "device_put"
+        "neg",
+        "abs",
+        "convert_element_type",
+        "copy",
+        "stop_gradient",
+        "device_put",
+        "conj",
     )
     def passthrough(
         eqn,
@@ -1262,13 +1287,10 @@ class Handlers:
     @TRACER_REGISTRY.register(
         "scatter",
         "scatter-add",
+        "scatter-sub",
         "scatter-mul",
         "scatter-min",
         "scatter-max",
-        "scatter_add",
-        "scatter_mul",
-        "scatter_min",
-        "scatter_max",
     )
     def scatter(
         eqn: JaxprEqn,
@@ -1281,7 +1303,7 @@ class Handlers:
         d_vals = in_d[2]
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
         p = eqn.primitive.name
-        nonlinear = p in ("scatter-mul", "scatter_mul")
+        nonlinear = p == "scatter-mul"
 
         u_vals = sps.csr_matrix(d_vals.dep.sum(axis=0).astype(bool))
         idx = state.get_val(eqn.invars[1])
@@ -1474,6 +1496,20 @@ class Handlers:
         acc: "CouplingAccumulator",
         trial_test_split: int | None,
     ) -> None:
+        """Conservative fallback for control-flow primitives.
+
+        Unions the input dependencies into every output element without descending
+        into the carried jaxpr, so it propagates first-order dependencies but records
+        no second-order couplings of its own. ``cond`` is handled precisely by the
+        dedicated ``cond`` handler (which overrides this registration); ``switch``
+        lowers to ``cond``, so in practice only ``while`` reaches here.
+
+        The missing couplings are not reachable for the Hessian use case: a ``while``
+        appearing inside an energy would have to be double-differentiable to contribute
+        to the Hessian, but ``lax.while_loop`` is not reverse-mode differentiable in JAX
+        (this is precisely why iterative solvers are wrapped in ``custom_vjp`` /
+        implicit differentiation, which is handled by ``custom_vjp_jvp_call`` instead).
+        """
         in_d = [state.get(v) for v in eqn.invars]
         cols_active = np.zeros(state.n_dofs, dtype=bool)
         has_active = False
@@ -1780,16 +1816,21 @@ class Handlers:
                 state.set(y, SparseDepSet(expanded_dep, y_shape))
 
     @staticmethod
-    @TRACER_REGISTRY.register("pjit", "jit")
+    @TRACER_REGISTRY.register("pjit", "jit", "remat2")
     def subjaxpr(
         eqn: JaxprEqn,
         state: TraceState,
         acc: "CouplingAccumulator",
         trial_test_split: int | None,
     ) -> None:
-        closed_sub = eqn.params["jaxpr"]
-        sub = closed_sub.jaxpr
-        sub_consts = closed_sub.consts
+        """Trace a single carried sub-jaxpr (``pjit``/``jit``/``remat2``).
+
+        ``remat2`` (``jax.checkpoint``) is just a memory-recompute wrapper around an
+        ordinary computation: descending into its jaxpr records the couplings created
+        inside exactly as for ``pjit``. Treating it as opaque (fallback) would silently
+        drop those couplings and under-count the Hessian.
+        """
+        sub, sub_consts = _subjaxpr_and_consts(eqn)
         in_d = [state.get(v) for v in eqn.invars]
 
         # Retrieve the pre-resolved active set and bound equations for this sub-jaxpr
@@ -1903,3 +1944,42 @@ class Handlers:
             state.set(
                 ov, d if d is not None else SparseDepSet.empty(_get_shape(ov), n_dofs)
             )
+
+    @staticmethod
+    @TRACER_REGISTRY.register("custom_vjp_call", "custom_jvp_call")
+    def custom_vjp_jvp_call(
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: "CouplingAccumulator",
+        trial_test_split: int | None,
+    ) -> None:
+        """Handler for JAX custom_vjp and custom_jvp calls.
+        These represent general nonlinear black-box functions.
+        We propagate the union of input dependencies to each output element,
+        and record the self-couplings of the inputs (since they are nonlinear).
+        Since the internal structure of the custom call is opaque, we couple all inputs
+        together even if internals are linear.
+        """
+        in_d = [state.get(v) for v in eqn.invars]
+
+        # 1. Accumulate all input active columns to record couplings
+        cols_active = np.zeros(state.n_dofs, dtype=bool)
+        has_active = False
+        for d in in_d:
+            if isinstance(d, SparseDepSet) and d.dep.shape[0] > 0:
+                cols_active[d.dep.indices] = True
+                has_active = True
+
+        if not has_active:
+            total = SparseDepSet.empty((), state.n_dofs)
+        else:
+            reduced = sps.csr_matrix(cols_active.reshape(1, -1))
+            total = SparseDepSet(reduced, ())
+            # Record couplings for the active input DOFs
+            acc.record_dep(total.dep, trial_test_split)
+
+        # 2. Set the dependency set for all output variables
+        for ovar in eqn.outvars:
+            oshp = _get_shape(ovar)
+            stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
+            state.set(ovar, SparseDepSet(stacked_dep, oshp))

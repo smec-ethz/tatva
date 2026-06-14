@@ -323,6 +323,46 @@ def test_lagrangian_multiplier_sparsity():
     )
 
 
+def test_remat_checkpoint_sparsity():
+    """Couplings created inside a ``jax.checkpoint`` block must be traced.
+
+    ``jax.checkpoint`` emits a ``remat2`` primitive carrying a (bare) sub-jaxpr. The
+    tracer must descend into it; treating it as an opaque fallback would silently drop
+    the second-order couplings produced inside and under-count the Hessian.
+    """
+    M = 8
+
+    @jax.checkpoint
+    def coupled_block(eps):
+        # genuine nonlinear coupling-producing block, wrapped in remat
+        return 0.5 * eps**2 + 0.25 * eps**4
+
+    def macro_energy(U):
+        energy = 0.0
+        for i in range(M - 1):
+            energy += coupled_block(U[i] - U[i + 1])
+        return energy
+
+    U_dummy = np.random.randn(M)
+
+    # Guard: the test is only meaningful if remat2 actually survives in the jaxpr.
+    prims = {e.primitive.name for e in jax.make_jaxpr(macro_energy)(U_dummy).jaxpr.eqns}
+    assert "remat2" in prims, "expected jax.checkpoint to emit a remat2 primitive"
+
+    h_dense = jax.hessian(macro_energy)(U_dummy)
+    ref_sparsity = np.abs(h_dense) > 1e-12
+
+    pat_traced = pattern_from_energy(macro_energy, n_dofs=M)
+    traced_sparsity = pat_traced.toarray() > 0
+
+    # No false negatives: every true coupling must be present in the traced pattern.
+    fn_count = np.sum(ref_sparsity & (~traced_sparsity))
+    assert fn_count == 0, "remat2 couplings were dropped by the tracer"
+
+    # Coupling structure is exactly tridiagonal (eps_i = U[i] - U[i+1]).
+    assert pat_traced.nnz == int(np.sum(ref_sparsity)) == 3 * M - 2
+
+
 # ---------------------------------------------------------------------------
 # virtual-work tracing (tangent stiffness K = dR/du = d²G/dv du)
 # ---------------------------------------------------------------------------
