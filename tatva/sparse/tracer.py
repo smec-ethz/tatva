@@ -16,17 +16,8 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 import inspect
-from typing import (
-    Any,
-    Callable,
-    Concatenate,
-    Dict,
-    List,
-    ParamSpec,
-    Sequence,
-    Set,
-    Tuple,
-)
+from collections.abc import Callable, Sequence
+from typing import Any, Concatenate, ParamSpec
 
 import jax
 import numpy as np
@@ -37,12 +28,13 @@ from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 P = ParamSpec("P")
 
 
-def _get_shape(var: Var | Literal) -> Tuple[int, ...]:
-    """Helper to safely retrieve shape from a JAX Var/Literal abstract value (satisfying static type checkers)."""
+def _get_shape(var: Var | Literal) -> tuple[int, ...]:
+    """Helper to safely retrieve shape from a JAX Var/Literal abstract value (satisfying
+    static type checkers)."""
     return getattr(var.aval, "shape", ())
 
 
-def _subjaxpr_and_consts(eqn) -> Tuple[Jaxpr, Sequence]:
+def _subjaxpr_and_consts(eqn) -> tuple[Jaxpr, Sequence]:
     """Normalize the ``jaxpr`` param of a single-subgraph higher-order primitive.
 
     ``pjit``/``jit``/``scan``/``map`` store a ``ClosedJaxpr`` (``.jaxpr`` + ``.consts``),
@@ -89,13 +81,14 @@ def _broadcast_single_row(row: sps.csr_matrix, N: int) -> sps.csr_matrix:
 
 
 class CouplingAccumulator:
-    """Accumulates Hessian coupling pairs as numpy-array chunks; fingerprints dep matrices to skip redundant recordings."""
+    """Accumulates Hessian coupling pairs as numpy-array chunks; fingerprints dep matrices
+    to skip redundant recordings."""
 
     def __init__(self, n_dofs: int):
         self.n_dofs = n_dofs
-        self._row_chunks: List[np.ndarray] = []
-        self._col_chunks: List[np.ndarray] = []
-        self._seen_fingerprints: Set[int] = set()
+        self._row_chunks: list[np.ndarray] = []
+        self._col_chunks: list[np.ndarray] = []
+        self._seen_fingerprints: set[int] = set()
 
     def add_coords(self, rows: np.ndarray, cols: np.ndarray) -> None:
         """Append a chunk of coordinate pairs without converting to Python lists."""
@@ -107,7 +100,8 @@ class CouplingAccumulator:
     def record_dep(
         self, dep: sps.csr_matrix, trial_test_split: int | None = None
     ) -> None:
-        """Compute dep.T @ dep couplings; skip if an identical dep structure has already been recorded."""
+        """Compute dep.T @ dep couplings; skip if an identical dep structure has already
+        been recorded."""
         if dep.nnz == 0:
             return
         # Fingerprint: identical (indptr, indices) + split → identical couplings
@@ -233,7 +227,7 @@ TRACER_REGISTRY = TracerRegistry()
 # solver vmapped over quad points. Declaring a target here lets the tracer recover the
 # sparse (block-diagonal) coupling from the single batched ``ffi_call`` instead of the
 # conservative dense couple-all. See ``register_elementwise_ffi``.
-_ELEMENTWISE_FFI_TARGETS: Set[str] = set()
+_ELEMENTWISE_FFI_TARGETS: set[str] = set()
 
 
 def register_elementwise_ffi(*target_names: str) -> None:
@@ -263,8 +257,8 @@ class SparseDepSet:
 
         Args:
             dep: sps.csr_matrix of shape (prod(shape), n_dofs) with boolean data
-            shape: logical shape of the array this dep-set corresponds to (e.g., (3,4) for a 3×4 array);
-                   the dep-array is always flattened in row-major order
+            shape: logical shape of the array this dep-set corresponds to (e.g., (3,4) for
+                a 3×4 array); the dep-array is always flattened in row-major order
         """
         self.dep = dep  # sps.csr_matrix of shape (prod(shape), n_dofs)
         self.shape = tuple(shape)
@@ -284,7 +278,8 @@ class SparseDepSet:
 
     @classmethod
     def singletons(cls, n_dofs: int) -> "SparseDepSet":
-        """Create an identity-seeded SparseDepSet of shape (n_dofs,) where element i depends only on DOF i."""
+        """Create an identity-seeded SparseDepSet of shape (n_dofs,) where element i
+        depends only on DOF i."""
         dep = sps.eye(n_dofs, format="csr", dtype=bool)
         return cls(dep, (n_dofs,))
 
@@ -319,22 +314,25 @@ class TraceState:
     def __init__(
         self,
         n_dofs: int,
-        active_ids: Set[int],
+        active_ids: set[int],
         tags: dict | None = None,
         sub_info: dict | None = None,
     ):
         """
         Args:
             n_dofs: total number of DOFs (size of the input variable)
-            active_ids: set of variable IDs that are currently active (feed into nonlinear primitives)
-            tags: dict mapping variable IDs to their current tag (0=inactive, 1=trial-only, 2=test-only, 3=both); used for trial/test splitting
-            sub_info: dict to store sub-jaxpr analysis results for nested jits; maps eqn IDs to (active_set, resolved_eqns)
+            active_ids: set of variable IDs that are currently active (feed into nonlinear
+                primitives)
+            tags: dict mapping variable IDs to their current tag (0=inactive,
+                1=trial-only, 2=test-only, 3=both); used for trial/test splitting
+            sub_info: dict to store sub-jaxpr analysis results for nested jits; maps eqn
+                IDs to (active_set, resolved_eqns)
         """
         self.n_dofs = n_dofs
         self.active_ids = active_ids
         self.tags = tags if tags is not None else {}
-        self.dep_of: Dict[int, SparseDepSet] = {}
-        self.val_of: Dict[int, np.ndarray] = {}
+        self.dep_of: dict[int, SparseDepSet] = {}
+        self.val_of: dict[int, np.ndarray] = {}
         self.sub_info = sub_info if sub_info is not None else {}
 
     def set(self, var, d: SparseDepSet) -> None:
@@ -359,10 +357,10 @@ class TraceState:
 def _analyze_and_resolve_jaxpr(
     jaxpr,
     trial_test_split: int | None,
-    tags: Dict[int, int],
+    tags: dict[int, int],
     main_input_id: int | None,
-    sub_info: Dict[int, Any],
-) -> Tuple[List[Tuple[Any, Callable, bool, Any]], Set[int]]:
+    sub_info: dict[int, Any],
+) -> tuple[list[tuple[Any, Callable, bool, Any]], set[int]]:
     """
     Performs the forward pass of a unified JAXpr analysis traversal:
     - Propagates tags (forward)
@@ -371,10 +369,14 @@ def _analyze_and_resolve_jaxpr(
 
     Args:
         jaxpr: the JAXpr to analyze
-        trial_test_split: if not None, the DOF index at which to split trial vs test variables for nonlinear interaction detection
-        tags: a dict mapping variable IDs to their current tag (0=inactive, 1=trial-only, 2=test-only, 3=both)
-        main_input_id: the variable ID of the main input (e.g., the trial function) to seed with tags; used for trial/test splitting
-        sub_info: a dict to store sub-jaxpr analysis results for nested jits; maps eqn IDs to (active_set, resolved_eqns)
+        trial_test_split: if not None, the DOF index at which to split trial vs test
+            variables for nonlinear interaction detection
+        tags: a dict mapping variable IDs to their current tag (0=inactive, 1=trial-only,
+            2=test-only, 3=both)
+        main_input_id: the variable ID of the main input (e.g., the trial function) to
+            seed with tags; used for trial/test splitting
+        sub_info: a dict to store sub-jaxpr analysis results for nested jits; maps eqn IDs
+            to (active_set, resolved_eqns)
 
     Returns:
         A list of forward data tuples: (eqn, handler, is_nonlinear, sub_res)
@@ -542,21 +544,24 @@ def _analyze_and_resolve_jaxpr(
 
 
 def _propagate_active_backward(
-    forward_data: List[Tuple[Any, Callable, bool, Any]],
-    active_set: Set[int],
-    sub_info: Dict[int, Any],
-) -> List[Tuple[Any, Callable, bool]]:
+    forward_data: list[tuple[Any, Callable, bool, Any]],
+    active_set: set[int],
+    sub_info: dict[int, Any],
+) -> list[tuple[Any, Callable, bool]]:
     """
     Performs the backward pass of a unified JAXpr analysis traversal:
     Propagates the active state backwards through the resolved equations list.
 
     Args:
-        forward_data: the list of forward data tuples (eqn, handler, is_nonlinear, sub_res) from the forward pass
+        forward_data: the list of forward data tuples (eqn, handler, is_nonlinear,
+            sub_res) from the forward pass
         active_set: the initial set of active variable IDs seeded from the outputs
-        sub_info: the dict storing sub-jaxpr analysis results for nested jits; maps eqn IDs to (active_set, resolved_eqns)
+        sub_info: the dict storing sub-jaxpr analysis results for nested jits; maps eqn
+            IDs to (active_set, resolved_eqns)
 
     Returns:
-        A list of tuples (eqn, handler, is_active) where is_active indicates whether this equation is on an active path.
+        A list of tuples (eqn, handler, is_active) where is_active indicates whether this
+        equation is on an active path.
     """
     pruned_eqns = []
     for eqn, handler, is_nonlinear, sub_res in reversed(forward_data):
@@ -633,10 +638,8 @@ def _trace_hessian_sparsity(
     *static_args,
     trial_test_split: int | None = None,
 ) -> sps.csr_matrix:
-    """
-    Return the sparsity pattern of d²E/du² (or tangent stiffness matrix K for virtual work formulations)
-    as a CSR matrix.
-    """
+    """Return the sparsity pattern of d²E/du² (or tangent stiffness matrix K for virtual
+    work formulations) as a CSR matrix."""
     # Unwrap any outer @jax.jit so static slice indices stay static during tracing
     fn = _unwrap_jit(fn)
 
@@ -716,16 +719,18 @@ def pattern_from_energy(
     *static_args,
 ) -> sps.csr_matrix:
     """
-    Return the sparsity pattern of d²E/du² as a symmetric CSR matrix for a scalar energy function E(u)
-    where u has n_dofs degrees of freedom.
+    Return the sparsity pattern of d²E/du² as a symmetric CSR matrix for a scalar energy
+    function E(u) where u has n_dofs degrees of freedom.
 
     Args:
-        energy_fn: scalar JAX array energy function E(u, *static_args) as a function of input variable u and optional static arguments
+        energy_fn: scalar JAX array energy function E(u, *static_args) as a function of
+            input variable u and optional static arguments
         n_dofs: number of DOFs (integer size of flattened input array u)
         static_args: extra args passed to energy_fn, treated as constants
 
     Returns:
-        A symmetric CSR matrix of shape (n_dofs, n_dofs) with binary entries indicating the sparsity pattern of the Hessian d²E/du².
+        A symmetric CSR matrix of shape (n_dofs, n_dofs) with binary entries indicating
+        the sparsity pattern of the Hessian d²E/du².
     """
     return _trace_hessian_sparsity(
         energy_fn, n_dofs, *static_args, trial_test_split=None
@@ -744,15 +749,18 @@ def pattern_from_virtual_work(
     for a virtual work function virtual_work_fn(*args) as a CSR matrix.
 
     Args:
-        virtual_work_fn : scalar JAX array (virtual work) as a function of trial and test variables (e.g., G(u, v, *static_args))
-        n_dofs          : number of DOFs (integer size of flattened input arrays u and v)
-        trial_arg       : parameter name of the trial function in virtual_work_fn
-        test_arg        : parameter name of the test function in virtual_work_fn
-        static_args     : extra arguments (e.g., mesh coordinates, parameters) passed to virtual_work_fn, treated as constants
+        virtual_work_fn: scalar JAX array (virtual work) as a function of trial and test
+            variables (e.g., G(u, v, *static_args))
+        n_dofs: number of DOFs (integer size of flattened input arrays u and v)
+        trial_arg: parameter name of the trial function in virtual_work_fn
+        test_arg: parameter name of the test function in virtual_work_fn
+        static_args: extra arguments (e.g., mesh coordinates, parameters) passed to
+            virtual_work_fn, treated as constants
 
     Returns:
-        A CSR matrix of shape (n_dofs, n_dofs) with binary entries indicating the sparsity pattern of the tangent stiffness matrix K = dR/du = d²G/dvdu,
-        where G is the virtual work and u,v are the trial and test functions respectively.
+        A CSR matrix of shape (n_dofs, n_dofs) with binary entries indicating the sparsity
+        pattern of the tangent stiffness matrix K = dR/du = d²G/dvdu, where G is the
+        virtual work and u,v are the trial and test functions respectively.
     """
     # Unwrap any outer @jax.jit so static slice indices stay static during tracing
     virtual_work_fn = _unwrap_jit(virtual_work_fn)
@@ -1740,9 +1748,9 @@ class Handlers:
         # per-local-index cache of strided column slices (the same local index recurs
         # across many coupling pairs, so slicing once avoids redundant CSR fancy-indexing).
         offsets = np.concatenate(([0], np.cumsum(local_size_slices)))
-        slice_cache: Dict[int, Tuple[sps.csr_matrix, np.ndarray]] = {}
+        slice_cache: dict[int, tuple[sps.csr_matrix, np.ndarray]] = {}
 
-        def _get_col(local_idx: int) -> Tuple[sps.csr_matrix, np.ndarray]:
+        def _get_col(local_idx: int) -> tuple[sps.csr_matrix, np.ndarray]:
             cached = slice_cache.get(local_idx)
             if cached is not None:
                 return cached
@@ -1945,7 +1953,7 @@ class Handlers:
         n_dofs = state.n_dofs
         branch_sub_list = state.sub_info[id(eqn)]
 
-        out_deps: Dict[int, SparseDepSet | None] = {id(ov): None for ov in eqn.outvars}
+        out_deps: dict[int, SparseDepSet | None] = {id(ov): None for ov in eqn.outvars}
         for (sub_active, sub_bound_eqns), branch in zip(
             branch_sub_list, eqn.params["branches"]
         ):

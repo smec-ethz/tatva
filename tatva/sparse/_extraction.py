@@ -30,7 +30,7 @@ from tatva import Mesh
 if TYPE_CHECKING:
     from scipy.sparse import csr_matrix
 
-    from tatva.compound import Compound, CompoundError
+    from tatva.compound import Compound
     from tatva.lifter import Lifter
 
 
@@ -137,6 +137,7 @@ def pattern_from_compound(
         block_wise: If True, return the pattern as a list of lists of sparse matrices
             corresponding to the compound fields/blocks. Stacked fields are one block.
     """
+    from tatva.compound import CompoundError
     from tatva.compound.field_types import Nodal
 
     if compound_cls._mesh is None:

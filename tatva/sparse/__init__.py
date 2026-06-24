@@ -31,9 +31,9 @@ __all__ = [
     "ColoredMatrix",
     "jacfwd",
     "linearized_jacfwd",
-    "pattern_from_energy",
-    "pattern_from_virtual_work",
     "pattern_from_compound",
+    "pattern_from_energy",
     "pattern_from_mesh",
+    "pattern_from_virtual_work",
     "register_elementwise_ffi",
 ]
