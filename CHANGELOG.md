@@ -5,6 +5,23 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.0](https://github.com/smec-ethz/tatva/compare/v0.10.1...v0.11.0) (2026-06-26)
+
+
+### Features
+
+* changes to the api for creating and reducing sparsity pattern ([f2a5d2e](https://github.com/smec-ethz/tatva/commit/f2a5d2e454c9494851bec8f69b36f5608af26800))
+* **sparse:** adds automatic sparsity detection from energy form ([4359503](https://github.com/smec-ethz/tatva/commit/4359503487a80fa449e65dee386c83e31fd9cb4a))
+
+
+### Bug Fixes
+
+* add custom_vjp/custom_jvp/remat primitives for tracing ([38ab604](https://github.com/smec-ethz/tatva/commit/38ab60471559ae604577380a050a9497b90c0f03))
+* add full test suite for checking if all jax primitives are covered ([558ead9](https://github.com/smec-ethz/tatva/commit/558ead9cf649432d44fe4b3dd90d78f20a74046b))
+* add test for sparsity tracer based on fem application ([3311f78](https://github.com/smec-ethz/tatva/commit/3311f784cd0ce08141fc6bbe0aa6366266e218a5))
+* add tracer for opaque primitive such as ffi/callback and debug ([83b0475](https://github.com/smec-ethz/tatva/commit/83b0475d12a0c27a0f5dd3600259c514b82b95b1))
+* only consider trial-test pair for coupling, vectorize python for-loop inside scan_mp for speed up ([3f104d4](https://github.com/smec-ethz/tatva/commit/3f104d496232142002146e33ff937a0a469336a3))
+
 ## [0.10.1](https://github.com/smec-ethz/tatva/compare/v0.10.0...v0.10.1) (2026-04-27)
 
 
