@@ -1504,19 +1504,24 @@ class Handlers:
                 dtype=bool,
             )
 
-            # Record A and B self-couplings via accumulator (fingerprint-cached)
-            acc.record_dep(A_active, trial_test_split)
-            acc.record_dep(B_active, trial_test_split)
+            # A batched contraction is bilinear: it couples only when BOTH
+            # operands depend on the input. If either is constant (no active
+            # DOFs) the contraction is linear -> record no couplings. Covers
+            # both (const, var) and (var, const).
+            if A_active.nnz and B_active.nnz:
+                # Record A and B self-couplings via accumulator (fingerprint-cached)
+                acc.record_dep(A_active, trial_test_split)
+                acc.record_dep(B_active, trial_test_split)
 
-            # Cross-couplings between A and B (no fingerprint cache - structurally distinct)
-            P_cross = (A_active.T @ B_active).tocsr()
-            r_c, c_c = P_cross.nonzero()
-            if trial_test_split is not None:
-                mask_c = (r_c < trial_test_split) & (c_c >= trial_test_split)
-                mask_c |= (r_c >= trial_test_split) & (c_c < trial_test_split)
-                r_c, c_c = r_c[mask_c], c_c[mask_c]
-            acc.add_coords(r_c, c_c)
-            acc.add_coords(c_c, r_c)
+                # Cross-couplings between A and B (no fingerprint cache - structurally distinct)
+                P_cross = (A_active.T @ B_active).tocsr()
+                r_c, c_c = P_cross.nonzero()
+                if trial_test_split is not None:
+                    mask_c = (r_c < trial_test_split) & (c_c >= trial_test_split)
+                    mask_c |= (r_c >= trial_test_split) & (c_c < trial_test_split)
+                    r_c, c_c = r_c[mask_c], c_c[mask_c]
+                acc.add_coords(r_c, c_c)
+                acc.add_coords(c_c, r_c)
 
             # Vectorized construction of stacked output dependencies
             C_active = (A_active + B_active).astype(bool).tocsr()
@@ -1528,12 +1533,19 @@ class Handlers:
             ua = in_d[0].total_union()
             ub = in_d[1].total_union()
 
-            ua.record_couplings(acc, trial_test_split)
-            ub.record_couplings(acc, trial_test_split)
-
             ia = ua.dep.indices
             ib = ub.dep.indices
+            # A contraction dot(a, b) is bilinear, so it contributes second-order
+            # coupling only when BOTH operands depend on the input. If either
+            # operand is constant (empty dep-set) the contraction is linear in the
+            # other and has zero Hessian -> record no couplings. This guard covers
+            # both (const, var) and (var, const). Same-operand nonlinearity is
+            # already captured upstream at the primitive that made it nonlinear, so
+            # only the bilinear cross-term needs to be recorded here.
             if ia.size and ib.size:
+                ua.record_couplings(acc, trial_test_split)
+                ub.record_couplings(acc, trial_test_split)
+
                 # Vectorized outer-product of active DOF indices for cross-couplings
                 r_c = np.repeat(ia, ib.size)
                 c_c = np.tile(ib, ia.size)

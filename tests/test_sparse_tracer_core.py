@@ -251,6 +251,40 @@ def test_linear_scaling_not_recorded(fn):
     assert nz_set(pat) == nz_set(sps.eye(5))
 
 
+_DOT_C5 = jnp.arange(1.0, 6.0)  # constant vector
+_DOT_M5 = jnp.arange(1.0, 26.0).reshape(5, 5)  # constant matrix
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda u: jnp.dot(_DOT_C5, u),  # dot(const, var)
+        lambda u: jnp.dot(u, _DOT_C5),  # dot(var, const)
+        lambda u: jnp.sum(_DOT_M5 @ u),  # constant matrix-vector contraction
+    ],
+    ids=["dot_const_lhs", "dot_const_rhs", "const_matvec"],
+)
+def test_dot_general_constant_operand_not_recorded(fn):
+    """A ``dot_general`` contraction with a constant operand is linear and has zero
+    Hessian, so it must record no couplings — for *both* ``dot(const, u)`` and
+    ``dot(u, const)``. Regression for the dense-pattern bug where the handler
+    recorded each operand's self-coupling unconditionally; ``dot(f_ext, u.ravel())``
+    then collapsed all DOFs into one clique and produced a fully dense pattern.
+    """
+    pat = pattern_from_energy(fn, 5)
+    assert nz_set(pat) == nz_set(sps.eye(5))
+
+
+def test_dot_general_bilinear_still_couples():
+    """The constant-operand fix must not introduce false negatives: a genuine
+    quadratic form ``uᵀ M u`` (a contraction where *both* operands depend on the
+    input) must still record the full coupling."""
+    n = 5
+    fn = lambda u: u @ _DOT_M5 @ u
+    pat = pattern_from_energy(fn, n)
+    assert dense_hessian_pattern(fn, n) <= nz_set(pat)
+
+
 def test_unary_nonlinear_is_separable_diagonal():
     """An element-wise unary nonlinearity yields a purely diagonal Hessian pattern."""
     pat = pattern_from_energy(lambda u: jnp.sum(jnp.sin(u)), 5)
