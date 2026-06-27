@@ -5,6 +5,13 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.1](https://github.com/smec-ethz/tatva/compare/v0.11.0...v0.11.1) (2026-06-27)
+
+
+### Bug Fixes
+
+* adds missing case for dot_general jnp.dot ([08d034f](https://github.com/smec-ethz/tatva/commit/08d034f6d44510acc7b4b0d9244b7d4c9dace899))
+
 ## [0.11.0](https://github.com/smec-ethz/tatva/compare/v0.10.1...v0.11.0) (2026-06-26)
 
 
