@@ -611,9 +611,7 @@ def test_ffi_leaf_virtual_work_register_elementwise(line_operator):
     def g_elastic(w, u):
         (u_n,) = Field(u)
         (w_n,) = Field(w)
-        return op.integrate(
-            jnp.einsum("eqd,eqd->eq", op.grad(u_n), op.grad(w_n))
-        ).sum()
+        return op.integrate(jnp.einsum("eqd,eqd->eq", op.grad(u_n), op.grad(w_n))).sum()
 
     ref = pattern_from_virtual_work(g_elastic, Field.size, trial_arg="u", test_arg="w")
     try:

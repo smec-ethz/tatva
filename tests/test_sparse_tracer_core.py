@@ -799,7 +799,9 @@ def test_debug_print_is_noop():
         jax.debug.print("tracing U with shape {}", U.shape)
         return jnp.sum(U[:-1] * U[1:])
 
-    assert nz_set(pattern_from_energy(with_print, M)) == nz_set(pattern_from_energy(base, M))
+    assert nz_set(pattern_from_energy(with_print, M)) == nz_set(
+        pattern_from_energy(base, M)
+    )
 
 
 def test_ffi_call_default_dense_registered_block_diagonal():

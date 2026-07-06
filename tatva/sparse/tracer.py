@@ -152,7 +152,9 @@ def _dot_general_out_dep(
         # conservative whole-array union rather than risk a mismatch.
         combined = sps.csr_matrix((lhs.dep + rhs.dep).astype(bool))
         return SparseDepSet(
-            _broadcast_single_row(sps.csr_matrix(combined.sum(axis=0).astype(bool)), n_out),
+            _broadcast_single_row(
+                sps.csr_matrix(combined.sum(axis=0).astype(bool)), n_out
+            ),
             oshp,
         )
 
@@ -173,8 +175,10 @@ def _dot_general_out_dep(
         else np.zeros(n_out, int)
     )
     out_dep = (
-        lhs_red[lhs_keys].astype(np.int8) + rhs_red[rhs_keys].astype(np.int8)
-    ).astype(bool).tocsr()
+        (lhs_red[lhs_keys].astype(np.int8) + rhs_red[rhs_keys].astype(np.int8))
+        .astype(bool)
+        .tocsr()
+    )
     return SparseDepSet(out_dep, oshp)
 
 
@@ -680,15 +684,19 @@ def _analyze_and_resolve_jaxpr(
                 if exponent >= 2 or exponent <= -1:
                     if tags.get(id(eqn.invars[0]), 0) == 3:
                         is_nonlinear = True
-            elif p in (
-                "dot_general",
-                "scatter-mul",
-                "custom_vjp_call",
-                "custom_jvp_call",
-                "pure_callback",
-                "io_callback",
-                "ffi_call",
-            ) or p in _DENSE_LINALG:
+            elif (
+                p
+                in (
+                    "dot_general",
+                    "scatter-mul",
+                    "custom_vjp_call",
+                    "custom_jvp_call",
+                    "pure_callback",
+                    "io_callback",
+                    "ffi_call",
+                )
+                or p in _DENSE_LINALG
+            ):
                 combined_mask = 0
                 for v in eqn.invars:
                     combined_mask |= tags.get(id(v), 0)
@@ -705,15 +713,19 @@ def _analyze_and_resolve_jaxpr(
                 exponent = eqn.params.get("y", 0)
                 if exponent >= 2 or exponent <= -1:
                     is_nonlinear = True
-            elif p in (
-                "dot_general",
-                "scatter-mul",
-                "custom_vjp_call",
-                "custom_jvp_call",
-                "pure_callback",
-                "io_callback",
-                "ffi_call",
-            ) or p in _DENSE_LINALG:
+            elif (
+                p
+                in (
+                    "dot_general",
+                    "scatter-mul",
+                    "custom_vjp_call",
+                    "custom_jvp_call",
+                    "pure_callback",
+                    "io_callback",
+                    "ffi_call",
+                )
+                or p in _DENSE_LINALG
+            ):
                 is_nonlinear = True
 
         # Seed active variables if it is a nonlinear primitive
