@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.sparse as sps
+from jax_autovmap import autovmap
 
 from tatva.sparse import pattern_from_energy, pattern_from_virtual_work
 from tatva.sparse.tracer import (
@@ -283,6 +284,88 @@ def test_dot_general_bilinear_still_couples():
     fn = lambda u: u @ _DOT_M5 @ u
     pat = pattern_from_energy(fn, n)
     assert dense_hessian_pattern(fn, n) <= nz_set(pat)
+
+
+def _cross_segment_pairs(pairs: set, block: int) -> set:
+    """The subset of ``(row, col)`` pairs that couple DOFs of *different* segments,
+    where segment = ``dof // block``."""
+    return {(r, c) for (r, c) in pairs if r // block != c // block}
+
+
+@pytest.mark.parametrize("d", [2, 3], ids=["2d-normal", "3d-normal"])
+def test_dot_general_batched_matvec_preserves_locality(d):
+    """A batched ``field @ const`` contraction must keep per-segment (batch-row) support
+    instead of collapsing to the whole-array union.
+
+    This is the minimal reproduction of the Nitsche-interface blow-up: a per-segment
+    ``stress_avg`` (here a symmetric ``d×d`` tensor, affine in that segment's DOFs only)
+    is contracted with a *constant* normal to form a ``traction``, which then enters a
+    bilinear ``traction·jump`` term. Because every segment reads only its own DOFs, the
+    true Hessian is block-diagonal (one ``d²×d²`` block per segment) with **no**
+    cross-segment coupling. Before the fix the ``dot_general`` fallback broadcast the
+    total union to every output, so ``traction`` appeared to depend on all DOFs and the
+    pattern saturated to fully dense — an over-approximation that grows ~linearly with the
+    number of segments. Parametrised over a 2D and a 3D normal to mirror the 2D/3D
+    fracture examples.
+    """
+    N = 6  # interface segments
+    b = d * d  # DOFs per segment (a full d×d "stress" tensor)
+    n = N * b
+    normal = jnp.arange(1.0, d + 1)
+
+    def energy(u):
+        S = u.reshape(N, d, d)
+        S = 0.5 * (S + jnp.swapaxes(S, 1, 2))  # symmetric, still segment-local & affine
+        traction = S @ normal  # (N, d) batched matvec with a constant  <-- under test
+        jump = S[:, 0, :]  # (N, d) per-segment jump, segment-local
+        return jnp.sum(traction * jump)  # bilinear traction·jump summed over segments
+
+    pat = pattern_from_energy(energy, n)
+    traced = nz_set(pat)
+
+    # No false negatives: the traced pattern contains the true Hessian.
+    assert dense_hessian_pattern(energy, n) <= traced
+    # The regression guard: the pattern must stay block-diagonal per segment. A single
+    # cross-segment entry means ``traction``'s support globalized (the old behaviour).
+    assert _cross_segment_pairs(traced, b) == set()
+    # Locality => nnz is linear in the segment count, never the dense N²·b².
+    assert pat.nnz <= N * b * b
+
+
+@pytest.mark.parametrize("d", [2, 3], ids=["2d-normal", "3d-normal"])
+def test_dot_general_batched_matvec_locality_under_autovmap(d):
+    """Same per-segment locality when the contraction is written per-element and lifted by
+    ``autovmap`` — the way the Nitsche interface density is actually expressed — with the
+    normal captured as a *global closure constant* rather than an argument.
+
+    ``autovmap`` adds a leading batch axis over the segments, but the constant normal still
+    reaches ``dot_general`` with no batch dimension and an empty dep-set, so it is
+    indistinguishable (at the primitive) from the non-vmapped case above and the support
+    propagation stays block-diagonal. This guards the closure-constant / vmapped framing
+    explicitly, since it is the one used in practice.
+    """
+    N = 6
+    b = d * d
+    n = N * b
+    normal = jnp.arange(1.0, d + 1)  # global closure constant, NOT an autovmap argument
+
+    @autovmap(stress_avg=2)
+    def density(stress_avg):
+        traction = stress_avg @ normal  # constant captured; vmapped over segments
+        jump = stress_avg[0, :]
+        return jnp.dot(traction, jump)
+
+    def energy(u):
+        S = u.reshape(N, d, d)
+        S = 0.5 * (S + jnp.swapaxes(S, 1, 2))  # symmetric, segment-local & affine
+        return jnp.sum(density(S))
+
+    pat = pattern_from_energy(energy, n)
+    traced = nz_set(pat)
+
+    assert dense_hessian_pattern(energy, n) <= traced  # no false negatives
+    assert _cross_segment_pairs(traced, b) == set()  # no support globalization
+    assert pat.nnz <= N * b * b  # linear, never dense
 
 
 def test_unary_nonlinear_is_separable_diagonal():
