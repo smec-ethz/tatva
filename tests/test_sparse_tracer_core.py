@@ -412,20 +412,42 @@ def test_stack_preserves_per_slice_support():
     assert _cross_segment_pairs(traced, block) == set()  # no cross-slice globalization
 
 
+def test_eigh_is_dense_nonlinear_no_false_negatives():
+    """``jnp.linalg.eigh`` (→ ``eigh``) is a dense nonlinear op: every eigenvalue depends on
+    the whole matrix, so consuming it — even linearly — must record the full block. Covers
+    both a nonlinear (``**2``) and a purely linear (``sum``) consumer."""
+    for consume in (lambda w: jnp.sum(w**2), lambda w: jnp.sum(w)):
+        fn = lambda u: consume(jnp.linalg.eigvalsh(u.reshape(3, 3) + u.reshape(3, 3).T))
+        pat = pattern_from_energy(fn, 9)
+        assert dense_hessian_pattern(fn, 9) <= nz_set(pat)  # no false negatives
+
+
+def test_rev_preserves_support():
+    """``rev`` (``jnp.flip``) is a structural permutation: it reorders dependencies without
+    unioning or coupling them. ``sum(flip(u) * u)`` couples DOF i with n-1-i and nothing
+    else — a pure anti-diagonal, which the generic-fallback union would have smeared dense."""
+    n = 6
+    fn = lambda u: jnp.sum(jnp.flip(u) * u)
+    pat = pattern_from_energy(fn, n)
+    traced = nz_set(pat)
+    assert dense_hessian_pattern(fn, n) <= traced  # no false negatives
+    # locality: every coupling is self or mirror only — never the dense block the
+    # generic-fallback union of flip(u) would have produced.
+    assert all(c in (r, n - 1 - r) for (r, c) in traced)
+
+
 def test_generic_fallback_warns_on_unhandled_primitive():
-    """A primitive the tracer has no handler for — here ``eigvalsh`` (→ ``eigh``) — carrying
-    a solution dependence must not degrade the pattern silently: the generic fallback
-    over-approximates support and records no couplings, so it emits a ``UserWarning`` naming
-    the primitive. This is the signal that would catch the next unhandled-primitive gap.
+    """A primitive the tracer has no handler for — here ``sort`` — carrying a solution
+    dependence must not degrade the pattern silently: the generic fallback over-approximates
+    support and records no couplings, so it emits a ``UserWarning`` naming the primitive.
+    This is the signal that would catch the next unhandled-primitive gap.
     """
 
     def energy(u):
-        A = u.reshape(3, 3)
-        A = A + A.T
-        return jnp.sum(jnp.linalg.eigvalsh(A) ** 2)
+        return jnp.sum(jnp.sort(u) ** 2)  # 'sort' has no handler; **2 makes it active
 
-    with pytest.warns(UserWarning, match=r"no handler for primitive 'eigh'"):
-        pattern_from_energy(energy, 9)
+    with pytest.warns(UserWarning, match=r"no handler for primitive 'sort'"):
+        pattern_from_energy(energy, 6)
 
 
 def test_no_fallback_warning_for_handled_primitives():
