@@ -293,6 +293,21 @@ _NONLINEAR_BINARY = frozenset(
     }
 )
 
+# Dense nonlinear linear-algebra primitives: the leaf ops that back jnp.linalg.inv/solve/
+# det(large)/cholesky. Each is a dense nonlinear map of its matrix argument — every output
+# entry depends on all input entries and those input DOFs mutually couple. Treated as one
+# dense black box (see Handlers.dense_linalg); classified nonlinear so its inputs are
+# traced and its curvature is recorded rather than silently dropped by the generic fallback.
+_DENSE_LINALG = frozenset(
+    {
+        "lu",
+        "custom_linear_solve",
+        "triangular_solve",
+        "lu_solve",
+        "cholesky",
+    }
+)
+
 
 def _prim_introduces_nonlinearity(eqn: JaxprEqn, invar_active: list[bool]) -> bool:
     """Whether this primitive makes its output a *non-affine* function of ``u``.
@@ -327,6 +342,8 @@ def _prim_introduces_nonlinearity(eqn: JaxprEqn, invar_active: list[bool]) -> bo
         "io_callback",
         "ffi_call",
     ):
+        return any(invar_active)
+    if p in _DENSE_LINALG:
         return any(invar_active)
     return False
 
@@ -668,7 +685,7 @@ def _analyze_and_resolve_jaxpr(
                 "pure_callback",
                 "io_callback",
                 "ffi_call",
-            ):
+            ) or p in _DENSE_LINALG:
                 combined_mask = 0
                 for v in eqn.invars:
                     combined_mask |= tags.get(id(v), 0)
@@ -693,7 +710,7 @@ def _analyze_and_resolve_jaxpr(
                 "pure_callback",
                 "io_callback",
                 "ffi_call",
-            ):
+            ) or p in _DENSE_LINALG:
                 is_nonlinear = True
 
         # Seed active variables if it is a nonlinear primitive
@@ -1277,6 +1294,32 @@ class Handlers:
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep[concat_idx], oshp))
 
     @staticmethod
+    @TRACER_REGISTRY.register("stack")
+    def stack(
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: "CouplingAccumulator",
+        trial_test_split: int | None,
+    ) -> None:
+        """``stack`` inserts a new axis and places input ``i`` at position ``i`` along it —
+        purely structural, so each stacked slice keeps its own per-element support (no
+        globalizing union, no couplings). Same construction as ``concatenate`` but the
+        input blocks are laid out along a *new* axis rather than concatenated on an
+        existing one.
+        """
+        in_d = [state.get(v) for v in eqn.invars]
+        oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
+        idx_arrays = []
+        offset = 0
+        for b in in_d:
+            size = int(np.prod(b.shape))
+            idx_arrays.append(np.arange(size).reshape(b.shape) + offset)
+            offset += size
+        stacked_dep = sps.vstack([b.dep for b in in_d], format="csr")
+        stack_idx = np.stack(idx_arrays, axis=eqn.params["axis"]).ravel()
+        state.set(eqn.outvars[0], SparseDepSet(stacked_dep[stack_idx], oshp))
+
+    @staticmethod
     @TRACER_REGISTRY.register("pad")
     def pad(
         eqn: JaxprEqn,
@@ -1424,6 +1467,51 @@ class Handlers:
 
         if not is_linear:
             combined.record_couplings(acc, trial_test_split)
+
+    @staticmethod
+    @TRACER_REGISTRY.register(*_DENSE_LINALG)
+    def dense_linalg(
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: "CouplingAccumulator",
+        trial_test_split: int | None,
+    ) -> None:
+        """Dense nonlinear linear-algebra primitives (``lu`` / ``custom_linear_solve`` /
+        ``triangular_solve`` / ``lu_solve`` / ``cholesky``) — the leaf ops behind
+        ``jnp.linalg.inv`` / ``solve`` / ``cholesky``.
+
+        Each is a *dense* nonlinear map: every output entry depends on the union of all
+        solution-dependent input entries, and — being nonlinear — those input DOFs mutually
+        couple (a full Hessian block over the union). We treat the op as one dense black
+        box: union the solution-dependent inputs, record that union's self outer-product,
+        and give every output element the union support. It is conservative, but these ops
+        act on small element-local matrices whose DOFs already form a dense block in the
+        element stiffness, so in practice it adds no real fill. Without a handler these
+        primitives fell to the generic fallback, which records *no* couplings and can drop
+        the op's curvature (false negatives) when its result is not re-coupled downstream.
+        """
+        in_d = [state.get(v) for v in eqn.invars]
+        cols = np.zeros(state.n_dofs, dtype=bool)
+        for d in in_d:
+            if d.dep.shape[0] and d.dep.nnz:
+                cols[d.dep.indices] = True
+        union_row = sps.csr_matrix(cols.reshape(1, -1))
+
+        # Dense self-coupling over the union: a real Hessian block for a nonlinear op.
+        # record_dep computes union_rowᵀ @ union_row -> the full union×union block.
+        if union_row.nnz:
+            acc.record_dep(union_row, trial_test_split)
+
+        # Every output element (all outputs, e.g. lu's LU/pivots/permutation) depends on
+        # the whole union.
+        for ov in eqn.outvars:
+            oshp = _get_shape(ov)
+            state.set(
+                ov,
+                SparseDepSet(
+                    _broadcast_single_row(union_row, int(np.prod(oshp))), oshp
+                ),
+            )
 
     @staticmethod
     @TRACER_REGISTRY.register("integer_pow")

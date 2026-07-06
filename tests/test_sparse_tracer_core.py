@@ -368,6 +368,48 @@ def test_dot_general_batched_matvec_locality_under_autovmap(d):
     assert pat.nnz <= N * b * b  # linear, never dense
 
 
+@pytest.mark.parametrize("op", ["inv", "solve"], ids=["inv", "solve"])
+def test_dense_linalg_couples_when_consumed_linearly(op):
+    """``jnp.linalg.inv`` / ``solve`` are dense nonlinear maps. Even when the result is
+    consumed by only a *linear* reduction — so no downstream nonlinearity re-couples its
+    support — the handler must record the op's own curvature.
+
+    These lower to ``lu`` / ``custom_linear_solve``. Without a handler they hit the generic
+    fallback, which records *no* second-order couplings, and the true dense block collapses
+    to the diagonal → false negatives. With the ``dense_linalg`` handler the full block is
+    recorded. Regression for that soundness gap.
+    """
+    n = 9
+    if op == "inv":
+        fn = lambda u: jnp.sum(jnp.linalg.inv(u.reshape(3, 3) + 5.0 * jnp.eye(3)))
+    else:
+        b = jnp.arange(1.0, 4.0)
+        fn = lambda u: jnp.sum(jnp.linalg.solve(u.reshape(3, 3) + 5.0 * jnp.eye(3), b))
+    pat = pattern_from_energy(fn, n)
+    assert dense_hessian_pattern(fn, n) <= nz_set(pat)  # no false negatives
+
+
+def test_stack_preserves_per_slice_support():
+    """``stack`` is structural: each stacked slice keeps its own support, so a later
+    nonlinearity couples only *within* a slice, not across all of them. Without a handler
+    the generic fallback unions all inputs into every output element, so the downstream
+    ``**2`` would couple every slice to every other — a spurious dense block. Regression for
+    the ``stack`` handler.
+    """
+    N, block = 4, 2
+    n = block * N
+
+    def energy(u):
+        # slice i is a nonlinear scalar depending only on DOFs {2i, 2i+1}
+        parts = [jnp.sin(u[2 * i]) * u[2 * i + 1] for i in range(N)]
+        return jnp.sum(jnp.stack(parts) ** 2)
+
+    pat = pattern_from_energy(energy, n)
+    traced = nz_set(pat)
+    assert dense_hessian_pattern(energy, n) <= traced  # no false negatives
+    assert _cross_segment_pairs(traced, block) == set()  # no cross-slice globalization
+
+
 def test_unary_nonlinear_is_separable_diagonal():
     """An element-wise unary nonlinearity yields a purely diagonal Hessian pattern."""
     pat = pattern_from_energy(lambda u: jnp.sum(jnp.sin(u)), 5)
