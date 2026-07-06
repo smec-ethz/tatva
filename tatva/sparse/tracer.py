@@ -295,9 +295,9 @@ _NONLINEAR_BINARY = frozenset(
 )
 
 # Dense nonlinear linear-algebra primitives: the leaf ops that back jnp.linalg.inv/solve/
-# det(large)/cholesky. Each is a dense nonlinear map of its matrix argument — every output
-# entry depends on all input entries and those input DOFs mutually couple. Treated as one
-# dense black box (see Handlers.dense_linalg); classified nonlinear so its inputs are
+# det(large)/cholesky/eig(h). Each is a dense nonlinear map of its matrix argument — every
+# output entry depends on all input entries and those input DOFs mutually couple. Treated as
+# one dense black box (see Handlers.dense_linalg); classified nonlinear so its inputs are
 # traced and its curvature is recorded rather than silently dropped by the generic fallback.
 _DENSE_LINALG = frozenset(
     {
@@ -306,6 +306,8 @@ _DENSE_LINALG = frozenset(
         "triangular_solve",
         "lu_solve",
         "cholesky",
+        "eig",
+        "eigh",
     }
 )
 
@@ -1197,6 +1199,8 @@ class Handlers:
         "stop_gradient",
         "device_put",
         "conj",
+        "real",
+        "imag",
     )
     def passthrough(
         eqn,
@@ -1333,6 +1337,28 @@ class Handlers:
         stacked_dep = sps.vstack([b.dep for b in in_d], format="csr")
         stack_idx = np.stack(idx_arrays, axis=eqn.params["axis"]).ravel()
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep[stack_idx], oshp))
+
+    @staticmethod
+    @TRACER_REGISTRY.register("rev")
+    def rev(
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: "CouplingAccumulator",
+        trial_test_split: int | None,
+    ) -> None:
+        """``rev`` (``jnp.flip``) reverses element order along the given axes — a pure
+        permutation, so it just reorders the dependency rows and keeps each element's own
+        support (structural, no couplings)."""
+        d = state.get(eqn.invars[0])
+        shape = d.shape
+        dims = eqn.params["dimensions"]
+        src = np.arange(int(np.prod(shape))).reshape(shape)
+        slicer = tuple(
+            slice(None, None, -1) if ax in dims else slice(None)
+            for ax in range(len(shape))
+        )
+        rev_idx = src[slicer].ravel()
+        state.set(eqn.outvars[0], SparseDepSet(d.dep[rev_idx], shape))
 
     @staticmethod
     @TRACER_REGISTRY.register("pad")
