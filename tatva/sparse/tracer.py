@@ -80,6 +80,103 @@ def _broadcast_single_row(row: sps.csr_matrix, N: int) -> sps.csr_matrix:
     return sps.csr_matrix((data, indices, indptr), shape=(N, row.shape[1]))
 
 
+def _reduce_union_over_axes(
+    dep: sps.csr_matrix, shape: tuple[int, ...], keep_axes: list[int]
+) -> sps.csr_matrix:
+    """OR-reduce a dep-array over all axes NOT in ``keep_axes``.
+
+    ``dep`` is a (prod(shape), n_dofs) CSR whose rows are the row-major flattening of a
+    tensor of logical ``shape``. Returns a (prod(shape[keep_axes]), n_dofs) CSR whose rows
+    are the row-major flattening over ``keep_axes`` (in the given order), where each kept
+    row is the union of the dependency sets of every original element that maps to it.
+
+    This is the exact support map for a reduction (a summed-out axis makes the result
+    depend on the union along it), so it only ever preserves or tightens support -- never
+    drops a real dependency.
+    """
+    n_rows = dep.shape[0]
+    if not keep_axes:
+        # Reducing over everything -> single-row total union.
+        return sps.csr_matrix(dep.sum(axis=0).astype(bool)) if n_rows else dep
+    orig = np.arange(n_rows)
+    multi = np.unravel_index(orig, shape) if shape else (np.zeros(n_rows, int),)
+    keep_dims = tuple(shape[a] for a in keep_axes)
+    key = np.ravel_multi_index(tuple(multi[a] for a in keep_axes), keep_dims)
+    n_keys = int(np.prod(keep_dims))
+    # Boolean aggregation matrix (n_keys x n_rows); (agg @ dep) unions the rows per key.
+    agg = sps.csr_matrix(
+        (np.ones(n_rows, dtype=np.int8), (key, orig)), shape=(n_keys, n_rows)
+    )
+    return (agg @ dep.astype(np.int8)).astype(bool).tocsr()
+
+
+def _dot_general_out_dep(
+    lhs: "SparseDepSet",
+    rhs: "SparseDepSet",
+    lhs_c: Sequence[int],
+    rhs_c: Sequence[int],
+    lhs_b: Sequence[int],
+    rhs_b: Sequence[int],
+    oshp: tuple[int, ...],
+    n_dofs: int,
+) -> "SparseDepSet":
+    """Structure-preserving support propagation for a ``dot_general``.
+
+    Output element ``out[b, fl, fr]`` (batch ``b``, lhs-free ``fl``, rhs-free ``fr``)
+    depends on exactly ``(union_c lhs[b, fl, c]) | (union_c rhs[b, c, fr])``. We reduce
+    each operand over its contracting axes, then broadcast the two reduced dep-tensors to
+    the output layout ``[batch..., lhs_free..., rhs_free...]`` (JAX's ``dot_general`` output
+    order) and union them. This keeps per-row (per-element) support instead of collapsing
+    to the whole-array ``total_union`` -- the difference between a locally-supported field
+    and one that appears to depend on every DOF.
+    """
+    La, Lb = lhs.shape, rhs.shape
+    lhs_b, rhs_b = list(lhs_b), list(rhs_b)
+    lhs_c, rhs_c = list(lhs_c), list(rhs_c)
+    lhs_free = [a for a in range(len(La)) if a not in lhs_b and a not in lhs_c]
+    rhs_free = [a for a in range(len(Lb)) if a not in rhs_b and a not in rhs_c]
+
+    # Reduce out contracting axes, keeping (batch, free) in output order.
+    lhs_red = _reduce_union_over_axes(lhs.dep, La, lhs_b + lhs_free)
+    rhs_red = _reduce_union_over_axes(rhs.dep, Lb, rhs_b + rhs_free)
+
+    batch_sizes = tuple(La[a] for a in lhs_b)
+    lhs_free_sizes = tuple(La[a] for a in lhs_free)
+    rhs_free_sizes = tuple(Lb[a] for a in rhs_free)
+    out_dims = batch_sizes + lhs_free_sizes + rhs_free_sizes
+
+    n_out = int(np.prod(oshp))
+    if int(np.prod(out_dims)) != n_out:
+        # Shape bookkeeping disagrees with the reported output shape; fall back to the
+        # conservative whole-array union rather than risk a mismatch.
+        combined = sps.csr_matrix((lhs.dep + rhs.dep).astype(bool))
+        return SparseDepSet(
+            _broadcast_single_row(sps.csr_matrix(combined.sum(axis=0).astype(bool)), n_out),
+            oshp,
+        )
+
+    nb, nlf = len(lhs_b), len(lhs_free)
+    omulti = np.unravel_index(np.arange(n_out), out_dims) if out_dims else ()
+    batch_m = omulti[:nb]
+    lf_m = omulti[nb : nb + nlf]
+    rf_m = omulti[nb + nlf :]
+
+    lhs_keys = (
+        np.ravel_multi_index(batch_m + lf_m, batch_sizes + lhs_free_sizes)
+        if (batch_sizes + lhs_free_sizes)
+        else np.zeros(n_out, int)
+    )
+    rhs_keys = (
+        np.ravel_multi_index(batch_m + rf_m, batch_sizes + rhs_free_sizes)
+        if (batch_sizes + rhs_free_sizes)
+        else np.zeros(n_out, int)
+    )
+    out_dep = (
+        lhs_red[lhs_keys].astype(np.int8) + rhs_red[rhs_keys].astype(np.int8)
+    ).astype(bool).tocsr()
+    return SparseDepSet(out_dep, oshp)
+
+
 class CouplingAccumulator:
     """Accumulates Hessian coupling pairs as numpy-array chunks; fingerprints dep matrices
     to skip redundant recordings."""
@@ -1540,15 +1637,21 @@ class Handlers:
         in_d = [state.get(v) for v in eqn.invars]
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
 
-        # Determine if there is a batch axis
+        # Determine contracting and batch axes
         dn = eqn.params.get("dimension_numbers")
         lhs_batch = []
         rhs_batch = []
+        lhs_contract = []
+        rhs_contract = []
         if dn is not None:
             if hasattr(dn, "lhs_batch_dimensions"):
                 lhs_batch = dn.lhs_batch_dimensions
                 rhs_batch = dn.rhs_batch_dimensions
+                lhs_contract = dn.lhs_contracting_dimensions
+                rhs_contract = dn.rhs_contracting_dimensions
             elif len(dn) > 1:
+                lhs_contract = dn[0][0]
+                rhs_contract = dn[0][1]
                 lhs_batch = dn[1][0]
                 rhs_batch = dn[1][1]
 
@@ -1649,9 +1752,21 @@ class Handlers:
                 acc.add_coords(r_c, c_c)
                 acc.add_coords(c_c, r_c)
 
-            combined = sps.csr_matrix((ua.dep + ub.dep).astype(bool))
-            stacked_dep = _broadcast_single_row(combined, int(np.prod(oshp)))
-            state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
+            # Propagate output support preserving per-element (free-dimension) structure
+            # rather than broadcasting the whole-array union to every output element. This
+            # keeps a locally-supported contraction (e.g. ``field @ normal`` with a constant
+            # normal) local, instead of making every output component depend on all DOFs.
+            out_dep = _dot_general_out_dep(
+                in_d[0],
+                in_d[1],
+                lhs_contract,
+                rhs_contract,
+                lhs_batch,
+                rhs_batch,
+                oshp,
+                state.n_dofs,
+            )
+            state.set(eqn.outvars[0], out_dep)
 
     @staticmethod
     @TRACER_REGISTRY.register("cond", "switch", "while")
