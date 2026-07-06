@@ -17,6 +17,8 @@ captured). One genuine soundness boundary remains documented as ``xfail``:
   * a data-dependent *carry* coupling in ``lax.scan``.
 """
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -408,6 +410,39 @@ def test_stack_preserves_per_slice_support():
     traced = nz_set(pat)
     assert dense_hessian_pattern(energy, n) <= traced  # no false negatives
     assert _cross_segment_pairs(traced, block) == set()  # no cross-slice globalization
+
+
+def test_generic_fallback_warns_on_unhandled_primitive():
+    """A primitive the tracer has no handler for — here ``eigvalsh`` (→ ``eigh``) — carrying
+    a solution dependence must not degrade the pattern silently: the generic fallback
+    over-approximates support and records no couplings, so it emits a ``UserWarning`` naming
+    the primitive. This is the signal that would catch the next unhandled-primitive gap.
+    """
+
+    def energy(u):
+        A = u.reshape(3, 3)
+        A = A + A.T
+        return jnp.sum(jnp.linalg.eigvalsh(A) ** 2)
+
+    with pytest.warns(UserWarning, match=r"no handler for primitive 'eigh'"):
+        pattern_from_energy(energy, 9)
+
+
+def test_no_fallback_warning_for_handled_primitives():
+    """A fully-handled energy (inv + stack + element-wise nonlinears) must emit no
+    fallback warning — the handlers keep the generic fallback silent, so its warning stays
+    clean signal rather than noise."""
+
+    def energy(u):
+        A = u.reshape(3, 3) + 5.0 * jnp.eye(3)
+        return jnp.sum(jnp.linalg.inv(A)) + jnp.sum(
+            jnp.stack([jnp.sin(u[0]) * u[1]]) ** 2
+        )
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        pattern_from_energy(energy, 9)
+    assert not [w for w in rec if "no handler for primitive" in str(w.message)]
 
 
 def test_unary_nonlinear_is_separable_diagonal():

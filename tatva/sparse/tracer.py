@@ -16,6 +16,7 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 import inspect
+import warnings
 from collections.abc import Callable, Sequence
 from typing import Any, Concatenate, ParamSpec
 
@@ -1136,6 +1137,20 @@ class Handlers:
         if not has_active:
             total = SparseDepSet.empty((), state.n_dofs)
         else:
+            # This primitive carries a solution dependence but has no handler, so we can
+            # only over-approximate its first-order support and cannot record its
+            # second-order couplings -> possible false negatives if the result is not
+            # re-coupled by a downstream nonlinear primitive. Flag it so an unhandled
+            # primitive does not silently degrade the pattern.
+            warnings.warn(
+                f"Sparsity tracer has no handler for primitive "
+                f"'{eqn.primitive.name}'; falling back to a conservative first-order "
+                "approximation (second-order couplings not recorded, which can cause "
+                "false negatives if the result is not re-coupled by a downstream "
+                "nonlinear primitive). Register a handler for this primitive to make "
+                "the pattern exact.",
+                UserWarning,
+            )
             reduced = sps.csr_matrix(cols_active.reshape(1, -1))
             total = SparseDepSet(reduced, ())
         stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
