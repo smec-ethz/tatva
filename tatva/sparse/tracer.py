@@ -197,6 +197,43 @@ _NONLINEAR_BINARY = frozenset(
 )
 
 
+def _prim_introduces_nonlinearity(eqn: JaxprEqn, invar_active: list[bool]) -> bool:
+    """Whether this primitive makes its output a *non-affine* function of ``u``.
+
+    Mirrors exactly the sites where the tracer records second-order couplings, so a
+    variable is flagged nonlinear iff a coupling-recording primitive touched it. Every
+    other (structural / additive) primitive is affine-preserving and returns ``False`` --
+    nonlinearity then only reaches the output via a nonlinear *input* (handled by the
+    caller). ``invar_active[i]`` is whether input ``i`` depends on ``u``.
+    """
+    p = eqn.primitive.name
+    if p in _NONLINEAR_UNARY:
+        return bool(invar_active) and invar_active[0]
+    if p == "integer_pow":
+        y = eqn.params.get("y", 0)
+        return (y >= 2 or y <= -1) and bool(invar_active) and invar_active[0]
+    if p in ("mul", "scatter-mul"):
+        # bilinear: nonlinear only if *both* factors depend on u (scaling by a
+        # constant stays affine)
+        return sum(invar_active) >= 2
+    if p == "div":
+        # x / c is affine; nonlinear only when the divisor depends on u
+        return len(invar_active) > 1 and invar_active[1]
+    if p in _NONLINEAR_BINARY:  # pow, rem, atan2, igamma, igammac, nextafter, complex
+        return any(invar_active)
+    if p == "dot_general":
+        return sum(invar_active) >= 2
+    if p in (
+        "custom_vjp_call",
+        "custom_jvp_call",
+        "pure_callback",
+        "io_callback",
+        "ffi_call",
+    ):
+        return any(invar_active)
+    return False
+
+
 class TracerRegistry:
     """Registry for JAX primitive dependency propagation handlers."""
 
@@ -317,6 +354,7 @@ class TraceState:
         active_ids: set[int],
         tags: dict | None = None,
         sub_info: dict | None = None,
+        nonlinear_ids: set[int] | None = None,
     ):
         """
         Args:
@@ -327,6 +365,13 @@ class TraceState:
                 1=trial-only, 2=test-only, 3=both); used for trial/test splitting
             sub_info: dict to store sub-jaxpr analysis results for nested jits; maps eqn
                 IDs to (active_set, resolved_eqns)
+            nonlinear_ids: set of variable IDs that are a *non-affine* (nonlinear) function
+                of the input ``u``. A variable enters this set when a coupling-recording
+                (second-order) primitive touches its computation from ``u``. Shared across
+                nested sub-states so operand nonlinearity propagates across jit/cond/scan
+                boundaries. Used to gate the self-couplings recorded by bilinear
+                contractions (``dot_general``): an affine operand has zero second
+                derivative, so its self outer-product is not a real Hessian block.
         """
         self.n_dofs = n_dofs
         self.active_ids = active_ids
@@ -334,6 +379,39 @@ class TraceState:
         self.dep_of: dict[int, SparseDepSet] = {}
         self.val_of: dict[int, np.ndarray] = {}
         self.sub_info = sub_info if sub_info is not None else {}
+        self.nonlinear_ids = nonlinear_ids if nonlinear_ids is not None else set()
+
+    def is_nonlinear(self, var) -> bool:
+        """Whether ``var`` is a non-affine (nonlinear) function of the input ``u``."""
+        return id(var) in self.nonlinear_ids
+
+    def mark_nonlinear(self, eqn: JaxprEqn) -> None:
+        """Flag ``eqn``'s outputs as nonlinear if a coupling-recording primitive touches
+        their computation, or if any input is already nonlinear.
+
+        Conservative: it only ever *adds* nonlinearity (over-flagging keeps a self-coupling
+        that is at worst redundant), so it can never cause a bilinear contraction to drop a
+        real second-order block. Higher-order primitives (jit/cond/scan) propagate their
+        sub-jaxpr's nonlinearity explicitly in their handlers, so they are skipped here.
+        """
+        if not eqn.outvars or eqn.primitive.name in (
+            "pjit",
+            "jit",
+            "scan",
+            "map",
+            "remat2",
+            "cond",
+            "switch",
+            "while",
+        ):
+            return
+        out_nl = any(id(v) in self.nonlinear_ids for v in eqn.invars)
+        if not out_nl:
+            invar_active = [self.get(v).dep.nnz > 0 for v in eqn.invars]
+            out_nl = _prim_introduces_nonlinearity(eqn, invar_active)
+        if out_nl:
+            for ov in eqn.outvars:
+                self.nonlinear_ids.add(id(ov))
 
     def set(self, var, d: SparseDepSet) -> None:
         """Associate dep-set with a JAX variable."""
@@ -699,6 +777,7 @@ def _trace_hessian_sparsity(
             continue
 
         handler(eqn, state, acc, trial_test_split)
+        state.mark_nonlinear(eqn)
 
         # Propagate concrete value for executed equations as well (essential for active gather/scatter routing)
         if ovars:
@@ -1509,9 +1588,15 @@ class Handlers:
             # DOFs) the contraction is linear -> record no couplings. Covers
             # both (const, var) and (var, const).
             if A_active.nnz and B_active.nnz:
-                # Record A and B self-couplings via accumulator (fingerprint-cached)
-                acc.record_dep(A_active, trial_test_split)
-                acc.record_dep(B_active, trial_test_split)
+                # Self-couplings (A.T@A / B.T@B) are real Hessian blocks only for an
+                # operand that is itself a *nonlinear* function of u -- and in that case
+                # they are already recorded upstream at the primitive that made it
+                # nonlinear. An affine operand has zero second derivative, so its self
+                # outer-product is spurious; record it only for nonlinear operands.
+                if state.is_nonlinear(eqn.invars[0]):
+                    acc.record_dep(A_active, trial_test_split)
+                if state.is_nonlinear(eqn.invars[1]):
+                    acc.record_dep(B_active, trial_test_split)
 
                 # Cross-couplings between A and B (no fingerprint cache - structurally distinct)
                 P_cross = (A_active.T @ B_active).tocsr()
@@ -1539,12 +1624,18 @@ class Handlers:
             # coupling only when BOTH operands depend on the input. If either
             # operand is constant (empty dep-set) the contraction is linear in the
             # other and has zero Hessian -> record no couplings. This guard covers
-            # both (const, var) and (var, const). Same-operand nonlinearity is
-            # already captured upstream at the primitive that made it nonlinear, so
-            # only the bilinear cross-term needs to be recorded here.
+            # both (const, var) and (var, const). The self outer-products ua.T@ua /
+            # ub.T@ub are real Hessian blocks only when that operand is itself a
+            # *nonlinear* function of u (and are then already recorded upstream at the
+            # primitive that made it nonlinear); for an affine operand the second
+            # derivative vanishes, so recording the self-product is spurious. Hence
+            # gate each self-recording on operand nonlinearity and always record the
+            # bilinear cross-term.
             if ia.size and ib.size:
-                ua.record_couplings(acc, trial_test_split)
-                ub.record_couplings(acc, trial_test_split)
+                if state.is_nonlinear(eqn.invars[0]):
+                    ua.record_couplings(acc, trial_test_split)
+                if state.is_nonlinear(eqn.invars[1]):
+                    ub.record_couplings(acc, trial_test_split)
 
                 # Vectorized outer-product of active DOF indices for cross-couplings
                 r_c = np.repeat(ia, ib.size)
@@ -1646,7 +1737,9 @@ class Handlers:
 
         # Seed sub-state with symbolic dependencies for mapped inputs
         sub_active, sub_bound_eqns = state.sub_info[id(eqn)]
-        sub_state = TraceState(n_local_dofs, sub_active, {}, state.sub_info)
+        sub_state = TraceState(
+            n_local_dofs, sub_active, {}, state.sub_info, state.nonlinear_ids
+        )
 
         # Seed consts: empty deps
         for i in range(num_const):
@@ -1654,6 +1747,8 @@ class Handlers:
                 sub.invars[i],
                 SparseDepSet.empty(_get_shape(sub.invars[i]), n_local_dofs),
             )
+            if state.is_nonlinear(eqn.invars[i]):
+                sub_state.nonlinear_ids.add(id(sub.invars[i]))
             val = state.get_val(eqn.invars[i])
             if val is not None:
                 sub_state.val_of[id(sub.invars[i])] = val
@@ -1711,6 +1806,8 @@ class Handlers:
             sub_state.set(
                 sub.invars[num_const + num_carry + k], SparseDepSet(sub_dep, shp)
             )
+            if state.is_nonlinear(eqn.invars[num_const + num_carry + k]):
+                sub_state.nonlinear_ids.add(id(sub.invars[num_const + num_carry + k]))
 
             # Set a representative concrete value from element 0
             val = state.get_val(eqn.invars[num_const + num_carry + k])
@@ -1733,6 +1830,7 @@ class Handlers:
                 continue
 
             sub_handler(sub_eqn, sub_state, sub_acc, None)
+            sub_state.mark_nonlinear(sub_eqn)
 
             if sub_ovars:
                 in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
@@ -1888,6 +1986,8 @@ class Handlers:
 
                 y_shape = (length,) + slice_shape
                 state.set(y, SparseDepSet(expanded_dep, y_shape))
+                if sub_state.is_nonlinear(sub_y):
+                    state.nonlinear_ids.add(id(y))
 
     @staticmethod
     @TRACER_REGISTRY.register("pjit", "jit", "remat2")
@@ -1911,10 +2011,16 @@ class Handlers:
         sub_active, sub_bound_eqns = state.sub_info[id(eqn)]
 
         n_dofs = state.n_dofs
-        sub_state = TraceState(n_dofs, sub_active, state.tags, state.sub_info)
+        sub_state = TraceState(
+            n_dofs, sub_active, state.tags, state.sub_info, state.nonlinear_ids
+        )
 
         for v, d in zip(sub.invars, in_d):
             sub_state.set(v, d)
+        # Carry operand nonlinearity across the jit boundary onto the sub-invars.
+        for pv, sv in zip(eqn.invars, sub.invars):
+            if state.is_nonlinear(pv):
+                sub_state.nonlinear_ids.add(id(sv))
         for v, c in zip(sub.constvars, sub_consts):
             sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
             sub_state.val_of[id(v)] = np.asarray(c)
@@ -1932,6 +2038,7 @@ class Handlers:
                 continue
 
             sub_handler(sub_eqn, sub_state, acc, trial_test_split)
+            sub_state.mark_nonlinear(sub_eqn)
 
             # Propagate concrete value for executed equations as well
             if ovars:
@@ -1942,6 +2049,8 @@ class Handlers:
 
         for pv, sv in zip(eqn.outvars, sub.outvars):
             state.set(pv, sub_state.get(sv))
+            if sub_state.is_nonlinear(sv):
+                state.nonlinear_ids.add(id(pv))
 
     @staticmethod
     @TRACER_REGISTRY.register("cond")
@@ -1971,12 +2080,16 @@ class Handlers:
         ):
             sub = branch.jaxpr
             sub_consts = branch.consts
-            sub_state = TraceState(n_dofs, sub_active, state.tags, state.sub_info)
+            sub_state = TraceState(
+                n_dofs, sub_active, state.tags, state.sub_info, state.nonlinear_ids
+            )
 
             # Seed branch invars with operand dep-sets and concrete values (the latter
             # are needed to route any gather/scatter indices inside the branch).
             for sv, d, ov in zip(sub.invars, in_d, operands):
                 sub_state.set(sv, d)
+                if state.is_nonlinear(ov):
+                    sub_state.nonlinear_ids.add(id(sv))
                 val = state.get_val(ov)
                 if val is not None:
                     sub_state.val_of[id(sv)] = val
@@ -1996,6 +2109,7 @@ class Handlers:
                     continue
 
                 sub_handler(sub_eqn, sub_state, acc, trial_test_split)
+                sub_state.mark_nonlinear(sub_eqn)
 
                 if ovars:
                     in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
@@ -2005,6 +2119,8 @@ class Handlers:
 
             for ov, sv in zip(eqn.outvars, sub.outvars):
                 d = sub_state.get(sv)
+                if sub_state.is_nonlinear(sv):
+                    state.nonlinear_ids.add(id(ov))
                 prev = out_deps[id(ov)]
                 if prev is None:
                     out_deps[id(ov)] = d
