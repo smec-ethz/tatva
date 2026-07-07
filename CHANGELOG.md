@@ -5,6 +5,17 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.2](https://github.com/smec-ethz/tatva/compare/v0.11.1...v0.11.2) (2026-07-07)
+
+
+### Bug Fixes
+
+* add handlers for eigvalues, flip ([35c5652](https://github.com/smec-ethz/tatva/commit/35c565200f6296011d87d15454a6ae4857db752b))
+* add sparsity handlers for dense linear-algebra ops and stack ([d1277a4](https://github.com/smec-ethz/tatva/commit/d1277a41c12e4f5b10984b2860f4cd8aa3cdac41))
+* add warnings for not considered primitives ([e519f3f](https://github.com/smec-ethz/tatva/commit/e519f3facc790f30099b25256d232ee002ed7160))
+* fix over-conservatism in dot_general if one of the operand is linear in solution ([f7fe819](https://github.com/smec-ethz/tatva/commit/f7fe819fc95862514557d326843040c63e162a5f))
+* make dot_general aware of the contracting axes ([f917939](https://github.com/smec-ethz/tatva/commit/f9179390344b6f59739032da1fbeccfa3ea46bef))
+
 ## [0.11.1](https://github.com/smec-ethz/tatva/compare/v0.11.0...v0.11.1) (2026-06-27)
 
 
