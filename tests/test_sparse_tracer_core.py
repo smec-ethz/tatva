@@ -412,6 +412,96 @@ def test_stack_preserves_per_slice_support():
     assert _cross_segment_pairs(traced, block) == set()  # no cross-slice globalization
 
 
+def test_split_preserves_per_piece_support():
+    """``split`` is structural: each piece keeps its own support, so a later nonlinearity
+    couples only *within* a piece. The generic fallback unions the whole input into the
+    first output element, so the downstream ``**2`` would couple every DOF to every other —
+    a spuriously dense block. Regression for the ``split`` handler (false *positives*).
+    """
+    N, block = 4, 2
+    n = block * N
+
+    def energy(u):
+        # piece i is nonlinear in — and only in — DOFs {2i, 2i+1}
+        return sum(jnp.sum(jnp.sin(p[0]) * p[1]) for p in jnp.split(u, N))
+
+    pat = pattern_from_energy(energy, n)
+    traced = nz_set(pat)
+    assert dense_hessian_pattern(energy, n) <= traced  # no false negatives
+    assert _cross_segment_pairs(traced, block) == set()  # no cross-piece globalization
+    assert pat.nnz <= N * block * block  # locality => never the dense n²
+
+
+def test_split_records_couplings_of_every_output_piece():
+    """``split`` is a rare *multi-output* primitive, and ``Handlers.fallback`` writes only
+    ``outvars[0]`` — so without a handler every piece but the first gets an *empty* dep-set
+    and its couplings are silently dropped (false *negatives*, the dangerous direction).
+
+    Here the sole nonlinearity lives in the *last* piece and produces a genuine off-diagonal
+    coupling, so a dropped output cannot be masked by the tracer's ``nnz == 0 -> identity``
+    safety net.
+    """
+    n = 6
+
+    def energy(u):
+        _, _, c = jnp.split(u, 3)
+        return jnp.sum(c[0] * c[1])  # couples DOFs 4 and 5, nothing else
+
+    pat = pattern_from_energy(energy, n)
+    traced = nz_set(pat)
+    assert dense_hessian_pattern(energy, n) <= traced  # the (4,5)/(5,4) block survives
+    assert {(4, 5), (5, 4)} <= traced
+    assert _cross_segment_pairs(traced, 2) == set()
+
+
+@pytest.mark.parametrize("axis", [0, 1], ids=["axis0", "axis1"])
+def test_split_along_axis_matches_equivalent_slicing(axis):
+    """Splitting along a *trailing* axis makes the dep rows a piece inherits strided rather
+    than contiguous, so the handler must slice the row-index map along ``axis`` instead of
+    assuming a flat offset.
+
+    Pinned against the same energy written with plain ``[]`` slicing — which goes through
+    the long-trusted ``slice`` handler — so a misrouted row shows up as a pattern mismatch.
+    Equivalence (not just superset) is the real contract: ``split`` is structural, so it must
+    be *invisible* to the pattern. Asserting only ``true <= traced`` would be satisfied by
+    the dense generic fallback and would not test the routing at all.
+    """
+    n = 8
+
+    def with_split(u):
+        a, b = jnp.split(u.reshape(4, 2), 2, axis=axis)
+        return jnp.sum(a * b) + jnp.sum(jnp.sin(a))
+
+    def with_slicing(u):
+        m = u.reshape(4, 2)
+        a, b = (m[:2], m[2:]) if axis == 0 else (m[:, :1], m[:, 1:])
+        return jnp.sum(a * b) + jnp.sum(jnp.sin(a))
+
+    pat = pattern_from_energy(with_split, n)
+    traced = nz_set(pat)
+    assert traced == nz_set(pattern_from_energy(with_slicing, n))  # rows routed identically
+    assert dense_hessian_pattern(with_split, n) <= traced  # no false negatives
+    assert traced == nz_set(pat.T)  # structural symmetry
+    assert pat.nnz < n * n  # locality: never the dense fallback block
+
+
+def test_split_uses_handler_not_generic_fallback():
+    """``split`` must be *handled*, not silently over-approximated: the generic fallback
+    warns, so an energy containing a ``split`` on an active path must emit no warning.
+    Guards against the handler being dropped or the primitive being renamed upstream.
+    """
+
+    def energy(u):
+        return sum(jnp.sum(p**2) for p in jnp.split(u, 2))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any fallback UserWarning becomes a failure
+        pat = pattern_from_energy(energy, 4)
+
+    # exact here: split is structural, so **2 couples each DOF only with itself
+    assert nz_set(pat) == {(i, i) for i in range(4)}
+
+
 def test_eigh_is_dense_nonlinear_no_false_negatives():
     """``jnp.linalg.eigh`` (→ ``eigh``) is a dense nonlinear op: every eigenvalue depends on
     the whole matrix, so consuming it — even linearly — must record the full block. Covers
