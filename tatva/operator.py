@@ -396,15 +396,15 @@ class Operator(Generic[ElementT]):
 
         return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
 
-    def interpolate(self, arg: jax.Array, points: jax.Array) -> jax.Array:
-        """Interpolates nodal values to a set of points in the physical space.
+    def make_interpolate(self, points: jax.Array) -> Callable[[jax.Array], jax.Array]:
+        """Returns a function that interpolates nodal values to a set of static points.
 
         Args:
-            arg: The nodal values to interpolate.
-            points: The points to interpolate the function or nodal values to.
+            points: The statically known points to interpolate to.
 
         Returns:
-            A `jax.Array` with the interpolated values at the given points.
+            A function that takes nodal values (`arg`) and returns the interpolated values
+            at the statically known points.
         """
 
         @jax.jit
@@ -445,10 +445,9 @@ class Operator(Generic[ElementT]):
                 valid_indices,
             )
 
-        valid_quad_points, valid_elements, valid_indices = map_physical_to_reference(
+        xi_in_valid_element, valid_elements, valid_indices = map_physical_to_reference(
             points
         )
-        interpolated = self._interpolate_direct(arg, valid_quad_points, valid_elements)
 
         try:
             if bool(jnp.any(~valid_indices)):
@@ -458,22 +457,40 @@ class Operator(Generic[ElementT]):
         except TracerBoolConversionError:
             pass
 
-        mask = valid_indices.reshape(
-            (valid_indices.shape[0],) + (1,) * (interpolated.ndim - 1)
-        )
-        return jnp.where(mask, interpolated, jnp.nan)
+        def interpolate_fn(arg: jax.Array) -> jax.Array:
+            interpolated = self._interpolate_direct(
+                arg, xi_in_valid_element, valid_elements
+            )
+            mask = valid_indices.reshape(
+                (valid_indices.shape[0],) + (1,) * (interpolated.ndim - 1)
+            )
+            return jnp.where(mask, interpolated, jnp.nan)
+
+        return interpolate_fn
+
+    def interpolate(self, arg: jax.Array, points: jax.Array) -> jax.Array:
+        """Interpolates nodal values to a set of points in the physical space.
+
+        Args:
+            arg: The nodal values to interpolate.
+            points: The points to interpolate the function or nodal values to.
+
+        Returns:
+            A `jax.Array` with the interpolated values at the given points.
+        """
+        return self.make_interpolate(points)(arg)
 
     def _interpolate_direct(
         self,
         nodal_values: jax.Array,
-        valid_quad_points: jax.Array,
+        xi_in_valid_element: jax.Array,
         valid_elements: jax.Array,
     ) -> jax.Array:
         """Interpolates the given nodal values at the quad points.
 
         Args:
             nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
-            valid_quad_points: The quadrature points in the reference element
+            xi_in_valid_element: The points in the reference element
                 (shape: (n_valid_points, n_dim))
             valid_elements: The indices of the elements containing the quadrature points
                 (shape: (n_valid_points,))
@@ -483,19 +500,19 @@ class Operator(Generic[ElementT]):
             each element (shape: (n_valid_points, n_values)).
         """
 
-        def _interpolate_quad(
+        def _interpolate_at_xi(
             xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
-            """Calls the function (interpolator) on a quad point."""
+            """Calls the function (interpolator) on arbitrary reference coord."""
             return self.element.interpolate(
                 xi, el_nodal_values, el_nodal_coords
             )  # nodal coords are needed for hermite elements, but not for lagrange elements, so we pass them in either way
 
         return jax.vmap(
-            _interpolate_quad,
+            _interpolate_at_xi,
             in_axes=(0, 0, 0),
         )(
-            valid_quad_points,
+            xi_in_valid_element,
             nodal_values[valid_elements],
             self.mesh.coords[valid_elements],
         )
