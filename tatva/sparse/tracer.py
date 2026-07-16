@@ -842,7 +842,8 @@ def _propagate_active_backward(
 def _trace_hessian_sparsity(
     fn: Callable[Concatenate[Array, P], Array],
     n_dofs: int,
-    *static_args,
+    static_args: tuple,
+    static_kwargs: dict,
     trial_test_split: int | None = None,
 ) -> sps.csr_matrix:
     """Return the sparsity pattern of d²E/du² (or tangent stiffness matrix K for virtual
@@ -850,7 +851,8 @@ def _trace_hessian_sparsity(
     # Unwrap any outer @jax.jit so static slice indices stay static during tracing
     fn = _unwrap_jit(fn)
 
-    closed = jax.make_jaxpr(fn)(np.zeros((n_dofs,)), *static_args)
+    captured_args = (np.zeros((n_dofs,)), *static_args)
+    closed = jax.make_jaxpr(fn)(*captured_args, **static_kwargs)
     jaxpr: Jaxpr = closed.jaxpr
     consts: Sequence = closed.consts
 
@@ -870,7 +872,7 @@ def _trace_hessian_sparsity(
     state = TraceState(n_dofs, active_ids, tags, sub_info)
 
     # Seed concrete values of the input variables (essential for dynamic gather/scatter routing of static PyTree params)
-    flat_args, _ = jax.tree_util.tree_flatten((np.zeros((n_dofs,)), *static_args))
+    flat_args, _ = jax.tree_util.tree_flatten((captured_args, static_kwargs))
     for invar, arg_val in zip(jaxpr.invars, flat_args):
         state.val_of[id(invar)] = np.asarray(arg_val)
 
@@ -924,7 +926,8 @@ def _trace_hessian_sparsity(
 def pattern_from_energy(
     energy_fn: Callable[Concatenate[Array, P], Array],
     n_dofs: int,
-    *static_args,
+    *args: P.args,
+    **kwargs: P.kwargs,
 ) -> sps.csr_matrix:
     """
     Return the sparsity pattern of d²E/du² as a symmetric CSR matrix for a scalar energy
@@ -934,14 +937,18 @@ def pattern_from_energy(
         energy_fn: scalar JAX array energy function E(u, *static_args) as a function of
             input variable u and optional static arguments
         n_dofs: number of DOFs (integer size of flattened input array u)
-        static_args: extra args passed to energy_fn, treated as constants
+        args/kwargs: extra args passed to energy_fn, treated as constants
 
     Returns:
         A symmetric CSR matrix of shape (n_dofs, n_dofs) with binary entries indicating
         the sparsity pattern of the Hessian d²E/du².
     """
     return _trace_hessian_sparsity(
-        energy_fn, n_dofs, *static_args, trial_test_split=None
+        energy_fn,
+        n_dofs,
+        args,
+        kwargs,
+        trial_test_split=None,
     )
 
 
@@ -1023,7 +1030,7 @@ def pattern_from_virtual_work(
 
     # Trace the full Hessian of the combined function w_fn using private helper
     H_w: sps.csr_matrix = _trace_hessian_sparsity(
-        w_fn, combined_dofs, trial_test_split=n_dofs
+        w_fn, combined_dofs, (), {}, trial_test_split=n_dofs
     )
 
     # Extract the cross-coupling block (v-derivatives vs u-derivatives)
