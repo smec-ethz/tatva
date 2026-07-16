@@ -5,6 +5,14 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.3](https://github.com/smec-ethz/tatva/compare/v0.11.2...v0.11.3) (2026-07-16)
+
+
+### Bug Fixes
+
+* add jnp.split primitive to tracer ([7a5af7d](https://github.com/smec-ethz/tatva/commit/7a5af7d098135eb70e064af9d2b6fc560516f8cd))
+* **operator:** add make_interpolate to get an interpolator for fixed points ([688e61f](https://github.com/smec-ethz/tatva/commit/688e61f30d0889a71b14ccbf023d9583aa9f1218))
+
 ## [0.11.2](https://github.com/smec-ethz/tatva/compare/v0.11.1...v0.11.2) (2026-07-07)
 
 
