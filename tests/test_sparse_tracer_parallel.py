@@ -56,19 +56,29 @@ def nz_set(m: sps.spmatrix) -> set[tuple[int, int]]:
 class _StubComm:
     """Stands in for one rank of a ``size``-rank job, without launching MPI.
 
-    ``allreduce`` returns its argument untouched, so ``pattern_from_energy`` hands back
-    this rank's *local* pattern rather than the reduced one. Unioning those across all
-    ranks (see :func:`parallel_pattern`) reproduces exactly what the real allreduce
-    computes -- which is what lets the decomposition be tested in-process, at rank counts
-    that would otherwise need a separate ``mpirun`` per case.
+    ``size`` and ``rank`` are honest, so ``_chunk_operator`` selects the same cells it
+    would under real MPI. The *collectives*, though, deliberately behave as if this rank
+    were the only participant: ``allgather`` reports just its own contribution and
+    ``Allgatherv`` copies the send buffer straight into the receive buffer. So
+    ``pattern_from_energy`` returns this rank's **local** pattern rather than the reduced
+    one, and :func:`parallel_pattern` performs the union across ranks itself.
+
+    Splitting those two responsibilities is what lets the decomposition be tested
+    in-process at any rank count, instead of needing a separate ``mpirun`` per case. The
+    real collective is covered by :func:`test_matches_serial_under_mpi`.
     """
 
     def __init__(self, size: int, rank: int):
         self.size = size
         self.rank = rank
 
-    def allreduce(self, obj, op=None):
-        return obj
+    def allgather(self, value):
+        return [value]
+
+    def Allgatherv(self, send, recv):
+        send_buf = send[0]
+        recv_buf = recv[0]
+        recv_buf[: send_buf.size] = send_buf
 
 
 def parallel_pattern(energy, *static_args, n_dofs: int, size: int) -> sps.csr_matrix:

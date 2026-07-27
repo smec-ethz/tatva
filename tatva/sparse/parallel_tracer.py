@@ -67,26 +67,60 @@ def _get_operators_from_args(static_args):
     return [arg for arg in static_args if isinstance(arg, Operator)]
 
 
-def _allreduce_union(pattern: sps.csr_matrix, comm) -> sps.csr_matrix:
+def _allreduce_union(pattern: sps.csr_matrix, comm, n_dofs: int) -> sps.csr_matrix:
     """OR-reduce a replicated pattern across ranks; every rank gets the full result.
 
-    ``MPI.SUM`` cannot be applied to CSR matrices through the buffer interface -- that
-    reduces fixed-layout buffers, and two ranks' matrices have different ``nnz``,
-    ``indices`` and ``indptr``, so there is no elementwise correspondence to sum. A dense
-    reduction would have the right layout but costs ``n_dofs**2``.
+    ``MPI.SUM`` cannot be applied to CSR matrices through the *buffer* interface: that
+    reduces fixed-layout buffers elementwise, and two ranks' matrices have different
+    ``nnz``, ``indices`` and ``indptr``, so there is no positional correspondence to sum.
+    The only common layout is dense, which costs ``n_dofs**2``.
 
-    mpi4py's *object* allreduce sidesteps both: it pickles the matrices and applies
-    Python ``+``, which for CSR is exactly the structural union, as a tree reduction over
-    ``log(size)`` stages. Entries appearing on more than one rank -- the ones on chunk
-    interfaces -- sum above 1, hence the clamp back to a binary pattern.
+    So the entries are moved rather than reduced. Each ``(row, col)`` is packed into one
+    ``int64`` key, the keys are exchanged with a single ``Allgatherv``, and the union falls
+    out of rebuilding a CSR from the concatenation. Duplicates -- entries on chunk
+    interfaces, contributed by more than one rank -- are collapsed by ``sum_duplicates``
+    during the COO to CSR conversion, which has to happen anyway, so no separate
+    deduplication pass is needed. The data is then clamped back to a binary pattern.
 
-    The one limit worth knowing: pickled messages hit a ~2 GB ceiling in some MPI builds,
-    which at ~20 bytes per entry means tens of millions of nonzeros. Beyond that, pack
-    ``(row, col)`` into int64 keys and exchange them with ``Allgatherv`` instead.
+    mpi4py's *object* allreduce (``comm.allreduce(pattern, op=MPI.SUM)``) also works, by
+    pickling the matrices and applying Python ``+``, and is roughly 3x faster at moderate
+    size. It is not used here because pickled messages hit a ~2 GB ceiling in some MPI
+    builds, which at ~5 bytes of CSR per entry puts a hard wall around 25M DOFs for a
+    typical nnz/DOF ratio. The buffer interface has no byte ceiling -- MPI counts are
+    32-bit *element* counts, so one ``int64`` key per entry allows ~2**31 entries per
+    message, which at the same ratio is past 100M DOFs and well beyond the point where
+    holding the result at all becomes the binding constraint.
+
     """
     from mpi4py import MPI
 
-    out = comm.allreduce(pattern, op=MPI.SUM).tocsr()
+    if n_dofs > int(np.sqrt(np.iinfo(np.int64).max)):
+        raise ValueError(
+            f"n_dofs={n_dofs} is too large to pack (row, col) pairs into int64 keys."
+        )
+
+    row, col = pattern.nonzero()
+    keys = row.astype(np.int64) * n_dofs + col.astype(np.int64)
+
+    counts = np.array(comm.allgather(keys.size), dtype=np.int64)
+    total = int(counts.sum())
+    if total == 0:
+        return sps.csr_matrix((n_dofs, n_dofs), dtype=np.int8)
+
+    displ = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    gathered = np.empty(total, dtype=np.int64)
+    comm.Allgatherv(
+        [keys, MPI.INT64_T],
+        [gathered, (counts.astype(np.int32), displ.astype(np.int32)), MPI.INT64_T],
+    )
+    del keys
+
+    rows, cols = np.divmod(gathered, n_dofs)
+    del gathered
+    out = sps.csr_matrix(
+        (np.ones(rows.size, dtype=np.int8), (rows, cols)), shape=(n_dofs, n_dofs)
+    )
+    out.sum_duplicates()
     if out.nnz:
         out.data[:] = 1
     return out
@@ -142,14 +176,12 @@ def pattern_from_energy(
     chunked_ops = [_chunk_operator(op, comm=comm) for op in ops]
 
     # Replace the original Operators in static_args with their chunked versions.
-    # `chunked_ops` is indexed by position among the *operators*, not by position in
-    # `static_args`, so consume it in order rather than indexing with the arg position.
     chunked_iter = iter(chunked_ops)
     chunked_static_args = [
         next(chunked_iter) if isinstance(arg, Operator) else arg for arg in static_args
     ]
 
-    # Trace this rank's chunk. Already binary, so no local clamp is needed.
+    # Trace this rank's chunk of the energy function
     local_pattern = _serial_pattern_from_energy(energy, n_dofs, *chunked_static_args)
 
-    return _allreduce_union(local_pattern, comm)
+    return _allreduce_union(local_pattern, comm, n_dofs)
