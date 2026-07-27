@@ -3,8 +3,8 @@ from ._extraction import (
     pattern_from_mesh,
 )
 from .base import ColoredMatrix, jacfwd, linearized_jacfwd
+from .parallel_tracer import pattern_from_energy
 from .tracer import (
-    pattern_from_energy,
     pattern_from_virtual_work,
     register_elementwise_ffi,
 )
