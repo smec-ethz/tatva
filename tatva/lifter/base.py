@@ -275,7 +275,11 @@ class Lifter:
 
         constrained = jnp.concatenate([cond.dofs for cond in self.constraints])
         constrained = jnp.unique(constrained)
-        free = jnp.setdiff1d(all_dofs, constrained, assume_unique=True)
+        # removed jnp.setdiff1d in favor of mask-based approach because setdiff1d with
+        # optional assume_unique=True creates size x constrained size dense matrix
+        # which is inefficient for large systems
+        mask = jnp.ones(self.size, dtype=bool).at[constrained].set(False)
+        free = jnp.flatnonzero(mask)
         return free, constrained, free.size
 
     def adapt_sparsity(self, sparsity: sps.csr_matrix) -> sps.csr_matrix:
