@@ -15,6 +15,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
+from ._basix import BasixElement as BasixElement
+from ._basix import MapType as MapType
+from ._basix import Sobolev as Sobolev
+from ._basix import from_basix as from_basix
 from .base import Element as Element
 from .base import (  # noqa: F401
     Hexahedron8,

@@ -16,11 +16,36 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
+import enum
 from abc import ABC, abstractmethod
 
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+
+
+class Sobolev(str, enum.Enum):
+    """The space the element conforms to; decides which operators are legal."""
+
+    L2 = "L2"
+    H1 = "H1"
+    H2 = "H2"
+    H3 = "H3"
+    HINF = "HInf"
+    HDIV = "HDiv"
+    HCURL = "HCurl"
+    HEIN = "HEin"
+    HDIVDIV = "HDivDiv"
+
+
+class MapType(str, enum.Enum):
+    """Push-forward from the reference cell to the physical cell."""
+
+    IDENTITY = "identity"
+    COVARIANT_PIOLA = "covariantPiola"
+    CONTRAVARIANT_PIOLA = "contravariantPiola"
+    DOUBLE_COVARIANT_PIOLA = "doubleCovariantPiola"
+    DOUBLE_CONTRAVARIANT_PIOLA = "doubleContravariantPiola"
 
 
 class Element(ABC):
@@ -33,9 +58,13 @@ class Element(ABC):
 
     quad_points: Array
     quad_weights: Array
+    sobolev: Sobolev
 
     def __init__(
-        self, quad_points: Array | None = None, quad_weights: Array | None = None
+        self,
+        quad_points: Array | None = None,
+        quad_weights: Array | None = None,
+        sobolev: Sobolev = Sobolev.H1,
     ):
         """Initializes the element, optionally with custom quadrature points and weights.
 
@@ -43,12 +72,15 @@ class Element(ABC):
             quad_points: An array of shape (n_q, n_dim) containing the quadrature points
                 in local coordinates.
             quad_weights: An array of shape (n_q,) containing the quadrature weights.
+            sobolev_space: The Sobolev space the element conforms to. Defaults to H1.
         """
         if (quad_points is not None) and (quad_weights is not None):
             self.quad_points = quad_points
             self.quad_weights = quad_weights
         else:
             self.quad_points, self.quad_weights = self._default_quadrature()
+
+        self.sobolev = sobolev
 
     def __eq__(self, other: object) -> bool:
         if type(self) is not type(other):
