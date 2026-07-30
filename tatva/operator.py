@@ -41,6 +41,7 @@ from jax.errors import TracerBoolConversionError
 from jax_autovmap import autovmap
 
 from tatva.element import Element
+from tatva.function_space import FunctionSpace
 from tatva.mesh import Mesh, find_containing_polygons
 from tatva.utils import make_project_function
 
@@ -80,8 +81,8 @@ class Operator(Generic[ElementT]):
     """A class that provides an Operator for finite element method (FEM) assembly.
 
     Args:
-        mesh: The mesh containing the elements and nodes.
-        element: The element type used for the finite element method.
+        space: The function space to assemble over, pairing a mesh with an element and
+            owning the connectivity between them.
         batch_size: Optional batch size for mapping operations over elements. If None, it
             defaults to the number of elements in the mesh. If many elements are present,
             setting a smaller batch size can reduce memory usage.
@@ -95,17 +96,21 @@ class Operator(Generic[ElementT]):
     integrals, evaluate functions at quadrature points, and compute gradients of
     functions at quadrature points.
 
+    Two connectivity tables are read from the space and are not interchangeable: dof
+    values are gathered through `space.dofmap`, and node coordinates through
+    `space.geometry_dofmap`. They are the same table for a degree-1 space, and diverge as
+    soon as the field carries dofs the geometry does not.
+
     Example:
-        >>> from tatva import Mesh, Tri3, Operator
+        >>> from tatva import FunctionSpace, Mesh, Operator, Tri3
         >>> mesh = Mesh.unit_square(10, 10)  # Create a mesh
-        >>> element = Tri3()  # Define an element type
-        >>> operator = Operator(mesh, element)
-        >>> nodal_values = jnp.array(...)  # Nodal values at the mesh nodes
-        >>> energy = operator.integrate(energy_density)(nodal_values)
+        >>> space = FunctionSpace(mesh, Tri3())  # Pair it with an element
+        >>> operator = Operator(space)
+        >>> dof_values = jnp.array(...)  # Nodal values at the mesh nodes
+        >>> energy = operator.integrate(energy_density)(dof_values)
     """
 
-    mesh: Mesh
-    element: ElementT = field(metadata=dict(static=True))
+    space: FunctionSpace[ElementT]
     batch_size: int | None = field(metadata=dict(static=True), default=None)
     cache_weights: bool = field(metadata=dict(static=True), default=False)
 
@@ -114,7 +119,7 @@ class Operator(Generic[ElementT]):
         # shape/type validations
         self.__check_init__()
         if self.batch_size is None:
-            object.__setattr__(self, "batch_size", self.mesh.elements.shape[0])
+            object.__setattr__(self, "batch_size", self.n_elements)
 
         if self.cache_weights:
 
@@ -122,12 +127,43 @@ class Operator(Generic[ElementT]):
                 """Calls the function element.get_jacobian and returns the second output."""
                 return self.element.get_jacobian(xi, el_nodal_coords)[1]
 
-            det_J_elements = self.map(_get_det_J)(self.mesh.coords)
+            det_J_elements = self.map(_get_det_J, geometry_quantity=(0,))(
+                self.mesh.coords
+            )
             object.__setattr__(
                 self,
                 "_det_J_elements_weights",
                 jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights),
             )
+
+    # ---------------------------------------------------------------- space accessors
+
+    @property
+    def mesh(self) -> Mesh:
+        """The mesh underlying the space."""
+        return self.space.mesh
+
+    @property
+    def element(self) -> ElementT:
+        """The element defining the basis. Static under jax transformations."""
+        return self.space.element
+
+    @property
+    def dofmap(self) -> Array:
+        """Global dof index of each element-local dof (shape: (n_elements, n_dofs))."""
+        assert self.space.dofmap is not None
+        return self.space.dofmap
+
+    @property
+    def geometry_dofmap(self) -> Array:
+        """Global node index of each element-local geometry node."""
+        assert self.space.geometry_dofmap is not None
+        return self.space.geometry_dofmap
+
+    @property
+    def n_elements(self) -> int:
+        """Number of elements in the mesh."""
+        return self.geometry_dofmap.shape[0]
 
     def __check_init__(self) -> None:
         """Validates the mesh and element compatibility. Does a series of checks to ensure
@@ -188,17 +224,19 @@ class Operator(Generic[ElementT]):
                 """Calls the function element.get_jacobian and returns the second output."""
                 return self.element.get_jacobian(xi, el_nodal_coords)[1]
 
-            det_J_elements = self.map(_get_det_J)(self.mesh.coords)
+            det_J_elements = self.map(_get_det_J, geometry_quantity=(0,))(
+                self.mesh.coords
+            )
             return jnp.einsum("eq,q->eq", det_J_elements, self.element.quad_weights)
 
     def _vmap_over_elements_and_quads(
-        self, nodal_values: jax.Array, func: MappableOverElementsAndQuads
+        self, dof_values: jax.Array, func: MappableOverElementsAndQuads
     ) -> jax.Array:
         """Helper function. Maps a function over the elements and quadrature points of the
         mesh.
 
         Args:
-            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+            dof_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
             func: The function to map over the elements and quadrature points.
 
         Returns:
@@ -207,26 +245,62 @@ class Operator(Generic[ElementT]):
         """
 
         def _at_each_element(args: tuple[Array, Array]) -> Array:
-            el_nodal_values, el_nodal_coords = args
+            el_dof_values, el_nodal_coords = args
             return jax.vmap(
                 partial(
                     func,
-                    el_nodal_values=el_nodal_values,
+                    el_dof_values=el_dof_values,
                     el_nodal_coords=el_nodal_coords,
                 )
             )(self.element.quad_points)
 
         return jax.lax.map(
             _at_each_element,
-            xs=(nodal_values[self.mesh.elements], self.mesh.coords[self.mesh.elements]),
+            xs=(
+                dof_values[self.dofmap],
+                self.mesh.coords[self.geometry_dofmap],
+            ),
             batch_size=self.batch_size,
         )
+
+    def _gather(
+        self,
+        values: tuple[jax.Array, ...],
+        element_quantity: Sequence[int],
+        geometry_quantity: Sequence[int],
+    ) -> tuple[jax.Array, ...]:
+        """Gathers global arrays to element-local ones, one table per argument kind.
+
+        Args:
+            values: The global arrays passed to a mapped function.
+            element_quantity: Indices of arguments already defined per element, which are
+                passed through untouched.
+            geometry_quantity: Indices of arguments indexed by mesh node rather than by
+                dof, gathered through the geometry table. Node coordinates are the usual
+                case.
+        """
+        overlap = set(element_quantity) & set(geometry_quantity)
+        if overlap:
+            raise ValueError(
+                f"arguments {sorted(overlap)} are marked both element_quantity and "
+                f"geometry_quantity; an argument is gathered exactly one way"
+            )
+
+        def _gather_one(i: int, v: jax.Array) -> jax.Array:
+            if i in element_quantity:
+                return v
+            if i in geometry_quantity:
+                return v[self.geometry_dofmap]
+            return v[self.dofmap]
+
+        return tuple(_gather_one(i, v) for i, v in enumerate(values))
 
     def map(
         self,
         func: MappableOverElementsAndQuads[P, RT],
         *,
         element_quantity: Sequence[int] = (),
+        geometry_quantity: Sequence[int] = (),
     ) -> MappedCallable[P, RT]:
         """Maps a function over the elements and quad points of the mesh.
 
@@ -238,6 +312,10 @@ class Operator(Generic[ElementT]):
             element_quantity: Indices of the arguments of `func` that are quantities
                 defined per element. The rest of the arguments are assumed to be defined
                 at nodal points.
+            geometry_quantity: Indices of the arguments of `func` that are indexed by mesh
+                node instead of by dof, and so are gathered through the geometry table.
+                Pass this for node coordinates; the two tables coincide only while every
+                dof sits on a vertex.
         """
 
         def _mapped(*values: P.args, **kwargs: P.kwargs) -> RT:
@@ -252,10 +330,7 @@ class Operator(Generic[ElementT]):
 
             # Construct the tuple of inputs (xs) by iterating over _values
             # and gathering nodal values to elements where necessary.
-            xs = tuple(
-                v[self.mesh.elements] if i not in element_quantity else v
-                for i, v in enumerate(_values)
-            )
+            xs = self._gather(_values, element_quantity, geometry_quantity)
 
             return jax.lax.map(
                 _at_each_element,
@@ -270,6 +345,7 @@ class Operator(Generic[ElementT]):
         func: MappableOverElements[P, RT],
         *,
         element_quantity: Sequence[int] = (),
+        geometry_quantity: Sequence[int] = (),
     ) -> MappedCallable[P, RT]:
         """Maps a function over the elements of the mesh.
 
@@ -281,6 +357,8 @@ class Operator(Generic[ElementT]):
             element_quantity: Indices of the arguments of `func` that are quantities
                 defined per element. The rest of the arguments are assumed to be defined
                 at nodal points.
+            geometry_quantity: Indices of the arguments of `func` that are indexed by mesh
+                node instead of by dof, and so are gathered through the geometry table.
         """
 
         def _mapped(*values: P.args, **kwargs: P.kwargs) -> RT:
@@ -292,10 +370,7 @@ class Operator(Generic[ElementT]):
 
             # Construct the tuple of inputs (xs) by iterating over _values
             # and gathering nodal values to elements where necessary.
-            xs = tuple(
-                v[self.mesh.elements] if i not in element_quantity else v
-                for i, v in enumerate(_values)
-            )
+            xs = self._gather(_values, element_quantity, geometry_quantity)
             return jax.lax.map(
                 _at_each_element,
                 xs=xs,
@@ -333,7 +408,7 @@ class Operator(Generic[ElementT]):
         """
         if isinstance(arg, Numeric):
             res = self._integrate_quad_array(self.eval(jnp.array([arg])))
-        elif arg.shape[0] == self.mesh.elements.shape[0]:  # element field
+        elif arg.shape[0] == self.n_elements:  # element field
             res = self._integrate_quad_array(arg)
         else:  # nodal field
             field_at_quads = self.eval(arg)
@@ -355,11 +430,11 @@ class Operator(Generic[ElementT]):
 
         return jnp.einsum("eq...,eq->e...", quad_values, self.get_integration_weights())
 
-    def eval(self, nodal_values: jax.Array) -> jax.Array:
+    def eval(self, dof_values: jax.Array) -> jax.Array:
         """Evaluates the nodal values at the quadrature points.
 
         Args:
-            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+            dof_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
 
         Returns:
             A `jax.Array` with the values of the nodal values at each quadrature point of
@@ -367,20 +442,20 @@ class Operator(Generic[ElementT]):
         """
 
         def _eval_quad(
-            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
+            xi: jax.Array, el_dof_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             """Calls the function (interpolator) on a quad point."""
             return self.element.interpolate(
-                xi, el_nodal_values, el_nodal_coords
+                xi, el_dof_values, el_nodal_coords
             )  # nodal coords are needed for hermite elements, but not for lagrange elements, so we pass them in either way
 
-        return self._vmap_over_elements_and_quads(nodal_values, _eval_quad)
+        return self._vmap_over_elements_and_quads(dof_values, _eval_quad)
 
-    def grad(self, nodal_values: jax.Array) -> jax.Array:
+    def grad(self, dof_values: jax.Array) -> jax.Array:
         """Computes the gradient of the nodal values at the quad points.
 
         Args:
-            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+            dof_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
 
         Returns:
             A `jax.Array` with the gradient of the nodal values at each quadrature point
@@ -388,13 +463,13 @@ class Operator(Generic[ElementT]):
         """
 
         def _gradient_quad(
-            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
+            xi: jax.Array, el_dof_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             """Calls the function (gradient) on a quad point."""
-            u_grad = self.element.gradient(xi, el_nodal_values, el_nodal_coords)
+            u_grad = self.element.gradient(xi, el_dof_values, el_nodal_coords)
             return u_grad
 
-        return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
+        return self._vmap_over_elements_and_quads(dof_values, _gradient_quad)
 
     def make_interpolate(self, points: jax.Array) -> Callable[[jax.Array], jax.Array]:
         """Returns a function that interpolates nodal values to a set of static points.
@@ -429,24 +504,28 @@ class Operator(Generic[ElementT]):
 
         def map_physical_to_reference(
             points: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             element_indices: Array = find_containing_polygons(
-                points, self.mesh.coords[self.mesh.elements]
+                points, self.mesh.coords[self.geometry_dofmap]
             )
             valid_indices = element_indices != -1
             safe_element_indices = jnp.where(valid_indices, element_indices, 0)
-            valid_elements = self.mesh.elements[safe_element_indices]
+            # Point location is geometry; the dofs of the same cells are what the field is
+            # then read from, so both tables are sliced by the same element indices.
+            valid_geometry = self.geometry_dofmap[safe_element_indices]
+            valid_dofs = self.dofmap[safe_element_indices]
             return (
                 _map_physical_to_reference(
                     points,
-                    self.mesh.coords[valid_elements],
+                    self.mesh.coords[valid_geometry],
                 ),
-                valid_elements,
+                valid_geometry,
+                valid_dofs,
                 valid_indices,
             )
 
-        xi_in_valid_element, valid_elements, valid_indices = map_physical_to_reference(
-            points
+        xi_in_valid_element, valid_geometry, valid_dofs, valid_indices = (
+            map_physical_to_reference(points)
         )
 
         try:
@@ -459,7 +538,7 @@ class Operator(Generic[ElementT]):
 
         def interpolate_fn(arg: jax.Array) -> jax.Array:
             interpolated = self._interpolate_direct(
-                arg, xi_in_valid_element, valid_elements
+                arg, xi_in_valid_element, valid_geometry, valid_dofs
             )
             mask = valid_indices.reshape(
                 (valid_indices.shape[0],) + (1,) * (interpolated.ndim - 1)
@@ -482,18 +561,21 @@ class Operator(Generic[ElementT]):
 
     def _interpolate_direct(
         self,
-        nodal_values: jax.Array,
+        dof_values: jax.Array,
         xi_in_valid_element: jax.Array,
-        valid_elements: jax.Array,
+        valid_geometry: jax.Array,
+        valid_dofs: jax.Array,
     ) -> jax.Array:
         """Interpolates the given nodal values at the quad points.
 
         Args:
-            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+            dof_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
             xi_in_valid_element: The points in the reference element
                 (shape: (n_valid_points, n_dim))
-            valid_elements: The indices of the elements containing the quadrature points
-                (shape: (n_valid_points,))
+            valid_geometry: The geometry nodes of the element containing each point
+                (shape: (n_valid_points, n_geometry_nodes)).
+            valid_dofs: The dofs of the element containing each point
+                (shape: (n_valid_points, n_dofs)).
 
         Returns:
             A `jax.Array` with the values of the nodal values at each quadrature point of
@@ -501,11 +583,11 @@ class Operator(Generic[ElementT]):
         """
 
         def _interpolate_at_xi(
-            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
+            xi: jax.Array, el_dof_values: jax.Array, el_nodal_coords: jax.Array
         ) -> jax.Array:
             """Calls the function (interpolator) on arbitrary reference coord."""
             return self.element.interpolate(
-                xi, el_nodal_values, el_nodal_coords
+                xi, el_dof_values, el_nodal_coords
             )  # nodal coords are needed for hermite elements, but not for lagrange elements, so we pass them in either way
 
         return jax.vmap(
@@ -513,8 +595,8 @@ class Operator(Generic[ElementT]):
             in_axes=(0, 0, 0),
         )(
             xi_in_valid_element,
-            nodal_values[valid_elements],
-            self.mesh.coords[valid_elements],
+            dof_values[valid_dofs],
+            self.mesh.coords[valid_geometry],
         )
 
     def _replace(self, **changes: Any) -> Self:
@@ -535,6 +617,10 @@ class Operator(Generic[ElementT]):
             An array with the quadrature points of the mesh in physical coordinates
             (shape: (n_elements, n_quad_points, n_dim)).
         """
+        # This pushes the coordinates through the *dof* table, which is the geometry table
+        # only while every dof sits on a vertex. Mapping the reference quadrature points
+        # through the geometry element is the general form, and is needed as soon as the
+        # space carries edge or interior dofs.
         return self.eval(self.mesh.coords)
 
     def project(
@@ -548,7 +634,7 @@ class Operator(Generic[ElementT]):
 
         Uses ``jax.experimental.sparse.linalg.spsolve`` to solve the linear system
         resulting from the projection. If `colored_matrix` is None (the default), a
-        compatible colored matrix is assembled from `self.mesh.elements`. When a
+        compatible colored matrix is assembled from `self.dofmap`. When a
         `colored_matrix` is passed explicitly, it must be compatible with the dimensions
         of the projected field and with the chosen fem space.
 
@@ -556,16 +642,16 @@ class Operator(Generic[ElementT]):
             field: The field to project, defined at the quadrature points
                 (shape: (n_elements, n_quad_points, ...)).
             colored_matrix: Optional colored matrix representing the finite element space.
-                If omitted, it is constructed from `self.mesh.elements`.
+                If omitted, it is constructed from `self.dofmap`.
             lifter: Optional lifter used to lift and reduce between the full and reduced
                 spaces.
         """
-        nnodes = self.mesh.coords.shape[0]
-
+        # The sparsity pattern is that of the dof graph, not the mesh node graph — the two
+        # coincide only while every dof sits on a vertex.
         fn_project = make_project_function(
-            nnodes=nnodes,
+            nnodes=self.space.n_global_dofs,
             colored_matrix=colored_matrix,
-            elements=self.mesh.elements,  # ignored if colored_matrix is provided
+            elements=self.dofmap,  # ignored if colored_matrix is provided
             lifter=lifter,
         )
         return fn_project(self, field)

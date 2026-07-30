@@ -95,11 +95,12 @@ def test_basix_p1_matches_handwritten_element(cell: str):
     mesh = make_mesh()
     f = jnp.sin(mesh.coords[:, 0]) * mesh.coords[:, 1] ** 2 + 1.0
 
-    reference = Operator(mesh, native)
+    reference_space = FunctionSpace(mesh, native)
+    reference = Operator(reference_space)
     expected = reference.integrate(reference.eval(f))
 
     space = FunctionSpace(mesh, p1_element(cell))
-    operator = Operator(mesh._replace(elements=space.geometry_dofmap), space.element)
+    operator = Operator(space)
     assert operator.integrate(operator.eval(f)) == pytest.approx(expected, rel=1e-12)
 
 
@@ -108,11 +109,13 @@ def test_operator_functions(cell: str):
     native, make_mesh = CASES[cell]
     mesh = make_mesh()
 
-    native_op = Operator(mesh, native)
+    native_space = FunctionSpace(mesh, native)
+
+    native_op = Operator(native_space)
     native_quad_points = native_op.eval(mesh.coords)
 
-    V = FunctionSpace(mesh, p1_element(cell))
-    op = Operator(mesh._replace(elements=V.dofmap), V.element)
+    space = FunctionSpace(mesh, p1_element(cell))
+    op = Operator(space)
     quad_points = op.eval(mesh.coords)
     print(quad_points)
     print(native_quad_points)
