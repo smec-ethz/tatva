@@ -39,10 +39,10 @@ __all__ = ["FunctionSpace"]
 class FunctionSpace(Generic[ElementT]):
     """Pairs a mesh with an element and owns the connectivity between them.
 
-    A mesh records its cells in tatva's own vertex order; an element expects them in
-    whatever order its basis was built for. `FunctionSpace` reconciles the two so that
-    neither has to know about the other, and is the object that will grow the extra dofs
-    for higher-degree spaces.
+    A mesh records its cells in tatva's own vertex order which is counter-clockwise; an
+    element expects them in whatever order its basis was built for. `FunctionSpace` reconciles
+    the two so that neither has to know about the other, and is the object that will grow
+    the extra dofs for higher-degree spaces.
 
     A space covers a single cell type. Meshes mixing cell types are handled by splitting
     them and building one space — and one `Operator` — per type.
@@ -89,18 +89,39 @@ class FunctionSpace(Generic[ElementT]):
             raise NotImplementedError(
                 f"{self.element!r} has {n_dofs} dofs but the mesh supplies only "
                 f"{n_vertices} per cell. Dofs on edges, faces and cell interiors are not "
-                f"generated yet, so only degree-1 spaces are supported."
+                f"generated yet, so only vertex-dof spaces are supported."
             )
+
+        # Matching counts are not enough: a triangle has as many edges as vertices, so RT1
+        # and N1E1 pass the check above while their dofs are edge functionals, not point
+        # evaluations. Only an element whose dofs all sit on vertices can be indexed by the
+        # mesh connectivity, so ask the element where its dofs live.
+        entity_dofs = getattr(self.element, "entity_dofs", None)
+        if entity_dofs is not None:
+            n_vertex_dofs = sum(len(slots) for slots in entity_dofs[0])
+            if n_vertex_dofs != n_dofs:
+                raise NotImplementedError(
+                    f"{self.element!r} has {n_dofs} dofs of which only {n_vertex_dofs} sit "
+                    f"on vertices; the rest live on edges, faces or the cell interior and "
+                    f"need entity numbering, which is not implemented yet."
+                )
 
         table = elements[:, perm]
         object.__setattr__(self, "dofmap", table)
         object.__setattr__(self, "geometry_dofmap", table)
 
     @property
-    def n_global_dofs(self) -> int:
-        """Number of dofs in the space.
+    def n_scalar_dofs(self) -> int:
+        """Number of dofs in the space, counted once per basis function.
 
-        Equal to the node count while every dof sits on a vertex.
+        A space is scalar: how many components a field carries is a property of the field,
+        so a field of shape `(2,)` over this space has `2 * n_scalar_dofs` dofs in total.
+
+        In general this is `sum over entity dimension d of n_entities(d) * dofs_per_entity(d)`
+        — the node count for a vertex-dof space, the edge count for RT1 or N1E1 on a
+        triangle, and node + edge count for P2. Only vertex-dof spaces are constructible for
+        now, which is what makes the node count the right answer here; entity numbering
+        supplies the general form.
         """
         return self.mesh.coords.shape[0]
 

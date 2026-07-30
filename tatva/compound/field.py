@@ -26,6 +26,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from tatva.compound.field_types import FieldType, _FieldType
+from tatva.function_space import FunctionSpace
 
 if TYPE_CHECKING:
     from tatva.compound import Compound
@@ -40,17 +41,74 @@ class FieldSize(IntEnum):
 
 @dataclass(frozen=True)
 class _FieldSpec:
-    """A specification for a field in a Compound class."""
+    """A specification for a field in a Compound class.
 
-    shape: tuple[int, ...]
+    A field is declared in one of two ways, and they are not interchangeable:
+
+    - Over a function space — `field(V, (2,))`. The space supplies the number of dofs and
+      `components` says how many values each dof carries, so the field is shaped
+      `(V.n_scalar_dofs, 2)`.
+
+    - Over a literal shape — `field(shape=(2,))`. The shape is given directly, and the
+      space is `None`.
+
+    Attributes:
+        space: The space the field lives on, or `None` for a literally shaped field.
+        components: The value shape of a single dof, only with `space`. `()` is scalar.
+        shape: The full shape of the field. Derived from `space` and `components` when
+            those are given, and stated directly otherwise.
+        default_factory: Called to produce the field's initial values.
+        field_type: Where the field lives for MPI purposes.
+    """
+
+    space: FunctionSpace | None = None
+    components: tuple[int, ...] | None = None
+    shape: tuple[int, ...] | None = None
     default_factory: Callable | None = None
     field_type: FieldType | _FieldType = FieldType.LOCAL
+
+    def __post_init__(self) -> None:
+        if self.space is None:
+            if self.components is not None:
+                raise ValueError(
+                    "components describes the values carried by one dof of a space, so it "
+                    "needs a space; pass field(space, components) or state the full shape "
+                    "with field(shape=...)"
+                )
+            if self.shape is None:
+                raise ValueError(
+                    "a field needs either a space — field(space, components) — or a "
+                    "literal shape — field(shape=...)"
+                )
+            object.__setattr__(self, "shape", tuple(self.shape))
+            return
+
+        if not isinstance(self.space, FunctionSpace):
+            raise TypeError(
+                f"the first argument of field() is the function space, got "
+                f"{type(self.space).__name__}. Pass a shape as a keyword instead: "
+                f"field(shape={self.space!r})"
+            )
+
+        components = () if self.components is None else tuple(self.components)
+        derived = (self.space.n_scalar_dofs, *components)
+        # A shape may still be passed alongside a space — dataclasses.replace() round-trips
+        # every field — but it has to agree with what the space and components imply.
+        if self.shape is not None and tuple(self.shape) != derived:
+            raise ValueError(
+                f"shape {tuple(self.shape)} contradicts the space and components, which "
+                f"imply {derived}"
+            )
+        object.__setattr__(self, "components", components)
+        object.__setattr__(self, "shape", derived)
 
 
 if TYPE_CHECKING:
     # We lie to the type checker. We tell it field() returns a runtime Field descriptor
     def field(
-        shape: tuple[int, ...],
+        space: FunctionSpace | None = None,
+        components: tuple[int, ...] | None = None,
+        shape: tuple[int, ...] | None = None,
         default_factory: Callable | None = None,
         field_type: FieldType | _FieldType = FieldType.LOCAL,
     ) -> Field: ...

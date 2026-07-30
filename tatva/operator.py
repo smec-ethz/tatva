@@ -649,7 +649,7 @@ class Operator(Generic[ElementT]):
         # The sparsity pattern is that of the dof graph, not the mesh node graph — the two
         # coincide only while every dof sits on a vertex.
         fn_project = make_project_function(
-            nnodes=self.space.n_global_dofs,
+            nnodes=self.space.n_scalar_dofs,
             colored_matrix=colored_matrix,
             elements=self.dofmap,  # ignored if colored_matrix is provided
             lifter=lifter,
