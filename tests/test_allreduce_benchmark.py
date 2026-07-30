@@ -30,6 +30,7 @@ except ImportError:
 
 from tatva import Mesh, Operator, element, sparse
 from tatva.lifter import Fixed, Lifter
+from tatva.function_space import FunctionSpace
 
 pytestmark = pytest.mark.skipif(not HAS_MPI, reason="mpi4py and mpi4jax required")
 
@@ -56,7 +57,7 @@ def _build_problem(nx, ny, rank, size, comm):
         coords=raw_mesh.coords,
         elements=jnp.array(np.asarray(raw_mesh.elements)[e_start:e_end]),
     )
-    local_op = Operator(local_mesh, element.Tri3())
+    local_op = Operator(FunctionSpace(local_mesh, element.Tri3()))
 
     n_dofs = raw_mesh.coords.shape[0] * N_DOFS_PER_NODE
     coords_np = np.asarray(raw_mesh.coords)

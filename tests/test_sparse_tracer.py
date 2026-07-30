@@ -11,6 +11,7 @@ from jax_autovmap import autovmap
 
 from tatva import Mesh, Operator, compound, element, lifter, sparse
 from tatva.compound import FieldSize
+from tatva.function_space import FunctionSpace
 from tatva.sparse import (
     pattern_from_compound,
     pattern_from_energy,
@@ -82,7 +83,7 @@ def line_operator():
         x = jnp.linspace(0, length, n_nodes)
         coords = jnp.stack([x, jnp.zeros(n_nodes)], axis=1)
         elements = jnp.stack([jnp.arange(n_nodes - 1), jnp.arange(1, n_nodes)], axis=1)
-        return Operator(Mesh(coords=coords, elements=elements), element.Line2())
+        return Operator(FunctionSpace(Mesh(coords=coords, elements=elements), element.Line2()))
 
     return _make
 
@@ -122,7 +123,7 @@ def test_3d_vector_field_sparsity():
         u = compound.field(shape=(FieldSize.AUTO, 3))
 
     tet_elem = element.Tetrahedron4()
-    op = Operator(mesh, tet_elem)
+    op = Operator(FunctionSpace(mesh, tet_elem))
     mat = Material(mu=500.0, lmbda=1000.0)
 
     x_min, x_max = jnp.min(mesh.coords[:, 0]), jnp.max(mesh.coords[:, 0])
@@ -165,7 +166,7 @@ def test_periodic_constraint_sparsity():
 
     n_x, n_y = 4, 4
     mesh = Mesh.unit_square(n_x, n_y)
-    op = Operator(mesh, element.Tri3())
+    op = Operator(FunctionSpace(mesh, element.Tri3()))
 
     # Define boundaries
     y_min = np.min(mesh.coords[:, 1])
@@ -248,8 +249,8 @@ def test_lagrangian_multiplier_sparsity():
         line_elements.append([n0, n1])
     line_elements = np.array(line_elements)
 
-    op = Operator(mesh, element.Tri3())
-    op_line = Operator(replace(mesh, elements=line_elements), element.Line2())
+    op = Operator(FunctionSpace(mesh, element.Tri3()))
+    op_line = Operator(FunctionSpace(replace(mesh, elements=line_elements), element.Line2()))
 
     class Material(NamedTuple):
         mu: float

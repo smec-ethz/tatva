@@ -11,6 +11,7 @@ import pytest
 from tatva import Mesh
 from tatva import element as tatva_element
 from tatva.element import Quadrature, from_basix
+from tatva.function_space import FunctionSpace
 
 
 def get_cell_mesh(cell: str):
@@ -53,11 +54,11 @@ def test_lagrange_family(family: str, cell: str):
         print(telement.shape_function_derivative(element.quad_points[0]))
 
         mesh = get_cell_mesh(cell)
-        op = Operator(mesh, element)
+        op = Operator(FunctionSpace(mesh, element))
         print(op.eval(jnp.array([1])))
         print(op.integrate(op.eval(jnp.array([1]))))
 
-        op = Operator(mesh, telement)
+        op = Operator(FunctionSpace(mesh, telement))
         print(op.eval(jnp.array([1])))
         print(op.integrate(op.eval(jnp.array([1]))))
 

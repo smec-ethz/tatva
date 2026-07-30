@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from tatva import Mesh, Operator, element, sparse
+from tatva.function_space import FunctionSpace
 
 jax.config.update("jax_enable_x64", True)
 
@@ -15,7 +16,7 @@ def mesh():
 
 @pytest.fixture
 def op(mesh):
-    return Operator(mesh, element.Quad4())
+    return Operator(FunctionSpace(mesh, element.Quad4()))
 
 
 def test_project_scalar_field(op, mesh):

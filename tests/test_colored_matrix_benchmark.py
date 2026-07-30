@@ -27,6 +27,7 @@ from jax_autovmap import autovmap
 
 from tatva import Mesh, Operator, element
 from tatva.sparse import ColoredMatrix, jacfwd, pattern_from_mesh
+from tatva.function_space import FunctionSpace
 
 jax.config.update("jax_enable_x64", True)
 
@@ -59,7 +60,7 @@ def _build_problem(
     mesh = Mesh.unit_square(nx, ny)
     n_dofs = mesh.coords.shape[0] * 2
 
-    op = Operator(mesh, element.Tri3())
+    op = Operator(FunctionSpace(mesh, element.Tri3()))
 
     mu, lmbda = 1.0, 1.0
 

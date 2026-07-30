@@ -7,6 +7,7 @@ from jax_autovmap import autovmap
 from tatva_coloring import distance2_color_and_seeds
 
 from tatva import Mesh, Operator, element, sparse
+from tatva.function_space import FunctionSpace
 
 jax.config.update("jax_enable_x64", True)
 
@@ -42,7 +43,7 @@ def strain_energy(grad_u: Array, mu: float, lmbda: float) -> Array:
 def op():
     mesh = Mesh.unit_square(8, 8)
     tri = element.Tri3()
-    return Operator(mesh, tri)
+    return Operator(FunctionSpace(mesh, tri))
 
 
 @pytest.mark.parametrize("coloring_func", COLORING_VARIANTS)

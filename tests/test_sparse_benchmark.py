@@ -25,6 +25,7 @@ from jax_autovmap import autovmap
 from tatva_coloring import distance2_color_and_seeds
 
 from tatva import Mesh, Operator, element, sparse
+from tatva.function_space import FunctionSpace
 
 
 class Material(NamedTuple):
@@ -53,7 +54,7 @@ def _build_problem(
 ]:
     mesh = Mesh.unit_square(nx, ny)
 
-    op = Operator(mesh, element.Tri3())
+    op = Operator(FunctionSpace(mesh, element.Tri3()))
     mat = Material.from_youngs_poisson_2d(E=1.0, nu=0.3)
 
     @autovmap(grad_u=2)

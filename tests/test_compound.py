@@ -10,15 +10,15 @@ jax.config.update("jax_enable_x64", True)
 
 
 class SimpleState(Compound):
-    u = field((2, 3))
-    phi = field((2,))
+    u = field(shape=(2, 3))
+    phi = field(shape=(2,))
 
 
 @stack_fields("u", "v", axis=-1)
 class StackedState(Compound):
-    u = field((2, 2))
-    v = field((2, 2))
-    w = field((2,))
+    u = field(shape=(2, 2))
+    v = field(shape=(2, 2))
+    w = field(shape=(2,))
 
 
 @pytest.mark.parametrize("state_cls", [SimpleState, StackedState])

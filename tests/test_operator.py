@@ -8,6 +8,7 @@ import pytest
 from tatva.element import Tri3
 from tatva.mesh import Mesh
 from tatva.operator import Operator
+from tatva.function_space import FunctionSpace
 
 jax.config.update("jax_enable_x64", True)
 
@@ -35,7 +36,7 @@ EXPECTED_ELEMENT_AREAS = np.array([0.5, 0.5], dtype=np.float64)
 @pytest.fixture(scope="module")
 def tri_operator() -> Operator:
     mesh = Mesh(coords=NODES, elements=ELEMENTS)
-    return Operator(mesh, Tri3())
+    return Operator(FunctionSpace(mesh, Tri3()))
 
 
 def _manual_map_results(func, dof_values: jnp.ndarray) -> np.ndarray:
