@@ -42,6 +42,7 @@ class MapType(str, enum.Enum):
     """Push-forward from the reference cell to the physical cell."""
 
     IDENTITY = "identity"
+    L2PIOLA = "l2Piola"
     COVARIANT_PIOLA = "covariantPiola"
     CONTRAVARIANT_PIOLA = "contravariantPiola"
     DOUBLE_COVARIANT_PIOLA = "doubleCovariantPiola"
@@ -59,12 +60,14 @@ class Element(ABC):
     quad_points: Array
     quad_weights: Array
     sobolev: Sobolev
+    map_type: MapType
 
     def __init__(
         self,
         quad_points: Array | None = None,
         quad_weights: Array | None = None,
         sobolev: Sobolev = Sobolev.H1,
+        map_type: MapType = MapType.IDENTITY,
     ):
         """Initializes the element, optionally with custom quadrature points and weights.
 
@@ -73,6 +76,7 @@ class Element(ABC):
                 in local coordinates.
             quad_weights: An array of shape (n_q,) containing the quadrature weights.
             sobolev_space: The Sobolev space the element conforms to. Defaults to H1.
+            map_type: The map type of the element. Defaults to identity.
         """
         if (quad_points is not None) and (quad_weights is not None):
             self.quad_points = quad_points
@@ -81,6 +85,7 @@ class Element(ABC):
             self.quad_points, self.quad_weights = self._default_quadrature()
 
         self.sobolev = sobolev
+        self.map_type = map_type
 
     def __eq__(self, other: object) -> bool:
         if type(self) is not type(other):
@@ -124,16 +129,16 @@ class Element(ABC):
         J = dNdr @ nodal_coords
         return J, jnp.linalg.det(J)
 
-    def interpolate(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
+    def interpolate(self, xi: Array, dof_values: Array, nodal_coords: Array) -> Array:
         N = self.shape_function(xi)
-        return jnp.einsum("n,n...->...", N, nodal_values)
+        return jnp.einsum("n,n...->...", N, dof_values)
 
-    def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
+    def gradient(self, xi: Array, dof_values: Array, nodal_coords: Array) -> Array:
         """Returns the gradient of the nodal values at the local coordinates xi.
 
         Args:
             xi: Local coordinates (shape: (n_dim,)).
-            nodal_values: Values at the nodes of the element (shape: (n_nodes, n_values)).
+            dof_values: Values at the nodes of the element (shape: (n_nodes, n_values)).
             nodal_coords: Coordinates of the nodes of the element (shape: (n_nodes, n_dim)).
 
         Returns:
@@ -144,16 +149,16 @@ class Element(ABC):
         dNdr = self.shape_function_derivative(xi)  # (d, n)
         J = dNdr @ nodal_coords  # (d, n) x (n, d) -> (d, d)
         dNdX = jnp.linalg.inv(J) @ dNdr  # (d, d) x (d, n) -> (d, n)
-        return jnp.einsum("dn,n...->...d", dNdX, nodal_values)  # (..., d)
+        return jnp.einsum("dn,n...->...d", dNdX, dof_values)  # (..., d)
 
     def get_local_values(
-        self, xi: Array, nodal_values: Array, nodal_coords: Array
+        self, xi: Array, dof_values: Array, nodal_coords: Array
     ) -> tuple[Array, Array, Array]:
         """Returns a tuple containing the interpolated value, gradient, and determinant of the Jacobian.
 
         Args:
             xi: Local coordinates (shape: (n_dim,)).
-            nodal_values: Values at the nodes of the element (shape: (n_nodes, n_values)).
+            dof_values: Values at the nodes of the element (shape: (n_nodes, n_values)).
             nodal_coords: Coordinates of the nodes of the element (shape: (n_nodes, n_dim)).
 
         Returns:
@@ -167,8 +172,8 @@ class Element(ABC):
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = jnp.linalg.inv(J) @ dNdr
         return (
-            jnp.einsum("n,n...->...", N, nodal_values),
-            jnp.einsum("dn,n...->...d", dNdX, nodal_values),
+            jnp.einsum("n,n...->...", N, dof_values),
+            jnp.einsum("dn,n...->...d", dNdX, dof_values),
             detJ,
         )
 
@@ -199,21 +204,21 @@ class Line2(Element):
         t = jnp.asarray([J[0], J[1]]) / jnp.linalg.norm(J)
         return jnp.dot(J, t), jnp.dot(J, t)
 
-    def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
+    def gradient(self, xi: Array, dof_values: Array, nodal_coords: Array) -> Array:
         _N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
-        return jnp.einsum("n,n...->...", dNdX, nodal_values)
+        return jnp.einsum("n,n...->...", dNdX, dof_values)
 
     def get_local_values(
-        self, xi: Array, nodal_values: Array, nodal_coords: Array
+        self, xi: Array, dof_values: Array, nodal_coords: Array
     ) -> tuple[Array, Array, Array]:
         N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
         return (
-            jnp.einsum("n,n...->...", N, nodal_values),
-            jnp.einsum("n,n...->...", dNdX, nodal_values),
+            jnp.einsum("n,n...->...", N, dof_values),
+            jnp.einsum("n,n...->...", dNdX, dof_values),
             detJ,
         )
 
@@ -253,14 +258,14 @@ class Line3(Element):
         J = jnp.dot(Jvec, t)
         return J, J
 
-    def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
+    def gradient(self, xi: Array, dof_values: Array, nodal_coords: Array) -> Array:
         dNdr = self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdS = dNdr / J
-        return jnp.einsum("n,n...->...", dNdS, nodal_values)
+        return jnp.einsum("n,n...->...", dNdS, dof_values)
 
     def get_local_values(
-        self, xi: Array, nodal_values: Array, nodal_coords: Array
+        self, xi: Array, dof_values: Array, nodal_coords: Array
     ) -> tuple[Array, Array, Array]:
 
         N = self.shape_function(xi)
@@ -268,8 +273,8 @@ class Line3(Element):
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdS = dNdr / J
         return (
-            jnp.einsum("n,n...->...", N, nodal_values),
-            jnp.einsum("n,n...->...", dNdS, nodal_values),
+            jnp.einsum("n,n...->...", N, dof_values),
+            jnp.einsum("n,n...->...", dNdS, dof_values),
             detJ,
         )
 
