@@ -49,6 +49,45 @@ def _subjaxpr_and_consts(eqn) -> tuple[Jaxpr, Sequence]:
     return sub, ()
 
 
+def _scan_operand_counts(eqn) -> tuple[int, int, int]:
+    """Split a ``scan``/``map`` equation's operands into ``(consts, carry, xs)`` counts.
+
+    jax < 0.11 stored these directly as the ``num_consts``/``num_carry`` params. jax >=
+    0.11 removed both and encodes the split as the *group sizes* of the ``ft_in``
+    flat-tree; ``jax/_src/lax/control_flow/loops.py`` reads it the same way.
+
+    Getting this wrong is silent: consts and carries have no leading scan axis, so
+    misclassifying one as an ``xs`` makes the caller strip an axis that was never there
+    and mis-address every subsequent lookup. Hence the hard failures below rather than a
+    default.
+    """
+    par = eqn.params
+
+    ft_in = par.get("ft_in")
+
+    # jax < 0.11: num_consts/num_carry params exist; jax >= 0.11: ft_in exists
+    if ft_in is not None:
+        num_const, num_carry, num_xs = (len(g) for g in ft_in.unpack())
+    elif "num_consts" in par:
+        num_const = par["num_consts"]
+        num_carry = par["num_carry"]
+        num_xs = len(eqn.invars) - num_const - num_carry
+    else:
+        raise NotImplementedError(
+            f"'{eqn.primitive.name}' exposes neither 'ft_in' nor 'num_consts'/"
+            f"'num_carry'; cannot split operands into (consts, carry, xs). "
+            f"jax {jax.__version__} — the tracer needs updating for this version."
+        )
+
+    # check that the split covers all operands; otherwise the caller will mis-address everything
+    if num_const + num_carry + num_xs != len(eqn.invars):
+        raise ValueError(
+            f"operand split ({num_const}, {num_carry}, {num_xs}) does not cover the "
+            f"{len(eqn.invars)} operands of '{eqn.primitive.name}'"
+        )
+    return num_const, num_carry, num_xs
+
+
 def _unwrap_jit(fn):
     """Recursively unwrap `@jax.jit` / `@pjit` decorators only.
 
@@ -1997,9 +2036,7 @@ class Handlers:
         sub = closed_sub.jaxpr
         sub_consts = closed_sub.consts
 
-        num_const = eqn.params.get("num_consts", 0)
-        num_carry = eqn.params.get("num_carry", 0)
-        num_xs = len(eqn.invars) - num_const - num_carry
+        num_const, num_carry, num_xs = _scan_operand_counts(eqn)
 
         # Determine local shapes and sizes
         slice_shapes = []
