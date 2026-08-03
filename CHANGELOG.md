@@ -5,6 +5,13 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.4](https://github.com/smec-ethz/tatva/compare/v0.11.3...v0.11.4) (2026-08-03)
+
+
+### Bug Fixes
+
+* **tracer:** makes tracer compatible with jax 0.11 ([8253ff9](https://github.com/smec-ethz/tatva/commit/8253ff911cf17cd1ab0d72359b21fd43ae410d39))
+
 ## [0.11.3](https://github.com/smec-ethz/tatva/compare/v0.11.2...v0.11.3) (2026-07-16)
 
 
