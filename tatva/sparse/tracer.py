@@ -18,13 +18,15 @@
 import inspect
 import warnings
 from collections.abc import Callable, Sequence
-from typing import Any, Concatenate, ParamSpec
+from typing import Any, Concatenate, ParamSpec, cast
 
 import jax
 import numpy as np
 import scipy.sparse as sps
 from jax import Array
-from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
+
+from tatva.sparse.tracer_cache import persistent_tracer_cache
 
 P = ParamSpec("P")
 
@@ -840,21 +842,17 @@ def _propagate_active_backward(
 
 
 def _trace_hessian_sparsity(
-    fn: Callable[Concatenate[Array, P], Array],
-    n_dofs: int,
-    static_args: tuple,
-    static_kwargs: dict,
+    jaxpr: ClosedJaxpr,
+    tracer_shape: tuple[int, ...],
+    concrete_vals: list[Any],
     trial_test_split: int | None = None,
 ) -> sps.csr_matrix:
     """Return the sparsity pattern of d²E/du² (or tangent stiffness matrix K for virtual
     work formulations) as a CSR matrix."""
-    # Unwrap any outer @jax.jit so static slice indices stay static during tracing
-    fn = _unwrap_jit(fn)
+    n_dofs = int(np.prod(tracer_shape))
 
-    captured_args = (np.zeros((n_dofs,)), *static_args)
-    closed = jax.make_jaxpr(fn)(*captured_args, **static_kwargs)
-    jaxpr: Jaxpr = closed.jaxpr
-    consts: Sequence = closed.consts
+    consts: Sequence = jaxpr.consts
+    jaxpr: Jaxpr = jaxpr.jaxpr
 
     # Propagate tags, classify active primitives, and pre-resolve handlers in a single forward-backward pass
     tags = {}
@@ -872,8 +870,7 @@ def _trace_hessian_sparsity(
     state = TraceState(n_dofs, active_ids, tags, sub_info)
 
     # Seed concrete values of the input variables (essential for dynamic gather/scatter routing of static PyTree params)
-    flat_args, _ = jax.tree_util.tree_flatten((captured_args, static_kwargs))
-    for invar, arg_val in zip(jaxpr.invars, flat_args):
+    for invar, arg_val in zip(jaxpr.invars, concrete_vals):
         state.val_of[id(invar)] = np.asarray(arg_val)
 
     # seed: u gets singleton dep-sets; everything else gets empty sets
@@ -924,32 +921,41 @@ def _trace_hessian_sparsity(
 
 
 def pattern_from_energy(
-    energy_fn: Callable[Concatenate[Array, P], Array],
-    n_dofs: int,
-    *args: P.args,
-    **kwargs: P.kwargs,
-) -> sps.csr_matrix:
-    """
-    Return the sparsity pattern of d²E/du² as a symmetric CSR matrix for a scalar energy
-    function E(u) where u has n_dofs degrees of freedom.
+    energy_fn: Callable[P, Array], skip_cache: bool = False
+) -> Callable[P, sps.csr_matrix]:
+    """Return a function that computes the sparsity pattern of d²E/du² as a symmetric CSR
+    matrix for a scalar energy function E(u) where u has n_dofs degrees of freedom.
 
     Args:
         energy_fn: scalar JAX array energy function E(u, *static_args) as a function of
             input variable u and optional static arguments
-        n_dofs: number of DOFs (integer size of flattened input array u)
-        args/kwargs: extra args passed to energy_fn, treated as constants
-
-    Returns:
-        A symmetric CSR matrix of shape (n_dofs, n_dofs) with binary entries indicating
-        the sparsity pattern of the Hessian d²E/du².
+        skip_cache: if True, skip the custom sparsity cache and recompute.
     """
-    return _trace_hessian_sparsity(
-        energy_fn,
-        n_dofs,
-        args,
-        kwargs,
-        trial_test_split=None,
-    )
+
+    _tracer_fn = persistent_tracer_cache(skip_cache=skip_cache)(_trace_hessian_sparsity)
+
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> sps.csr_matrix:
+        # Unwrap any outer @jax.jit so static slice indices stay static during tracing
+        fn = _unwrap_jit(energy_fn)
+
+        u = cast(Array, args[0])
+        assert isinstance(args[0], Array), (
+            "First argument to energy_fn must be a JAX array (the input variable u)."
+        )
+        assert u.ndim == 1, (
+            "Input variable u must be a 1D JAX array (flattened degrees of freedom)."
+        )
+        closed = jax.make_jaxpr(fn)(*args, **kwargs)
+        flat_args, _ = jax.tree_util.tree_flatten((args, kwargs))
+
+        return _tracer_fn(
+            closed,
+            tracer_shape=u.shape,
+            concrete_vals=flat_args,
+            trial_test_split=None,
+        )
+
+    return wrapper
 
 
 def pattern_from_virtual_work(
