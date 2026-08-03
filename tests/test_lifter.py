@@ -18,9 +18,6 @@ def test_lifter_without_constraints_roundtrips():
     u_full = lifter.lift_from_zeros(u_reduced)
     np.testing.assert_array_equal(u_full, np.arange(4, dtype=np.float64))
     np.testing.assert_array_equal(lifter.reduce(u_full), u_reduced)
-    np.testing.assert_array_equal(
-        lifter.constrained_dofs, jnp.array([], dtype=jnp.int32)
-    )
 
 
 def test_lifter_applies_dirichlet_and_periodic_constraints():

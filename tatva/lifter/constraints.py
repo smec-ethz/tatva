@@ -17,12 +17,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Hashable, Iterable, Mapping
 from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
-    Hashable,
     Self,
     TypeVar,
     overload,

@@ -17,10 +17,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Concatenate,
     Literal,
     ParamSpec,
@@ -77,9 +77,6 @@ class Lifter:
     free_dofs: Array
     """Array of free dofs as integer indices (not constrained)."""
 
-    constrained_dofs: Array
-    """Array of constrained dofs as integer indices."""
-
     size: int
     """Total number of dofs in the full vector."""
 
@@ -105,7 +102,7 @@ class Lifter:
         # runtime values that are not hashable. By treating the runtime values as non-static
         # children, we can keep the lifter itself as a static arg while still allowing the
         # runtime values to be passed in and used during lifting.
-        children = (self._runtime_values, self.free_dofs, self.constrained_dofs)
+        children = (self._runtime_values, self.free_dofs)
         aux_data = (
             self.size,
             self.constraints,
@@ -125,14 +122,13 @@ class Lifter:
         # runtime values without having to go through the normal initialization process,
         # which would require us to recompute the sizes and runtime pairs.
         size, constraints, size_reduced, _runtime_keys, _nb_extra_ghost_dofs = aux_data
-        _runtime_values, free_dofs, constrained_dofs = children
+        _runtime_values, free_dofs = children
 
         lifter = cls.__new__(cls)
         lifter.__dict__ = {
             "size": size,
             "constraints": tuple(c._bind(lifter) for c in constraints),
             "free_dofs": free_dofs,
-            "constrained_dofs": constrained_dofs,
             "size_reduced": size_reduced,
             "_runtime_keys": _runtime_keys,
             "_nb_extra_ghost_dofs": _nb_extra_ghost_dofs,
@@ -168,7 +164,7 @@ class Lifter:
         # only based on the dofs specified in the constraints, not on any runtime values,
         # so we can compute it once at init and not have to worry about it changing at
         # runtime.
-        self.free_dofs, self.constrained_dofs, self.size_reduced = self._compute_sizes()
+        self.free_dofs, self.size_reduced = self._compute_sizes()
 
     def __hash__(self):
         return hash((self.size, self.constraints, self._nb_extra_ghost_dofs))
@@ -185,6 +181,11 @@ class Lifter:
             and _runtime_value_map_is_equal(self._runtime_values, other._runtime_values)
             and self._nb_extra_ghost_dofs == other._nb_extra_ghost_dofs
         )
+
+    @property
+    def constrained_dofs(self) -> Array:
+        """Array of constrained dofs as integer indices (not free)."""
+        return jnp.where(~self.free_dofs)[0]
 
     @property
     def _local_size(self) -> int:
@@ -265,18 +266,19 @@ class Lifter:
         new.constraints = tuple(cond._bind(new) for cond in new.constraints)
         return new
 
-    def _compute_sizes(self) -> tuple[Array, Array, int]:
+    def _compute_sizes(self) -> tuple[Array, int]:
         """Compute free/constrained dofs and reduced size."""
-        all_dofs = jnp.arange(self.size)
-
         if not self.constraints:
             # base case: no constraints
-            return all_dofs, jnp.array([], dtype=jnp.int32), self.size
+            return jnp.arange(self.size), self.size
 
-        constrained = jnp.concatenate([cond.dofs for cond in self.constraints])
-        constrained = jnp.unique(constrained)
-        free = jnp.setdiff1d(all_dofs, constrained, assume_unique=True)
-        return free, constrained, free.size
+        free = np.ones(self.size, dtype=bool)
+
+        for cond in self.constraints:
+            free[cond.dofs] = False
+
+        free_dofs = np.nonzero(free)[0]
+        return jnp.asarray(free_dofs, dtype=jnp.uint32), free_dofs.size
 
     def adapt_sparsity(self, sparsity: sps.csr_matrix) -> sps.csr_matrix:
         """Augment and reduce the sparsity pattern to account for all constraints. From
@@ -385,11 +387,9 @@ class Lifter:
             lifter._nb_extra_ghost_dofs = len(local_extra_g)
 
         # 3. Reduce the full layout to the free-DOF layout
-        free_dofs = lifter.free_dofs
-        mask_free = np.zeros(full_layout.n_total, dtype=bool)
-        mask_free[free_dofs] = True
-        mask_free_owned = full_layout.owned_mask[free_dofs]
-        local_to_global_free = full_layout.local_to_global[free_dofs]
+        mask_free = lifter.free_dofs
+        mask_free_owned = full_layout.owned_mask[mask_free]
+        local_to_global_free = full_layout.local_to_global[mask_free]
 
         n_owned = int(np.sum(mask_free_owned))
         n_global = comm.allreduce(n_owned, op=MPI.SUM)
@@ -398,7 +398,7 @@ class Lifter:
         n_per_rank = comm.allgather(n_owned)
         offset = np.cumsum([0] + n_per_rank[:-1])[comm.rank]
 
-        l2g = np.full(free_dofs.size, -1, dtype=_dtype)
+        l2g = np.full(self.size_reduced, -1, dtype=_dtype)
         l2g[mask_free_owned] = offset + np.arange(n_owned, dtype=_dtype)
 
         # Resolve ghosts using full_layout.l2g as the unique global identifier
@@ -415,7 +415,7 @@ class Lifter:
             local_to_global=l2g,
             offset=offset,
             n_owned=n_owned,
-            n_total=free_dofs.size,
+            n_total=self.size_reduced,
             n_global=n_global,
             owned_mask=mask_free_owned,
             natural_l2g=local_to_global_free,
