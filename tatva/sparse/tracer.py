@@ -18,9 +18,11 @@
 import inspect
 import warnings
 from collections.abc import Callable, Sequence
-from typing import Any, Concatenate, ParamSpec, cast
+from typing import Any, Concatenate, Generator, ParamSpec, cast
 
 import jax
+import jax.extend.core
+import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
 from jax import Array
@@ -245,7 +247,8 @@ class CouplingAccumulator:
         cols = np.concatenate(self._col_chunks)
         data = np.ones(rows.shape[0], dtype=np.int8)
         pat = sps.csr_matrix((data, (rows, cols)), shape=(self.n_dofs, self.n_dofs))
-        pat.sum_duplicates()
+        if hasattr(pat, "sum_duplicates"):
+            pat.sum_duplicates()
         pat.data[:] = 1
         return pat
 
@@ -899,7 +902,7 @@ def _trace_hessian_sparsity(
                 state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
             # propagate concrete values (essential for gather/scatter routing indices)
             in_vals = [state.get_val(v) for v in eqn.invars]
-            cv = _try_concrete(eqn.primitive.name, in_vals, eqn.params)
+            cv = _try_concrete(eqn.primitive, in_vals, eqn.params)
             if cv is not None:
                 state.val_of[id(ovars[0])] = cv
             continue
@@ -910,7 +913,7 @@ def _trace_hessian_sparsity(
         # Propagate concrete value for executed equations as well (essential for active gather/scatter routing)
         if ovars:
             in_vals = [state.get_val(v) for v in eqn.invars]
-            cv = _try_concrete(eqn.primitive.name, in_vals, eqn.params)
+            cv = _try_concrete(eqn.primitive, in_vals, eqn.params)
             if cv is not None:
                 state.val_of[id(ovars[0])] = cv
 
@@ -1049,10 +1052,11 @@ def pattern_from_virtual_work(
 # ---------------------------------------------------------------------------
 
 
-def _try_concrete(p: str, in_vals, par: dict):
+def _try_concrete(primitive: jax.extend.core.Primitive, in_vals, par: dict):
     """Evaluate primitive on numpy values; return None if any input is unknown."""
     if any(v is None for v in in_vals):
         return None
+    p = primitive.name
     try:
         v = [np.asarray(x) for x in in_vals]
         if p == "add":
@@ -1062,22 +1066,26 @@ def _try_concrete(p: str, in_vals, par: dict):
         if p == "mul":
             return np.multiply(v[0], v[1])
         if p == "div":
+            if np.issubdtype(v[0].dtype, np.integer) and np.issubdtype(
+                v[1].dtype, np.integer
+            ):
+                return np.floor_divide(v[0], v[1])
             return np.true_divide(v[0], v[1])
         if p == "neg":
             return np.negative(v[0])
         if p == "abs":
             return np.abs(v[0])
-        if p == "lt":
+        if p in ("lt", "lt_to"):
             return np.less(v[0], v[1])
-        if p == "le":
+        if p in ("le", "le_to"):
             return np.less_equal(v[0], v[1])
-        if p == "gt":
+        if p in ("gt", "gt_to"):
             return np.greater(v[0], v[1])
-        if p == "ge":
+        if p in ("ge", "ge_to"):
             return np.greater_equal(v[0], v[1])
-        if p == "eq":
+        if p in ("eq", "eq_to"):
             return np.equal(v[0], v[1])
-        if p == "ne":
+        if p in ("ne", "ne_to"):
             return np.not_equal(v[0], v[1])
         if p == "min":
             return np.minimum(v[0], v[1])
@@ -1127,6 +1135,26 @@ def _try_concrete(p: str, in_vals, par: dict):
             for i, case in enumerate(cases[1:], 1):
                 result = np.where(cond == i, case, result)
             return result
+        if p in ("pjit", "jit", "remat2"):
+            sub = par["jaxpr"]
+            jaxpr_body = sub.jaxpr if hasattr(sub, "jaxpr") else sub
+            consts = sub.consts if hasattr(sub, "consts") else ()
+            v_casted = []
+            for x, invar in zip(v, jaxpr_body.invars):
+                target_dtype = getattr(invar.aval, "dtype", None)
+                if target_dtype is not None and x.dtype != target_dtype:
+                    x = x.astype(target_dtype)
+                v_casted.append(x)
+            res = jax._core.eval_jaxpr(jaxpr_body, consts, *v_casted)
+            print(f"Concrete evaluation of {p} returned: {res}")
+            return np.asarray(res[0])
+
+        # For other primitives, use jax itself to evaluate the primitive on concrete numpy
+        # values. This is a fallback for primitives that don't have a specific
+        # implementation above.
+        res = np.asarray(primitive.bind(*[jnp.asarray(x) for x in v], **par))
+        warnings.warn(f"Concrete evaluation through bind needed for {p}")
+        return res
     except Exception:
         pass
     return None
@@ -1486,16 +1514,50 @@ class Handlers:
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
+        cond_val = state.get_val(eqn.invars[0])
         branches = in_d[1:]
-        summed = sum(b.dep for b in branches)
-        dep_out = sps.csr_matrix(summed.astype(bool))  # ty:ignore[unresolved-attribute]
+
+        if cond_val is not None and len(branches) == 2:
+            cond_flat = np.asarray(cond_val).ravel().astype(bool)
+            dep_0 = branches[0].dep.tocsr()
+            dep_1 = branches[1].dep.tocsr()
+
+            d0_data = dep_0.data.copy()
+            d1_data = dep_1.data.copy()
+
+            row_0 = np.repeat(
+                np.arange(dep_0.shape[0]), dep_0.indptr[1:] - dep_0.indptr[:-1]
+            )
+            d0_data[cond_flat[row_0]] = 0
+
+            row_1 = np.repeat(
+                np.arange(dep_1.shape[0]), dep_1.indptr[1:] - dep_1.indptr[:-1]
+            )
+            d1_data[~cond_flat[row_1]] = 0
+
+            dep0_masked = sps.csr_matrix(
+                (d0_data, dep_0.indices, dep_0.indptr), shape=dep_0.shape
+            )
+            dep1_masked = sps.csr_matrix(
+                (d1_data, dep_1.indices, dep_1.indptr), shape=dep_1.shape
+            )
+            dep0_masked.eliminate_zeros()
+            dep1_masked.eliminate_zeros()
+
+            dep_out = (dep0_masked + dep1_masked).astype(bool).tocsr()
+        else:
+            summed = sum(b.dep for b in branches)
+            dep_out = sps.csr_matrix(summed.astype(bool))  # ty:ignore[unresolved-attribute]
+
         state.set(eqn.outvars[0], SparseDepSet(dep_out, oshp))
 
     @staticmethod
     @TRACER_REGISTRY.register(
         "iota",
         "lt",
+        "lt_to",
         "le",
+        "le_to",
         "gt",
         "ge",
         "eq",
@@ -1640,18 +1702,18 @@ class Handlers:
         par = eqn.params
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
 
-        if idx is not None and d_src.dep.shape[0] > 1:
+        if idx is not None and d_src.dep.shape[0] >= 1:
             try:
                 dnums = par["dimension_numbers"]
                 ss = par["slice_sizes"]
                 collapsed = dnums.collapsed_slice_dims
                 sim = dnums.start_index_map
 
+                arr_indices = np.arange(int(np.prod(d_src.shape))).reshape(d_src.shape)
+
+                # Branch 1: 1D gather along dimension 0
                 if collapsed == (0,) and sim == (0,) and ss[0] == 1:
-                    rows = idx.ravel().astype(int)
-                    arr_indices = np.arange(int(np.prod(d_src.shape))).reshape(
-                        d_src.shape
-                    )
+                    rows = np.clip(idx.ravel().astype(int), 0, d_src.shape[0] - 1)
                     slc = (rows,) + tuple(slice(None, s) for s in ss[1:])
                     flat_src_indices = arr_indices[slc].ravel()
                     state.set(
@@ -1659,6 +1721,7 @@ class Handlers:
                     )
                     return
 
+                # Branch 2: 2D indexing with slice along axis 1
                 if (
                     collapsed == (0,)
                     and sim == (0, 1)
@@ -1666,37 +1729,36 @@ class Handlers:
                     and idx.ndim == 2
                     and idx.shape[1] == 2
                 ):
-                    n_gathered = idx.shape[0]
-                    n_cols = ss[1]
-                    arr_indices = np.arange(int(np.prod(d_src.shape))).reshape(
-                        d_src.shape
-                    )
-                    flat_src_indices = []
-                    for k in range(n_gathered):
-                        r = int(idx[k, 0])
-                        c0 = int(idx[k, 1])
-                        flat_src_indices.extend(
-                            arr_indices[r, c0 : c0 + n_cols].tolist()
-                        )
+                    r = np.clip(idx[:, 0].astype(int), 0, d_src.shape[0] - 1)
+                    c0 = np.clip(idx[:, 1].astype(int), 0, d_src.shape[1] - ss[1])
+
+                    # Vectorized slice index calculation
+                    col_offsets = np.arange(ss[1])
+                    cols = (
+                        c0[:, None] + col_offsets[None, :]
+                    )  # Shape: (n_gathered, ss[1])
+                    flat_src_indices = arr_indices[r[:, None], cols].ravel()
+
                     state.set(
                         eqn.outvars[0], SparseDepSet(d_src.dep[flat_src_indices], oshp)
                     )
                     return
 
+                # Branch 3: N-D point indexing with proper start_index_map mapping
                 if (
                     set(collapsed) == set(sim)
                     and idx.ndim == 2
                     and idx.shape[1] == len(sim)
                     and all(ss[a] == 1 for a in sim)
                 ):
-                    n_gathered = idx.shape[0]
-                    arr_indices = np.arange(int(np.prod(d_src.shape))).reshape(
-                        d_src.shape
-                    )
-                    flat_src_indices = []
-                    for k in range(n_gathered):
-                        src_idx = tuple(int(idx[k, j]) for j in range(idx.shape[1]))
-                        flat_src_indices.append(arr_indices[src_idx])
+                    # Map index columns to proper operand axes according to sim
+                    coords = [None] * len(d_src.shape)
+                    for j, axis in enumerate(sim):
+                        coords[axis] = np.clip(
+                            idx[:, j].astype(int), 0, d_src.shape[axis] - 1
+                        )
+
+                    flat_src_indices = arr_indices[tuple(coords)].ravel()
                     state.set(
                         eqn.outvars[0], SparseDepSet(d_src.dep[flat_src_indices], oshp)
                     )
@@ -2126,7 +2188,7 @@ class Handlers:
                 for v in sub_ovars:
                     sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_local_dofs))
                 in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
-                cv = _try_concrete(sub_eqn.primitive.name, in_vals, sub_eqn.params)
+                cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
                 if cv is not None:
                     sub_state.val_of[id(sub_ovars[0])] = cv
                 continue
@@ -2136,7 +2198,7 @@ class Handlers:
 
             if sub_ovars:
                 in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
-                cv = _try_concrete(sub_eqn.primitive.name, in_vals, sub_eqn.params)
+                cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
                 if cv is not None:
                     sub_state.val_of[id(sub_ovars[0])] = cv
 
@@ -2221,6 +2283,26 @@ class Handlers:
                 eqn.outvars[i],
                 SparseDepSet.empty(_get_shape(eqn.outvars[i]), state.n_dofs),
             )
+            c_val = sub_state.get_val(sub.outvars[i])
+            if c_val is not None:
+                state.val_of[id(eqn.outvars[i])] = c_val
+
+        # Propagate exact concrete values for scan outputs if invars have known values
+        in_vals = [state.get_val(v) for v in eqn.invars]
+        if not any(v is None for v in in_vals):
+            try:
+                v_casted = []
+                for x, invar in zip(in_vals, sub.invars):
+                    target_dtype = getattr(invar.aval, "dtype", None)
+                    x_arr = np.asarray(x)
+                    if target_dtype is not None and x_arr.dtype != target_dtype:
+                        x_arr = x_arr.astype(target_dtype)
+                    v_casted.append(x_arr)
+                res = jax.core.eval_jaxpr(sub, sub_consts, *v_casted)
+                for i in range(len(eqn.outvars)):
+                    state.val_of[id(eqn.outvars[i])] = np.asarray(res[i])
+            except Exception:
+                pass
 
         # mapped outputs (ys)
         if len(eqn.outvars) > num_carry:
@@ -2290,6 +2372,12 @@ class Handlers:
                 state.set(y, SparseDepSet(expanded_dep, y_shape))
                 if sub_state.is_nonlinear(sub_y):
                     state.nonlinear_ids.add(id(y))
+                sub_y_val = sub_state.get_val(sub_y)
+                if sub_y_val is not None:
+                    try:
+                        state.val_of[id(y)] = np.broadcast_to(sub_y_val, y_shape).copy()
+                    except Exception:
+                        pass
 
     @staticmethod
     @TRACER_REGISTRY.register("pjit", "jit", "remat2")
@@ -2323,6 +2411,9 @@ class Handlers:
         for pv, sv in zip(eqn.invars, sub.invars):
             if state.is_nonlinear(pv):
                 sub_state.nonlinear_ids.add(id(sv))
+            val = state.get_val(pv)
+            if val is not None:
+                sub_state.val_of[id(sv)] = val
         for v, c in zip(sub.constvars, sub_consts):
             sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
             sub_state.val_of[id(v)] = np.asarray(c)
@@ -2334,7 +2425,7 @@ class Handlers:
                     sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
                 # propagate concrete values (essential for gather/scatter routing indices)
                 in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
-                cv = _try_concrete(sub_eqn.primitive.name, in_vals, sub_eqn.params)
+                cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
                 if cv is not None:
                     sub_state.val_of[id(ovars[0])] = cv
                 continue
@@ -2345,7 +2436,7 @@ class Handlers:
             # Propagate concrete value for executed equations as well
             if ovars:
                 in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
-                cv = _try_concrete(sub_eqn.primitive.name, in_vals, sub_eqn.params)
+                cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
                 if cv is not None:
                     sub_state.val_of[id(ovars[0])] = cv
 
@@ -2353,6 +2444,25 @@ class Handlers:
             state.set(pv, sub_state.get(sv))
             if sub_state.is_nonlinear(sv):
                 state.nonlinear_ids.add(id(pv))
+            val = sub_state.get_val(sv)
+            if val is not None:
+                state.val_of[id(pv)] = val
+
+        in_vals = [state.get_val(v) for v in eqn.invars]
+        if not any(v is None for v in in_vals):
+            try:
+                v_casted = []
+                for x, invar in zip(in_vals, sub.invars):
+                    target_dtype = getattr(invar.aval, "dtype", None)
+                    x_arr = np.asarray(x)
+                    if target_dtype is not None and x_arr.dtype != target_dtype:
+                        x_arr = x_arr.astype(target_dtype)
+                    v_casted.append(x_arr)
+                res = jax.core.eval_jaxpr(sub, sub_consts, *v_casted)
+                for pv, r in zip(eqn.outvars, res):
+                    state.val_of[id(pv)] = np.asarray(r)
+            except Exception:
+                pass
 
     @staticmethod
     @TRACER_REGISTRY.register("cond")
@@ -2405,7 +2515,11 @@ class Handlers:
                     for v in ovars:
                         sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
                     in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
-                    cv = _try_concrete(sub_eqn.primitive.name, in_vals, sub_eqn.params)
+                    cv = _try_concrete(
+                        sub_eqn.primitive,
+                        in_vals,
+                        sub_eqn.params,
+                    )
                     if cv is not None:
                         sub_state.val_of[id(ovars[0])] = cv
                     continue
@@ -2415,7 +2529,7 @@ class Handlers:
 
                 if ovars:
                     in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
-                    cv = _try_concrete(sub_eqn.primitive.name, in_vals, sub_eqn.params)
+                    cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
                     if cv is not None:
                         sub_state.val_of[id(ovars[0])] = cv
 
