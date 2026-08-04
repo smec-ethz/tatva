@@ -564,12 +564,13 @@ def _analyze_and_resolve_jaxpr(
     tags: dict[int, int],
     main_input_id: int | None,
     sub_info: dict[int, Any],
-) -> tuple[list[tuple[Any, Callable, bool, Any]], set[int]]:
+) -> tuple[list[tuple[Any, Callable, bool, Any]], set[int], set[int]]:
     """
     Performs the forward pass of a unified JAXpr analysis traversal:
     - Propagates tags (forward)
     - Identifies nonlinear active equations (forward)
     - Resolves registered handlers (forward)
+    - Collects index variable IDs for indexing operations (forward)
 
     Args:
         jaxpr: the JAXpr to analyze
@@ -580,17 +581,40 @@ def _analyze_and_resolve_jaxpr(
         main_input_id: the variable ID of the main input (e.g., the trial function) to
             seed with tags; used for trial/test splitting
         sub_info: a dict to store sub-jaxpr analysis results for nested jits; maps eqn IDs
-            to (active_set, resolved_eqns)
+            to (active_set, index_set, resolved_eqns)
 
     Returns:
         A list of forward data tuples: (eqn, handler, is_nonlinear, sub_res)
         The initial set of active variable IDs seeded from the outputs.
+        The initial set of index variable IDs seeded from indexing operations.
     """
     forward_data = []
     active_set = {id(v) for v in jaxpr.outvars}
+    index_set = set()
 
     for eqn in jaxpr.eqns:
         p = eqn.primitive.name
+
+        # Identify indexing primitives and seed index_set with their index operands
+        if p in (
+            "gather",
+            "scatter",
+            "scatter-add",
+            "scatter-sub",
+            "scatter-mul",
+            "scatter-min",
+            "scatter-max",
+        ):
+            if len(eqn.invars) > 1:
+                index_set.add(id(eqn.invars[1]))
+        elif p == "dynamic_slice":
+            for v in eqn.invars[1:]:
+                index_set.add(id(v))
+        elif p == "dynamic_update_slice":
+            for v in eqn.invars[2:]:
+                index_set.add(id(v))
+        elif p == "select_n" and len(eqn.invars) > 0:
+            index_set.add(id(eqn.invars[0]))
 
         # propagate tags & JIT recursion
         sub_res = None
@@ -616,14 +640,18 @@ def _analyze_and_resolve_jaxpr(
                     tags[id(sv)] = tags.get(id(pv), 0)
 
                 # Recursively analyze sub-jaxpr
-                sub_eqns, sub_active = _analyze_and_resolve_jaxpr(
+                sub_eqns, sub_active, sub_index_set = _analyze_and_resolve_jaxpr(
                     sub_jaxpr,
                     trial_test_split,
                     tags,
                     None,
                     sub_info,
                 )
-                sub_res = (sub_active, sub_eqns)
+                sub_res = (sub_active, sub_index_set, sub_eqns)
+
+                for pv, sv in zip(eqn.invars, sub_jaxpr.invars):
+                    if id(sv) in sub_index_set:
+                        index_set.add(id(pv))
 
                 # Map output tags back
                 mask = 0
@@ -640,12 +668,15 @@ def _analyze_and_resolve_jaxpr(
                     bj = branch.jaxpr
                     for pv, sv in zip(operands, bj.invars):
                         tags[id(sv)] = tags.get(id(pv), 0)
-                    sub_eqns, sub_active = _analyze_and_resolve_jaxpr(
+                    sub_eqns, sub_active, sub_index_set = _analyze_and_resolve_jaxpr(
                         bj, trial_test_split, tags, None, sub_info
                     )
-                    sub_res.append((sub_active, sub_eqns))
+                    sub_res.append((sub_active, sub_index_set, sub_eqns))
                     for sv in bj.outvars:
                         mask |= tags.get(id(sv), 0)
+                    for pv, sv in zip(operands, bj.invars):
+                        if id(sv) in sub_index_set:
+                            index_set.add(id(pv))
             else:
                 mask = 0
                 for v in eqn.invars:
@@ -656,21 +687,28 @@ def _analyze_and_resolve_jaxpr(
         else:
             if p in ("pjit", "jit", "scan", "map", "remat2"):
                 sub_jaxpr, _ = _subjaxpr_and_consts(eqn)
-                sub_eqns, sub_active = _analyze_and_resolve_jaxpr(
+                sub_eqns, sub_active, sub_index_set = _analyze_and_resolve_jaxpr(
                     sub_jaxpr,
                     None,
                     tags,
                     None,
                     sub_info,
                 )
-                sub_res = (sub_active, sub_eqns)
+                sub_res = (sub_active, sub_index_set, sub_eqns)
+                for pv, sv in zip(eqn.invars, sub_jaxpr.invars):
+                    if id(sv) in sub_index_set:
+                        index_set.add(id(pv))
             elif p == "cond":
                 sub_res = []
+                operands = eqn.invars[1:]
                 for branch in eqn.params["branches"]:
-                    sub_eqns, sub_active = _analyze_and_resolve_jaxpr(
+                    sub_eqns, sub_active, sub_index_set = _analyze_and_resolve_jaxpr(
                         branch.jaxpr, None, tags, None, sub_info
                     )
-                    sub_res.append((sub_active, sub_eqns))
+                    sub_res.append((sub_active, sub_index_set, sub_eqns))
+                    for pv, sv in zip(operands, branch.jaxpr.invars):
+                        if id(sv) in sub_index_set:
+                            index_set.add(id(pv))
 
         # check if the equation is a nonlinear primitive
         is_nonlinear = False
@@ -752,63 +790,79 @@ def _analyze_and_resolve_jaxpr(
             )
         )
 
-    return forward_data, active_set
+    return forward_data, active_set, index_set
 
 
 def _propagate_active_backward(
     forward_data: list[tuple[Any, Callable, bool, Any]],
     active_set: set[int],
+    index_set: set[int],
     sub_info: dict[int, Any],
-) -> list[tuple[Any, Callable, bool]]:
+) -> list[tuple[Any, Callable, bool, bool]]:
     """
     Performs the backward pass of a unified JAXpr analysis traversal:
-    Propagates the active state backwards through the resolved equations list.
+    Propagates the active state and index state backwards through the resolved equations list.
 
     Args:
         forward_data: the list of forward data tuples (eqn, handler, is_nonlinear,
             sub_res) from the forward pass
         active_set: the initial set of active variable IDs seeded from the outputs
+        index_set: the set of variable IDs required for concrete indexing operations
         sub_info: the dict storing sub-jaxpr analysis results for nested jits; maps eqn
-            IDs to (active_set, resolved_eqns)
+            IDs to (active_set, index_set, resolved_eqns)
 
     Returns:
-        A list of tuples (eqn, handler, is_active) where is_active indicates whether this
-        equation is on an active path.
+        A list of tuples (eqn, handler, is_active, needs_concrete) where is_active
+        indicates whether this equation is on an active path, and needs_concrete
+        indicates whether this equation's output must be evaluated concretely for indexing.
     """
     pruned_eqns = []
     for eqn, handler, is_nonlinear, sub_res in reversed(forward_data):
         p = eqn.primitive.name
         is_active = False
+        needs_concrete = False
 
         if p in ("pjit", "jit", "scan", "map", "remat2"):
-            if any(id(v) in active_set for v in eqn.outvars):
-                is_active = True
-                sub_active_set, sub_eqns = sub_res
+            outvars_active = any(id(v) in active_set for v in eqn.outvars)
+            outvars_index = any(id(v) in index_set for v in eqn.outvars)
+            if outvars_active or outvars_index:
+                sub_active_set, sub_index_set, sub_eqns = sub_res
                 sub, _ = _subjaxpr_and_consts(eqn)
 
-                # Map active outvars to sub outvars
+                # Map active/index outvars to sub outvars
                 for pv, sv in zip(eqn.outvars, sub.outvars):
                     if id(pv) in active_set:
                         sub_active_set.add(id(sv))
+                    if id(pv) in index_set:
+                        sub_index_set.add(id(sv))
 
                 # Recursively propagate active state backward in sub-jaxpr
                 sub_eqns_pruned = _propagate_active_backward(
-                    sub_eqns, sub_active_set, sub_info
+                    sub_eqns, sub_active_set, sub_index_set, sub_info
                 )
+
+                if outvars_active:
+                    is_active = True
+                if outvars_index or any(nc for _, _, _, nc in sub_eqns_pruned):
+                    needs_concrete = True
 
                 # Map active sub invars to parent invars
                 for pv, sv in zip(eqn.invars, sub.invars):
                     if id(sv) in sub_active_set:
                         active_set.add(id(pv))
+                    if id(sv) in sub_index_set:
+                        index_set.add(id(pv))
 
                 # Store sub-info for this jit equation
-                sub_info[id(eqn)] = (sub_active_set, sub_eqns_pruned)
+                sub_info[id(eqn)] = (sub_active_set, sub_index_set, sub_eqns_pruned)
         elif p == "cond":
-            if any(id(v) in active_set for v in eqn.outvars):
-                is_active = True
+            outvars_active = any(id(v) in active_set for v in eqn.outvars)
+            outvars_index = any(id(v) in index_set for v in eqn.outvars)
+            if outvars_active or outvars_index:
                 operands = eqn.invars[1:]
                 pruned_branches = []
-                for (sub_active_set, sub_eqns), branch in zip(
+                branch_has_concrete = False
+                for (sub_active_set, sub_index_set, sub_eqns), branch in zip(
                     sub_res, eqn.params["branches"]
                 ):
                     sub = branch.jaxpr
@@ -817,17 +871,30 @@ def _propagate_active_backward(
                     for pv, sv in zip(eqn.outvars, sub.outvars):
                         if id(pv) in active_set:
                             sub_active_set.add(id(sv))
+                        if id(pv) in index_set:
+                            sub_index_set.add(id(sv))
 
                     sub_eqns_pruned = _propagate_active_backward(
-                        sub_eqns, sub_active_set, sub_info
+                        sub_eqns, sub_active_set, sub_index_set, sub_info
                     )
+                    if any(nc for _, _, _, nc in sub_eqns_pruned):
+                        branch_has_concrete = True
 
                     # Map active branch invars back to the cond operands (invars[1:])
                     for pv, sv in zip(operands, sub.invars):
                         if id(sv) in sub_active_set:
                             active_set.add(id(pv))
+                        if id(sv) in sub_index_set:
+                            index_set.add(id(pv))
 
-                    pruned_branches.append((sub_active_set, sub_eqns_pruned))
+                    pruned_branches.append(
+                        (sub_active_set, sub_index_set, sub_eqns_pruned)
+                    )
+
+                if outvars_active:
+                    is_active = True
+                if outvars_index or branch_has_concrete:
+                    needs_concrete = True
 
                 sub_info[id(eqn)] = pruned_branches
         else:
@@ -838,7 +905,12 @@ def _propagate_active_backward(
                 for v in eqn.invars:
                     active_set.add(id(v))
 
-        pruned_eqns.append((eqn, handler, is_active))
+            if eqn.outvars and any(id(v) in index_set for v in eqn.outvars):
+                needs_concrete = True
+                for v in eqn.invars:
+                    index_set.add(id(v))
+
+        pruned_eqns.append((eqn, handler, is_active, needs_concrete))
 
     pruned_eqns.reverse()
     return pruned_eqns
@@ -864,10 +936,12 @@ def _trace_hessian_sparsity(
 
     sub_info = {}
     main_input_id = id(jaxpr.invars[0]) if jaxpr.invars else None
-    forward_data, active_ids = _analyze_and_resolve_jaxpr(
+    forward_data, active_ids, index_ids = _analyze_and_resolve_jaxpr(
         jaxpr, trial_test_split, tags, main_input_id, sub_info
     )
-    bound_eqns = _propagate_active_backward(forward_data, active_ids, sub_info)
+    bound_eqns = _propagate_active_backward(
+        forward_data, active_ids, index_ids, sub_info
+    )
 
     # initialize tracing state
     state = TraceState(n_dofs, active_ids, tags, sub_info)
@@ -895,23 +969,24 @@ def _trace_hessian_sparsity(
     acc = CouplingAccumulator(n_dofs)
 
     # forward pass: propagate dep-sets through the jaxpr, recording pairs at nonlinear primitives
-    for eqn, handler, is_active in bound_eqns:
+    for eqn, handler, is_active, needs_concrete in bound_eqns:
         ovars = eqn.outvars
         if ovars and not is_active:
             for v in ovars:
                 state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
-            # propagate concrete values (essential for gather/scatter routing indices)
-            in_vals = [state.get_val(v) for v in eqn.invars]
-            cv = _try_concrete(eqn.primitive, in_vals, eqn.params)
-            if cv is not None:
-                state.val_of[id(ovars[0])] = cv
+            # propagate concrete values ONLY if needed for gather/scatter routing indices
+            if needs_concrete:
+                in_vals = [state.get_val(v) for v in eqn.invars]
+                cv = _try_concrete(eqn.primitive, in_vals, eqn.params)
+                if cv is not None:
+                    state.val_of[id(ovars[0])] = cv
             continue
 
         handler(eqn, state, acc, trial_test_split)
         state.mark_nonlinear(eqn)
 
-        # Propagate concrete value for executed equations as well (essential for active gather/scatter routing)
-        if ovars:
+        # Propagate concrete value for executed equations ONLY if needed for active gather/scatter routing
+        if ovars and needs_concrete:
             in_vals = [state.get_val(v) for v in eqn.invars]
             cv = _try_concrete(eqn.primitive, in_vals, eqn.params)
             if cv is not None:
@@ -2100,7 +2175,7 @@ class Handlers:
         length = eqn.params.get("length", 1)
 
         # Seed sub-state with symbolic dependencies for mapped inputs
-        sub_active, sub_bound_eqns = state.sub_info[id(eqn)]
+        sub_active, sub_index_set, sub_bound_eqns = state.sub_info[id(eqn)]
         sub_state = TraceState(
             n_local_dofs, sub_active, {}, state.sub_info, state.nonlinear_ids
         )
@@ -2182,21 +2257,22 @@ class Handlers:
 
         # Trace the sub-jaxpr symbolically using a child accumulator
         sub_acc = CouplingAccumulator(n_local_dofs)
-        for sub_eqn, sub_handler, sub_is_active in sub_bound_eqns:
+        for sub_eqn, sub_handler, sub_is_active, sub_needs_concrete in sub_bound_eqns:
             sub_ovars = sub_eqn.outvars
             if sub_ovars and not sub_is_active:
                 for v in sub_ovars:
                     sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_local_dofs))
-                in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
-                cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
-                if cv is not None:
-                    sub_state.val_of[id(sub_ovars[0])] = cv
+                if sub_needs_concrete:
+                    in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
+                    cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
+                    if cv is not None:
+                        sub_state.val_of[id(sub_ovars[0])] = cv
                 continue
 
             sub_handler(sub_eqn, sub_state, sub_acc, None)
             sub_state.mark_nonlinear(sub_eqn)
 
-            if sub_ovars:
+            if sub_ovars and sub_needs_concrete:
                 in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
                 cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
                 if cv is not None:
@@ -2398,7 +2474,7 @@ class Handlers:
         in_d = [state.get(v) for v in eqn.invars]
 
         # Retrieve the pre-resolved active set and bound equations for this sub-jaxpr
-        sub_active, sub_bound_eqns = state.sub_info[id(eqn)]
+        sub_active, sub_index_set, sub_bound_eqns = state.sub_info[id(eqn)]
 
         n_dofs = state.n_dofs
         sub_state = TraceState(
@@ -2418,23 +2494,24 @@ class Handlers:
             sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
             sub_state.val_of[id(v)] = np.asarray(c)
 
-        for sub_eqn, sub_handler, sub_is_active in sub_bound_eqns:
+        for sub_eqn, sub_handler, sub_is_active, sub_needs_concrete in sub_bound_eqns:
             ovars = sub_eqn.outvars
             if ovars and not sub_is_active:
                 for v in ovars:
                     sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
                 # propagate concrete values (essential for gather/scatter routing indices)
-                in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
-                cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
-                if cv is not None:
-                    sub_state.val_of[id(ovars[0])] = cv
+                if sub_needs_concrete:
+                    in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
+                    cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
+                    if cv is not None:
+                        sub_state.val_of[id(ovars[0])] = cv
                 continue
 
             sub_handler(sub_eqn, sub_state, acc, trial_test_split)
             sub_state.mark_nonlinear(sub_eqn)
 
             # Propagate concrete value for executed equations as well
-            if ovars:
+            if ovars and sub_needs_concrete:
                 in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
                 cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
                 if cv is not None:
@@ -2487,7 +2564,7 @@ class Handlers:
         branch_sub_list = state.sub_info[id(eqn)]
 
         out_deps: dict[int, SparseDepSet | None] = {id(ov): None for ov in eqn.outvars}
-        for (sub_active, sub_bound_eqns), branch in zip(
+        for (sub_active, sub_index_set, sub_bound_eqns), branch in zip(
             branch_sub_list, eqn.params["branches"]
         ):
             sub = branch.jaxpr
@@ -2509,25 +2586,31 @@ class Handlers:
                 sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
                 sub_state.val_of[id(v)] = np.asarray(c)
 
-            for sub_eqn, sub_handler, sub_is_active in sub_bound_eqns:
+            for (
+                sub_eqn,
+                sub_handler,
+                sub_is_active,
+                sub_needs_concrete,
+            ) in sub_bound_eqns:
                 ovars = sub_eqn.outvars
                 if ovars and not sub_is_active:
                     for v in ovars:
                         sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
-                    in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
-                    cv = _try_concrete(
-                        sub_eqn.primitive,
-                        in_vals,
-                        sub_eqn.params,
-                    )
-                    if cv is not None:
-                        sub_state.val_of[id(ovars[0])] = cv
+                    if sub_needs_concrete:
+                        in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
+                        cv = _try_concrete(
+                            sub_eqn.primitive,
+                            in_vals,
+                            sub_eqn.params,
+                        )
+                        if cv is not None:
+                            sub_state.val_of[id(ovars[0])] = cv
                     continue
 
                 sub_handler(sub_eqn, sub_state, acc, trial_test_split)
                 sub_state.mark_nonlinear(sub_eqn)
 
-                if ovars:
+                if ovars and sub_needs_concrete:
                     in_vals = [sub_state.get_val(v) for v in sub_eqn.invars]
                     cv = _try_concrete(sub_eqn.primitive, in_vals, sub_eqn.params)
                     if cv is not None:
