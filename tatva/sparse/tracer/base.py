@@ -26,13 +26,15 @@ from jax import Array
 from jax.extend.core import ClosedJaxpr, Jaxpr
 
 from tatva.sparse.tracer.cache import persistent_tracer_cache
-from tatva.sparse.tracer.common import _get_shape, _try_concrete, _unwrap_jit
+from tatva.sparse.tracer.common import _get_shape, _unwrap_jit
 from tatva.sparse.tracer.state import (
+    _analyze_and_resolve_jaxpr,
+    _propagate_active_backward,
+)
+from tatva.sparse.tracer.types import (
     CouplingAccumulator,
     SparseDepSet,
     TraceState,
-    _analyze_and_resolve_jaxpr,
-    _propagate_active_backward,
 )
 
 P = ParamSpec("P")
@@ -91,28 +93,7 @@ def _trace_hessian_sparsity(
     acc = CouplingAccumulator(n_dofs)
 
     # forward pass: propagate dep-sets through the jaxpr, recording pairs at nonlinear primitives
-    for eqn, handler, is_active, needs_concrete in bound_eqns:
-        ovars = eqn.outvars
-        if ovars and not is_active:
-            for v in ovars:
-                state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
-            # propagate concrete values ONLY if needed for gather/scatter routing indices
-            if needs_concrete:
-                in_vals = [state.get_val(v) for v in eqn.invars]
-                cv = _try_concrete(eqn.primitive, in_vals, eqn.params)
-                if cv is not None:
-                    state.val_of[id(ovars[0])] = cv
-            continue
-
-        handler(eqn, state, acc, trial_test_split)
-        state.mark_nonlinear(eqn)
-
-        # Propagate concrete value for executed equations ONLY if needed for active gather/scatter routing
-        if ovars and needs_concrete:
-            in_vals = [state.get_val(v) for v in eqn.invars]
-            cv = _try_concrete(eqn.primitive, in_vals, eqn.params)
-            if cv is not None:
-                state.val_of[id(ovars[0])] = cv
+    state.run_bound_eqns(bound_eqns, acc, trial_test_split)
 
     pat = acc.finalize()
     if pat.nnz == 0:
