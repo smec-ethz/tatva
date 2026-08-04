@@ -24,6 +24,7 @@ from tatva.sparse.tracer.common import (
 )
 from tatva.sparse.tracer.handlers import PrimitiveHandler
 from tatva.sparse.tracer.registry import TR
+from tatva.sparse.tracer.types import BoundEqn, SubInfoDict
 
 P = ParamSpec("P")
 
@@ -33,7 +34,7 @@ def _analyze_and_resolve_jaxpr(
     trial_test_split: int | None,
     tags: dict[int, int],
     main_input_id: int | None,
-    sub_info: dict[int, Any],
+    sub_info: SubInfoDict,
 ) -> tuple[list[tuple[JaxprEqn, PrimitiveHandler, bool, Any]], set[int], set[int]]:
     """
     Performs the forward pass of a unified JAXpr analysis traversal:
@@ -135,12 +136,11 @@ def _analyze_and_resolve_jaxpr(
                 tags[id(v)] = mask
 
         # Polymorphic nonlinearity check & active set seeding
-        invar_active = [
-            tags.get(id(v), 0) == 3
-            if trial_test_split is not None
-            else tags.get(id(v), 0) > 0
-            for v in eqn.invars
-        ]
+        if trial_test_split is not None:
+            invar_active = [tags.get(id(v), 0) == 3 for v in eqn.invars]
+        else:
+            invar_active = [True for _ in eqn.invars]
+
         is_nonlinear = handler.introduces_nonlinearity(eqn, invar_active)
         if is_nonlinear:
             for v in eqn.invars:
@@ -155,8 +155,8 @@ def _propagate_active_backward(
     forward_data: list[tuple[JaxprEqn, PrimitiveHandler, bool, Any]],
     active_set: set[int],
     index_set: set[int],
-    sub_info: dict[int, Any],
-) -> list[tuple[JaxprEqn, PrimitiveHandler, bool, bool]]:
+    sub_info: SubInfoDict,
+) -> list[BoundEqn]:
     """Performs the backward pass of a unified JAXpr analysis traversal:
     Propagates the active state and index state backwards through the resolved equations list.
 

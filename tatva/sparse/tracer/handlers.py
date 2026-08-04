@@ -1,3 +1,20 @@
+# Copyright (C) 2025 ETH Zurich (SMEC)
+#
+# This file is part of tatva.
+#
+# tatva is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# tatva is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with tatva.  If not, see <https://www.gnu.org/licenses/>.
+
 from __future__ import annotations
 
 import warnings
@@ -5,7 +22,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from typing import Any, cast
 
-import jax
+import jax.core
 import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
@@ -19,7 +36,12 @@ from tatva.sparse.tracer.common import (
     _reduce_union_over_axes,
     _subjaxpr_and_consts,
 )
-from tatva.sparse.tracer.types import CouplingAccumulator, SparseDepSet, TraceState
+from tatva.sparse.tracer.types import (
+    CouplingAccumulator,
+    SparseDepSet,
+    SubEqnInfo,
+    TraceState,
+)
 
 # =============================================================================
 # Base Interface
@@ -63,7 +85,7 @@ class PrimitiveHandler(ABC):
                 f"Concrete evaluation through bind needed for {primitive.name}"
             )
             return res
-        except Exception:  # ruff: ignore[blind-except]
+        except (TypeError, ValueError, KeyError, AttributeError):
             warnings.warn(f"Concrete evaluation failed for {primitive.name}")
 
     def eval_concrete(
@@ -126,11 +148,16 @@ class ZeroDependencyHandler(PrimitiveHandler):
     def eval_concrete(
         self, in_vals: list[NDArray | None], params: dict[str, Any]
     ) -> NDArray | None:
+        if any(v is None for v in in_vals):
+            return None
         if self.eval_fn is not None:
             try:
-                return self.eval_fn(in_vals, params)
-            except TypeError:
-                return self.eval_fn(in_vals)
+                return np.asarray(self.eval_fn(*in_vals))
+            except (TypeError, ValueError, KeyError, AttributeError):
+                try:
+                    return np.asarray(self.eval_fn(*in_vals, **params))
+                except (TypeError, ValueError, KeyError, AttributeError):
+                    return None
 
         # iota fallback
         dim = params.get("dimension")
@@ -176,7 +203,7 @@ class ElementwiseUnary(PrimitiveHandler):
         else:
             dep_out = in_d
 
-        state.set(eqn.outvars[0], dep_out)
+        state.set(eqn.outvars[0], dep_out.copy())
 
         if self.is_nonlinear:
             dep_out.record_couplings(acc, trial_test_split)
@@ -228,7 +255,16 @@ class ElementwiseBinary(PrimitiveHandler):
         state.set(eqn.outvars[0], res)
 
         if self.is_nonlinear:
-            res.record_couplings(acc, trial_test_split)
+            # check if one or both inputs are constant
+            is_const0 = in_d[0].dep.nnz == 0
+            is_const1 = in_d[1].dep.nnz == 0
+            is_linear = False
+            if (eqn.primitive.name == "mul" and (is_const0 or is_const1)) or (
+                eqn.primitive.name == "div" and is_const1
+            ):
+                is_linear = True
+            if not is_linear:
+                res.record_couplings(acc, trial_test_split)
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         if not self.is_nonlinear:
@@ -306,11 +342,38 @@ class BroadcastHandler(PrimitiveHandler):
         if in_vals[0] is None:
             return None
         x = np.asarray(in_vals[0])
-        shape, bdims = params["shape"], params["broadcast_dimensions"]
+        shape = params.get("shape", ())
+        bdims = params.get("broadcast_dimensions", ())
+        if not shape:
+            return x.copy()
         newshape = [1] * len(shape)
         for i, b in enumerate(bdims):
-            newshape[b] = x.shape[i] if x.ndim > 0 else 1
+            newshape[b] = x.shape[i] if i < len(x.shape) else 1
         return np.broadcast_to(x.reshape(newshape), shape).copy()
+
+
+class TransposeHandler(PrimitiveHandler):
+    """Handler for `transpose` primitive."""
+
+    def propagate_deps(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: CouplingAccumulator,
+        trial_test_split: int | None,
+    ) -> None:
+        in_d = state.get(eqn.invars[0])
+        oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
+        arr_indices = np.arange(int(np.prod(in_d.shape))).reshape(in_d.shape)
+        perm = np.transpose(arr_indices, eqn.params["permutation"]).ravel()
+        state.set(eqn.outvars[0], SparseDepSet(in_d.dep[perm], oshp))
+
+    def eval_concrete(
+        self, in_vals: list[NDArray | None], params: dict[str, Any]
+    ) -> NDArray | None:
+        if in_vals[0] is None:
+            return None
+        return np.transpose(np.asarray(in_vals[0]), params["permutation"])
 
 
 class SliceHandler(PrimitiveHandler):
@@ -488,24 +551,112 @@ class GatherHandler(PrimitiveHandler):
         trial_test_split: int | None,
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
-        d_operand = in_d[0]
+        d_src = in_d[0]
+        idx = state.get_val(eqn.invars[1])
+        par = eqn.params
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
 
-        idx = state.get_val(eqn.invars[1])
-        if idx is not None and d_operand.dep.shape[0] > 1:
+        if idx is not None and d_src.dep.shape[0] >= 1:
             try:
-                idx_flat = idx.ravel().astype(int)
-                valid = (idx_flat >= 0) & (idx_flat < d_operand.dep.shape[0])
-                idx_flat = idx_flat[valid]
-                res_dep = d_operand.dep[idx_flat].tocsr()
+                dnums = par["dimension_numbers"]
+                ss = par["slice_sizes"]
+                collapsed = dnums.collapsed_slice_dims
+                sim = dnums.start_index_map
+
+                arr_indices = np.arange(int(np.prod(d_src.shape))).reshape(d_src.shape)
+
+                # Branch 1: 1D gather along dimension 0
+                if collapsed == (0,) and sim == (0,) and ss[0] == 1:
+                    rows = np.clip(idx.ravel().astype(int), 0, d_src.shape[0] - 1)
+                    slc = (rows,) + tuple(slice(None, s) for s in ss[1:])
+                    flat_src_indices = arr_indices[slc].ravel()
+                    res_dep = d_src.dep[flat_src_indices].tocsr()
+                    res_dep.data[:] = 1
+                    state.set(eqn.outvars[0], SparseDepSet(res_dep, oshp))
+                    return
+
+                # Branch 2: 2D indexing with slice along axis 1
+                if (
+                    collapsed == (0,)
+                    and sim == (0, 1)
+                    and ss[0] == 1
+                    and idx.ndim == 2
+                    and idx.shape[1] == 2
+                ):
+                    r = np.clip(idx[:, 0].astype(int), 0, d_src.shape[0] - 1)
+                    c0 = np.clip(idx[:, 1].astype(int), 0, d_src.shape[1] - ss[1])
+
+                    col_offsets = np.arange(ss[1])
+                    cols = c0[:, None] + col_offsets[None, :]
+                    flat_src_indices = arr_indices[r[:, None], cols].ravel()
+
+                    res_dep = d_src.dep[flat_src_indices].tocsr()
+                    res_dep.data[:] = 1
+                    state.set(eqn.outvars[0], SparseDepSet(res_dep, oshp))
+                    return
+
+                # Branch 3: N-D point indexing with proper start_index_map mapping
+                if (
+                    set(collapsed) == set(sim)
+                    and idx.ndim == 2
+                    and idx.shape[1] == len(sim)
+                    and all(ss[a] == 1 for a in sim)
+                ):
+                    coords = [None] * len(d_src.shape)
+                    for j, axis in enumerate(sim):
+                        coords[axis] = np.clip(
+                            idx[:, j].astype(int), 0, d_src.shape[axis] - 1
+                        )
+
+                    flat_src_indices = arr_indices[tuple(coords)].ravel()
+                    res_dep = d_src.dep[flat_src_indices].tocsr()
+                    res_dep.data[:] = 1
+                    state.set(eqn.outvars[0], SparseDepSet(res_dep, oshp))
+                    return
+            except (KeyError, IndexError, ValueError, TypeError, AttributeError):
+                pass
+
+        total = d_src.total_union()
+        stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
+        state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
+
+
+class DynamicSliceHandler(PrimitiveHandler):
+    """Handler for `dynamic_slice` primitive."""
+
+    def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
+        return list(range(1, len(eqn.invars)))
+
+    def propagate_deps(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: CouplingAccumulator,
+        trial_test_split: int | None,
+    ) -> None:
+        in_d = [state.get(v) for v in eqn.invars]
+        d_operand = in_d[0]
+        oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
+        slice_sizes = eqn.params.get("slice_sizes", ())
+
+        start_vals = [state.get_val(v) for v in eqn.invars[1:]]
+        if all(s is not None for s in start_vals) and d_operand.dep.shape[0] > 0:
+            start_vals = cast(list[NDArray], start_vals)
+            try:
+                arr = np.arange(int(np.prod(d_operand.shape))).reshape(d_operand.shape)
+                slices = tuple(
+                    slice(int(s), int(s) + sz) for s, sz in zip(start_vals, slice_sizes)
+                )
+                sliced_idx = arr[slices].ravel()
+                res_dep = d_operand.dep[sliced_idx].tocsr()
                 res_dep.data[:] = 1
                 state.set(eqn.outvars[0], SparseDepSet(res_dep, oshp))
                 return
-            except Exception:
+            except (KeyError, IndexError, ValueError, TypeError, AttributeError):
                 pass
 
-        u_vals = sps.csr_matrix(d_operand.dep.sum(axis=0).astype(bool))
-        stacked_dep = _broadcast_single_row(u_vals, int(np.prod(oshp)))
+        total = d_operand.total_union()
+        stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
 
 
@@ -577,7 +728,7 @@ class ScatterHandler(PrimitiveHandler):
                 if nonlinear:
                     res.record_couplings(acc, trial_test_split)
                 return
-            except Exception:
+            except (KeyError, IndexError, ValueError, TypeError, AttributeError):
                 pass
 
         result = d_tgt.dep + _broadcast_single_row(u_vals, int(np.prod(oshp)))
@@ -621,7 +772,7 @@ class SelectNHandler(PrimitiveHandler):
                 res_dep = sps.vstack(res_rows, format="csr")
                 state.set(eqn.outvars[0], SparseDepSet(res_dep, oshp))
                 return
-            except Exception:
+            except (KeyError, IndexError, ValueError, TypeError, AttributeError):
                 pass
 
         merged = sps.csr_matrix((int(np.prod(oshp)), state.n_dofs), dtype=bool)
@@ -909,7 +1060,9 @@ class SubJaxprHandler(PrimitiveHandler):
         sub, sub_consts = _subjaxpr_and_consts(eqn)
         in_d = [state.get(v) for v in eqn.invars]
 
-        sub_active, sub_index_set, sub_bound_eqns = state.sub_info[id(eqn)]
+        sub_active, _sub_index_set, sub_bound_eqns = cast(
+            SubEqnInfo, state.sub_info[id(eqn)]
+        )
         n_dofs = state.n_dofs
         sub_state = TraceState(
             n_dofs, sub_active, state.tags, state.sub_info, state.nonlinear_ids
@@ -950,8 +1103,31 @@ class SubJaxprHandler(PrimitiveHandler):
                 res = jax.core.eval_jaxpr(sub, sub_consts, *v_casted)
                 for pv, r in zip(eqn.outvars, res):
                     state.val_of[id(pv)] = np.asarray(r)
-            except Exception:
+            except (TypeError, ValueError, KeyError, AttributeError):
                 pass
+
+    def eval_concrete(
+        self, in_vals: list[NDArray | None], params: dict[str, Any]
+    ) -> NDArray | None:
+        if any(v is None for v in in_vals):
+            return None
+        sub = params.get("jaxpr")
+        if sub is None:
+            return None
+        jaxpr_body = sub.jaxpr if hasattr(sub, "jaxpr") else sub
+        consts = sub.consts if hasattr(sub, "consts") else ()
+        v_casted = []
+        for x, invar in zip(in_vals, jaxpr_body.invars):
+            target_dtype = getattr(invar.aval, "dtype", None)
+            x_arr = np.asarray(x)
+            if target_dtype is not None and x_arr.dtype != target_dtype:
+                x_arr = x_arr.astype(target_dtype)
+            v_casted.append(x_arr)
+        try:
+            res = jax.core.eval_jaxpr(jaxpr_body, consts, *v_casted)
+            return np.asarray(res[0])
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return None
 
 
 class CondHandler(PrimitiveHandler):
@@ -967,7 +1143,7 @@ class CondHandler(PrimitiveHandler):
         operands = eqn.invars[1:]
         in_d = [state.get(v) for v in operands]
         n_dofs = state.n_dofs
-        branch_sub_list = state.sub_info[id(eqn)]
+        branch_sub_list = cast(list[SubEqnInfo], state.sub_info[id(eqn)])
 
         out_deps: dict[int, SparseDepSet | None] = {id(ov): None for ov in eqn.outvars}
         for (sub_active, sub_index_set, sub_bound_eqns), branch in zip(
@@ -1047,7 +1223,9 @@ class ScanMapHandler(PrimitiveHandler):
         n_local_dofs = sum(local_size_slices)
         length = eqn.params.get("length", 1)
 
-        sub_active, sub_index_set, sub_bound_eqns = state.sub_info[id(eqn)]
+        sub_active, _sub_index_set, sub_bound_eqns = cast(
+            SubEqnInfo, state.sub_info[id(eqn)]
+        )
         sub_state = TraceState(
             n_local_dofs, sub_active, {}, state.sub_info, state.nonlinear_ids
         )
@@ -1195,7 +1373,7 @@ class ScanMapHandler(PrimitiveHandler):
                 res = jax.core.eval_jaxpr(sub, sub_consts, *v_casted)
                 for i in range(len(eqn.outvars)):
                     state.val_of[id(eqn.outvars[i])] = np.asarray(res[i])
-            except Exception:
+            except (TypeError, ValueError, RuntimeError, KeyError):
                 pass
 
         if len(eqn.outvars) > num_carry:
@@ -1263,7 +1441,7 @@ class ScanMapHandler(PrimitiveHandler):
                 if sub_y_val is not None:
                     try:
                         state.val_of[id(y)] = np.broadcast_to(sub_y_val, y_shape).copy()
-                    except Exception:
+                    except (TypeError, ValueError, RuntimeError, KeyError):
                         pass
 
 

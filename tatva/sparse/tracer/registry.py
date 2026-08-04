@@ -1,18 +1,31 @@
-import warnings
-from typing import Any
+# Copyright (C) 2025 ETH Zurich (SMEC)
+#
+# This file is part of tatva.
+#
+# tatva is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# tatva is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
-import jax.numpy as jnp
+import warnings
+
 import numpy as np
 import scipy.special as sp
-from jax.experimental.hijax import Zero
-from jax.extend.core import Primitive
-from numpy.typing import NDArray
 
 from tatva.sparse.tracer.handlers import (
     BroadcastHandler,
     ConcatenateHandler,
     CondHandler,
     DotHandler,
+    DynamicSliceHandler,
     ElementwiseBinary,
     ElementwiseUnary,
     FFICallHandler,
@@ -29,6 +42,7 @@ from tatva.sparse.tracer.handlers import (
     SelectNHandler,
     SliceHandler,
     SubJaxprHandler,
+    TransposeHandler,
     ZeroDependencyHandler,
 )
 
@@ -57,7 +71,13 @@ class TracerRegistry:
         """Get the registered handler, or return the fallback."""
         if default is None:
             default = self.fallback
-        return self._handlers.get(primitive_name, default)
+        handler = self._handlers.get(primitive_name)
+        if handler is None:
+            warnings.warn(
+                f"No handler registered for primitive '{primitive_name}'. Using fallback handler."
+            )
+            return default
+        return handler
 
 
 # Global registry instance
@@ -93,6 +113,9 @@ _COMPARISONS_MAP = {
     # Arg Reductions & Rounding
     "argmax": lambda x, **p: np.argmax(x, axis=p.get("axes")),
     "argmin": lambda x, **p: np.argmin(x, axis=p.get("axes")),
+    "floor": np.floor,
+    "ceil": np.ceil,
+    "round": np.round,
     "sign": np.sign,
 }
 for prim_name, eval_fn in _COMPARISONS_MAP.items():
@@ -105,16 +128,12 @@ for prim_name, eval_fn in _COMPARISONS_MAP.items():
 PASSTHROUGH_PRIMITIVES = (
     "neg",
     "abs",
-    "convert_element_type",
     "copy",
     "stop_gradient",
     "device_put",
     "conj",
     "real",
     "imag",
-    "floor",
-    "ceil",
-    "round",
 )
 TR.register_many(PASSTHROUGH_PRIMITIVES, ElementwiseUnary(is_nonlinear=False))
 
@@ -136,7 +155,7 @@ def _eval_convert_dtype(x, params):
 
 
 TR.register("reshape", ElementwiseUnary(False, _eval_reshape))
-TR.register("transpose", ElementwiseUnary(False, _eval_transpose))
+TR.register("transpose", TransposeHandler())
 TR.register("squeeze", ElementwiseUnary(False, _eval_squeeze))
 TR.register("convert_element_type", ElementwiseUnary(False, _eval_convert_dtype))
 
@@ -188,8 +207,18 @@ _LINEAR_BINARY_MAP = {
 for prim_name, eval_fn in _LINEAR_BINARY_MAP.items():
     TR.register(prim_name, ElementwiseBinary(is_nonlinear=False, eval_fn=eval_fn))
 
+
+def _eval_div(a, b, **_params):
+    a_arr, b_arr = np.asarray(a), np.asarray(b)
+    if np.issubdtype(a_arr.dtype, np.integer) and np.issubdtype(
+        b_arr.dtype, np.integer
+    ):
+        return np.floor_divide(a_arr, b_arr)
+    return np.true_divide(a_arr, b_arr)
+
+
 TR.register("mul", ElementwiseBinary(is_nonlinear=True, eval_fn=np.multiply))
-TR.register("div", ElementwiseBinary(is_nonlinear=True, eval_fn=np.true_divide))
+TR.register("div", ElementwiseBinary(is_nonlinear=True, eval_fn=_eval_div))
 TR.register("rem", ElementwiseBinary(is_nonlinear=True, eval_fn=np.remainder))
 TR.register("pow", ElementwiseBinary(is_nonlinear=True, eval_fn=np.power))
 TR.register("atan2", ElementwiseBinary(is_nonlinear=True, eval_fn=np.arctan2))
@@ -246,7 +275,8 @@ TR.register_many(_DENSE_LINALG, OpaqueBlackBoxHandler(record_couplings=True))
 _CALLBACKS = ("custom_vjp_call", "custom_jvp_call", "pure_callback", "io_callback")
 TR.register_many(_CALLBACKS, OpaqueBlackBoxHandler(record_couplings=True))
 
-_OPAQUE_FALLBACKS = ("dynamic_slice", "dynamic_update_slice", "while", "switch")
+TR.register("dynamic_slice", DynamicSliceHandler())
+_OPAQUE_FALLBACKS = ("dynamic_update_slice", "while", "switch")
 TR.register_many(_OPAQUE_FALLBACKS, OpaqueBlackBoxHandler(record_couplings=False))
 
 # -----------------------------------------------------------------------------

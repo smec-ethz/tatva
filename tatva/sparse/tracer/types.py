@@ -18,7 +18,8 @@
 from __future__ import annotations
 
 import builtins
-from typing import TYPE_CHECKING, ParamSpec, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, ParamSpec, TypeAlias
 
 import numpy as np
 import scipy.sparse as sps
@@ -168,6 +169,16 @@ class SparseDepSet:
         acc.record_dep(self.dep, trial_test_split)
 
 
+# A bound equation tuple: (eqn, handler, is_active, needs_concrete)
+BoundEqn: TypeAlias = tuple[JaxprEqn, "PrimitiveHandler", bool, bool]
+
+# Sub-jaxpr analysis result: (sub_active_set, sub_index_set, sub_bound_eqns)
+SubEqnInfo: TypeAlias = tuple[set[int], set[int], list[BoundEqn]]
+
+# sub_info dictionary mapping id(eqn) to SubEqnInfo (for jit/scan/map) or list[SubEqnInfo] (for cond branches)
+SubInfoDict: TypeAlias = dict[int, SubEqnInfo | list[SubEqnInfo]]
+
+
 class TraceState:
     """Encapsulates the state of dependency propagation and concrete value routing during tracing."""
 
@@ -176,7 +187,7 @@ class TraceState:
         n_dofs: int,
         active_ids: builtins.set[int],
         tags: dict | None = None,
-        sub_info: dict | None = None,
+        sub_info: SubInfoDict | None = None,
         nonlinear_ids: builtins.set[int] | None = None,
     ):
         """
@@ -201,7 +212,7 @@ class TraceState:
         self.tags = tags if tags is not None else {}
         self.dep_of: dict[int, SparseDepSet] = {}
         self.val_of: dict[int, np.ndarray] = {}
-        self.sub_info = sub_info if sub_info is not None else {}
+        self.sub_info: SubInfoDict = sub_info if sub_info is not None else {}
         self.nonlinear_ids = nonlinear_ids if nonlinear_ids is not None else set()
 
     def is_nonlinear(self, var) -> bool:
@@ -272,6 +283,8 @@ class TraceState:
                     self.set(v, SparseDepSet.empty(_get_shape(v), self.n_dofs))
 
             if ovars and needs_concrete:
+                if eqn.primitive.name in ("pjit", "jit", "scan", "map", "remat2"):
+                    continue  # sub-jaxpr concrete evaluation is handled in the handler
                 in_vals = [self.get_val(v) for v in eqn.invars]
                 cv = handler.safe_eval_concrete(eqn.primitive, in_vals, eqn.params)
                 if cv is not None:

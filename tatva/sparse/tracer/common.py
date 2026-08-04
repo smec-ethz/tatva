@@ -15,18 +15,11 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
-import warnings
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
-import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
-from jax.extend.core import Jaxpr, Literal, Primitive, Var
-
-if TYPE_CHECKING:
-    from tatva.sparse.tracer.types import SparseDepSet
-
+from jax.extend.core import Jaxpr, Literal, Var
 
 # FFI targets whose vmapped (batched) call is elementwise along the leading (vmap) axis,
 # i.e. output[i] depends only on input[i] -- e.g. a per-quad-point external constitutive

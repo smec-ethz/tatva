@@ -34,6 +34,7 @@ from tatva.sparse.tracer.state import (
 from tatva.sparse.tracer.types import (
     CouplingAccumulator,
     SparseDepSet,
+    SubInfoDict,
     TraceState,
 )
 
@@ -58,7 +59,7 @@ def _trace_hessian_sparsity(
     if trial_test_split is not None and jaxpr.invars:
         tags[id(jaxpr.invars[0])] = 3  # Seed main input with both
 
-    sub_info = {}
+    sub_info: SubInfoDict = {}
     main_input_id = id(jaxpr.invars[0]) if jaxpr.invars else None
     forward_data, active_ids, index_ids = _analyze_and_resolve_jaxpr(
         jaxpr, trial_test_split, tags, main_input_id, sub_info
@@ -145,6 +146,7 @@ def pattern_from_virtual_work(
     trial_arg: str,
     test_arg: str,
     *static_args,
+    skip_cache: bool = False,
 ) -> sps.csr_matrix:
     """
     Return the sparsity pattern of the tangent stiffness matrix K = dR/du = d²G/dvdu
@@ -215,9 +217,11 @@ def pattern_from_virtual_work(
 
         return virtual_work_fn(*args)
 
-    # Trace the full Hessian of the combined function w_fn using private helper
-    H_w: sps.csr_matrix = _trace_hessian_sparsity(
-        w_fn, combined_dofs, (), {}, trial_test_split=n_dofs
+    dummy_w = np.zeros(combined_dofs)
+    closed = jax.make_jaxpr(w_fn)(dummy_w)
+    _tracer_fn = persistent_tracer_cache(skip_cache=skip_cache)(_trace_hessian_sparsity)
+    H_w: sps.csr_matrix = _tracer_fn(
+        closed, (combined_dofs,), (dummy_w,), trial_test_split=n_dofs
     )
 
     # Extract the cross-coupling block (v-derivatives vs u-derivatives)
