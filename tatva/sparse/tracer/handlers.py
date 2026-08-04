@@ -26,6 +26,7 @@ import jax.core
 import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
+import scipy.special as sp
 from jax.extend.core import JaxprEqn, Primitive
 from numpy.typing import NDArray
 
@@ -36,12 +37,106 @@ from tatva.sparse.tracer.common import (
     _reduce_union_over_axes,
     _subjaxpr_and_consts,
 )
-from tatva.sparse.tracer.types import (
+from tatva.sparse.tracer.registry import TR
+from tatva.sparse.tracer.state import (
     CouplingAccumulator,
     SparseDepSet,
     SubEqnInfo,
     TraceState,
 )
+
+
+def _eval_reshape(x, params):
+    return x.reshape(params["new_sizes"])
+
+
+def _eval_squeeze(x, params):
+    return np.squeeze(x, axis=tuple(params["dimensions"]))
+
+
+def _eval_convert_dtype(x, params):
+    return x.astype(params["new_dtype"])
+
+
+def _eval_div(a, b, **_params):
+    a_arr, b_arr = np.asarray(a), np.asarray(b)
+    if np.issubdtype(a_arr.dtype, np.integer) and np.issubdtype(
+        b_arr.dtype, np.integer
+    ):
+        return np.floor_divide(a_arr, b_arr)
+    return np.true_divide(a_arr, b_arr)
+
+
+def _dot_general_out_dep(
+    lhs: SparseDepSet,
+    rhs: SparseDepSet,
+    lhs_c: Sequence[int],
+    rhs_c: Sequence[int],
+    lhs_b: Sequence[int],
+    rhs_b: Sequence[int],
+    oshp: tuple[int, ...],
+    n_dofs: int,
+) -> SparseDepSet:
+    """Structure-preserving support propagation for a ``dot_general``.
+
+    Output element ``out[b, fl, fr]`` (batch ``b``, lhs-free ``fl``, rhs-free ``fr``)
+    depends on exactly ``(union_c lhs[b, fl, c]) | (union_c rhs[b, c, fr])``. We reduce
+    each operand over its contracting axes, then broadcast the two reduced dep-tensors to
+    the output layout ``[batch..., lhs_free..., rhs_free...]`` (JAX's ``dot_general`` output
+    order) and union them. This keeps per-row (per-element) support instead of collapsing
+    to the whole-array ``total_union`` -- the difference between a locally-supported field
+    and one that appears to depend on every DOF.
+    """
+    La, Lb = lhs.shape, rhs.shape
+    lhs_b, rhs_b = list(lhs_b), list(rhs_b)
+    lhs_c, rhs_c = list(lhs_c), list(rhs_c)
+    lhs_free = [a for a in range(len(La)) if a not in lhs_b and a not in lhs_c]
+    rhs_free = [a for a in range(len(Lb)) if a not in rhs_b and a not in rhs_c]
+
+    # Reduce out contracting axes, keeping (batch, free) in output order.
+    lhs_red = _reduce_union_over_axes(lhs.dep, La, lhs_b + lhs_free)
+    rhs_red = _reduce_union_over_axes(rhs.dep, Lb, rhs_b + rhs_free)
+
+    batch_sizes = tuple(La[a] for a in lhs_b)
+    lhs_free_sizes = tuple(La[a] for a in lhs_free)
+    rhs_free_sizes = tuple(Lb[a] for a in rhs_free)
+    out_dims = batch_sizes + lhs_free_sizes + rhs_free_sizes
+
+    n_out = int(np.prod(oshp))
+    if int(np.prod(out_dims)) != n_out:
+        # Shape bookkeeping disagrees with the reported output shape; fall back to the
+        # conservative whole-array union rather than risk a mismatch.
+        combined = sps.csr_matrix((lhs.dep + rhs.dep).astype(bool))
+        return SparseDepSet(
+            _broadcast_single_row(
+                sps.csr_matrix(combined.sum(axis=0).astype(bool)), n_out
+            ),
+            oshp,
+        )
+
+    nb, nlf = len(lhs_b), len(lhs_free)
+    omulti = np.unravel_index(np.arange(n_out), out_dims) if out_dims else ()
+    batch_m = omulti[:nb]
+    lf_m = omulti[nb : nb + nlf]
+    rf_m = omulti[nb + nlf :]
+
+    lhs_keys = (
+        np.ravel_multi_index(batch_m + lf_m, batch_sizes + lhs_free_sizes)
+        if (batch_sizes + lhs_free_sizes)
+        else np.zeros(n_out, int)
+    )
+    rhs_keys = (
+        np.ravel_multi_index(batch_m + rf_m, batch_sizes + rhs_free_sizes)
+        if (batch_sizes + rhs_free_sizes)
+        else np.zeros(n_out, int)
+    )
+    out_dep = (
+        (lhs_red[lhs_keys].astype(np.int8) + rhs_red[rhs_keys].astype(np.int8))
+        .astype(bool)
+        .tocsr()
+    )
+    return SparseDepSet(out_dep, oshp)
+
 
 # =============================================================================
 # Base Interface
@@ -68,7 +163,8 @@ class PrimitiveHandler(ABC):
         in_vals: list[NDArray | None],
         params: dict[str, Any],
     ) -> NDArray | None:
-
+        """Evaluate concrete numpy values for this primitive. If the primitive is not
+        implemented, fall back to jax itself."""
         if any(v is None for v in in_vals):
             return None
         try:
@@ -115,6 +211,10 @@ class PrimitiveHandler(ABC):
 # =============================================================================
 
 
+@TR.register(
+    "debug_print",
+    "debug_callback",
+)
 class NoOpHandler(PrimitiveHandler):
     """Handler for effect-only primitives (debug_print, debug_callback)."""
 
@@ -128,6 +228,34 @@ class NoOpHandler(PrimitiveHandler):
         return
 
 
+@TR.register(
+    ("lt", np.less),
+    ("lt_to", np.less),
+    ("le", np.less_equal),
+    ("le_to", np.less_equal),
+    ("gt", np.greater),
+    ("ge", np.greater_equal),
+    ("eq", np.equal),
+    ("ne", np.not_equal),
+    ("and", np.logical_and),
+    ("or", np.logical_or),
+    ("not", np.logical_not),
+    ("xor", np.logical_xor),
+    ("shift_left", np.left_shift),
+    ("shift_right_arithmetic", np.right_shift),
+    ("is_finite", np.isfinite),
+    ("is_nan", np.isnan),
+    ("argmax", lambda x, **p: np.argmax(x, axis=p.get("axes"))),
+    ("argmin", lambda x, **p: np.argmin(x, axis=p.get("axes"))),
+    ("floor", np.floor),
+    ("ceil", np.ceil),
+    ("round", np.round),
+    ("sign", np.sign),
+    "iota",
+    "zeros",
+    "ones",
+    "full",
+)
 class ZeroDependencyHandler(PrimitiveHandler):
     """Handler for primitives with zero input dependency (iota, zeros, ones, full)."""
 
@@ -174,6 +302,46 @@ class ZeroDependencyHandler(PrimitiveHandler):
 # =============================================================================
 
 
+@TR.register(
+    ("neg", False),
+    ("abs", False),
+    ("copy", False),
+    ("stop_gradient", False),
+    ("device_put", False),
+    ("conj", False),
+    ("real", False),
+    ("imag", False),
+    ("reshape", False, _eval_reshape),
+    ("squeeze", False, _eval_squeeze),
+    ("convert_element_type", False, _eval_convert_dtype),
+    ("sin", True, np.sin),
+    ("cos", True, np.cos),
+    ("tan", True, np.tan),
+    ("asin", True, np.arcsin),
+    ("acos", True, np.arccos),
+    ("atan", True, np.arctan),
+    ("exp", True, np.exp),
+    ("exp2", True, np.exp2),
+    ("expm1", True, np.expm1),
+    ("log", True, np.log),
+    ("log1p", True, np.log1p),
+    ("log2", True, np.log2),
+    ("sqrt", True, np.sqrt),
+    ("rsqrt", True, lambda x: 1.0 / np.sqrt(x)),
+    ("cbrt", True, np.cbrt),
+    ("tanh", True, np.tanh),
+    ("sinh", True, np.sinh),
+    ("cosh", True, np.cosh),
+    ("atanh", True, np.arctanh),
+    ("asinh", True, np.arcsinh),
+    ("acosh", True, np.arccosh),
+    ("erf", True, sp.erf),
+    ("erfc", True, sp.erfc),
+    ("erfinv", True, sp.erfinv),
+    ("lgamma", True, sp.gammaln),
+    ("digamma", True, sp.psi),
+    ("logistic", True, sp.expit),
+)
 class ElementwiseUnary(PrimitiveHandler):
     """Handler for elementwise unary operations (1 input -> 1 output).
 
@@ -224,6 +392,19 @@ class ElementwiseUnary(PrimitiveHandler):
         return None
 
 
+@TR.register(
+    ("add", False, np.add),
+    ("add_any", False, np.add),
+    ("sub", False, np.subtract),
+    ("max", False, np.maximum),
+    ("min", False, np.minimum),
+    # nonlinear ops
+    ("mul", True, np.multiply),
+    ("div", True, _eval_div),
+    ("rem", True, np.remainder),
+    ("pow", True, np.power),
+    ("atan2", True, np.arctan2),
+)
 class ElementwiseBinary(PrimitiveHandler):
     """Handler for elementwise binary operations (2 inputs -> 1 output).
 
@@ -289,6 +470,9 @@ class ElementwiseBinary(PrimitiveHandler):
         return None
 
 
+@TR.register(
+    "integer_pow",
+)
 class IntegerPowHandler(PrimitiveHandler):
     """Handler for integer power operations (x ** n)."""
 
@@ -321,6 +505,9 @@ class IntegerPowHandler(PrimitiveHandler):
 # =============================================================================
 
 
+@TR.register(
+    "broadcast_in_dim",
+)
 class BroadcastHandler(PrimitiveHandler):
     """Handler for `broadcast_in_dim` primitive."""
 
@@ -352,6 +539,9 @@ class BroadcastHandler(PrimitiveHandler):
         return np.broadcast_to(x.reshape(newshape), shape).copy()
 
 
+@TR.register(
+    "transpose",
+)
 class TransposeHandler(PrimitiveHandler):
     """Handler for `transpose` primitive."""
 
@@ -376,6 +566,9 @@ class TransposeHandler(PrimitiveHandler):
         return np.transpose(np.asarray(in_vals[0]), params["permutation"])
 
 
+@TR.register(
+    "slice",
+)
 class SliceHandler(PrimitiveHandler):
     """Handler for static `slice` primitive."""
 
@@ -413,6 +606,9 @@ class SliceHandler(PrimitiveHandler):
         return np.asarray(in_vals[0])[sl]
 
 
+@TR.register(
+    "rev",
+)
 class ReverseHandler(PrimitiveHandler):
     """Handler for `rev` (reverse/flip axes) primitive."""
 
@@ -443,6 +639,9 @@ class ReverseHandler(PrimitiveHandler):
         return np.flip(np.asarray(in_vals[0]), axis=params["dimensions"])
 
 
+@TR.register(
+    "pad",
+)
 class PadHandler(PrimitiveHandler):
     """Handler for `pad` primitive."""
 
@@ -497,6 +696,9 @@ class PadHandler(PrimitiveHandler):
         )
 
 
+@TR.register(
+    "concatenate",
+)
 class ConcatenateHandler(PrimitiveHandler):
     """Handler for `concatenate` primitive."""
 
@@ -532,11 +734,85 @@ class ConcatenateHandler(PrimitiveHandler):
         return np.concatenate(in_vals, axis=params.get("dimension", 0))
 
 
+@TR.register(
+    "stack",
+)
+class StackHandler(PrimitiveHandler):
+    """Handler for `stack` primitive."""
+
+    def propagate_deps(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: CouplingAccumulator,
+        trial_test_split: int | None,
+    ) -> None:
+        """``stack`` inserts a new axis and places input ``i`` at position ``i`` along it —
+        purely structural, so each stacked slice keeps its own per-element support (no
+        globalizing union, no couplings). Same construction as ``concatenate`` but the
+        input blocks are laid out along a *new* axis rather than concatenated on an
+        existing one.
+        """
+        in_d = [state.get(v) for v in eqn.invars]
+        oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
+        idx_arrays = []
+        offset = 0
+        for b in in_d:
+            size = int(np.prod(b.shape))
+            idx_arrays.append(np.arange(size).reshape(b.shape) + offset)
+            offset += size
+        stacked_dep = sps.vstack([b.dep for b in in_d], format="csr")
+        stack_idx = np.stack(idx_arrays, axis=eqn.params["axis"]).ravel()
+        state.set(eqn.outvars[0], SparseDepSet(stacked_dep[stack_idx], oshp))
+
+
+@TR.register(
+    "split",
+)
+class SplitHandler(PrimitiveHandler):
+    """Handler for `split` primitive."""
+
+    def propagate_deps(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: CouplingAccumulator,
+        trial_test_split: int | None,
+    ) -> None:
+        """``split`` (``jnp.split``) cuts one array into several along ``axis`` -- the exact
+        inverse of ``concatenate``, and just as structural: every output element *is* one
+        input element, so it inherits that element's dependency row verbatim (no union, no
+        couplings).
+
+        Handled explicitly because it is a rare multi-output structural primitive:
+        ``Handlers.fallback`` writes only ``outvars[0]``, which would leave every piece but
+        the first with an empty dep-set (silently dropped couplings) while collapsing the
+        first to a whole-array union (a spuriously dense pattern).
+        """
+        d = state.get(eqn.invars[0])
+        axis = eqn.params["axis"]
+        # Row-major positions of the input's elements, laid out in its logical shape, so a
+        # slice of this index array names exactly the dep rows that piece is built from.
+        src_indices = np.arange(int(np.prod(d.shape))).reshape(d.shape)
+        offset = 0
+        for outvar, size in zip(eqn.outvars, eqn.params["sizes"]):
+            size = int(size)
+            oshp = _get_shape(outvar)
+            piece = np.take(
+                src_indices, np.arange(offset, offset + size), axis=axis
+            ).ravel()
+            state.set(outvar, SparseDepSet(d.dep[piece], oshp))
+            offset += size
+
+
 # =============================================================================
 # 4. Dynamic Indexing Handlers
 # =============================================================================
 
 
+@TR.register(
+    "gather",
+)
 class GatherHandler(PrimitiveHandler):
     """Handler for `gather` primitive."""
 
@@ -621,11 +897,20 @@ class GatherHandler(PrimitiveHandler):
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
 
 
+@TR.register(
+    "dynamic_slice",
+    "dynamic_update_slice",
+)
 class DynamicSliceHandler(PrimitiveHandler):
-    """Handler for `dynamic_slice` primitive."""
+    """Handler for `dynamic_slice` and `dynamic_update_slice` primitive."""
 
     def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
-        return list(range(1, len(eqn.invars)))
+        p = eqn.primitive.name
+        if p == "dynamic_slice":
+            return list(range(1, len(eqn.invars)))
+        elif p == "dynamic_update_slice":
+            return list(range(2, len(eqn.invars)))
+        return []
 
     def propagate_deps(
         self,
@@ -660,6 +945,14 @@ class DynamicSliceHandler(PrimitiveHandler):
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
 
 
+@TR.register(
+    "scatter",
+    "scatter-add",
+    "scatter-sub",
+    "scatter-mul",
+    "scatter-min",
+    "scatter-max",
+)
 class ScatterHandler(PrimitiveHandler):
     """Handler for `scatter` family primitives."""
 
@@ -740,6 +1033,9 @@ class ScatterHandler(PrimitiveHandler):
             res.record_couplings(acc, trial_test_split)
 
 
+@TR.register(
+    "select_n",
+)
 class SelectNHandler(PrimitiveHandler):
     """Handler for `select_n` primitive."""
 
@@ -795,77 +1091,9 @@ class SelectNHandler(PrimitiveHandler):
         return result
 
 
-def _dot_general_out_dep(
-    lhs: SparseDepSet,
-    rhs: SparseDepSet,
-    lhs_c: Sequence[int],
-    rhs_c: Sequence[int],
-    lhs_b: Sequence[int],
-    rhs_b: Sequence[int],
-    oshp: tuple[int, ...],
-    n_dofs: int,
-) -> SparseDepSet:
-    """Structure-preserving support propagation for a ``dot_general``.
-
-    Output element ``out[b, fl, fr]`` (batch ``b``, lhs-free ``fl``, rhs-free ``fr``)
-    depends on exactly ``(union_c lhs[b, fl, c]) | (union_c rhs[b, c, fr])``. We reduce
-    each operand over its contracting axes, then broadcast the two reduced dep-tensors to
-    the output layout ``[batch..., lhs_free..., rhs_free...]`` (JAX's ``dot_general`` output
-    order) and union them. This keeps per-row (per-element) support instead of collapsing
-    to the whole-array ``total_union`` -- the difference between a locally-supported field
-    and one that appears to depend on every DOF.
-    """
-    La, Lb = lhs.shape, rhs.shape
-    lhs_b, rhs_b = list(lhs_b), list(rhs_b)
-    lhs_c, rhs_c = list(lhs_c), list(rhs_c)
-    lhs_free = [a for a in range(len(La)) if a not in lhs_b and a not in lhs_c]
-    rhs_free = [a for a in range(len(Lb)) if a not in rhs_b and a not in rhs_c]
-
-    # Reduce out contracting axes, keeping (batch, free) in output order.
-    lhs_red = _reduce_union_over_axes(lhs.dep, La, lhs_b + lhs_free)
-    rhs_red = _reduce_union_over_axes(rhs.dep, Lb, rhs_b + rhs_free)
-
-    batch_sizes = tuple(La[a] for a in lhs_b)
-    lhs_free_sizes = tuple(La[a] for a in lhs_free)
-    rhs_free_sizes = tuple(Lb[a] for a in rhs_free)
-    out_dims = batch_sizes + lhs_free_sizes + rhs_free_sizes
-
-    n_out = int(np.prod(oshp))
-    if int(np.prod(out_dims)) != n_out:
-        # Shape bookkeeping disagrees with the reported output shape; fall back to the
-        # conservative whole-array union rather than risk a mismatch.
-        combined = sps.csr_matrix((lhs.dep + rhs.dep).astype(bool))
-        return SparseDepSet(
-            _broadcast_single_row(
-                sps.csr_matrix(combined.sum(axis=0).astype(bool)), n_out
-            ),
-            oshp,
-        )
-
-    nb, nlf = len(lhs_b), len(lhs_free)
-    omulti = np.unravel_index(np.arange(n_out), out_dims) if out_dims else ()
-    batch_m = omulti[:nb]
-    lf_m = omulti[nb : nb + nlf]
-    rf_m = omulti[nb + nlf :]
-
-    lhs_keys = (
-        np.ravel_multi_index(batch_m + lf_m, batch_sizes + lhs_free_sizes)
-        if (batch_sizes + lhs_free_sizes)
-        else np.zeros(n_out, int)
-    )
-    rhs_keys = (
-        np.ravel_multi_index(batch_m + rf_m, batch_sizes + rhs_free_sizes)
-        if (batch_sizes + rhs_free_sizes)
-        else np.zeros(n_out, int)
-    )
-    out_dep = (
-        (lhs_red[lhs_keys].astype(np.int8) + rhs_red[rhs_keys].astype(np.int8))
-        .astype(bool)
-        .tocsr()
-    )
-    return SparseDepSet(out_dep, oshp)
-
-
+@TR.register(
+    "dot_general",
+)
 class DotHandler(PrimitiveHandler):
     """Handler for bilinear contraction `dot_general` primitive."""
 
@@ -977,6 +1205,15 @@ class DotHandler(PrimitiveHandler):
             state.set(eqn.outvars[0], out_dep)
 
 
+@TR.register(
+    "reduce_sum",
+    "reduce_window_sum",
+    "reduce_max",
+    "reduce_min",
+    "reduce_prod",
+    "reduce_and",
+    "reduce_or",
+)
 class ReductionHandler(PrimitiveHandler):
     """Handler for reduction primitives (reduce_sum, reduce_max, etc.)."""
 
@@ -1001,6 +1238,21 @@ class ReductionHandler(PrimitiveHandler):
 # =============================================================================
 
 
+@TR.register(
+    "lu",
+    "custom_linear_solve",
+    "triangular_solve",
+    "lu_solve",
+    "cholesky",
+    "eig",
+    "eigh",
+    "custom_vjp_call",
+    "custom_jvp_call",
+    "pure_callback",
+    "io_callback",
+    ("while", False),
+    ("switch", False),
+)
 class OpaqueBlackBoxHandler(PrimitiveHandler):
     """Handler for opaque black-box primitives (callbacks, dense linalg, fallback)."""
 
@@ -1047,6 +1299,11 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
 # =============================================================================
 
 
+@TR.register(
+    "pjit",
+    "jit",
+    "remat2",
+)
 class SubJaxprHandler(PrimitiveHandler):
     """Handler for carried sub-jaxprs (pjit, jit, remat2)."""
 
@@ -1130,6 +1387,9 @@ class SubJaxprHandler(PrimitiveHandler):
             return None
 
 
+@TR.register(
+    "cond",
+)
 class CondHandler(PrimitiveHandler):
     """Handler for branching sub-jaxprs (cond, switch)."""
 
@@ -1186,6 +1446,10 @@ class CondHandler(PrimitiveHandler):
             )
 
 
+@TR.register(
+    "scan",
+    "map",
+)
 class ScanMapHandler(PrimitiveHandler):
     """Handler for looping/batched sub-jaxprs (scan, map)."""
 
@@ -1445,6 +1709,9 @@ class ScanMapHandler(PrimitiveHandler):
                         pass
 
 
+@TR.register(
+    "ffi_call",
+)
 class FFICallHandler(PrimitiveHandler):
     """Handler for `ffi_call` primitive."""
 
