@@ -27,7 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
 import scipy.special as sp
-from jax.extend.core import JaxprEqn, Primitive
+from jax.extend.core import JaxprEqn, Primitive, Var
 from numpy.typing import NDArray
 
 from tatva.sparse.tracer.common import (
@@ -40,6 +40,7 @@ from tatva.sparse.tracer.common import (
 from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import (
     CouplingAccumulator,
+    DistributionState,
     SparseDepSet,
     SubEqnInfo,
     TraceState,
@@ -204,6 +205,55 @@ class PrimitiveHandler(ABC):
     def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
         """Return invar indices that are used as index arrays (e.g. gather/scatter index)."""
         return []
+
+    def discover_distribution(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        dist_state: DistributionState,
+    ) -> None:
+        """Pass 1: Discover interactions, assign canonical ownership, and record required ghost DOFs."""
+        pass
+
+    def remap_local(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        dist_state: DistributionState,
+        rank: int,
+        var_map: dict[int, Any],
+    ) -> JaxprEqn:
+        """Pass 2: Remap primitive parameters (index arrays, shapes) and build localized JaxprEqn for rank."""
+        invars_local = [var_map.get(id(v), v) for v in eqn.invars]
+
+        # Shape propagation: if any invar has a modified local shape, propagate to outvars
+        ref_shape = None
+        for v in invars_local:
+            sh = getattr(v.aval, "shape", None)
+            if sh is not None and len(sh) > 0:
+                ref_shape = sh
+                break
+
+        if ref_shape is not None:
+            for v_out in eqn.outvars:
+                if id(v_out) not in var_map:
+                    out_shape = getattr(v_out.aval, "shape", ())
+                    if out_shape and out_shape[0] != ref_shape[0]:
+                        new_shape = (ref_shape[0],) + out_shape[1:]
+                        var_map[id(v_out)] = Var(
+                            jax.core.ShapedArray(new_shape, v_out.aval.dtype)
+                        )
+
+        outvars_local = [var_map.get(id(v), v) for v in eqn.outvars]
+        return JaxprEqn(
+            invars_local,
+            outvars_local,
+            eqn.primitive,
+            eqn.params.copy(),
+            eqn.effects,
+            eqn.source_info,
+            getattr(eqn, "ctx", None),
+        )
 
 
 # =============================================================================
@@ -538,6 +588,45 @@ class BroadcastHandler(PrimitiveHandler):
             newshape[b] = x.shape[i] if i < len(x.shape) else 1
         return np.broadcast_to(x.reshape(newshape), shape).copy()
 
+    def remap_local(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        dist_state: DistributionState,
+        rank: int,
+        var_map: dict[int, Any],
+    ) -> JaxprEqn:
+        invars_local = [var_map.get(id(v), v) for v in eqn.invars]
+        v_in = invars_local[0]
+        in_shape = getattr(v_in.aval, "shape", ())
+
+        params = eqn.params.copy()
+        old_shape = list(params.get("shape", ()))
+        bdims = params.get("broadcast_dimensions", ())
+
+        if old_shape and bdims:
+            new_shape = list(old_shape)
+            for i, b in enumerate(bdims):
+                if i < len(in_shape):
+                    new_shape[b] = in_shape[i]
+            params["shape"] = tuple(new_shape)
+
+            if eqn.outvars:
+                out_var = eqn.outvars[0]
+                out_aval = jax.core.ShapedArray(tuple(new_shape), out_var.aval.dtype)
+                var_map[id(out_var)] = Var(out_aval)
+
+        outvars_local = [var_map.get(id(v), v) for v in eqn.outvars]
+        return JaxprEqn(
+            invars_local,
+            outvars_local,
+            eqn.primitive,
+            params,
+            eqn.effects,
+            eqn.source_info,
+            getattr(eqn, "ctx", None),
+        )
+
 
 @TR.register(
     "transpose",
@@ -604,6 +693,69 @@ class SliceHandler(PrimitiveHandler):
         st = params["strides"] or [1] * len(ss)
         sl = tuple(slice(s, l, t) for s, l, t in zip(ss, ls, st))
         return np.asarray(in_vals[0])[sl]
+
+    def remap_local(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        dist_state: DistributionState,
+        rank: int,
+        var_map: dict[int, Any],
+    ) -> JaxprEqn:
+        invars_local = [var_map.get(id(v), v) for v in eqn.invars]
+        v_in = invars_local[0]
+        in_shape = getattr(v_in.aval, "shape", ())
+
+        params = eqn.params.copy()
+        ss = list(params.get("start_indices", ()))
+        ls = list(params.get("limit_indices", ()))
+        st = list(params.get("strides") or ([1] * len(ss)))
+
+        n_owned = len(dist_state.owned_dofs[rank])
+        glob_in_shape = getattr(eqn.invars[0].aval, "shape", ())
+
+        if in_shape and ss and ls:
+            new_ss, new_ls = [], []
+            for d in range(len(ss)):
+                max_len = in_shape[d] if d < len(in_shape) else ls[d]
+                g_len = glob_in_shape[d] if d < len(glob_in_shape) else ls[d]
+
+                if d < len(in_shape) and in_shape[d] == g_len:
+                    s_d = ss[d]
+                    l_d = ls[d]
+                else:
+                    k = g_len - (ls[d] - ss[d])
+                    if ss[d] == 0:
+                        s_d = 0
+                        l_d = max(0, min(ls[d], n_owned - k, max_len))
+                    else:
+                        s_d = min(ss[d], max_len)
+                        l_d = min(ls[d], s_d + min(n_owned, max_len - s_d), max_len)
+                new_ss.append(s_d)
+                new_ls.append(l_d)
+
+            params["start_indices"] = tuple(new_ss)
+            params["limit_indices"] = tuple(new_ls)
+
+            out_shape = tuple(
+                max(0, (l - s + step - 1) // step)
+                for s, l, step in zip(new_ss, new_ls, st)
+            )
+            if eqn.outvars:
+                out_var = eqn.outvars[0]
+                out_aval = jax.core.ShapedArray(out_shape, out_var.aval.dtype)
+                var_map[id(out_var)] = Var(out_aval)
+
+        outvars_local = [var_map.get(id(v), v) for v in eqn.outvars]
+        return JaxprEqn(
+            invars_local,
+            outvars_local,
+            eqn.primitive,
+            params,
+            eqn.effects,
+            eqn.source_info,
+            getattr(eqn, "ctx", None),
+        )
 
 
 @TR.register(
@@ -819,6 +971,41 @@ class GatherHandler(PrimitiveHandler):
     def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
         return [1] if len(eqn.invars) > 1 else []
 
+    def discover_distribution(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        dist_state: DistributionState,
+    ) -> None:
+        d_src = state.get(eqn.invars[0])
+        idx = state.get_val(eqn.invars[1]) if len(eqn.invars) > 1 else None
+        if idx is not None and d_src.dep.nnz > 0:
+            flat_idx = np.asarray(idx).ravel()
+            for i in flat_idx:
+                if 0 <= i < d_src.dep.shape[0]:
+                    dofs = d_src.dep[i].indices
+                    dist_state.add_interaction(dofs)
+
+    def remap_local(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        dist_state: DistributionState,
+        rank: int,
+        var_map: dict[int, Any],
+    ) -> JaxprEqn:
+        invars_local = [var_map.get(id(v), v) for v in eqn.invars]
+        outvars_local = [var_map.get(id(v), v) for v in eqn.outvars]
+        return JaxprEqn(
+            invars_local,
+            outvars_local,
+            eqn.primitive,
+            eqn.params.copy(),
+            eqn.effects,
+            eqn.source_info,
+            getattr(eqn, "ctx", None),
+        )
+
     def propagate_deps(
         self,
         eqn: JaxprEqn,
@@ -883,7 +1070,6 @@ class GatherHandler(PrimitiveHandler):
                         coords[axis] = np.clip(
                             idx[:, j].astype(int), 0, d_src.shape[axis] - 1
                         )
-
                     flat_src_indices = arr_indices[tuple(coords)].ravel()
                     res_dep = d_src.dep[flat_src_indices].tocsr()
                     res_dep.data[:] = 1
@@ -895,6 +1081,34 @@ class GatherHandler(PrimitiveHandler):
         total = d_src.total_union()
         stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
+
+    def remap_local(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        dist_state: DistributionState,
+        rank: int,
+        var_map: dict[int, Any],
+    ) -> JaxprEqn:
+        invars_local = [var_map.get(id(v), v) for v in eqn.invars]
+        idx_var = invars_local[1] if len(invars_local) > 1 else None
+        idx_shape = getattr(idx_var.aval, "shape", ()) if idx_var else ()
+
+        if idx_shape and idx_shape[0] == 0:
+            out_var = eqn.outvars[0]
+            out_aval = jax.core.ShapedArray((0,), out_var.aval.dtype)
+            var_map[id(out_var)] = Var(out_aval)
+
+        outvars_local = [var_map.get(id(v), v) for v in eqn.outvars]
+        return JaxprEqn(
+            invars_local,
+            outvars_local,
+            eqn.primitive,
+            eqn.params.copy(),
+            eqn.effects,
+            eqn.source_info,
+            getattr(eqn, "ctx", None),
+        )
 
 
 @TR.register(
@@ -961,6 +1175,45 @@ class ScatterHandler(PrimitiveHandler):
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         return eqn.primitive.name == "scatter-mul" and sum(invar_active) >= 2
+
+    def discover_distribution(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        dist_state: DistributionState,
+    ) -> None:
+        d_vals = state.get(eqn.invars[2]) if len(eqn.invars) > 2 else None
+        if d_vals is not None and d_vals.dep.nnz > 0:
+            for i in range(d_vals.dep.shape[0]):
+                dofs = d_vals.dep[i].indices
+                dist_state.add_interaction(dofs)
+
+    def remap_local(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        dist_state: DistributionState,
+        rank: int,
+        var_map: dict[int, Any],
+    ) -> JaxprEqn:
+        invars_local = [var_map.get(id(v), v) for v in eqn.invars]
+        idx_var = invars_local[1] if len(invars_local) > 1 else None
+        idx_shape = getattr(idx_var.aval, "shape", ()) if idx_var else ()
+
+        if idx_shape and idx_shape[0] == 0:
+            out_var = eqn.outvars[0]
+            var_map[id(out_var)] = invars_local[0]
+
+        outvars_local = [var_map.get(id(v), v) for v in eqn.outvars]
+        return JaxprEqn(
+            invars_local,
+            outvars_local,
+            eqn.primitive,
+            eqn.params.copy(),
+            eqn.effects,
+            eqn.source_info,
+            getattr(eqn, "ctx", None),
+        )
 
     def propagate_deps(
         self,

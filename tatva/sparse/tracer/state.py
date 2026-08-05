@@ -289,3 +289,48 @@ class TraceState:
                 cv = handler.safe_eval_concrete(eqn.primitive, in_vals, eqn.params)
                 if cv is not None:
                     self.val_of[id(ovars[0])] = cv
+
+
+class DistributionState:
+    """State management for Pass 1 (discovery & ghost tracking) and Pass 2 (graph remapping)."""
+
+    def __init__(self, part_map: np.ndarray):
+        self.part_map = np.asarray(part_map, dtype=np.int64)
+        self.n_dofs = self.part_map.size
+        self.n_ranks = int(np.max(self.part_map)) + 1 if self.part_map.size > 0 else 1
+
+        self.ghost_dofs: dict[int, set[int]] = {r: set() for r in range(self.n_ranks)}
+        self.owned_dofs: dict[int, np.ndarray] = {
+            r: np.where(self.part_map == r)[0] for r in range(self.n_ranks)
+        }
+        self.local_dofs: dict[int, np.ndarray] = {}
+        self.g2l_root: dict[int, np.ndarray] = {}
+
+        # Mappings for intermediate variables and scan/map sub-jaxprs per rank
+        self.var_shape_map: dict[tuple[int, int], tuple[int, ...]] = {}
+        self.var_g2l_map: dict[tuple[int, int], np.ndarray] = {}
+        self.active_elem_map: dict[tuple[int, int], np.ndarray] = {}
+
+    def add_interaction(self, dof_indices: Sequence[int] | np.ndarray) -> None:
+        """Register an interaction tuple S_k; assign owner via part_map[min(S_k)] and add ghosts to owner's rank."""
+        if len(dof_indices) == 0:
+            return
+        dofs = np.asarray(dof_indices, dtype=np.int64)
+        min_dof = int(np.min(dofs))
+        owner_rank = int(self.part_map[min_dof])
+
+        # Add any DOFs in S_k not owned by owner_rank as ghost DOFs
+        owned_set = set(self.owned_dofs[owner_rank])
+        for d in dofs:
+            if d not in owned_set:
+                self.ghost_dofs[owner_rank].add(int(d))
+
+    def finalize_pass1(self) -> None:
+        """Consolidate local DOF ordering [owned | ghosts] and construct g2l_root lookup maps for all ranks."""
+        for r in range(self.n_ranks):
+            ghosts = np.array(sorted(self.ghost_dofs[r]), dtype=np.int64)
+            self.local_dofs[r] = np.concatenate([self.owned_dofs[r], ghosts])
+
+            g2l = np.full(self.n_dofs, -1, dtype=np.int64)
+            g2l[self.local_dofs[r]] = np.arange(len(self.local_dofs[r]), dtype=np.int64)
+            self.g2l_root[r] = g2l

@@ -23,7 +23,8 @@ import jax
 import numpy as np
 import scipy.sparse as sps
 from jax import Array
-from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Var
+from numpy.typing import NDArray
 
 from tatva.sparse.tracer.cache import persistent_tracer_cache
 from tatva.sparse.tracer.common import (
@@ -36,6 +37,7 @@ from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import (
     BoundEqn,
     CouplingAccumulator,
+    DistributionState,
     SparseDepSet,
     SubInfoDict,
     TraceState,
@@ -474,3 +476,185 @@ def pattern_from_virtual_work(
     # Extract the cross-coupling block (v-derivatives vs u-derivatives)
     K_uv = H_w[n_dofs:, :n_dofs].tocsr()
     return K_uv
+
+
+def split_jaxpr_into_local(
+    closed_jaxpr: ClosedJaxpr,
+    part_map: NDArray[np.integer],
+    concrete_vals: list[Any],
+) -> list[tuple[ClosedJaxpr, list[Any]]]:
+    """
+    Split a ClosedJaxpr into local sub-ClosedJaxprs based on a partition map.
+
+    Args:
+        closed_jaxpr: The original ClosedJaxpr to be split.
+        part_map: An array mapping each global root DOF ID to a rank partition index.
+        concrete_vals: List of concrete input argument values.
+
+    Returns:
+        A list of ClosedJaxpr objects, one for each rank partition.
+    """
+    n_dofs = part_map.size
+    consts: Sequence = closed_jaxpr.consts
+    jaxpr: Jaxpr = closed_jaxpr.jaxpr
+
+    # 1. Initialize DistributionState
+    dist_state = DistributionState(part_map)
+
+    # 2. Forward-backward analysis pass and symbolic d1 propagation
+    tags = {}
+    sub_info: SubInfoDict = {}
+    main_input_id = id(jaxpr.invars[0]) if jaxpr.invars else None
+    forward_data, active_ids, index_ids = _analyze_and_resolve_jaxpr(
+        jaxpr, None, tags, main_input_id, sub_info
+    )
+    bound_eqns = _propagate_active_backward(
+        forward_data, active_ids, index_ids, sub_info
+    )
+
+    state = TraceState(n_dofs, active_ids, tags, sub_info)
+
+    # Attach concrete values to static invars (invars[1:]) and constvars
+    for invar, arg_val in zip(jaxpr.invars[1:], concrete_vals[1:]):
+        state.val_of[id(invar)] = np.asarray(arg_val)
+
+    for v, c in zip(jaxpr.constvars, consts):
+        state.val_of[id(v)] = np.asarray(c)
+
+    # Seed root input u (invars[0]) with identity singletons; invars[1:]/consts with empty
+    u_seed = SparseDepSet.singletons(n_dofs)
+    if jaxpr.invars:
+        state.set(jaxpr.invars[0], u_seed)
+        for v in jaxpr.invars[1:]:
+            state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
+
+    for v in jaxpr.constvars:
+        state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
+
+    acc = CouplingAccumulator(n_dofs)
+    state.run_bound_eqns(bound_eqns, acc, trial_test_split=None)
+
+    # 3. PASS 1: Discovery & Ghost Set Accumulation via Handlers
+    for eqn, handler, _, _ in bound_eqns:
+        handler.discover_distribution(eqn, state, dist_state)
+
+    # Also inspect constvars for explicit interaction index matrices
+    for const in consts:
+        arr = np.asarray(const)
+        if (
+            arr.dtype.kind in "iu"
+            and arr.ndim >= 1
+            and arr.size > 0
+            and np.max(arr) < n_dofs
+            and np.min(arr) >= 0
+        ):
+            if arr.ndim >= 2:
+                for row in arr:
+                    dist_state.add_interaction(row)
+            else:
+                dist_state.add_interaction(arr)
+
+    # Finalize Pass 1: compute owned + ghost DOFs and g2l_root for all ranks
+    dist_state.finalize_pass1()
+
+    # 4. PASS 2: Graph Localization & Remapping per rank via Handlers
+    local_closed_jaxprs: list[tuple[ClosedJaxpr, list[Any]]] = []
+
+    for r in range(dist_state.n_ranks):
+        var_map: dict[int, Any] = {}
+
+        # Remap root input u (invars[0]) to local shape (n_local_dofs,)
+        local_dofs_r = dist_state.local_dofs[r]
+        n_local = len(local_dofs_r)
+        if jaxpr.invars:
+            u_var = jaxpr.invars[0]
+            local_u_aval = jax.core.ShapedArray(
+                (n_local,), u_var.aval.dtype, weak_type=u_var.aval.weak_type
+            )
+            var_map[id(u_var)] = Var(local_u_aval)
+
+            # Remap static invars[1:] (e.g., static lifter indices or parameters)
+            local_concrete_args = []
+            for invar, arg_val in zip(jaxpr.invars[1:], concrete_vals[1:]):
+                arr = np.asarray(arg_val)
+                if arr.ndim >= 1 and arr.shape[0] == len(part_map):
+                    my_mask = part_map == r
+                    arr_local = arr[my_mask]
+                    local_concrete_args.append(arr_local)
+                    local_aval = jax.core.ShapedArray(
+                        arr_local.shape,
+                        invar.aval.dtype,
+                        weak_type=invar.aval.weak_type,
+                    )
+                    var_map[id(invar)] = Var(local_aval)
+                elif arr.dtype.kind in "iu" and arr.ndim >= 1 and arr.size > 0:
+                    raw_dofs = np.min(arr, axis=-1) if arr.ndim >= 2 else arr
+                    bounded_dofs = raw_dofs % len(part_map)
+                    owners = dist_state.part_map[bounded_dofs]
+                    my_mask = owners == r
+                    arr_local = arr[my_mask]
+                    local_concrete_args.append(arr_local)
+                    local_aval = jax.core.ShapedArray(
+                        arr_local.shape,
+                        invar.aval.dtype,
+                        weak_type=invar.aval.weak_type,
+                    )
+                    var_map[id(invar)] = Var(local_aval)
+                else:
+                    local_concrete_args.append(arg_val)
+                    var_map[id(invar)] = invar
+
+        for v in jaxpr.constvars:
+            var_map[id(v)] = v
+
+        # Remap constant values FIRST so var_map has localized c_var avals
+        local_consts = []
+        g2l = dist_state.g2l_root[r]
+        for c_var, const in zip(jaxpr.constvars, consts):
+            arr = np.asarray(const)
+            if arr.dtype.kind in "iu" and arr.ndim >= 1 and arr.size > 0:
+                if arr.shape[0] == len(part_map):
+                    arr_rank = arr[local_dofs_r]
+                    c_local = np.copy(arr_rank)
+                    mask = (c_local >= 0) & (c_local < len(g2l))
+                    c_local[mask] = g2l[c_local[mask]]
+                else:
+                    raw_dofs = np.min(arr, axis=-1) if arr.ndim >= 2 else arr
+                    bounded_dofs = raw_dofs % len(part_map)
+                    owners = dist_state.part_map[bounded_dofs]
+                    my_mask = owners == r
+                    arr_rank = arr[my_mask]
+                    c_local = np.copy(arr_rank)
+                    mask = (c_local >= 0) & (c_local < len(g2l))
+                    c_local[mask] = g2l[c_local[mask]]
+
+                local_consts.append(c_local)
+                var_map[id(c_var)] = Var(
+                    jax.core.ShapedArray(c_local.shape, c_var.aval.dtype)
+                )
+            else:
+                local_consts.append(const)
+
+        # Remap equations using handler.remap_local
+        local_eqns = []
+        for eqn, handler, _, _ in bound_eqns:
+            local_eqn = handler.remap_local(eqn, state, dist_state, r, var_map)
+            local_eqns.append(local_eqn)
+
+        local_invars = [var_map.get(id(v), v) for v in jaxpr.invars]
+        local_outvars = [var_map.get(id(v), v) for v in jaxpr.outvars]
+        local_constvars = [var_map.get(id(v), v) for v in jaxpr.constvars]
+
+        u_dtype = (
+            concrete_vals[0].dtype
+            if concrete_vals and hasattr(concrete_vals[0], "dtype")
+            else float
+        )
+        u_local = np.zeros(n_local, dtype=u_dtype)
+
+        local_jaxpr = Jaxpr(local_constvars, local_invars, local_outvars, local_eqns)
+        local_closed_jaxprs.append(
+            (ClosedJaxpr(local_jaxpr, local_consts), [u_local] + local_concrete_args)
+        )
+
+    return local_closed_jaxprs
