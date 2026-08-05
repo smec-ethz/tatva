@@ -23,7 +23,8 @@ from typing import TYPE_CHECKING, ParamSpec, TypeAlias
 
 import numpy as np
 import scipy.sparse as sps
-from jax.extend.core import JaxprEqn, Literal
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
+from numpy.typing import NDArray
 
 from tatva.sparse.tracer.common import _get_shape
 
@@ -186,7 +187,6 @@ class TraceState:
         self,
         n_dofs: int,
         active_ids: builtins.set[int],
-        tags: dict | None = None,
         sub_info: SubInfoDict | None = None,
         nonlinear_ids: builtins.set[int] | None = None,
     ):
@@ -195,8 +195,6 @@ class TraceState:
             n_dofs: total number of DOFs (size of the input variable)
             active_ids: set of variable IDs that are currently active (feed into nonlinear
                 primitives)
-            tags: dict mapping variable IDs to their current tag (0=inactive,
-                1=trial-only, 2=test-only, 3=both); used for trial/test splitting
             sub_info: dict to store sub-jaxpr analysis results for nested jits; maps eqn
                 IDs to (active_set, resolved_eqns)
             nonlinear_ids: set of variable IDs that are a *non-affine* (nonlinear) function
@@ -209,15 +207,44 @@ class TraceState:
         """
         self.n_dofs = n_dofs
         self.active_ids = active_ids
-        self.tags = tags if tags is not None else {}
         self.dep_of: dict[int, SparseDepSet] = {}
         self.val_of: dict[int, np.ndarray] = {}
         self.sub_info: SubInfoDict = sub_info if sub_info is not None else {}
         self.nonlinear_ids = nonlinear_ids if nonlinear_ids is not None else set()
 
+    def attach_concrete_values(
+        self, jaxpr: ClosedJaxpr, concrete_vals: list[NDArray]
+    ) -> None:
+        for invar, arg_val in zip(jaxpr.invars, concrete_vals):
+            self.val_of[id(invar)] = np.asarray(arg_val)
+
+        # seed: u gets singleton dep-sets; everything else gets empty sets
+        u_seed = SparseDepSet.singletons(self.n_dofs)
+        if jaxpr.invars:
+            self.set(
+                jaxpr.invars[0], u_seed
+            )  # seed the input variable with singleton dep-sets
+            for v in jaxpr.invars[1:]:
+                self.set(
+                    v, SparseDepSet.empty(_get_shape(v), self.n_dofs)
+                )  # seed other input variables (e.g., static args) with empty dep-sets
+
+        # constants: empty deps but store concrete values for gather routing
+        for v, c in zip(jaxpr.constvars, jaxpr.consts):
+            self.set(v, SparseDepSet.empty(_get_shape(v), self.n_dofs))
+            self.val_of[id(v)] = np.asarray(c)
+
     def is_nonlinear(self, var) -> bool:
         """Whether ``var`` is a non-affine (nonlinear) function of the input ``u``."""
         return id(var) in self.nonlinear_ids
+
+    def is_inactive(self, var) -> bool:
+        """Whether ``var`` is inactive (does not depend on the input ``u``)."""
+        return self.get(var).dep.nnz == 0
+
+    def is_scalar(self, var) -> bool:
+        """Whether ``var`` is a scalar (shape () or (1,))."""
+        return int(np.prod(_get_shape(var))) == 1
 
     def mark_nonlinear(self, eqn: JaxprEqn, handler: PrimitiveHandler) -> None:
         """Flag ``eqn``'s outputs as nonlinear if a coupling-recording primitive touches

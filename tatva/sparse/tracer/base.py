@@ -17,13 +17,14 @@
 
 import inspect
 from collections.abc import Callable, Sequence
-from typing import Any, Concatenate, ParamSpec, cast
+from itertools import chain
+from typing import Any, Concatenate, ParamSpec, Self, cast
 
 import jax
 import numpy as np
 import scipy.sparse as sps
 from jax import Array
-from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Var
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
 from numpy.typing import NDArray
 
 from tatva.sparse.tracer.cache import persistent_tracer_cache
@@ -37,7 +38,6 @@ from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import (
     BoundEqn,
     CouplingAccumulator,
-    DistributionState,
     SparseDepSet,
     SubInfoDict,
     TraceState,
@@ -46,308 +46,398 @@ from tatva.sparse.tracer.state import (
 P = ParamSpec("P")
 
 
-def _analyze_and_resolve_jaxpr(
-    jaxpr: Jaxpr,
-    trial_test_split: int | None,
-    tags: dict[int, int],
-    main_input_id: int | None,
-    sub_info: SubInfoDict,
-) -> tuple[list[tuple[JaxprEqn, PrimitiveHandler, bool, Any]], set[int], set[int]]:
-    """
-    Performs the forward pass of a unified JAXpr analysis traversal:
-    - Propagates tags (forward)
-    - Identifies nonlinear active equations (forward)
-    - Resolves registered handlers (forward)
-    - Collects index variable IDs for indexing operations (forward)
+class ParsedJaxpr:
+    def __init__(self, jaxpr: ClosedJaxpr, trial_test_split: int | None = None):
+        self.jaxpr = jaxpr
+        self.trial_test_split = trial_test_split
 
-    Args:
-        jaxpr: the JAXpr to analyze
-        trial_test_split: if not None, the DOF index at which to split trial vs test
-            variables for nonlinear interaction detection
-        tags: a dict mapping variable IDs to their current tag (0=inactive, 1=trial-only,
-            2=test-only, 3=both)
-        main_input_id: the variable ID of the main input (e.g., the trial function) to
-            seed with tags; used for trial/test splitting
-        sub_info: a dict to store sub-jaxpr analysis results for nested jits; maps eqn IDs
-            to (active_set, index_set, resolved_eqns)
+        if not jaxpr.jaxpr.invars:
+            raise ValueError("The functional Jaxpr must have a first DOF-vector input.")
+        main_input_shape = _get_shape(jaxpr.jaxpr.invars[0])
+        if len(main_input_shape) != 1:
+            raise ValueError(
+                "The functional's first input must be a one-dimensional DOF array."
+            )
 
-    Returns:
-        A list of forward data tuples: (eqn, handler, is_nonlinear, sub_res)
-        The initial set of active variable IDs seeded from the outputs.
-        The initial set of index variable IDs seeded from indexing operations.
-    """
-    forward_data = []
-    active_set = {id(v) for v in jaxpr.outvars}
-    index_set = set()
+        self.n_dofs = main_input_shape[0]
+        self.vars: dict[int, Var] = {}
+        self.tags: dict[int, int] = {}
+        self.sub_info: SubInfoDict = {}
 
-    for eqn in jaxpr.eqns:
-        p = eqn.primitive.name
-        handler = TR.get(p)
-
-        # identify indexing variable IDs via handler
-        for idx_pos in handler.get_index_invar_indices(eqn):
-            index_set.add(id(eqn.invars[idx_pos]))
-
-        # Main input slice tag seeding for trial/test split
-        if (
-            trial_test_split is not None
-            and p == "slice"
-            and main_input_id is not None
-            and id(eqn.invars[0]) == main_input_id
+        # prepopulate invars, constvars, and outvars with their IDs
+        for var in chain(
+            jaxpr.jaxpr.invars[1:], jaxpr.jaxpr.constvars, jaxpr.jaxpr.outvars
         ):
-            start, limit = (
-                eqn.params["start_indices"][0],
-                eqn.params["limit_indices"][0],
-            )
-            tags[id(eqn.outvars[0])] = (
-                1
-                if (start == 0 and limit <= trial_test_split)
-                else (2 if start >= trial_test_split else 3)
-            )
+            self.get_var_id(var)
 
-        # Sub-jaxpr recursion (unified for both trial_test_split modes)
-        sub_res = None
-        if p in ("pjit", "jit", "scan", "map", "remat2"):
-            sub_jaxpr, _ = _subjaxpr_and_consts(eqn)
-            for pv, sv in zip(eqn.invars, sub_jaxpr.invars):
-                tags[id(sv)] = tags.get(id(pv), 0)
-            sub_eqns, sub_active, sub_index_set = _analyze_and_resolve_jaxpr(
-                sub_jaxpr, trial_test_split, tags, None, sub_info
-            )
-            sub_res = (sub_active, sub_index_set, sub_eqns)
-            for pv, sv in zip(eqn.invars, sub_jaxpr.invars):
-                if id(sv) in sub_index_set:
-                    index_set.add(id(pv))
-            if trial_test_split is not None:
-                mask = 0
-                for pv, sv in zip(eqn.outvars, sub_jaxpr.outvars):
-                    tags[id(pv)] = tags.get(id(sv), 0)
-                    mask |= tags[id(pv)]
-                for v in eqn.outvars:
-                    tags[id(v)] = mask
-
-        elif p == "cond":
-            operands, sub_res = eqn.invars[1:], []
-            for branch in eqn.params["branches"]:
-                bj = branch.jaxpr
-                for pv, sv in zip(operands, bj.invars):
-                    tags[id(sv)] = tags.get(id(pv), 0)
-                sub_eqns, sub_active, sub_index_set = _analyze_and_resolve_jaxpr(
-                    bj, trial_test_split, tags, None, sub_info
-                )
-                sub_res.append((sub_active, sub_index_set, sub_eqns))
-                for pv, sv in zip(operands, bj.invars):
-                    if id(sv) in sub_index_set:
-                        index_set.add(id(pv))
-            if trial_test_split is not None:
-                mask = 0
-                for branch in eqn.params["branches"]:
-                    for sv in branch.jaxpr.outvars:
-                        mask |= tags.get(id(sv), 0)
-                for v in eqn.outvars:
-                    tags[id(v)] = mask
-
-        elif trial_test_split is not None:
-            mask = handler.propagate_tags(eqn, [tags.get(id(v), 0) for v in eqn.invars])
-            for v in eqn.outvars:
-                tags[id(v)] = mask
-
-        # Polymorphic nonlinearity check & active set seeding
         if trial_test_split is not None:
-            invar_active = [tags.get(id(v), 0) == 3 for v in eqn.invars]
-        else:
-            invar_active = [True for _ in eqn.invars]
+            self.tags[self.main_id()] = 3  # Seed main input with both
 
-        is_nonlinear = handler.introduces_nonlinearity(eqn, invar_active)
-        if is_nonlinear:
-            for v in eqn.invars:
-                active_set.add(id(v))
+    def main(self) -> Var:
+        """Return the main input variable (the first DOF vector) of the JAXpr."""
+        return self.vars[0]
 
-        forward_data.append((eqn, handler, is_nonlinear, sub_res))
+    def main_id(self) -> int:
+        """Return the ID of the main input variable (the first DOF vector) of the JAXpr."""
+        return 0
 
-    return forward_data, active_set, index_set
+    def shape_of(self, var: Var | int) -> tuple[int, ...]:
+        """Return the shape of a JAXpr variable."""
+        if isinstance(var, int):
+            var = self.vars[var]
+        return _get_shape(var)
 
+    def get_var_id(self, var: Var | Literal) -> int:
+        if isinstance(var, Literal):
+            raise TypeError("Cannot get ID for a Literal; only Var is supported.")
 
-def _propagate_active_backward(
-    forward_data: list[tuple[JaxprEqn, PrimitiveHandler, bool, Any]],
-    active_set: set[int],
-    index_set: set[int],
-    sub_info: SubInfoDict,
-) -> list[BoundEqn]:
-    """Performs the backward pass of a unified JAXpr analysis traversal:
-    Propagates the active state and index state backwards through the resolved equations list.
+        if id(var) not in self.vars:
+            self.vars[id(var)] = var
+        return id(var)
 
-    Args:
-        forward_data: the list of forward data tuples (eqn, handler, is_nonlinear,
-            sub_res) from the forward pass
-        active_set: the initial set of active variable IDs seeded from the outputs
-        index_set: the set of variable IDs required for concrete indexing operations
-        sub_info: the dict storing sub-jaxpr analysis results for nested jits; maps eqn
-            IDs to (active_set, index_set, resolved_eqns)
+    @property
+    def active_ids(self) -> set[int]:
+        """Return the set of active variable IDs after forward pass analysis."""
+        if not hasattr(self, "_active_ids"):
+            raise AttributeError(
+                "Active IDs have not been computed yet. Call fwd_pass() first."
+            )
+        return self._active_ids
 
-    Returns:
-        A list of tuples (eqn, handler, is_active, needs_concrete) where is_active
-        indicates whether this equation is on an active path, and needs_concrete
-        indicates whether this equation's output must be evaluated concretely for indexing.
-    """
-    pruned_eqns = []
-    for eqn, handler, is_nonlinear, sub_res in reversed(forward_data):
-        p = eqn.primitive.name
-        is_active = False
-        needs_concrete = False
+    @property
+    def index_ids(self) -> set[int]:
+        """Return the set of index variable IDs after forward pass analysis."""
+        if not hasattr(self, "_index_ids"):
+            raise AttributeError(
+                "Index IDs have not been computed yet. Call fwd_pass() first."
+            )
+        return self._index_ids
 
-        if p in ("pjit", "jit", "scan", "map", "remat2"):
-            outvars_active = any(id(v) in active_set for v in eqn.outvars)
-            outvars_index = any(id(v) in index_set for v in eqn.outvars)
-            if outvars_active or outvars_index:
-                sub_active_set, sub_index_set, sub_eqns = sub_res
-                sub, _ = _subjaxpr_and_consts(eqn)
+    @property
+    def forward_data(self) -> list[tuple[JaxprEqn, PrimitiveHandler, bool, Any]]:
+        """Return the list of forward data tuples (eqn, handler, is_nonlinear, sub_res)
+        after forward pass analysis."""
+        if not hasattr(self, "_forward_data"):
+            raise AttributeError(
+                "Forward data has not been computed yet. Call fwd_pass() first."
+            )
+        return self._forward_data
 
-                # Map active/index outvars to sub outvars
-                for pv, sv in zip(eqn.outvars, sub.outvars):
-                    if id(pv) in active_set:
-                        sub_active_set.add(id(sv))
-                    if id(pv) in index_set:
-                        sub_index_set.add(id(sv))
+    @property
+    def bound_eqns(self) -> list[BoundEqn]:
+        """Return the list of bound equations (eqn, handler, is_active, needs_concrete)
+        after backward pass analysis."""
+        if not hasattr(self, "_bound_eqns"):
+            raise AttributeError(
+                "Bound equations have not been computed yet. Call bwd_pass() first."
+            )
+        return self._bound_eqns
 
-                # Recursively propagate active state backward in sub-jaxpr
-                sub_eqns_pruned = _propagate_active_backward(
-                    sub_eqns, sub_active_set, sub_index_set, sub_info
+    def trace_eqns(self) -> list[BoundEqn]:
+        """Return the list of bound equations (eqn, handler, is_active, needs_concrete)
+        after forward and backward pass analysis."""
+        self.fwd_pass().bwd_pass()
+        return self.bound_eqns
+
+    def fwd_pass(self) -> Self:
+        """Perform the forward pass of the unified JAXpr analysis traversal."""
+        self._forward_data, self._active_ids, self._index_ids = (
+            self._analyze_and_resolve_jaxpr(self.jaxpr.jaxpr)
+        )
+        return self
+
+    def bwd_pass(self) -> Self:
+        """Perform the backward pass of the unified JAXpr analysis traversal."""
+        if not hasattr(self, "forward_data"):
+            raise AttributeError(
+                "Forward pass has not been performed yet. Call fwd_pass() first."
+            )
+        self._bound_eqns = self._propagate_active_backward(
+            self.forward_data, self._active_ids, self._index_ids, self.sub_info
+        )
+        return self
+
+    def _analyze_and_resolve_jaxpr(
+        self,
+        jaxpr: Jaxpr,
+    ) -> tuple[list[tuple[JaxprEqn, PrimitiveHandler, bool, Any]], set[int], set[int]]:
+        """
+        Performs the forward pass of a unified JAXpr analysis traversal:
+        - Propagates tags (forward)
+        - Identifies nonlinear active equations (forward)
+        - Resolves registered handlers (forward)
+        - Collects index variable IDs for indexing operations (forward)
+
+        Args:
+            jaxpr: the JAXpr to analyze
+
+        Returns:
+            A list of forward data tuples: (eqn, handler, is_nonlinear, sub_res)
+            The initial set of active variable IDs seeded from the outputs.
+            The initial set of index variable IDs seeded from indexing operations.
+        """
+        forward_data = []
+        tags = self.tags
+        trial_test_split = self.trial_test_split
+
+        active_set = {self.get_var_id(v) for v in jaxpr.outvars}
+        index_set = set()
+
+        for eqn in jaxpr.eqns:
+            p = eqn.primitive.name
+            handler = TR.get(p)
+
+            # identify indexing variable IDs via handler
+            for idx_pos in handler.get_index_invar_indices(eqn):
+                index_set.add(self.get_var_id(eqn.invars[idx_pos]))
+
+            # Main input slice tag seeding for trial/test split
+            if (
+                trial_test_split is not None
+                and p == "slice"
+                and self.get_var_id(eqn.invars[0]) == self.main_id()
+            ):
+                start, limit = (
+                    eqn.params["start_indices"][0],
+                    eqn.params["limit_indices"][0],
+                )
+                tags[self.get_var_id(eqn.outvars[0])] = (
+                    1
+                    if (start == 0 and limit <= trial_test_split)
+                    else (2 if start >= trial_test_split else 3)
                 )
 
-                if outvars_active:
-                    is_active = True
-                if outvars_index or any(nc for _, _, _, nc in sub_eqns_pruned):
-                    needs_concrete = True
+            # Sub-jaxpr recursion (unified for both trial_test_split modes)
+            sub_res = None
+            if p in ("pjit", "jit", "scan", "map", "remat2"):
+                sub_jaxpr, _ = _subjaxpr_and_consts(eqn)
+                for pv, sv in zip(eqn.invars, sub_jaxpr.invars):
+                    tags[self.get_var_id(sv)] = tags.get(self.get_var_id(pv), 0)
+                sub_eqns, sub_active, sub_index_set = self._analyze_and_resolve_jaxpr(
+                    sub_jaxpr
+                )
+                sub_res = (sub_active, sub_index_set, sub_eqns)
+                for pv, sv in zip(eqn.invars, sub_jaxpr.invars):
+                    if self.get_var_id(sv) in sub_index_set:
+                        index_set.add(self.get_var_id(pv))
+                if trial_test_split is not None:
+                    mask = 0
+                    for pv, sv in zip(eqn.outvars, sub_jaxpr.outvars):
+                        tags[self.get_var_id(pv)] = tags.get(self.get_var_id(sv), 0)
+                        mask |= tags[self.get_var_id(pv)]
+                    for v in eqn.outvars:
+                        tags[self.get_var_id(v)] = mask
 
-                # Map active sub invars to parent invars
-                for pv, sv in zip(eqn.invars, sub.invars):
-                    if id(sv) in sub_active_set:
-                        active_set.add(id(pv))
-                    if id(sv) in sub_index_set:
-                        index_set.add(id(pv))
+            elif p == "cond":
+                operands, sub_res = eqn.invars[1:], []
+                for branch in eqn.params["branches"]:
+                    bj = branch.jaxpr
+                    for pv, sv in zip(operands, bj.invars):
+                        tags[self.get_var_id(sv)] = tags.get(self.get_var_id(pv), 0)
+                    sub_eqns, sub_active, sub_index_set = (
+                        self._analyze_and_resolve_jaxpr(bj)
+                    )
+                    sub_res.append((sub_active, sub_index_set, sub_eqns))
+                    for pv, sv in zip(operands, bj.invars):
+                        if self.get_var_id(sv) in sub_index_set:
+                            index_set.add(self.get_var_id(pv))
+                if trial_test_split is not None:
+                    mask = 0
+                    for branch in eqn.params["branches"]:
+                        for sv in branch.jaxpr.outvars:
+                            mask |= tags.get(self.get_var_id(sv), 0)
+                    for v in eqn.outvars:
+                        tags[self.get_var_id(v)] = mask
 
-                # Store sub-info for this jit equation
-                sub_info[id(eqn)] = (sub_active_set, sub_index_set, sub_eqns_pruned)
-        elif p == "cond":
-            outvars_active = any(id(v) in active_set for v in eqn.outvars)
-            outvars_index = any(id(v) in index_set for v in eqn.outvars)
-            if outvars_active or outvars_index:
-                operands = eqn.invars[1:]
-                pruned_branches = []
-                branch_has_concrete = False
-                for (sub_active_set, sub_index_set, sub_eqns), branch in zip(
-                    sub_res, eqn.params["branches"]
-                ):
-                    sub = branch.jaxpr
+            elif trial_test_split is not None:
+                mask = handler.propagate_tags(
+                    eqn, [tags.get(self.get_var_id(v), 0) for v in eqn.invars]
+                )
+                for v in eqn.outvars:
+                    tags[self.get_var_id(v)] = mask
 
-                    # Map active outvars to each branch's outvars
+            # Polymorphic nonlinearity check & active set seeding
+            if trial_test_split is not None:
+                invar_active = [
+                    tags.get(self.get_var_id(v), 0) == 3 for v in eqn.invars
+                ]
+            else:
+                invar_active = [True for _ in eqn.invars]
+
+            is_nonlinear = handler.introduces_nonlinearity(eqn, invar_active)
+            if is_nonlinear:
+                for v in eqn.invars:
+                    active_set.add(self.get_var_id(v))
+
+            forward_data.append((eqn, handler, is_nonlinear, sub_res))
+
+        return forward_data, active_set, index_set
+
+    def _propagate_active_backward(
+        self,
+        forward_data: list[tuple[JaxprEqn, PrimitiveHandler, bool, Any]],
+        active_set: set[int],
+        index_set: set[int],
+        sub_info: SubInfoDict,
+    ) -> list[BoundEqn]:
+        """Performs the backward pass of a unified JAXpr analysis traversal:
+        Propagates the active state and index state backwards through the resolved equations list.
+
+        Args:
+            forward_data: the list of forward data tuples (eqn, handler, is_nonlinear,
+                sub_res) from the forward pass
+            active_set: the initial set of active variable IDs seeded from the outputs
+            index_set: the set of variable IDs required for concrete indexing operations
+            sub_info: the dict storing sub-jaxpr analysis results for nested jits; maps eqn
+                IDs to (active_set, index_set, resolved_eqns)
+
+        Returns:
+            A list of tuples (eqn, handler, is_active, needs_concrete) where is_active
+            indicates whether this equation is on an active path, and needs_concrete
+            indicates whether this equation's output must be evaluated concretely for indexing.
+        """
+        pruned_eqns = []
+        for eqn, handler, is_nonlinear, sub_res in reversed(forward_data):
+            p = eqn.primitive.name
+            is_active = False
+            needs_concrete = False
+
+            if p in ("pjit", "jit", "scan", "map", "remat2"):
+                outvars_active = any(
+                    self.get_var_id(v) in active_set for v in eqn.outvars
+                )
+                outvars_index = any(
+                    self.get_var_id(v) in index_set for v in eqn.outvars
+                )
+                if outvars_active or outvars_index:
+                    sub_active_set, sub_index_set, sub_eqns = sub_res
+                    sub, _ = _subjaxpr_and_consts(eqn)
+
+                    # Map active/index outvars to sub outvars
                     for pv, sv in zip(eqn.outvars, sub.outvars):
-                        if id(pv) in active_set:
-                            sub_active_set.add(id(sv))
-                        if id(pv) in index_set:
-                            sub_index_set.add(id(sv))
+                        if self.get_var_id(pv) in active_set:
+                            sub_active_set.add(self.get_var_id(sv))
+                        if self.get_var_id(pv) in index_set:
+                            sub_index_set.add(self.get_var_id(sv))
 
-                    sub_eqns_pruned = _propagate_active_backward(
+                    # Recursively propagate active state backward in sub-jaxpr
+                    sub_eqns_pruned = self._propagate_active_backward(
                         sub_eqns, sub_active_set, sub_index_set, sub_info
                     )
-                    if any(nc for _, _, _, nc in sub_eqns_pruned):
-                        branch_has_concrete = True
 
-                    # Map active branch invars back to the cond operands (invars[1:])
-                    for pv, sv in zip(operands, sub.invars):
-                        if id(sv) in sub_active_set:
-                            active_set.add(id(pv))
-                        if id(sv) in sub_index_set:
-                            index_set.add(id(pv))
+                    if outvars_active:
+                        is_active = True
+                    if outvars_index or any(nc for _, _, _, nc in sub_eqns_pruned):
+                        needs_concrete = True
 
-                    pruned_branches.append(
-                        (sub_active_set, sub_index_set, sub_eqns_pruned)
-                    )
+                    # Map active sub invars to parent invars
+                    for pv, sv in zip(eqn.invars, sub.invars):
+                        if self.get_var_id(sv) in sub_active_set:
+                            active_set.add(self.get_var_id(pv))
+                        if self.get_var_id(sv) in sub_index_set:
+                            index_set.add(self.get_var_id(pv))
 
-                if outvars_active:
+                    # Store sub-info for this jit equation
+                    sub_info[id(eqn)] = (sub_active_set, sub_index_set, sub_eqns_pruned)
+            elif p == "cond":
+                outvars_active = any(
+                    self.get_var_id(v) in active_set for v in eqn.outvars
+                )
+                outvars_index = any(
+                    self.get_var_id(v) in index_set for v in eqn.outvars
+                )
+                if outvars_active or outvars_index:
+                    operands = eqn.invars[1:]
+                    pruned_branches = []
+                    branch_has_concrete = False
+                    for (sub_active_set, sub_index_set, sub_eqns), branch in zip(
+                        sub_res, eqn.params["branches"]
+                    ):
+                        sub = branch.jaxpr
+
+                        # Map active outvars to each branch's outvars
+                        for pv, sv in zip(eqn.outvars, sub.outvars):
+                            if self.get_var_id(pv) in active_set:
+                                sub_active_set.add(self.get_var_id(sv))
+                            if self.get_var_id(pv) in index_set:
+                                sub_index_set.add(self.get_var_id(sv))
+
+                        sub_eqns_pruned = self._propagate_active_backward(
+                            sub_eqns, sub_active_set, sub_index_set, sub_info
+                        )
+                        if any(nc for _, _, _, nc in sub_eqns_pruned):
+                            branch_has_concrete = True
+
+                        # Map active branch invars back to the cond operands (invars[1:])
+                        for pv, sv in zip(operands, sub.invars):
+                            if self.get_var_id(sv) in sub_active_set:
+                                active_set.add(self.get_var_id(pv))
+                            if self.get_var_id(sv) in sub_index_set:
+                                index_set.add(self.get_var_id(pv))
+
+                        pruned_branches.append(
+                            (sub_active_set, sub_index_set, sub_eqns_pruned)
+                        )
+
+                    if outvars_active:
+                        is_active = True
+                    if outvars_index or branch_has_concrete:
+                        needs_concrete = True
+
+                    sub_info[id(eqn)] = pruned_branches
+            else:
+                if is_nonlinear or (
+                    eqn.outvars
+                    and any(self.get_var_id(v) in active_set for v in eqn.outvars)
+                ):
                     is_active = True
-                if outvars_index or branch_has_concrete:
+                    for v in eqn.invars:
+                        active_set.add(self.get_var_id(v))
+
+                if eqn.outvars and any(
+                    self.get_var_id(v) in index_set for v in eqn.outvars
+                ):
                     needs_concrete = True
+                    for v in eqn.invars:
+                        index_set.add(self.get_var_id(v))
 
-                sub_info[id(eqn)] = pruned_branches
-        else:
-            if is_nonlinear or (
-                eqn.outvars and any(id(v) in active_set for v in eqn.outvars)
-            ):
-                is_active = True
-                for v in eqn.invars:
-                    active_set.add(id(v))
+            pruned_eqns.append((eqn, handler, is_active, needs_concrete))
 
-            if eqn.outvars and any(id(v) in index_set for v in eqn.outvars):
-                needs_concrete = True
-                for v in eqn.invars:
-                    index_set.add(id(v))
-
-        pruned_eqns.append((eqn, handler, is_active, needs_concrete))
-
-    pruned_eqns.reverse()
-    return pruned_eqns
+        pruned_eqns.reverse()
+        return pruned_eqns
 
 
 def _trace_hessian_sparsity(
-    jaxpr: ClosedJaxpr,
-    tracer_shape: tuple[int, ...],
+    closed_jaxpr: ClosedJaxpr,
     concrete_vals: list[Any],
     trial_test_split: int | None = None,
 ) -> sps.csr_matrix:
     """Return the sparsity pattern of d²E/du² (or tangent stiffness matrix K for virtual
     work formulations) as a CSR matrix."""
-    n_dofs = int(np.prod(tracer_shape))
+    parsed_jaxpr = ParsedJaxpr(closed_jaxpr)
 
-    consts: Sequence = jaxpr.consts
-    jaxpr: Jaxpr = jaxpr.jaxpr
-
-    # Propagate tags, classify active primitives, and pre-resolve handlers in a single forward-backward pass
-    tags = {}
-    if trial_test_split is not None and jaxpr.invars:
-        tags[id(jaxpr.invars[0])] = 3  # Seed main input with both
-
-    sub_info: SubInfoDict = {}
-    main_input_id = id(jaxpr.invars[0]) if jaxpr.invars else None
-    forward_data, active_ids, index_ids = _analyze_and_resolve_jaxpr(
-        jaxpr, trial_test_split, tags, main_input_id, sub_info
-    )
-    bound_eqns = _propagate_active_backward(
-        forward_data, active_ids, index_ids, sub_info
-    )
+    # run forward and backward passes to resolve active equations and index dependencies
+    bound_eqns = parsed_jaxpr.trace_eqns()
 
     # initialize tracing state
-    state = TraceState(n_dofs, active_ids, tags, sub_info)
+    state = TraceState(
+        parsed_jaxpr.n_dofs,
+        parsed_jaxpr.active_ids,
+        parsed_jaxpr.sub_info,
+    )
+    acc = CouplingAccumulator(
+        parsed_jaxpr.n_dofs,
+    )
 
     # Seed concrete values of the input variables (essential for dynamic gather/scatter routing of static PyTree params)
-    for invar, arg_val in zip(jaxpr.invars, concrete_vals):
-        state.val_of[id(invar)] = np.asarray(arg_val)
-
-    # seed: u gets singleton dep-sets; everything else gets empty sets
-    u_seed = SparseDepSet.singletons(n_dofs)
-    if jaxpr.invars:
-        state.set(
-            jaxpr.invars[0], u_seed
-        )  # seed the input variable with singleton dep-sets
-        for v in jaxpr.invars[1:]:
-            state.set(
-                v, SparseDepSet.empty(_get_shape(v), n_dofs)
-            )  # seed other input variables (e.g., static args) with empty dep-sets
-
-    # constants: empty deps but store concrete values for gather routing
-    for v, c in zip(jaxpr.constvars, consts):
-        state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
-        state.val_of[id(v)] = np.asarray(c)
-
-    acc = CouplingAccumulator(n_dofs)
+    state.attach_concrete_values(closed_jaxpr, concrete_vals)
 
     # forward pass: propagate dep-sets through the jaxpr, recording pairs at nonlinear primitives
     state.run_bound_eqns(bound_eqns, acc, trial_test_split)
 
     pat = acc.finalize()
     if pat.nnz == 0:
-        return sps.eye(n_dofs, format="csr", dtype=np.int8)
+        return sps.eye(parsed_jaxpr.n_dofs, format="csr", dtype=np.int8)
     return pat
 
 
@@ -381,10 +471,197 @@ def pattern_from_energy(
 
         return _tracer_fn(
             closed,
-            tracer_shape=u.shape,
             concrete_vals=flat_args,
             trial_test_split=None,
         )
+
+    return wrapper
+
+
+def _validate_partition_map(part_map: NDArray[np.integer], n_dofs: int) -> np.ndarray:
+    """Return a validated, contiguous rank map for a global DOF vector."""
+    partition = np.asarray(part_map, dtype=np.int64)
+    if partition.ndim != 1:
+        raise ValueError("part_map must be a one-dimensional array of rank IDs.")
+    if partition.size != n_dofs:
+        raise ValueError(
+            f"part_map has {partition.size} entries, but the functional has {n_dofs} DOFs."
+        )
+    if partition.size and np.any(partition < 0):
+        raise ValueError("part_map rank IDs must be non-negative.")
+    if partition.size:
+        ranks = np.unique(partition)
+        expected = np.arange(ranks[-1] + 1, dtype=np.int64)
+        if not np.array_equal(ranks, expected):
+            raise ValueError("part_map rank IDs must be contiguous and start at zero.")
+    return partition
+
+
+def ghost_dofs_from_jaxpr(
+    closed_jaxpr: ClosedJaxpr,
+    part_map: NDArray[np.integer],
+    concrete_vals: Sequence[Any],
+) -> dict[int, NDArray[np.int64]]:
+    """Find the remote DOFs read by rank-owned energy contributions.
+
+    The first Jaxpr input is interpreted as the global one-dimensional DOF vector.
+    A scalar reduction is split into the dependency rows of its input: each row is an
+    energy contribution and is assigned to the owner of its smallest global DOF.  The
+    returned array for rank ``r`` contains the sorted *global* IDs read by its assigned
+    contributions but owned by another rank.
+
+    This is a first-order read-support trace, not a Hessian trace.  It consequently
+    retains affine functional reads that have no Hessian entry.  This deliberately does
+    not inspect integer constants as if they were connectivity; concrete values are used
+    only to resolve routing for recognised dynamic indexing primitives.
+    """
+    jaxpr = closed_jaxpr.jaxpr
+    if not jaxpr.invars:
+        raise ValueError("The functional Jaxpr must have a first DOF-vector input.")
+
+    dof_shape = _get_shape(jaxpr.invars[0])
+    if len(dof_shape) != 1:
+        raise ValueError(
+            "The functional's first input must be a one-dimensional DOF array."
+        )
+    n_dofs = dof_shape[0]
+    partition = _validate_partition_map(part_map, n_dofs)
+    if len(concrete_vals) < len(jaxpr.invars):
+        raise ValueError(
+            "concrete_vals must provide a value for every flattened Jaxpr input."
+        )
+
+    tags: dict[int, int] = {}
+    sub_info: SubInfoDict = {}
+    forward_data, active_ids, index_ids = _analyze_and_resolve_jaxpr(
+        jaxpr, None, tags, id(jaxpr.invars[0]), sub_info
+    )
+    bound_eqns = _propagate_active_backward(
+        forward_data, active_ids, index_ids, sub_info
+    )
+    state = TraceState(n_dofs, active_ids, tags, sub_info)
+
+    for invar, value in zip(jaxpr.invars, concrete_vals):
+        state.val_of[id(invar)] = np.asarray(value)
+    for constvar, value in zip(jaxpr.constvars, closed_jaxpr.consts):
+        state.set(constvar, SparseDepSet.empty(_get_shape(constvar), n_dofs))
+        state.val_of[id(constvar)] = np.asarray(value)
+
+    state.set(jaxpr.invars[0], SparseDepSet.singletons(n_dofs))
+    for invar in jaxpr.invars[1:]:
+        state.set(invar, SparseDepSet.empty(_get_shape(invar), n_dofs))
+    state.run_bound_eqns(bound_eqns, CouplingAccumulator(n_dofs))
+
+    # A scalar reduction is the compiler-visible boundary between independent energy
+    # contributions and their global aggregation.  Keep the input rows, rather than the
+    # scalar's unioned support, so ranks retain only the terms they own.  If there is no
+    # such boundary (for example, an opaque scalar dot), use the scalar output support as
+    # a conservative single contribution.
+    scalar_reductions = {
+        "reduce_sum",
+        "reduce_window_sum",
+        "reduce_max",
+        "reduce_min",
+        "reduce_prod",
+        "reduce_and",
+        "reduce_or",
+    }
+    producers = {
+        id(outvar): eqn
+        for eqn, _handler, is_active, _needs_concrete in bound_eqns
+        if is_active
+        for outvar in eqn.outvars
+    }
+    additive_scalar_primitives = {"add", "add_any", "sub"}
+    passthrough_scalar_primitives = {
+        "copy",
+        "stop_gradient",
+        "device_put",
+        "convert_element_type",
+        "reshape",
+        "squeeze",
+    }
+
+    def is_inactive_scalar(var: Any) -> bool:
+        deps = state.get(var)
+        return deps.dep.nnz == 0 and int(np.prod(deps.shape)) == 1
+
+    def scalar_contributions(var: Any) -> list[sps.csr_matrix]:
+        """Split additive scalar composition without dropping non-reduction branches."""
+        eqn = producers.get(id(var))
+        if eqn is None:
+            return [state.get(var).dep]
+
+        primitive = eqn.primitive.name
+        if primitive in additive_scalar_primitives:
+            return [dep for invar in eqn.invars for dep in scalar_contributions(invar)]
+        if primitive in passthrough_scalar_primitives and eqn.invars:
+            return scalar_contributions(eqn.invars[0])
+        if primitive == "mul" and len(eqn.invars) == 2:
+            lhs, rhs = eqn.invars
+            if is_inactive_scalar(lhs):
+                return scalar_contributions(rhs)
+            if is_inactive_scalar(rhs):
+                return scalar_contributions(lhs)
+        if primitive in scalar_reductions and eqn.invars:
+            return [state.get(eqn.invars[0]).dep]
+
+        # A scalar produced by any other primitive (dot, opaque call, scalar multiply,
+        # control flow, ...) cannot generally be split without primitive-specific
+        # semantics.  Retaining its full support is conservative and prevents a read
+        # from being dropped just because another energy branch had a reduction.
+        return [state.get(var).dep]
+
+    contribution_deps = [
+        dep for outvar in jaxpr.outvars for dep in scalar_contributions(outvar)
+    ]
+
+    n_ranks = int(partition.max()) + 1 if n_dofs else 1
+    ghost_sets: dict[int, set[int]] = {rank: set() for rank in range(n_ranks)}
+    for dep in contribution_deps:
+        row_sizes = np.diff(dep.indptr)
+        nonempty_rows = np.flatnonzero(row_sizes)
+        if nonempty_rows.size == 0:
+            continue
+        row_starts = dep.indptr[nonempty_rows]
+        owner_dofs = np.minimum.reduceat(dep.indices, row_starts)
+        row_owners = partition[owner_dofs]
+
+        for rank in np.unique(row_owners):
+            rank_rows = nonempty_rows[row_owners == rank]
+            read_dofs = np.unique(dep[rank_rows].indices)
+            ghost_sets[int(rank)].update(read_dofs[partition[read_dofs] != rank])
+
+    ghost_dofs: dict[int, NDArray[np.int64]] = {}
+    for rank in range(n_ranks):
+        ghost_dofs[rank] = np.asarray(sorted(ghost_sets[rank]), dtype=np.int64)
+    return ghost_dofs
+
+
+def ghost_dofs_from_energy(
+    energy_fn: Callable[P, Array],
+    part_map: NDArray[np.integer],
+) -> Callable[P, dict[int, NDArray[np.int64]]]:
+    """Build a callable that traces the per-rank ghost-DOF layout of an energy.
+
+    ``part_map[i]`` is the MPI rank owning global DOF ``i``.  The returned callable
+    accepts exactly the arguments of ``energy_fn`` and returns ``{rank: ghost_dofs}``.
+    The first energy argument must be the global, one-dimensional DOF array.
+    """
+
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> dict[int, NDArray[np.int64]]:
+        fn = _unwrap_jit(energy_fn)
+        if not args or not isinstance(args[0], Array):
+            raise TypeError("The first energy argument must be a JAX DOF array.")
+        u = args[0]
+        if u.ndim != 1:
+            raise ValueError(
+                "The first energy argument must be a one-dimensional DOF array."
+            )
+
+        closed = jax.make_jaxpr(fn)(*args, **kwargs)
+        flat_args, _ = jax.tree_util.tree_flatten((args, kwargs))
+        return ghost_dofs_from_jaxpr(closed, part_map, flat_args)
 
     return wrapper
 
@@ -476,185 +753,3 @@ def pattern_from_virtual_work(
     # Extract the cross-coupling block (v-derivatives vs u-derivatives)
     K_uv = H_w[n_dofs:, :n_dofs].tocsr()
     return K_uv
-
-
-def split_jaxpr_into_local(
-    closed_jaxpr: ClosedJaxpr,
-    part_map: NDArray[np.integer],
-    concrete_vals: list[Any],
-) -> list[tuple[ClosedJaxpr, list[Any]]]:
-    """
-    Split a ClosedJaxpr into local sub-ClosedJaxprs based on a partition map.
-
-    Args:
-        closed_jaxpr: The original ClosedJaxpr to be split.
-        part_map: An array mapping each global root DOF ID to a rank partition index.
-        concrete_vals: List of concrete input argument values.
-
-    Returns:
-        A list of ClosedJaxpr objects, one for each rank partition.
-    """
-    n_dofs = part_map.size
-    consts: Sequence = closed_jaxpr.consts
-    jaxpr: Jaxpr = closed_jaxpr.jaxpr
-
-    # 1. Initialize DistributionState
-    dist_state = DistributionState(part_map)
-
-    # 2. Forward-backward analysis pass and symbolic d1 propagation
-    tags = {}
-    sub_info: SubInfoDict = {}
-    main_input_id = id(jaxpr.invars[0]) if jaxpr.invars else None
-    forward_data, active_ids, index_ids = _analyze_and_resolve_jaxpr(
-        jaxpr, None, tags, main_input_id, sub_info
-    )
-    bound_eqns = _propagate_active_backward(
-        forward_data, active_ids, index_ids, sub_info
-    )
-
-    state = TraceState(n_dofs, active_ids, tags, sub_info)
-
-    # Attach concrete values to static invars (invars[1:]) and constvars
-    for invar, arg_val in zip(jaxpr.invars[1:], concrete_vals[1:]):
-        state.val_of[id(invar)] = np.asarray(arg_val)
-
-    for v, c in zip(jaxpr.constvars, consts):
-        state.val_of[id(v)] = np.asarray(c)
-
-    # Seed root input u (invars[0]) with identity singletons; invars[1:]/consts with empty
-    u_seed = SparseDepSet.singletons(n_dofs)
-    if jaxpr.invars:
-        state.set(jaxpr.invars[0], u_seed)
-        for v in jaxpr.invars[1:]:
-            state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
-
-    for v in jaxpr.constvars:
-        state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
-
-    acc = CouplingAccumulator(n_dofs)
-    state.run_bound_eqns(bound_eqns, acc, trial_test_split=None)
-
-    # 3. PASS 1: Discovery & Ghost Set Accumulation via Handlers
-    for eqn, handler, _, _ in bound_eqns:
-        handler.discover_distribution(eqn, state, dist_state)
-
-    # Also inspect constvars for explicit interaction index matrices
-    for const in consts:
-        arr = np.asarray(const)
-        if (
-            arr.dtype.kind in "iu"
-            and arr.ndim >= 1
-            and arr.size > 0
-            and np.max(arr) < n_dofs
-            and np.min(arr) >= 0
-        ):
-            if arr.ndim >= 2:
-                for row in arr:
-                    dist_state.add_interaction(row)
-            else:
-                dist_state.add_interaction(arr)
-
-    # Finalize Pass 1: compute owned + ghost DOFs and g2l_root for all ranks
-    dist_state.finalize_pass1()
-
-    # 4. PASS 2: Graph Localization & Remapping per rank via Handlers
-    local_closed_jaxprs: list[tuple[ClosedJaxpr, list[Any]]] = []
-
-    for r in range(dist_state.n_ranks):
-        var_map: dict[int, Any] = {}
-
-        # Remap root input u (invars[0]) to local shape (n_local_dofs,)
-        local_dofs_r = dist_state.local_dofs[r]
-        n_local = len(local_dofs_r)
-        if jaxpr.invars:
-            u_var = jaxpr.invars[0]
-            local_u_aval = jax.core.ShapedArray(
-                (n_local,), u_var.aval.dtype, weak_type=u_var.aval.weak_type
-            )
-            var_map[id(u_var)] = Var(local_u_aval)
-
-            # Remap static invars[1:] (e.g., static lifter indices or parameters)
-            local_concrete_args = []
-            for invar, arg_val in zip(jaxpr.invars[1:], concrete_vals[1:]):
-                arr = np.asarray(arg_val)
-                if arr.ndim >= 1 and arr.shape[0] == len(part_map):
-                    my_mask = part_map == r
-                    arr_local = arr[my_mask]
-                    local_concrete_args.append(arr_local)
-                    local_aval = jax.core.ShapedArray(
-                        arr_local.shape,
-                        invar.aval.dtype,
-                        weak_type=invar.aval.weak_type,
-                    )
-                    var_map[id(invar)] = Var(local_aval)
-                elif arr.dtype.kind in "iu" and arr.ndim >= 1 and arr.size > 0:
-                    raw_dofs = np.min(arr, axis=-1) if arr.ndim >= 2 else arr
-                    bounded_dofs = raw_dofs % len(part_map)
-                    owners = dist_state.part_map[bounded_dofs]
-                    my_mask = owners == r
-                    arr_local = arr[my_mask]
-                    local_concrete_args.append(arr_local)
-                    local_aval = jax.core.ShapedArray(
-                        arr_local.shape,
-                        invar.aval.dtype,
-                        weak_type=invar.aval.weak_type,
-                    )
-                    var_map[id(invar)] = Var(local_aval)
-                else:
-                    local_concrete_args.append(arg_val)
-                    var_map[id(invar)] = invar
-
-        for v in jaxpr.constvars:
-            var_map[id(v)] = v
-
-        # Remap constant values FIRST so var_map has localized c_var avals
-        local_consts = []
-        g2l = dist_state.g2l_root[r]
-        for c_var, const in zip(jaxpr.constvars, consts):
-            arr = np.asarray(const)
-            if arr.dtype.kind in "iu" and arr.ndim >= 1 and arr.size > 0:
-                if arr.shape[0] == len(part_map):
-                    arr_rank = arr[local_dofs_r]
-                    c_local = np.copy(arr_rank)
-                    mask = (c_local >= 0) & (c_local < len(g2l))
-                    c_local[mask] = g2l[c_local[mask]]
-                else:
-                    raw_dofs = np.min(arr, axis=-1) if arr.ndim >= 2 else arr
-                    bounded_dofs = raw_dofs % len(part_map)
-                    owners = dist_state.part_map[bounded_dofs]
-                    my_mask = owners == r
-                    arr_rank = arr[my_mask]
-                    c_local = np.copy(arr_rank)
-                    mask = (c_local >= 0) & (c_local < len(g2l))
-                    c_local[mask] = g2l[c_local[mask]]
-
-                local_consts.append(c_local)
-                var_map[id(c_var)] = Var(
-                    jax.core.ShapedArray(c_local.shape, c_var.aval.dtype)
-                )
-            else:
-                local_consts.append(const)
-
-        # Remap equations using handler.remap_local
-        local_eqns = []
-        for eqn, handler, _, _ in bound_eqns:
-            local_eqn = handler.remap_local(eqn, state, dist_state, r, var_map)
-            local_eqns.append(local_eqn)
-
-        local_invars = [var_map.get(id(v), v) for v in jaxpr.invars]
-        local_outvars = [var_map.get(id(v), v) for v in jaxpr.outvars]
-        local_constvars = [var_map.get(id(v), v) for v in jaxpr.constvars]
-
-        u_dtype = (
-            concrete_vals[0].dtype
-            if concrete_vals and hasattr(concrete_vals[0], "dtype")
-            else float
-        )
-        u_local = np.zeros(n_local, dtype=u_dtype)
-
-        local_jaxpr = Jaxpr(local_constvars, local_invars, local_outvars, local_eqns)
-        local_closed_jaxprs.append(
-            (ClosedJaxpr(local_jaxpr, local_consts), [u_local] + local_concrete_args)
-        )
-
-    return local_closed_jaxprs
