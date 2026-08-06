@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 import numpy as np
 from jax.extend.core import Jaxpr, JaxprEqn
 from numpy.typing import NDArray
+
+from tatva.sparse.tracer.common import _get_shape
 
 if TYPE_CHECKING:
     from tatva.sparse.tracer.state import BoundEqn, TraceState
@@ -68,11 +70,30 @@ class EnergyPartitionPlan:
         return {rank_plan.rank: rank_plan.ghost_dofs for rank_plan in self.ranks}
 
 
+@dataclass(frozen=True)
+class RankLivenessPlan:
+    rank: int
+
+    # demanded_rows: dict[int, NDArray[np.int64]]
+    # """var id -> demanded flat entries"""
+    all_demands: dict[int, ContributionDemand]
+    """var id -> demanded flat entries"""
+
+    live_eqn_ids: frozenset[int]
+    """eqn ids needed by this rank"""
+
+
 def _demand(rows: NDArray[np.integer]) -> ContributionDemand | None:
     """Build a canonical demand, dropping rows with no source element."""
     rows = np.asarray(rows, dtype=np.int64)
     rows = rows[rows >= 0]
-    return ContributionDemand(np.unique(rows)) if rows.size else None
+    if not rows.size:
+        return None
+    # Most liveness rules preserve an already canonical demand (or create an
+    # ``arange``).  Avoid allocating a hash table/sorted copy on that hot path.
+    if rows.size == 1 or np.all(rows[1:] > rows[:-1]):
+        return ContributionDemand(rows)
+    return ContributionDemand(np.unique(rows))
 
 
 def _invalid_contribution(eqn: JaxprEqn) -> ContributionPropagation:
@@ -126,6 +147,18 @@ def _dependency_row_owners(
     return owners
 
 
+@overload
+def merge_demands(
+    left: ContributionDemand, right: ContributionDemand
+) -> ContributionDemand: ...
+@overload
+def merge_demands(
+    left: ContributionDemand | None, right: ContributionDemand
+) -> ContributionDemand: ...
+@overload
+def merge_demands(
+    left: ContributionDemand, right: ContributionDemand | None
+) -> ContributionDemand: ...
 def merge_demands(
     left: ContributionDemand | None, right: ContributionDemand | None
 ) -> ContributionDemand | None:
@@ -133,6 +166,8 @@ def merge_demands(
     if left is None:
         return right
     if right is None:
+        return left
+    if left is right or np.array_equal(left.rows, right.rows):
         return left
     return ContributionDemand(np.union1d(left.rows, right.rows).astype(np.int64))
 
@@ -367,3 +402,141 @@ def _validate_energy_partition_plan(
             raise AssertionError(
                 f"Rank {rank.rank} has an invalid global-to-local map."
             )
+
+
+def seed_rank_demands(
+    partition_plan: EnergyPartitionPlan,
+    rank: int,
+) -> dict[int, ContributionDemand]:
+    rank_plan = partition_plan.ranks[rank]
+    demand_of: dict[int, ContributionDemand] = {}
+
+    for root_index, rows in rank_plan.contribution_rows.items():
+        root = partition_plan.roots[root_index]
+        existing = demand_of.get(id(root.var))
+        demand_of[id(root.var)] = merge_demands(existing, ContributionDemand(rows))
+
+    return demand_of
+
+
+def _propagate_demands_backward(
+    bound_eqns: list[BoundEqn],
+    state: TraceState,
+    seed_demands: dict[int, ContributionDemand],
+    live_eqn_ids: set[int] | None = None,
+) -> dict[int, ContributionDemand]:
+    """Implementation shared by rank and nested-JAXPR liveness passes."""
+    pending = dict(seed_demands)
+    all_demands: dict[int, ContributionDemand] = dict(pending)
+
+    def add_demand(var: Any, demand: ContributionDemand) -> None:
+        var_id = id(var)
+        previous_pending = pending.get(var_id)
+        previous_all = all_demands.get(var_id)
+        merged_pending = merge_demands(previous_pending, demand)
+        pending[var_id] = merged_pending
+        # While a demand is pending, both maps normally reference the same
+        # object.  Reuse that one union instead of canonicalizing twice.
+        all_demands[var_id] = (
+            merged_pending
+            if previous_all is previous_pending
+            else merge_demands(previous_all, demand)
+        )
+
+    for eqn, handler, _is_active, _needs_concrete in reversed(bound_eqns):
+        out_demands = [pending.pop(id(outvar), None) for outvar in eqn.outvars]
+
+        if not any(demand is not None for demand in out_demands):
+            continue
+
+        if len(out_demands) != len(eqn.outvars):
+            raise RuntimeError(
+                f"{eqn.primitive.name} has an invalid output demand list."
+            )
+        for var, demand in zip(eqn.outvars, out_demands):
+            if demand is not None:
+                size = int(np.prod(_get_shape(var)))
+                if np.any((demand.rows < 0) | (demand.rows >= size)):
+                    raise ValueError(
+                        f"{eqn.primitive.name} received out-of-range output rows."
+                    )
+
+        if live_eqn_ids is not None:
+            live_eqn_ids.add(id(eqn))
+        in_demands = handler.propagate_liveness_demand(eqn, state, out_demands)
+
+        if len(in_demands) != len(eqn.invars):
+            raise RuntimeError(
+                f"{eqn.primitive.name} returned "
+                f"{len(in_demands)} input demands for "
+                f"{len(eqn.invars)} inputs."
+            )
+
+        out_count = sum(
+            len(d.rows)
+            for d in out_demands
+            if d is not None
+        )
+
+        for i, (invar, demand) in enumerate(zip(eqn.invars, in_demands)):
+            if demand is None:
+                continue
+
+            total = int(np.prod(_get_shape(invar)))
+            demanded = len(demand.rows)
+
+            if total >= 100 and demanded / total > 0.9:
+                print(
+                    eqn.primitive.name,
+                    {
+                        "index": i,
+                        "shape": _get_shape(invar),
+                        "demanded": demanded,
+                        "total": total,
+                        "fraction": demanded / total,
+                        "out_count": out_count,
+                    },
+                )
+
+        for invar, demand in zip(eqn.invars, in_demands):
+            if demand is None:
+                continue
+
+            size = int(np.prod(_get_shape(invar)))
+            if np.any((demand.rows < 0) | (demand.rows >= size)):
+                raise ValueError(
+                    f"{eqn.primitive.name} produced out-of-range input rows."
+                )
+            add_demand(invar, demand)
+
+    return all_demands
+
+
+def propagate_demands_backward(
+    bound_eqns: list[BoundEqn],
+    state: TraceState,
+    seed_demands: dict[int, ContributionDemand],
+) -> dict[int, ContributionDemand]:
+    """Propagate arbitrary demanded entries backwards through a bound JAXPR."""
+    return _propagate_demands_backward(bound_eqns, state, seed_demands)
+
+
+def build_rank_liveness(
+    bound_eqns: list[BoundEqn],
+    state: TraceState,
+    partition_plan: EnergyPartitionPlan,
+    rank: int,
+) -> RankLivenessPlan:
+    live_eqn_ids: set[int] = set()
+    all_demands = _propagate_demands_backward(
+        bound_eqns,
+        state,
+        seed_rank_demands(partition_plan, rank),
+        live_eqn_ids,
+    )
+
+    return RankLivenessPlan(
+        rank=rank,
+        all_demands=all_demands,
+        live_eqn_ids=frozenset(live_eqn_ids),
+    )
