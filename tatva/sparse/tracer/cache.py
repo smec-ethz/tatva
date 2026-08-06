@@ -47,7 +47,6 @@ class _TraceHessianSparsity(Protocol):
     def __call__(
         self,
         jaxpr: jax._src.core.ClosedJaxpr,
-        tracer_shape: tuple[int, ...],
         concrete_vals: tuple,
         trial_test_split: int | None = None,
     ) -> sps.csr_matrix: ...
@@ -66,12 +65,11 @@ def persistent_tracer_cache(
     def decorator(func: _TraceHessianSparsity) -> _TraceHessianSparsity:
         def wrapper(
             jaxpr: jax._src.core.ClosedJaxpr,
-            tracer_shape: tuple[int, ...],
             concrete_vals: tuple,
             trial_test_split: int | None = None,
         ) -> sps.csr_matrix:
             if skip_cache:
-                return func(jaxpr, tracer_shape, concrete_vals, trial_test_split)
+                return func(jaxpr, concrete_vals, trial_test_split)
 
             key = _compute_cache_key(jaxpr, concrete_vals)
             cache_file = cache_dir / f"{key}.pkl"
@@ -82,7 +80,7 @@ def persistent_tracer_cache(
                     return pickle.load(f)
 
             # Cache miss: execute the function and store the result
-            result = func(jaxpr, tracer_shape, concrete_vals, trial_test_split)
+            result = func(jaxpr, concrete_vals, trial_test_split)
             # make sure the cache directory exists
             cache_dir.mkdir(parents=True, exist_ok=True)
             with open(cache_file, "wb") as f:

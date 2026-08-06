@@ -34,11 +34,11 @@ from tatva.sparse.tracer.common import (
     _unwrap_jit,
 )
 from tatva.sparse.tracer.handlers import PrimitiveHandler
+from tatva.sparse.tracer.partitioning import find_contribution_roots
 from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import (
     BoundEqn,
     CouplingAccumulator,
-    SparseDepSet,
     SubInfoDict,
     TraceState,
 )
@@ -88,9 +88,6 @@ class ParsedJaxpr:
         return _get_shape(var)
 
     def get_var_id(self, var: Var | Literal) -> int:
-        if isinstance(var, Literal):
-            raise TypeError("Cannot get ID for a Literal; only Var is supported.")
-
         if id(var) not in self.vars:
             self.vars[id(var)] = var
         return id(var)
@@ -519,102 +516,21 @@ def ghost_dofs_from_jaxpr(
     if not jaxpr.invars:
         raise ValueError("The functional Jaxpr must have a first DOF-vector input.")
 
-    dof_shape = _get_shape(jaxpr.invars[0])
-    if len(dof_shape) != 1:
-        raise ValueError(
-            "The functional's first input must be a one-dimensional DOF array."
-        )
-    n_dofs = dof_shape[0]
-    partition = _validate_partition_map(part_map, n_dofs)
-    if len(concrete_vals) < len(jaxpr.invars):
-        raise ValueError(
-            "concrete_vals must provide a value for every flattened Jaxpr input."
-        )
-
-    tags: dict[int, int] = {}
-    sub_info: SubInfoDict = {}
-    forward_data, active_ids, index_ids = _analyze_and_resolve_jaxpr(
-        jaxpr, None, tags, id(jaxpr.invars[0]), sub_info
+    parsed_jaxpr = ParsedJaxpr(closed_jaxpr)
+    n_dofs = parsed_jaxpr.n_dofs
+    bound_eqns = parsed_jaxpr.trace_eqns()
+    state = TraceState(
+        parsed_jaxpr.n_dofs,
+        parsed_jaxpr.active_ids,
+        parsed_jaxpr.sub_info,
     )
-    bound_eqns = _propagate_active_backward(
-        forward_data, active_ids, index_ids, sub_info
-    )
-    state = TraceState(n_dofs, active_ids, tags, sub_info)
-
-    for invar, value in zip(jaxpr.invars, concrete_vals):
-        state.val_of[id(invar)] = np.asarray(value)
-    for constvar, value in zip(jaxpr.constvars, closed_jaxpr.consts):
-        state.set(constvar, SparseDepSet.empty(_get_shape(constvar), n_dofs))
-        state.val_of[id(constvar)] = np.asarray(value)
-
-    state.set(jaxpr.invars[0], SparseDepSet.singletons(n_dofs))
-    for invar in jaxpr.invars[1:]:
-        state.set(invar, SparseDepSet.empty(_get_shape(invar), n_dofs))
+    state.attach_concrete_values(closed_jaxpr, list(concrete_vals))
     state.run_bound_eqns(bound_eqns, CouplingAccumulator(n_dofs))
 
-    # A scalar reduction is the compiler-visible boundary between independent energy
-    # contributions and their global aggregation.  Keep the input rows, rather than the
-    # scalar's unioned support, so ranks retain only the terms they own.  If there is no
-    # such boundary (for example, an opaque scalar dot), use the scalar output support as
-    # a conservative single contribution.
-    scalar_reductions = {
-        "reduce_sum",
-        "reduce_window_sum",
-        "reduce_max",
-        "reduce_min",
-        "reduce_prod",
-        "reduce_and",
-        "reduce_or",
-    }
-    producers = {
-        id(outvar): eqn
-        for eqn, _handler, is_active, _needs_concrete in bound_eqns
-        if is_active
-        for outvar in eqn.outvars
-    }
-    additive_scalar_primitives = {"add", "add_any", "sub"}
-    passthrough_scalar_primitives = {
-        "copy",
-        "stop_gradient",
-        "device_put",
-        "convert_element_type",
-        "reshape",
-        "squeeze",
-    }
+    roots = find_contribution_roots(jaxpr, bound_eqns, state)
+    contribution_deps = [state.get(root.var).dep[root.rows] for root in roots]
 
-    def is_inactive_scalar(var: Any) -> bool:
-        deps = state.get(var)
-        return deps.dep.nnz == 0 and int(np.prod(deps.shape)) == 1
-
-    def scalar_contributions(var: Any) -> list[sps.csr_matrix]:
-        """Split additive scalar composition without dropping non-reduction branches."""
-        eqn = producers.get(id(var))
-        if eqn is None:
-            return [state.get(var).dep]
-
-        primitive = eqn.primitive.name
-        if primitive in additive_scalar_primitives:
-            return [dep for invar in eqn.invars for dep in scalar_contributions(invar)]
-        if primitive in passthrough_scalar_primitives and eqn.invars:
-            return scalar_contributions(eqn.invars[0])
-        if primitive == "mul" and len(eqn.invars) == 2:
-            lhs, rhs = eqn.invars
-            if is_inactive_scalar(lhs):
-                return scalar_contributions(rhs)
-            if is_inactive_scalar(rhs):
-                return scalar_contributions(lhs)
-        if primitive in scalar_reductions and eqn.invars:
-            return [state.get(eqn.invars[0]).dep]
-
-        # A scalar produced by any other primitive (dot, opaque call, scalar multiply,
-        # control flow, ...) cannot generally be split without primitive-specific
-        # semantics.  Retaining its full support is conservative and prevents a read
-        # from being dropped just because another energy branch had a reduction.
-        return [state.get(var).dep]
-
-    contribution_deps = [
-        dep for outvar in jaxpr.outvars for dep in scalar_contributions(outvar)
-    ]
+    partition = _validate_partition_map(part_map, n_dofs)
 
     n_ranks = int(partition.max()) + 1 if n_dofs else 1
     ghost_sets: dict[int, set[int]] = {rank: set() for rank in range(n_ranks)}

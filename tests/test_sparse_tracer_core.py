@@ -479,7 +479,9 @@ def test_split_along_axis_matches_equivalent_slicing(axis):
 
     pat = pattern_from_energy(with_split, n)
     traced = nz_set(pat)
-    assert traced == nz_set(pattern_from_energy(with_slicing, n))  # rows routed identically
+    assert traced == nz_set(
+        pattern_from_energy(with_slicing, n)
+    )  # rows routed identically
     assert dense_hessian_pattern(with_split, n) <= traced  # no false negatives
     assert traced == nz_set(pat.T)  # structural symmetry
     assert pat.nnz < n * n  # locality: never the dense fallback block

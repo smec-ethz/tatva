@@ -20,6 +20,7 @@ from __future__ import annotations
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, cast
 
 import jax.core
@@ -144,6 +145,67 @@ def _dot_general_out_dep(
 # =============================================================================
 
 
+@dataclass
+class ContributionDemand:
+    rows: NDArray[np.int64]
+
+
+@dataclass
+class ContributionRoot:
+    var: Any
+    rows: NDArray[np.int64]
+
+
+@dataclass
+class ContributionPropagation:
+    in_demands: list[ContributionDemand | None]
+    roots: list[ContributionRoot]
+    valid: bool = True
+
+
+def _demand(rows: NDArray[np.integer]) -> ContributionDemand | None:
+    """Build a canonical demand, dropping rows with no source element."""
+    rows = np.asarray(rows, dtype=np.int64)
+    rows = rows[rows >= 0]
+    return ContributionDemand(np.unique(rows)) if rows.size else None
+
+
+def _invalid_contribution(eqn: JaxprEqn) -> ContributionPropagation:
+    """Conservatively stop decomposition at the demanded output."""
+    return ContributionPropagation([None] * len(eqn.invars), [], valid=False)
+
+
+def _inverse_elementwise_rows(
+    rows: NDArray[np.integer], in_shape: tuple, out_shape: tuple
+) -> NDArray[np.int64]:
+    """Map broadcasted output flat rows to the corresponding input flat rows."""
+    if not in_shape:
+        return np.zeros(len(rows), dtype=np.int64)
+    out_coords = np.unravel_index(rows, out_shape)
+    lead = len(out_shape) - len(in_shape)
+    in_coords = []
+    for axis, size in enumerate(in_shape):
+        coord = out_coords[lead + axis]
+        in_coords.append(np.zeros_like(coord) if size == 1 else coord)
+    return np.ravel_multi_index(tuple(in_coords), in_shape).astype(np.int64)
+
+
+def _inverse_broadcast_rows(
+    rows: NDArray[np.integer],
+    in_shape: tuple,
+    out_shape: tuple,
+    dimensions: Sequence[int],
+) -> NDArray[np.int64]:
+    if not in_shape:
+        return np.zeros(len(rows), dtype=np.int64)
+    out_coords = np.unravel_index(rows, out_shape)
+    in_coords = [
+        np.zeros_like(out_coords[axis]) if size == 1 else out_coords[axis]
+        for size, axis in zip(in_shape, dimensions)
+    ]
+    return np.ravel_multi_index(tuple(in_coords), in_shape).astype(np.int64)
+
+
 class PrimitiveHandler(ABC):
     """Abstract base class for all JAX primitive tracer handlers."""
 
@@ -157,6 +219,20 @@ class PrimitiveHandler(ABC):
     ) -> None:
         """Forward dependency set propagation & coupling accumulation."""
         raise NotImplementedError
+
+    def propagate_contribution_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> ContributionPropagation:
+        """Stop safely when this primitive has no additive inverse rule.
+
+        ``find_contribution_roots`` turns a non-valid result into roots at the
+        demanded output entries.  Keeping the fallback here deliberately small makes
+        unsupported primitives conservative instead of silently losing a read.
+        """
+        return _invalid_contribution(eqn)
 
     def safe_eval_concrete(
         self,
@@ -213,7 +289,6 @@ class PrimitiveHandler(ABC):
         dist_state: DistributionState,
     ) -> None:
         """Pass 1: Discover interactions, assign canonical ownership, and record required ghost DOFs."""
-        pass
 
     def remap_local(
         self,
@@ -426,6 +501,28 @@ class ElementwiseUnary(PrimitiveHandler):
         if self.is_nonlinear:
             dep_out.record_couplings(acc, trial_test_split)
 
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None], [])
+        transparent = {
+            "neg",
+            "copy",
+            "stop_gradient",
+            "device_put",
+            "conj",
+            "real",
+            "imag",
+            "reshape",
+            "squeeze",
+            "convert_element_type",
+        }
+        if eqn.primitive.name not in transparent:
+            return _invalid_contribution(eqn)
+        return ContributionPropagation([_demand(demand.rows)], [])
+
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         return self.is_nonlinear and bool(invar_active) and invar_active[0]
 
@@ -497,6 +594,38 @@ class ElementwiseBinary(PrimitiveHandler):
             if not is_linear:
                 res.record_couplings(acc, trial_test_split)
 
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None, None], [])
+        lhs, rhs = eqn.invars[:2]
+        out_shape = _get_shape(eqn.outvars[0])
+        lhs_demand = _demand(
+            _inverse_elementwise_rows(demand.rows, _get_shape(lhs), out_shape)
+        )
+        rhs_demand = _demand(
+            _inverse_elementwise_rows(demand.rows, _get_shape(rhs), out_shape)
+        )
+        primitive = eqn.primitive.name
+        if primitive in {"add", "add_any", "sub"}:
+            return ContributionPropagation(
+                [
+                    None if state.is_inactive(lhs) else lhs_demand,
+                    None if state.is_inactive(rhs) else rhs_demand,
+                ],
+                [],
+            )
+        if primitive == "mul":
+            if state.is_inactive(lhs):
+                return ContributionPropagation([None, rhs_demand], [])
+            if state.is_inactive(rhs):
+                return ContributionPropagation([lhs_demand, None], [])
+        if primitive == "div" and state.is_inactive(rhs):
+            return ContributionPropagation([lhs_demand, None], [])
+        return _invalid_contribution(eqn)
+
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         if not self.is_nonlinear:
             return False
@@ -537,6 +666,19 @@ class IntegerPowHandler(PrimitiveHandler):
         state.set(eqn.outvars[0], in_d.copy())
         if self.introduces_nonlinearity(eqn, [in_d.dep.nnz > 0]):
             in_d.record_couplings(acc, trial_test_split)
+
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None], [])
+        exponent = eqn.params.get("y", 0)
+        if exponent == 1:
+            return ContributionPropagation([_demand(demand.rows)], [])
+        if exponent == 0:
+            return ContributionPropagation([None], [])
+        return _invalid_contribution(eqn)
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         y = eqn.params.get("y", 0)
@@ -587,6 +729,20 @@ class BroadcastHandler(PrimitiveHandler):
         for i, b in enumerate(bdims):
             newshape[b] = x.shape[i] if i < len(x.shape) else 1
         return np.broadcast_to(x.reshape(newshape), shape).copy()
+
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None], [])
+        rows = _inverse_broadcast_rows(
+            demand.rows,
+            _get_shape(eqn.invars[0]),
+            _get_shape(eqn.outvars[0]),
+            eqn.params["broadcast_dimensions"],
+        )
+        return ContributionPropagation([_demand(rows)], [])
 
     def remap_local(
         self,
@@ -654,6 +810,20 @@ class TransposeHandler(PrimitiveHandler):
             return None
         return np.transpose(np.asarray(in_vals[0]), params["permutation"])
 
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None], [])
+        in_shape = _get_shape(eqn.invars[0])
+        out_coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
+        in_coords = [None] * len(in_shape)
+        for out_axis, in_axis in enumerate(eqn.params["permutation"]):
+            in_coords[in_axis] = out_coords[out_axis]
+        rows = np.ravel_multi_index(tuple(in_coords), in_shape)
+        return ContributionPropagation([_demand(rows)], [])
+
 
 @TR.register(
     "slice",
@@ -693,6 +863,25 @@ class SliceHandler(PrimitiveHandler):
         st = params["strides"] or [1] * len(ss)
         sl = tuple(slice(s, l, t) for s, l, t in zip(ss, ls, st))
         return np.asarray(in_vals[0])[sl]
+
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None], [])
+        in_shape = _get_shape(eqn.invars[0])
+        out_coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
+        strides = eqn.params["strides"] or (1,) * len(in_shape)
+        in_coords = tuple(
+            start + coord * stride
+            for start, coord, stride in zip(
+                eqn.params["start_indices"], out_coords, strides
+            )
+        )
+        return ContributionPropagation(
+            [_demand(np.ravel_multi_index(in_coords, in_shape))], []
+        )
 
     def remap_local(
         self,
@@ -790,6 +979,20 @@ class ReverseHandler(PrimitiveHandler):
             return None
         return np.flip(np.asarray(in_vals[0]), axis=params["dimensions"])
 
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None], [])
+        shape = _get_shape(eqn.invars[0])
+        coords = list(np.unravel_index(demand.rows, shape))
+        for axis in eqn.params["dimensions"]:
+            coords[axis] = shape[axis] - 1 - coords[axis]
+        return ContributionPropagation(
+            [_demand(np.ravel_multi_index(tuple(coords), shape))], []
+        )
+
 
 @TR.register(
     "pad",
@@ -847,6 +1050,33 @@ class PadHandler(PrimitiveHandler):
             constant_values=fill_val,
         )
 
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None, None], [])
+        in_shape = _get_shape(eqn.invars[0])
+        out_shape = _get_shape(eqn.outvars[0])
+        low, _high, interior = zip(*eqn.params["padding_config"])
+        out_coords = np.unravel_index(demand.rows, out_shape)
+        in_coords = []
+        valid = np.ones(len(demand.rows), dtype=bool)
+        for coord, lo, step, size in zip(out_coords, low, interior, in_shape):
+            shifted = coord - lo
+            stride = step + 1
+            valid &= shifted >= 0
+            valid &= shifted % stride == 0
+            source = shifted // stride
+            valid &= source < size
+            in_coords.append(source)
+        rows = np.full(len(demand.rows), -1, dtype=np.int64)
+        if np.any(valid):
+            rows[valid] = np.ravel_multi_index(
+                tuple(coord[valid] for coord in in_coords), in_shape
+            )
+        return ContributionPropagation([_demand(rows), None], [])
+
 
 @TR.register(
     "concatenate",
@@ -885,6 +1115,35 @@ class ConcatenateHandler(PrimitiveHandler):
             return None
         return np.concatenate(in_vals, axis=params.get("dimension", 0))
 
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None] * len(eqn.invars), [])
+        shapes = [_get_shape(invar) for invar in eqn.invars]
+        offset = 0
+        index_parts = []
+        for shape in shapes:
+            size = int(np.prod(shape))
+            index_parts.append(np.arange(size).reshape(shape) + offset)
+            offset += size
+        source_ids = np.concatenate(
+            index_parts, axis=eqn.params.get("dimension", 0)
+        ).ravel()
+        selected = source_ids[demand.rows]
+        in_demands = []
+        offset = 0
+        for shape in shapes:
+            size = int(np.prod(shape))
+            in_demands.append(
+                _demand(
+                    selected[(selected >= offset) & (selected < offset + size)] - offset
+                )
+            )
+            offset += size
+        return ContributionPropagation(in_demands, [])
+
 
 @TR.register(
     "stack",
@@ -916,6 +1175,30 @@ class StackHandler(PrimitiveHandler):
         stacked_dep = sps.vstack([b.dep for b in in_d], format="csr")
         stack_idx = np.stack(idx_arrays, axis=eqn.params["axis"]).ravel()
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep[stack_idx], oshp))
+
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None] * len(eqn.invars), [])
+        shape = _get_shape(eqn.invars[0])
+        size = int(np.prod(shape))
+        indices = [
+            np.arange(size).reshape(shape) + i * size for i in range(len(eqn.invars))
+        ]
+        source_ids = np.stack(indices, axis=eqn.params["axis"]).ravel()
+        selected = source_ids[demand.rows]
+        return ContributionPropagation(
+            [
+                _demand(
+                    selected[(selected >= i * size) & (selected < (i + 1) * size)]
+                    - i * size
+                )
+                for i in range(len(eqn.invars))
+            ],
+            [],
+        )
 
 
 @TR.register(
@@ -956,6 +1239,28 @@ class SplitHandler(PrimitiveHandler):
             state.set(outvar, SparseDepSet(d.dep[piece], oshp))
             offset += size
 
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        source_shape = _get_shape(eqn.invars[0])
+        source_ids = np.arange(int(np.prod(source_shape))).reshape(source_shape)
+        axis = eqn.params["axis"]
+        roots = []
+        demanded_rows = []
+        offset = 0
+        for outvar, size, demand in zip(eqn.outvars, eqn.params["sizes"], out_demands):
+            if demand is not None:
+                piece = np.take(
+                    source_ids, np.arange(offset, offset + int(size)), axis=axis
+                ).ravel()
+                demanded_rows.append(piece[demand.rows])
+            offset += int(size)
+        if demanded_rows:
+            return ContributionPropagation(
+                [_demand(np.concatenate(demanded_rows))], roots
+            )
+        return ContributionPropagation([None], roots)
+
 
 # =============================================================================
 # 4. Dynamic Indexing Handlers
@@ -981,6 +1286,7 @@ class GatherHandler(PrimitiveHandler):
         idx = state.get_val(eqn.invars[1]) if len(eqn.invars) > 1 else None
         if idx is not None and d_src.dep.nnz > 0:
             flat_idx = np.asarray(idx).ravel()
+            # this will be painfully slow..
             for i in flat_idx:
                 if 0 <= i < d_src.dep.shape[0]:
                     dofs = d_src.dep[i].indices
@@ -995,6 +1301,14 @@ class GatherHandler(PrimitiveHandler):
         var_map: dict[int, Any],
     ) -> JaxprEqn:
         invars_local = [var_map.get(id(v), v) for v in eqn.invars]
+        idx_var = invars_local[1] if len(invars_local) > 1 else None
+        idx_shape = getattr(idx_var.aval, "shape", ()) if idx_var else ()
+
+        if idx_shape and idx_shape[0] == 0:
+            out_var = eqn.outvars[0]
+            out_aval = jax.core.ShapedArray((0,), out_var.aval.dtype)
+            var_map[id(out_var)] = Var(out_aval)
+
         outvars_local = [var_map.get(id(v), v) for v in eqn.outvars]
         return JaxprEqn(
             invars_local,
@@ -1081,34 +1395,6 @@ class GatherHandler(PrimitiveHandler):
         total = d_src.total_union()
         stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
-
-    def remap_local(
-        self,
-        eqn: JaxprEqn,
-        state: TraceState,
-        dist_state: DistributionState,
-        rank: int,
-        var_map: dict[int, Any],
-    ) -> JaxprEqn:
-        invars_local = [var_map.get(id(v), v) for v in eqn.invars]
-        idx_var = invars_local[1] if len(invars_local) > 1 else None
-        idx_shape = getattr(idx_var.aval, "shape", ()) if idx_var else ()
-
-        if idx_shape and idx_shape[0] == 0:
-            out_var = eqn.outvars[0]
-            out_aval = jax.core.ShapedArray((0,), out_var.aval.dtype)
-            var_map[id(out_var)] = Var(out_aval)
-
-        outvars_local = [var_map.get(id(v), v) for v in eqn.outvars]
-        return JaxprEqn(
-            invars_local,
-            outvars_local,
-            eqn.primitive,
-            eqn.params.copy(),
-            eqn.effects,
-            eqn.source_info,
-            getattr(eqn, "ctx", None),
-        )
 
 
 @TR.register(
@@ -1485,6 +1771,29 @@ class ReductionHandler(PrimitiveHandler):
         reduced_dep = _reduce_union_over_axes(in_d.dep, in_d.shape, keep_axes)
         state.set(eqn.outvars[0], SparseDepSet(reduced_dep, oshp))
 
+    def propagate_contribution_demand(
+        self, eqn, state, out_demands
+    ) -> ContributionPropagation:
+        demand = out_demands[0]
+        if demand is None:
+            return ContributionPropagation([None], [])
+        if eqn.primitive.name != "reduce_sum":
+            return _invalid_contribution(eqn)
+        in_shape = _get_shape(eqn.invars[0])
+        axes = set(eqn.params["axes"])
+        kept_axes = [axis for axis in range(len(in_shape)) if axis not in axes]
+        out_shape = _get_shape(eqn.outvars[0])
+        out_coords = np.unravel_index(demand.rows, out_shape) if out_shape else ()
+        grids = np.indices(in_shape, sparse=False).reshape(len(in_shape), -1)
+        mask = np.zeros(grids.shape[1], dtype=bool)
+        for demand_index in range(len(demand.rows)):
+            matches = np.ones(grids.shape[1], dtype=bool)
+            for coord_index, axis in enumerate(kept_axes):
+                matches &= grids[axis] == out_coords[coord_index][demand_index]
+            mask |= matches
+        rows = np.flatnonzero(mask).astype(np.int64)
+        return ContributionPropagation([None], [ContributionRoot(eqn.invars[0], rows)])
+
 
 # =============================================================================
 # 5. Opaque Black-Box Handler
@@ -1574,9 +1883,7 @@ class SubJaxprHandler(PrimitiveHandler):
             SubEqnInfo, state.sub_info[id(eqn)]
         )
         n_dofs = state.n_dofs
-        sub_state = TraceState(
-            n_dofs, sub_active, state.tags, state.sub_info, state.nonlinear_ids
-        )
+        sub_state = TraceState(n_dofs, sub_active, state.sub_info, state.nonlinear_ids)
 
         for v, d in zip(sub.invars, in_d):
             sub_state.set(v, d)
@@ -1664,7 +1971,7 @@ class CondHandler(PrimitiveHandler):
         ):
             sub, sub_consts = branch.jaxpr, branch.consts
             sub_state = TraceState(
-                n_dofs, sub_active, state.tags, state.sub_info, state.nonlinear_ids
+                n_dofs, sub_active, state.sub_info, state.nonlinear_ids
             )
 
             for sv, d, ov in zip(sub.invars, in_d, operands):
@@ -1744,7 +2051,7 @@ class ScanMapHandler(PrimitiveHandler):
             SubEqnInfo, state.sub_info[id(eqn)]
         )
         sub_state = TraceState(
-            n_local_dofs, sub_active, {}, state.sub_info, state.nonlinear_ids
+            n_local_dofs, sub_active, state.sub_info, state.nonlinear_ids
         )
 
         for i in range(num_const):
