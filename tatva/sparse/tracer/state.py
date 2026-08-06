@@ -223,10 +223,19 @@ class TraceState:
     def attach_concrete_values(
         self, jaxpr: ClosedJaxpr, concrete_vals: list[NDArray]
     ) -> None:
+        """Store concrete input and constant values for routing operations."""
         for invar, arg_val in zip(jaxpr.invars, concrete_vals):
             self.val_of[id(invar)] = np.asarray(arg_val)
 
-        # seed: u gets singleton dep-sets; everything else gets empty sets
+        for v, c in zip(jaxpr.constvars, jaxpr.consts):
+            self.val_of[id(v)] = np.asarray(c)
+
+    def seed_input_dependencies(self, jaxpr: ClosedJaxpr) -> None:
+        """Seed dependency sets for JAXpr inputs and constants.
+
+        The first input is the traced DOF vector and receives singleton dependencies;
+        all other inputs and constants are independent of it.
+        """
         u_seed = SparseDepSet.singletons(self.n_dofs)
         if jaxpr.invars:
             self.set(
@@ -237,10 +246,8 @@ class TraceState:
                     v, SparseDepSet.empty(_get_shape(v), self.n_dofs)
                 )  # seed other input variables (e.g., static args) with empty dep-sets
 
-        # constants: empty deps but store concrete values for gather routing
-        for v, c in zip(jaxpr.constvars, jaxpr.consts):
+        for v in jaxpr.constvars:
             self.set(v, SparseDepSet.empty(_get_shape(v), self.n_dofs))
-            self.val_of[id(v)] = np.asarray(c)
 
     def is_nonlinear(self, var) -> bool:
         """Whether ``var`` is a non-affine (nonlinear) function of the input ``u``."""

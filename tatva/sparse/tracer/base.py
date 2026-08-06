@@ -17,14 +17,14 @@
 
 import inspect
 from collections.abc import Callable, Sequence
-from itertools import chain
-from typing import Any, Concatenate, ParamSpec, Self, cast
+from dataclasses import dataclass
+from typing import Any, Concatenate, ParamSpec, cast
 
 import jax
 import numpy as np
 import scipy.sparse as sps
 from jax import Array
-from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn
 from numpy.typing import NDArray
 
 from tatva.sparse.tracer.cache import persistent_tracer_cache
@@ -46,7 +46,23 @@ from tatva.sparse.tracer.state import (
 P = ParamSpec("P")
 
 
-class ParsedJaxpr:
+@dataclass(frozen=True)
+class JaxprTracePlan:
+    """Resolved execution plan for tracing one closed JAXpr."""
+
+    n_dofs: int
+    active_ids: set[int]
+    sub_info: SubInfoDict
+    bound_eqns: list[BoundEqn]
+
+
+class _JaxprAnalyzer:
+    """Build a :class:`JaxprTracePlan` from a closed JAXpr.
+
+    The analyzer's mutable data is deliberately confined to one ``analyze`` call.  The
+    resulting plan is the only object consumed by dependency propagation.
+    """
+
     def __init__(self, jaxpr: ClosedJaxpr, trial_test_split: int | None = None):
         self.jaxpr = jaxpr
         self.trial_test_split = trial_test_split
@@ -60,100 +76,35 @@ class ParsedJaxpr:
             )
 
         self.n_dofs = main_input_shape[0]
-        self.vars: dict[int, Var] = {}
         self.tags: dict[int, int] = {}
         self.sub_info: SubInfoDict = {}
-        self._main_id = self.get_var_id(jaxpr.jaxpr.invars[0])
-
-        # prepopulate invars, constvars, and outvars with their IDs
-        for var in chain(
-            jaxpr.jaxpr.invars[1:], jaxpr.jaxpr.constvars, jaxpr.jaxpr.outvars
-        ):
-            self.get_var_id(var)
+        self.main_input_id = id(jaxpr.jaxpr.invars[0])
 
         if trial_test_split is not None:
-            self.tags[self.main_id()] = 3  # Seed main input with both
+            self.tags[self.main_input_id] = 3  # Seed main input with both
 
-    def main(self) -> Var:
-        """Return the main input variable (the first DOF vector) of the JAXpr."""
-        return self.vars[self._main_id]
+    def analyze(self) -> JaxprTracePlan:
+        """Resolve handlers and compute the active/concrete execution plan."""
+        forward_data, active_ids, index_ids = self._analyze_and_resolve_jaxpr(
+            self.jaxpr.jaxpr
+        )
+        bound_eqns = self._propagate_active_backward(
+            forward_data, active_ids, index_ids, self.sub_info
+        )
+        return JaxprTracePlan(
+            n_dofs=self.n_dofs,
+            active_ids=active_ids,
+            sub_info=self.sub_info,
+            bound_eqns=bound_eqns,
+        )
 
-    def main_id(self) -> int:
-        """Return the ID of the main input variable (the first DOF vector) of the JAXpr."""
-        return self._main_id
-
-    def shape_of(self, var: Var | int) -> tuple[int, ...]:
-        """Return the shape of a JAXpr variable."""
-        if isinstance(var, int):
-            var = self.vars[var]
-        return _get_shape(var)
-
-    def get_var_id(self, var: Var | Literal) -> int:
-        if id(var) not in self.vars:
-            self.vars[id(var)] = var
+    @staticmethod
+    def get_var_id(var: Any) -> int:
+        """Use JAXpr object identity as the analysis key."""
         return id(var)
 
-    @property
-    def active_ids(self) -> set[int]:
-        """Return the set of active variable IDs after forward pass analysis."""
-        if not hasattr(self, "_active_ids"):
-            raise AttributeError(
-                "Active IDs have not been computed yet. Call fwd_pass() first."
-            )
-        return self._active_ids
-
-    @property
-    def index_ids(self) -> set[int]:
-        """Return the set of index variable IDs after forward pass analysis."""
-        if not hasattr(self, "_index_ids"):
-            raise AttributeError(
-                "Index IDs have not been computed yet. Call fwd_pass() first."
-            )
-        return self._index_ids
-
-    @property
-    def forward_data(self) -> list[tuple[JaxprEqn, PrimitiveHandler, bool, Any]]:
-        """Return the list of forward data tuples (eqn, handler, is_nonlinear, sub_res)
-        after forward pass analysis."""
-        if not hasattr(self, "_forward_data"):
-            raise AttributeError(
-                "Forward data has not been computed yet. Call fwd_pass() first."
-            )
-        return self._forward_data
-
-    @property
-    def bound_eqns(self) -> list[BoundEqn]:
-        """Return the list of bound equations (eqn, handler, is_active, needs_concrete)
-        after backward pass analysis."""
-        if not hasattr(self, "_bound_eqns"):
-            raise AttributeError(
-                "Bound equations have not been computed yet. Call bwd_pass() first."
-            )
-        return self._bound_eqns
-
-    def trace_eqns(self) -> list[BoundEqn]:
-        """Return the list of bound equations (eqn, handler, is_active, needs_concrete)
-        after forward and backward pass analysis."""
-        self.fwd_pass().bwd_pass()
-        return self.bound_eqns
-
-    def fwd_pass(self) -> Self:
-        """Perform the forward pass of the unified JAXpr analysis traversal."""
-        self._forward_data, self._active_ids, self._index_ids = (
-            self._analyze_and_resolve_jaxpr(self.jaxpr.jaxpr)
-        )
-        return self
-
-    def bwd_pass(self) -> Self:
-        """Perform the backward pass of the unified JAXpr analysis traversal."""
-        if not hasattr(self, "forward_data"):
-            raise AttributeError(
-                "Forward pass has not been performed yet. Call fwd_pass() first."
-            )
-        self._bound_eqns = self._propagate_active_backward(
-            self.forward_data, self._active_ids, self._index_ids, self.sub_info
-        )
-        return self
+    def main_id(self) -> int:
+        return self.main_input_id
 
     def _analyze_and_resolve_jaxpr(
         self,
@@ -412,30 +363,28 @@ def _trace_hessian_sparsity(
 ) -> sps.csr_matrix:
     """Return the sparsity pattern of d²E/du² (or tangent stiffness matrix K for virtual
     work formulations) as a CSR matrix."""
-    parsed_jaxpr = ParsedJaxpr(closed_jaxpr)
-
-    # run forward and backward passes to resolve active equations and index dependencies
-    bound_eqns = parsed_jaxpr.trace_eqns()
+    plan = _JaxprAnalyzer(closed_jaxpr, trial_test_split).analyze()
 
     # initialize tracing state
     state = TraceState(
-        parsed_jaxpr.n_dofs,
-        parsed_jaxpr.active_ids,
-        parsed_jaxpr.sub_info,
+        plan.n_dofs,
+        plan.active_ids,
+        plan.sub_info,
     )
     acc = CouplingAccumulator(
-        parsed_jaxpr.n_dofs,
+        plan.n_dofs,
     )
 
-    # Seed concrete values of the input variables (essential for dynamic gather/scatter routing of static PyTree params)
+    # Concrete values resolve dynamic gather/scatter routing; dependencies seed the DOFs.
     state.attach_concrete_values(closed_jaxpr, concrete_vals)
+    state.seed_input_dependencies(closed_jaxpr)
 
     # forward pass: propagate dep-sets through the jaxpr, recording pairs at nonlinear primitives
-    state.run_bound_eqns(bound_eqns, acc, trial_test_split)
+    state.run_bound_eqns(plan.bound_eqns, acc, trial_test_split)
 
     pat = acc.finalize()
     if pat.nnz == 0:
-        return sps.eye(parsed_jaxpr.n_dofs, format="csr", dtype=np.int8)
+        return sps.eye(plan.n_dofs, format="csr", dtype=np.int8)
     return pat
 
 
@@ -517,18 +466,18 @@ def ghost_dofs_from_jaxpr(
     if not jaxpr.invars:
         raise ValueError("The functional Jaxpr must have a first DOF-vector input.")
 
-    parsed_jaxpr = ParsedJaxpr(closed_jaxpr)
-    n_dofs = parsed_jaxpr.n_dofs
-    bound_eqns = parsed_jaxpr.trace_eqns()
+    plan = _JaxprAnalyzer(closed_jaxpr).analyze()
+    n_dofs = plan.n_dofs
     state = TraceState(
-        parsed_jaxpr.n_dofs,
-        parsed_jaxpr.active_ids,
-        parsed_jaxpr.sub_info,
+        plan.n_dofs,
+        plan.active_ids,
+        plan.sub_info,
     )
     state.attach_concrete_values(closed_jaxpr, list(concrete_vals))
-    state.run_bound_eqns(bound_eqns, CouplingAccumulator(n_dofs))
+    state.seed_input_dependencies(closed_jaxpr)
+    state.run_bound_eqns(plan.bound_eqns, CouplingAccumulator(n_dofs))
 
-    roots = find_contribution_roots(jaxpr, bound_eqns, state)
+    roots = find_contribution_roots(jaxpr, plan.bound_eqns, state)
     contribution_deps = [state.get(root.var).dep[root.rows] for root in roots]
 
     partition = _validate_partition_map(part_map, n_dofs)
@@ -663,9 +612,7 @@ def pattern_from_virtual_work(
     dummy_w = np.zeros(combined_dofs)
     closed = jax.make_jaxpr(w_fn)(dummy_w)
     _tracer_fn = persistent_tracer_cache(skip_cache=skip_cache)(_trace_hessian_sparsity)
-    H_w: sps.csr_matrix = _tracer_fn(
-        closed, (combined_dofs,), (dummy_w,), trial_test_split=n_dofs
-    )
+    H_w: sps.csr_matrix = _tracer_fn(closed, (dummy_w,), trial_test_split=n_dofs)
 
     # Extract the cross-coupling block (v-derivatives vs u-derivatives)
     K_uv = H_w[n_dofs:, :n_dofs].tocsr()
