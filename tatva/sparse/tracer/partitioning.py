@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, TypeAlias, overload
 
 import numpy as np
 from jax.extend.core import Jaxpr, JaxprEqn
@@ -16,9 +16,75 @@ if TYPE_CHECKING:
     from tatva.sparse.tracer.state import BoundEqn, TraceState
 
 
+@dataclass(frozen=True)
+class AllRows:
+    """Every flat entry of a variable, represented without an index array."""
+
+    size: int
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __array__(self, dtype=None) -> NDArray[np.int64]:
+        return np.arange(self.size, dtype=dtype or np.int64)
+
+    def __getitem__(self, key):
+        return key
+
+
+@dataclass(frozen=True)
+class RangeRows:
+    """A contiguous half-open range of flat entries without materialization."""
+
+    start: int
+    stop: int
+
+    def __post_init__(self) -> None:
+        if self.start < 0 or self.stop < self.start:
+            raise ValueError("RangeRows must be a non-negative half-open range.")
+
+    def __len__(self) -> int:
+        return self.stop - self.start
+
+    @property
+    def size(self) -> int:
+        return self.stop - self.start
+
+    def __array__(self, dtype=None) -> NDArray[np.int64]:
+        return np.arange(self.start, self.stop, dtype=dtype or np.int64)
+
+    def __getitem__(self, key):
+        return key + self.start
+
+
+RowSelection: TypeAlias = NDArray[np.int64] | AllRows | RangeRows
+
+
 @dataclass
 class ContributionDemand:
-    rows: NDArray[np.int64]
+    """Demanded entries, stored explicitly or with a compact row selector."""
+
+    rows: RowSelection
+
+    def __len__(self) -> int:
+        rows = self.rows
+        return len(rows) if isinstance(rows, (AllRows, RangeRows)) else rows.size
+
+    def is_all_rows(self) -> bool:
+        return isinstance(self.rows, AllRows)
+
+    def is_range_rows(self) -> bool:
+        return isinstance(self.rows, RangeRows)
+
+
+def demand_rows(demand: ContributionDemand) -> NDArray[np.int64]:
+    """Materialize rows only at handlers requiring arbitrary index routing."""
+    rows = demand.rows
+    if isinstance(rows, AllRows):
+        return np.arange(rows.size, dtype=np.int64)
+    if isinstance(rows, RangeRows):
+        return np.arange(rows.start, rows.stop, dtype=np.int64)
+    return rows
 
 
 @dataclass
@@ -92,8 +158,19 @@ def _demand(rows: NDArray[np.integer]) -> ContributionDemand | None:
     # Most liveness rules preserve an already canonical demand (or create an
     # ``arange``).  Avoid allocating a hash table/sorted copy on that hot path.
     if rows.size == 1 or np.all(rows[1:] > rows[:-1]):
+        if rows.size > 1 and rows[-1] - rows[0] + 1 == rows.size:
+            return ContributionDemand(RangeRows(int(rows[0]), int(rows[-1]) + 1))
         return ContributionDemand(rows)
     return ContributionDemand(np.unique(rows))
+
+
+def _demand_in_bounds(demand: ContributionDemand, size: int) -> bool:
+    """Check bounds without materializing compact full/range demands."""
+    if isinstance(demand.rows, AllRows):
+        return demand.rows.size == size
+    if isinstance(demand.rows, RangeRows):
+        return demand.rows.stop <= size
+    return not np.any((demand.rows < 0) | (demand.rows >= size))
 
 
 def _invalid_contribution(eqn: JaxprEqn) -> ContributionPropagation:
@@ -156,9 +233,11 @@ def merge_demands(
     left: ContributionDemand | None, right: ContributionDemand
 ) -> ContributionDemand: ...
 @overload
+def merge_demands(left: ContributionDemand, right: None) -> ContributionDemand: ...
+@overload
 def merge_demands(
-    left: ContributionDemand, right: ContributionDemand | None
-) -> ContributionDemand: ...
+    left: ContributionDemand | None, right: ContributionDemand | None
+) -> ContributionDemand | None: ...
 def merge_demands(
     left: ContributionDemand | None, right: ContributionDemand | None
 ) -> ContributionDemand | None:
@@ -167,9 +246,25 @@ def merge_demands(
         return right
     if right is None:
         return left
-    if left is right or np.array_equal(left.rows, right.rows):
+    if isinstance(left.rows, AllRows):
         return left
-    return ContributionDemand(np.union1d(left.rows, right.rows).astype(np.int64))
+    if isinstance(right.rows, AllRows):
+        return right
+    if (
+        isinstance(left.rows, RangeRows)
+        and isinstance(right.rows, RangeRows)
+        and right.rows.start <= left.rows.stop
+        and left.rows.start <= right.rows.stop
+    ):
+        return ContributionDemand(
+            RangeRows(
+                min(left.rows.start, right.rows.start),
+                max(left.rows.stop, right.rows.stop),
+            )
+        )
+    if left is right or np.array_equal(demand_rows(left), demand_rows(right)):
+        return left
+    return _demand(np.union1d(demand_rows(left), demand_rows(right)).astype(np.int64))
 
 
 def merge_contribution_roots(
@@ -186,7 +281,7 @@ def merge_contribution_roots(
                 ContributionDemand(previous.rows), ContributionDemand(root.rows)
             )
             assert demand is not None
-            merged[id(root.var)] = ContributionRoot(root.var, demand.rows)
+            merged[id(root.var)] = ContributionRoot(root.var, demand_rows(demand))
     return list(merged.values())
 
 
@@ -223,7 +318,7 @@ def find_contribution_roots(
         result = handler.propagate_contribution_demand(eqn, state, out_demands)
         if not result.valid:
             roots.extend(
-                ContributionRoot(outvar, demand.rows)
+                ContributionRoot(outvar, demand_rows(demand))
                 for outvar, demand in zip(eqn.outvars, out_demands)
                 if demand is not None
             )
@@ -238,7 +333,7 @@ def find_contribution_roots(
     for var in (*jaxpr.invars, *jaxpr.constvars):
         demand = demand_of.get(id(var))
         if demand is not None and not state.is_inactive(var):
-            roots.append(ContributionRoot(var, demand.rows))
+            roots.append(ContributionRoot(var, demand_rows(demand)))
 
     return merge_contribution_roots(roots)
 
@@ -456,7 +551,7 @@ def _propagate_demands_backward(
         for var, demand in zip(eqn.outvars, out_demands):
             if demand is not None:
                 size = int(np.prod(_get_shape(var)))
-                if np.any((demand.rows < 0) | (demand.rows >= size)):
+                if not _demand_in_bounds(demand, size):
                     raise ValueError(
                         f"{eqn.primitive.name} received out-of-range output rows."
                     )
@@ -472,38 +567,12 @@ def _propagate_demands_backward(
                 f"{len(eqn.invars)} inputs."
             )
 
-        out_count = sum(
-            len(d.rows)
-            for d in out_demands
-            if d is not None
-        )
-
-        for i, (invar, demand) in enumerate(zip(eqn.invars, in_demands)):
-            if demand is None:
-                continue
-
-            total = int(np.prod(_get_shape(invar)))
-            demanded = len(demand.rows)
-
-            if total >= 100 and demanded / total > 0.9:
-                print(
-                    eqn.primitive.name,
-                    {
-                        "index": i,
-                        "shape": _get_shape(invar),
-                        "demanded": demanded,
-                        "total": total,
-                        "fraction": demanded / total,
-                        "out_count": out_count,
-                    },
-                )
-
         for invar, demand in zip(eqn.invars, in_demands):
             if demand is None:
                 continue
 
             size = int(np.prod(_get_shape(invar)))
-            if np.any((demand.rows < 0) | (demand.rows >= size)):
+            if not _demand_in_bounds(demand, size):
                 raise ValueError(
                     f"{eqn.primitive.name} produced out-of-range input rows."
                 )

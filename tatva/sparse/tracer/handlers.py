@@ -43,11 +43,14 @@ from tatva.sparse.tracer.common import (
     scatter_routes,
 )
 from tatva.sparse.tracer.partitioning import (
+    AllRows,
     ContributionDemand,
     ContributionPropagation,
     ContributionRoot,
+    RangeRows,
     _demand,
     _invalid_contribution,
+    demand_rows,
     merge_demands,
     propagate_demands_backward,
 )
@@ -80,6 +83,15 @@ def _eval_div(a, b, **_params):
     ):
         return np.floor_divide(a_arr, b_arr)
     return np.true_divide(a_arr, b_arr)
+
+
+def _inverse_elementwise_demand(demand, in_shape: tuple, out_shape: tuple):
+    """Reverse broadcast mapping with compact identity/scalar fast paths."""
+    if in_shape == out_shape:
+        return demand
+    if int(np.prod(in_shape)) == 1:
+        return ContributionDemand(RangeRows(0, 1))
+    return _demand(_inverse_elementwise_rows(demand.rows, in_shape, out_shape))
 
 
 # =============================================================================
@@ -132,8 +144,8 @@ class PrimitiveHandler(ABC):
             if isinstance(var, Literal):
                 result.append(None)
                 continue
-            size = _get_shape(var)[0]
-            result.append(_demand(np.arange(size, dtype=np.int64)))
+            size = int(np.prod(_get_shape(var)))
+            result.append(ContributionDemand(AllRows(size)) if size else None)
         return result
 
     def safe_eval_concrete(
@@ -288,7 +300,7 @@ class ElementWiseZeroDependencyHandler(ZeroDependencyHandler):
         return [
             None
             if isinstance(var, Literal)
-            else _demand(_inverse_elementwise_rows(demand.rows, _get_shape(var), oshp))
+            else _inverse_elementwise_demand(demand, _get_shape(var), oshp)
             for var in eqn.invars
         ]
 
@@ -404,7 +416,7 @@ class ElementwiseUnary(PrimitiveHandler):
             np.prod(_get_shape(eqn.outvars[0]))
         ):
             return super().propagate_liveness_demand(eqn, state, out_demands)
-        return [_demand(demand.rows)]
+        return [demand]
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         return self.is_nonlinear and bool(invar_active) and invar_active[0]
@@ -519,9 +531,7 @@ class ElementwiseBinary(PrimitiveHandler):
         return [
             None
             if isinstance(var, Literal)
-            else _demand(
-                _inverse_elementwise_rows(demand.rows, _get_shape(var), out_shape)
-            )
+            else _inverse_elementwise_demand(demand, _get_shape(var), out_shape)
             for var in eqn.invars
         ]
 
@@ -580,7 +590,7 @@ class IntegerPowHandler(PrimitiveHandler):
         return _invalid_contribution(eqn)
 
     def propagate_liveness_demand(self, eqn, state, out_demands):
-        return [_demand(out_demands[0].rows) if out_demands[0] is not None else None]
+        return [out_demands[0]]
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         y = eqn.params.get("y", 0)
@@ -650,6 +660,10 @@ class BroadcastHandler(PrimitiveHandler):
         demand = out_demands[0]
         if demand is None:
             return [None]
+        if _get_shape(eqn.invars[0]) == _get_shape(eqn.outvars[0]):
+            return [demand]
+        if int(np.prod(_get_shape(eqn.invars[0]))) == 1:
+            return [ContributionDemand(RangeRows(0, 1))]
         return [
             _demand(
                 _inverse_broadcast_rows(
@@ -699,21 +713,40 @@ class TransposeHandler(PrimitiveHandler):
         in_coords = [None] * len(in_shape)
         for out_axis, in_axis in enumerate(eqn.params["permutation"]):
             in_coords[in_axis] = out_coords[out_axis]
-        rows = np.ravel_multi_index(tuple(in_coords), in_shape)
+        rows = np.ravel_multi_index(
+            tuple(cast(NDArray, coord) for coord in in_coords), in_shape
+        )
         return ContributionPropagation([_demand(rows)], [])
 
     def propagate_liveness_demand(
-        self, eqn: JaxprEqn, state: TraceState, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
+        if tuple(eqn.params["permutation"]) == tuple(
+            range(len(_get_shape(eqn.invars[0])))
+        ):
+            return [demand]
+        if demand.is_all_rows():
+            return [
+                ContributionDemand(AllRows(int(np.prod(_get_shape(eqn.invars[0])))))
+            ]
         in_shape = _get_shape(eqn.invars[0])
         out_coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
         in_coords = [None] * len(in_shape)
         for out_axis, in_axis in enumerate(eqn.params["permutation"]):
             in_coords[in_axis] = out_coords[out_axis]
-        return [_demand(np.ravel_multi_index(tuple(in_coords), in_shape))]
+        return [
+            _demand(
+                np.ravel_multi_index(
+                    tuple(cast(NDArray, coord) for coord in in_coords), in_shape
+                )
+            )
+        ]
 
 
 @TR.register(
@@ -779,6 +812,20 @@ class SliceHandler(PrimitiveHandler):
         if demand is None:
             return [None]
         in_shape = _get_shape(eqn.invars[0])
+        if len(in_shape) == 1 and (demand.is_all_rows() or demand.is_range_rows()):
+            stride = (eqn.params["strides"] or (1,))[0]
+            start = (
+                eqn.params["start_indices"][0] + demand.rows.start * stride
+                if demand.is_range_rows()
+                else eqn.params["start_indices"][0]
+            )
+            stop = (
+                eqn.params["start_indices"][0] + demand.rows.stop * stride
+                if demand.is_range_rows()
+                else eqn.params["limit_indices"][0]
+            )
+            if stride == 1:
+                return [ContributionDemand(RangeRows(int(start), int(stop)))]
         coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
         strides = eqn.params["strides"] or (1,) * len(in_shape)
         source = tuple(
@@ -835,6 +882,11 @@ class ReverseHandler(PrimitiveHandler):
         )
 
     def propagate_liveness_demand(self, eqn, state, out_demands):
+        demand = out_demands[0]
+        if demand.is_all_rows():
+            return [
+                ContributionDemand(AllRows(int(np.prod(_get_shape(eqn.invars[0])))))
+            ]
         result = self.propagate_contribution_demand(eqn, state, out_demands)
         return result.in_demands
 
@@ -1011,6 +1063,30 @@ class ConcatenateHandler(PrimitiveHandler):
         if demand is None:
             return [None] * len(eqn.invars)
         shapes = [_get_shape(v) for v in eqn.invars]
+        axis = eqn.params.get("dimension", 0)
+        # Axis-zero concatenation preserves each input's contiguous C-order
+        # interval.  Keep full/range demands compact instead of constructing the
+        # whole source-ID routing tensor.
+        # Purely performance optimization!
+        if axis == 0 and (demand.is_all_rows() or demand.is_range_rows()):
+            start = demand.rows.start if demand.is_range_rows() else 0
+            stop = (
+                demand.rows.stop
+                if demand.is_range_rows()
+                else int(np.prod(_get_shape(eqn.outvars[0])))
+            )
+            result: list[ContributionDemand | None] = []
+            offset = 0
+            for shape, var in zip(shapes, eqn.invars):
+                size = int(np.prod(shape))
+                lo, hi = max(start, offset), min(stop, offset + size)
+                result.append(
+                    None
+                    if isinstance(var, Literal) or lo >= hi
+                    else ContributionDemand(RangeRows(lo - offset, hi - offset))
+                )
+                offset += size
+            return result
         offsets, index_parts = 0, []
         for shape in shapes:
             size = int(np.prod(shape))
@@ -1089,6 +1165,13 @@ class StackHandler(PrimitiveHandler):
         )
 
     def propagate_liveness_demand(self, eqn, state, out_demands):
+        if out_demands[0] is not None and out_demands[0].is_all_rows():
+            return [
+                None
+                if isinstance(var, Literal)
+                else ContributionDemand(AllRows(int(np.prod(_get_shape(var)))))
+                for var in eqn.invars
+            ]
         return self.propagate_contribution_demand(eqn, state, out_demands).in_demands
 
 
@@ -1230,7 +1313,7 @@ class GatherHandler(PrimitiveHandler):
         indices = state.get_val(indices_var)
 
         if indices is not None:
-            routes = gather_routes(eqn, np.asarray(indices), demand.rows)
+            routes = gather_routes(eqn, np.asarray(indices), demand_rows(demand))
 
             if routes is not None:
                 source_rows, index_rows = routes
@@ -1391,7 +1474,7 @@ class ScatterHandler(PrimitiveHandler):
         if demand is None:
             return [None] * len(eqn.invars)
         operand, indices, updates = eqn.invars[:3]
-        base = None if isinstance(operand, Literal) else _demand(demand.rows)
+        base = None if isinstance(operand, Literal) else demand
         if isinstance(indices, Literal) or isinstance(updates, Literal):
             return [base, None, None]
         concrete_indices = state.get_val(indices)
@@ -1409,7 +1492,12 @@ class ScatterHandler(PrimitiveHandler):
                 selected_routes = scatter_routes(eqn, concrete_indices, update_rows)
                 if selected_routes is not None:
                     _selected_targets, selected_index_rows = selected_routes
-                    return [base, _demand(selected_index_rows), _demand(update_rows)]
+                    if selected_index_rows is not None:
+                        return [
+                            base,
+                            _demand(selected_index_rows),
+                            _demand(update_rows),
+                        ]
         return [
             base,
             _demand(np.arange(int(np.prod(_get_shape(indices))), dtype=np.int64)),
@@ -1498,9 +1586,7 @@ class SelectNHandler(PrimitiveHandler):
         return [
             None
             if isinstance(v, Literal)
-            else _demand(
-                _inverse_elementwise_rows(demand.rows, _get_shape(v), out_shape)
-            )
+            else _inverse_elementwise_demand(demand, _get_shape(v), out_shape)
             for v in eqn.invars
         ]
 
@@ -1748,9 +1834,11 @@ class ReductionHandler(PrimitiveHandler):
         if demand is None:
             return [None]
         in_shape = _get_shape(eqn.invars[0])
+        if demand.is_all_rows():
+            return [ContributionDemand(AllRows(int(np.prod(in_shape))))]
         if "axes" not in eqn.params:
             # reduce_window_* has window geometry rather than reduction axes.
-            return [_demand(np.arange(int(np.prod(in_shape)), dtype=np.int64))]
+            return [ContributionDemand(AllRows(int(np.prod(in_shape))))]
         axes = set(eqn.params.get("axes", ()))
         kept = [axis for axis in range(len(in_shape)) if axis not in axes]
         out_shape = _get_shape(eqn.outvars[0])
@@ -1879,7 +1967,7 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             else:
                 block_size = int(np.prod(out_shape[len(batch_shape) :]))
 
-            demanded_batches.append(np.unique(demand.rows // block_size))
+            demanded_batches.append(np.unique(demand_rows(demand) // block_size))
 
         if not demanded_batches:
             return [None]
@@ -1925,7 +2013,7 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             if block_size == 0:
                 continue
 
-            ids = np.unique(demand.rows // block_size)
+            ids = np.unique(demand_rows(demand) // block_size)
 
             if np.any(ids >= n_batches):
                 return None
@@ -2024,7 +2112,7 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
         if n_batches == 0 or output_event_size == 0:
             return [None] * len(eqn.invars)
 
-        batch_ids = np.unique(demand.rows // output_event_size).astype(np.int64)
+        batch_ids = np.unique(demand_rows(demand) // output_event_size).astype(np.int64)
 
         if np.any(batch_ids < 0) or np.any(batch_ids >= n_batches):
             return None
@@ -2163,23 +2251,6 @@ class SubJaxprHandler(PrimitiveHandler):
         sub, sub_consts = _subjaxpr_and_consts(eqn)
         info = cast(SubEqnInfo, state.sub_info[id(eqn)])
 
-        if info is None:
-            print(
-                "JIT LIVENESS FALLBACK:",
-                id(eqn),
-                eqn.primitive.name,
-                [_get_shape(v) for v in eqn.invars],
-                [_get_shape(v) for v in eqn.outvars],
-            )
-            return super().propagate_liveness_demand(eqn, state, out_demands)
-        else:
-            print(
-                "sub_info size:",
-                len(state.sub_info),
-                "eqn in sub_info:",
-                id(eqn) in state.sub_info,
-            )
-
         _active, _indices, bound = info
         sub_state = TraceState(state.n_dofs, set(), state.sub_info, state.nonlinear_ids)
         for parent, child in zip(eqn.invars, sub.invars):
@@ -2196,16 +2267,6 @@ class SubJaxprHandler(PrimitiveHandler):
             if not any(outgoing):
                 continue
             incoming = handler.propagate_liveness_demand(subeqn, sub_state, outgoing)
-            print(
-                "JIT BODY:",
-                subeqn.primitive.name,
-                "out:",
-                [None if d is None else len(d.rows) for d in outgoing],
-                "in:",
-                [None if d is None else len(d.rows) for d in incoming],
-                "shapes:",
-                [_get_shape(v) for v in subeqn.invars],
-            )
             for var, required in zip(subeqn.invars, incoming):
                 if required is not None:
                     demands[id(var)] = merge_demands(demands.get(id(var)), required)
@@ -2657,7 +2718,7 @@ class ScanMapHandler(PrimitiveHandler):
                     or int(np.prod(parent_shape[1:])) != body_size
                 ):
                     raise ValueError("incompatible stacked scan output shape")
-                iterations, body_rows = divmod(demand.rows, body_size)
+                iterations, body_rows = divmod(demand_rows(demand), body_size)
                 for iteration in np.unique(iterations):
                     rows = body_rows[iterations == iteration]
                     seed = _demand(rows)
@@ -2725,7 +2786,7 @@ class ScanMapHandler(PrimitiveHandler):
                         continue
                     input_index = xs_start + offset
                     body_size = int(np.prod(_get_shape(body_input)))
-                    parent_rows = iteration * body_size + required.rows
+                    parent_rows = iteration * body_size + demand_rows(required)
                     mapped = _demand(parent_rows)
                     in_demands[input_index] = merge_demands(
                         in_demands[input_index], mapped
