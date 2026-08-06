@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Any, cast
 
 import jax.core
@@ -27,7 +27,6 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
 import scipy.special as sp
-from jax.experimental.hijax import Zero
 from jax.extend.core import JaxprEqn, Literal, Primitive
 from numpy.typing import NDArray
 
@@ -41,6 +40,7 @@ from tatva.sparse.tracer.common import (
     _reduce_union_over_axes,
     _subjaxpr_and_consts,
     gather_routes,
+    scatter_routes,
 )
 from tatva.sparse.tracer.partitioning import (
     ContributionDemand,
@@ -132,7 +132,7 @@ class PrimitiveHandler(ABC):
             if isinstance(var, Literal):
                 result.append(None)
                 continue
-            size = state.get(var).dep.shape[0]
+            size = _get_shape(var)[0]
             result.append(_demand(np.arange(size, dtype=np.int64)))
         return result
 
@@ -1360,50 +1360,23 @@ class ScatterHandler(PrimitiveHandler):
         idx = state.get_val(eqn.invars[1])
 
         if idx is not None and d_tgt.dep.shape[0] > 1:
-            try:
-                idx_flat = idx.ravel().astype(int)
-                if len(idx_flat) == d_vals.dep.shape[0]:
-                    coo_vals = d_vals.dep.tocoo()
-                    row_mapped = idx_flat[coo_vals.row]
-                    valid = (row_mapped >= 0) & (row_mapped < d_tgt.dep.shape[0])
-                    scattered_row = row_mapped[valid]
-                    scattered_col = coo_vals.col[valid]
-                    scattered_data = coo_vals.data[valid]
-
-                    scattered_mat = sps.csr_matrix(
-                        (scattered_data, (scattered_row, scattered_col)),
-                        shape=d_tgt.dep.shape,
-                    )
-                    res_dep = (d_tgt.dep + scattered_mat).tocsr()
-                else:
-                    valid_idx = idx_flat[
-                        (idx_flat >= 0) & (idx_flat < d_tgt.dep.shape[0])
-                    ]
-                    if len(valid_idx) > 0:
-                        coo_u = u_vals.tocoo()
-                        u_cols = coo_u.col
-                        u_data = coo_u.data
-
-                        scattered_row = np.repeat(valid_idx, len(u_cols))
-                        scattered_col = np.tile(u_cols, len(valid_idx))
-                        scattered_data = np.tile(u_data, len(valid_idx))
-
-                        scattered_mat = sps.csr_matrix(
-                            (scattered_data, (scattered_row, scattered_col)),
-                            shape=d_tgt.dep.shape,
-                        )
-                        res_dep = (d_tgt.dep + scattered_mat).tocsr()
-                    else:
-                        res_dep = d_tgt.dep.copy()
-
+            routes = scatter_routes(eqn, idx, include_index_rows=False)
+            if routes is not None:
+                target_rows, _index_rows = routes
+                coo_vals = d_vals.dep.tocoo()
+                mapped = target_rows[coo_vals.row]
+                valid = mapped >= 0
+                scattered_mat = sps.csr_matrix(
+                    (coo_vals.data[valid], (mapped[valid], coo_vals.col[valid])),
+                    shape=d_tgt.dep.shape,
+                )
+                res_dep = (d_tgt.dep + scattered_mat).tocsr()
                 res_dep.data[:] = 1
                 res = SparseDepSet(res_dep, oshp)
                 state.set(eqn.outvars[0], res)
                 if nonlinear:
                     res.record_couplings(acc, execution.trial_test_split)
                 return
-            except (KeyError, IndexError, ValueError, TypeError, AttributeError):
-                pass
 
         result = d_tgt.dep + _broadcast_single_row(u_vals, int(np.prod(oshp)))
         res_dep = result.tocsr()
@@ -1417,13 +1390,30 @@ class ScatterHandler(PrimitiveHandler):
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
-        # Base entries remain required for a read-modify-write scatter.  Exact
-        # update routing varies by ScatterDimensionNumbers, so retain all updates
-        # and indices; this is conservative for every scatter mode.
+        operand, indices, updates = eqn.invars[:3]
+        base = None if isinstance(operand, Literal) else _demand(demand.rows)
+        if isinstance(indices, Literal) or isinstance(updates, Literal):
+            return [base, None, None]
+        concrete_indices = state.get_val(indices)
+        if concrete_indices is not None:
+            # First pass only identifies update rows that land in the live
+            # output set.  Index rows are needed only for that selected subset.
+            routes = scatter_routes(eqn, concrete_indices, include_index_rows=False)
+            if routes is not None:
+                target_rows, _index_rows = routes
+                update_rows = np.flatnonzero(np.isin(target_rows, demand.rows)).astype(
+                    np.int64
+                )
+                # Reroute only selected updates so the index demand excludes
+                # index vectors used solely by dead updates.
+                selected_routes = scatter_routes(eqn, concrete_indices, update_rows)
+                if selected_routes is not None:
+                    _selected_targets, selected_index_rows = selected_routes
+                    return [base, _demand(selected_index_rows), _demand(update_rows)]
         return [
-            _demand(demand.rows),
-            _demand(np.arange(state.get(eqn.invars[1]).dep.shape[0])),
-            _demand(np.arange(state.get(eqn.invars[2]).dep.shape[0])),
+            base,
+            _demand(np.arange(int(np.prod(_get_shape(indices))), dtype=np.int64)),
+            _demand(np.arange(int(np.prod(_get_shape(updates))), dtype=np.int64)),
         ]
 
 

@@ -493,3 +493,147 @@ def gather_routes(
         ).astype(np.int64)
 
     return source_rows, np.unique(index_rows).astype(np.int64)
+
+
+def scatter_routes(
+    eqn: JaxprEqn,
+    indices: NDArray,
+    update_rows: NDArray | None = None,
+    *,
+    include_index_rows: bool = True,
+) -> tuple[NDArray[np.int64], NDArray[np.int64] | None] | None:
+    """Map update entries to operand entries for a JAX scatter.
+
+    ``target_rows`` is aligned with ``update_rows`` (or every flattened update
+    entry when omitted); invalid, dropped routes are represented by ``-1``.
+    The second result is the canonical set of flattened index-tensor entries
+    needed for those routes.  Forward support propagation only needs targets,
+    so it can disable index-row construction (and its costly canonicalization).
+    This is deliberately shared by forward support propagation and reverse
+    liveness so ScatterDimensionNumbers have one interpretation in the tracer.
+    """
+    if len(eqn.invars) < 3 or not eqn.outvars:
+        return None
+    operand_shape = tuple(_get_shape(eqn.invars[0]))
+    indices_shape = tuple(_get_shape(eqn.invars[1]))
+    updates_shape = tuple(_get_shape(eqn.invars[2]))
+    indices = np.asarray(indices)
+
+    if indices.ndim < 1 or tuple(indices.shape) != indices_shape:
+        return None
+
+    try:
+        dnums = eqn.params["dimension_numbers"]
+        window_dims = tuple(int(x) for x in dnums.update_window_dims)
+        inserted = tuple(int(x) for x in dnums.inserted_window_dims)
+        scatter_to_operand = tuple(int(x) for x in dnums.scatter_dims_to_operand_dims)
+        operand_batch = tuple(int(x) for x in dnums.operand_batching_dims)
+        indices_batch = tuple(int(x) for x in dnums.scatter_indices_batching_dims)
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+    if len(indices_shape) < 1 or indices_shape[-1] != len(scatter_to_operand):
+        return None
+    if len(operand_batch) != len(indices_batch):
+        return None
+
+    n_updates = int(np.prod(updates_shape))
+    rows = (
+        np.arange(n_updates, dtype=np.int64)
+        if update_rows is None
+        else np.asarray(update_rows, dtype=np.int64)
+    )
+    if np.any((rows < 0) | (rows >= n_updates)):
+        return None
+
+    try:
+        update_coords = np.unravel_index(rows, updates_shape)
+
+        # Each non-window update dimension corresponds positionally to an
+        # indices batch dimension.  This is JAX's shape-rule construction.
+        scatter_dim_in_updates: list[int | None] = list(range(len(indices_shape) - 1))
+
+        for axis in window_dims:
+            scatter_dim_in_updates.insert(axis, None)
+
+        if len(scatter_dim_in_updates) != len(updates_shape):
+            return None
+
+        index_coords = [
+            update_coords[axis]
+            for axis in range(len(updates_shape))
+            if scatter_dim_in_updates[axis] is not None
+        ]
+
+        if len(index_coords) != len(indices_shape) - 1:
+            return None
+
+        index_base = tuple(index_coords)
+        index_vector = indices[index_base]  # one vector for every update entry
+        target_coords = [np.zeros(rows.size, dtype=np.int64) for _ in operand_shape]
+
+        for operand_axis, indices_axis in zip(operand_batch, indices_batch):
+            target_coords[operand_axis] = index_coords[indices_axis]
+
+        for component, operand_axis in enumerate(scatter_to_operand):
+            target_coords[operand_axis] = np.asarray(
+                index_vector[..., component], dtype=np.int64
+            )
+        window_operand_axes = [
+            axis
+            for axis in range(len(operand_shape))
+            if axis not in inserted and axis not in operand_batch
+        ]
+        if len(window_operand_axes) != len(window_dims):
+            return None
+
+        for update_axis, operand_axis in zip(window_dims, window_operand_axes):
+            target_coords[operand_axis] += update_coords[update_axis]
+
+        valid = np.ones(rows.size, dtype=bool)
+
+        for coord, size in zip(target_coords, operand_shape):
+            valid &= (coord >= 0) & (coord < size)
+
+        target_rows = np.full(rows.size, -1, dtype=np.int64)
+        if np.any(valid):
+            target_rows[valid] = np.ravel_multi_index(
+                tuple(coord[valid] for coord in target_coords), operand_shape
+            )
+
+        if not include_index_rows:
+            return target_rows, None
+
+        components = np.arange(indices_shape[-1], dtype=np.int64)
+
+        # Give every batch coordinate an explicit trailing axis.  Without it,
+        # NumPy broadcasts ``(n,)`` against ``(n, 1)`` to ``(n, n)`` instead of
+        # the intended ``(n, index_vector_size)`` index-vector table.
+        index_base_columns = tuple(
+            np.asarray(coord, dtype=np.int64)[:, None] for coord in index_base
+        )
+        index_rows = np.ravel_multi_index(
+            (*index_base_columns, components[None, :]),
+            indices_shape,
+        ).ravel()
+
+        # ``np.unique`` takes a disproportionately expensive hash-based path
+        # for these large integer vectors on supported NumPy versions.  Scatter
+        # index rows are flat C-order integers, so sorting then de-duplicating
+        # is both canonical and substantially faster.
+        if not index_rows.size:
+            return target_rows, np.empty(0, dtype=np.int64)
+        index_rows = index_rows.astype(np.int64, copy=False)
+
+        # Requested update rows are normally C-order, which makes their index
+        # vectors monotonic as well (including repeated window entries).
+        # Preserve that common case without a costly sort/copy.
+        if not np.all(index_rows[1:] >= index_rows[:-1]):
+            index_rows = np.sort(index_rows)
+
+        index_rows = index_rows[
+            np.concatenate(([True], index_rows[1:] != index_rows[:-1]))
+        ]
+        return target_rows, index_rows
+    except (ValueError, IndexError, TypeError):
+        return None
