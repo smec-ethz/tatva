@@ -44,6 +44,7 @@ from tatva.sparse.tracer.state import (
     DistributionState,
     SparseDepSet,
     SubEqnInfo,
+    TraceExecution,
     TraceState,
 )
 
@@ -215,7 +216,7 @@ class PrimitiveHandler(ABC):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         """Forward dependency set propagation & coupling accumulation."""
         raise NotImplementedError
@@ -254,9 +255,6 @@ class PrimitiveHandler(ABC):
             # implementation above.
             v = [np.asarray(x) for x in in_vals]
             res = np.asarray(primitive.bind(*[jnp.asarray(x) for x in v], **params))
-            warnings.warn(
-                f"Concrete evaluation through bind needed for {primitive.name}"
-            )
             return res
         except (TypeError, ValueError, KeyError, AttributeError):
             warnings.warn(f"Concrete evaluation failed for {primitive.name}")
@@ -348,7 +346,7 @@ class NoOpHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         return
 
@@ -392,7 +390,7 @@ class ZeroDependencyHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         for ov in eqn.outvars:
             oshp = _get_shape(ov)
@@ -486,7 +484,7 @@ class ElementwiseUnary(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = state.get(eqn.invars[0])
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
@@ -499,7 +497,7 @@ class ElementwiseUnary(PrimitiveHandler):
         state.set(eqn.outvars[0], dep_out.copy())
 
         if self.is_nonlinear:
-            dep_out.record_couplings(acc, trial_test_split)
+            dep_out.record_couplings(acc, execution.trial_test_split)
 
     def propagate_contribution_demand(
         self, eqn, state, out_demands
@@ -571,7 +569,7 @@ class ElementwiseBinary(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
@@ -592,7 +590,7 @@ class ElementwiseBinary(PrimitiveHandler):
             ):
                 is_linear = True
             if not is_linear:
-                res.record_couplings(acc, trial_test_split)
+                res.record_couplings(acc, execution.trial_test_split)
 
     def propagate_contribution_demand(
         self, eqn, state, out_demands
@@ -660,12 +658,12 @@ class IntegerPowHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = state.get(eqn.invars[0])
         state.set(eqn.outvars[0], in_d.copy())
         if self.introduces_nonlinearity(eqn, [in_d.dep.nnz > 0]):
-            in_d.record_couplings(acc, trial_test_split)
+            in_d.record_couplings(acc, execution.trial_test_split)
 
     def propagate_contribution_demand(
         self, eqn, state, out_demands
@@ -708,7 +706,7 @@ class BroadcastHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = state.get(eqn.invars[0])
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
@@ -795,7 +793,7 @@ class TransposeHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = state.get(eqn.invars[0])
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
@@ -836,7 +834,7 @@ class SliceHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = state.get(eqn.invars[0])
         par = eqn.params
@@ -958,7 +956,7 @@ class ReverseHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = state.get(eqn.invars[0])
         dimensions = eqn.params["dimensions"]
@@ -1005,7 +1003,7 @@ class PadHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = state.get(eqn.invars[0])
         low, high, interior = zip(*eqn.params["padding_config"])
@@ -1089,7 +1087,7 @@ class ConcatenateHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
         axis = eqn.params.get("dimension", 0)
@@ -1111,8 +1109,6 @@ class ConcatenateHandler(PrimitiveHandler):
     def eval_concrete(
         self, in_vals: list[NDArray | None], params: dict[str, Any]
     ) -> NDArray | None:
-        if any(v is None for v in in_vals):
-            return None
         return np.concatenate(in_vals, axis=params.get("dimension", 0))
 
     def propagate_contribution_demand(
@@ -1156,7 +1152,7 @@ class StackHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         """``stack`` inserts a new axis and places input ``i`` at position ``i`` along it —
         purely structural, so each stacked slice keeps its own per-element support (no
@@ -1212,7 +1208,7 @@ class SplitHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         """``split`` (``jnp.split``) cuts one array into several along ``axis`` -- the exact
         inverse of ``concatenate``, and just as structural: every output element *is* one
@@ -1325,7 +1321,7 @@ class GatherHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
         d_src = in_d[0]
@@ -1347,9 +1343,9 @@ class GatherHandler(PrimitiveHandler):
                     rows = np.clip(idx.ravel().astype(int), 0, d_src.shape[0] - 1)
                     slc = (rows,) + tuple(slice(None, s) for s in ss[1:])
                     flat_src_indices = arr_indices[slc].ravel()
-                    res_dep = d_src.dep[flat_src_indices].tocsr()
-                    res_dep.data[:] = 1
-                    state.set(eqn.outvars[0], SparseDepSet(res_dep, oshp))
+                    state.set(
+                        eqn.outvars[0], SparseDepSet(d_src.dep[flat_src_indices], oshp)
+                    )
                     return
 
                 # Branch 2: 2D indexing with slice along axis 1
@@ -1363,13 +1359,16 @@ class GatherHandler(PrimitiveHandler):
                     r = np.clip(idx[:, 0].astype(int), 0, d_src.shape[0] - 1)
                     c0 = np.clip(idx[:, 1].astype(int), 0, d_src.shape[1] - ss[1])
 
+                    # Vectorized slice index calculation
                     col_offsets = np.arange(ss[1])
-                    cols = c0[:, None] + col_offsets[None, :]
+                    cols = (
+                        c0[:, None] + col_offsets[None, :]
+                    )  # Shape: (n_gathered, ss[1])
                     flat_src_indices = arr_indices[r[:, None], cols].ravel()
 
-                    res_dep = d_src.dep[flat_src_indices].tocsr()
-                    res_dep.data[:] = 1
-                    state.set(eqn.outvars[0], SparseDepSet(res_dep, oshp))
+                    state.set(
+                        eqn.outvars[0], SparseDepSet(d_src.dep[flat_src_indices], oshp)
+                    )
                     return
 
                 # Branch 3: N-D point indexing with proper start_index_map mapping
@@ -1379,15 +1378,17 @@ class GatherHandler(PrimitiveHandler):
                     and idx.shape[1] == len(sim)
                     and all(ss[a] == 1 for a in sim)
                 ):
+                    # Map index columns to proper operand axes according to sim
                     coords = [None] * len(d_src.shape)
                     for j, axis in enumerate(sim):
                         coords[axis] = np.clip(
                             idx[:, j].astype(int), 0, d_src.shape[axis] - 1
                         )
+
                     flat_src_indices = arr_indices[tuple(coords)].ravel()
-                    res_dep = d_src.dep[flat_src_indices].tocsr()
-                    res_dep.data[:] = 1
-                    state.set(eqn.outvars[0], SparseDepSet(res_dep, oshp))
+                    state.set(
+                        eqn.outvars[0], SparseDepSet(d_src.dep[flat_src_indices], oshp)
+                    )
                     return
             except (KeyError, IndexError, ValueError, TypeError, AttributeError):
                 pass
@@ -1417,7 +1418,7 @@ class DynamicSliceHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
         d_operand = in_d[0]
@@ -1506,7 +1507,7 @@ class ScatterHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
         d_tgt = in_d[0]
@@ -1558,7 +1559,7 @@ class ScatterHandler(PrimitiveHandler):
                 res = SparseDepSet(res_dep, oshp)
                 state.set(eqn.outvars[0], res)
                 if nonlinear:
-                    res.record_couplings(acc, trial_test_split)
+                    res.record_couplings(acc, execution.trial_test_split)
                 return
             except (KeyError, IndexError, ValueError, TypeError, AttributeError):
                 pass
@@ -1569,7 +1570,7 @@ class ScatterHandler(PrimitiveHandler):
         res = SparseDepSet(res_dep, oshp)
         state.set(eqn.outvars[0], res)
         if nonlinear:
-            res.record_couplings(acc, trial_test_split)
+            res.record_couplings(acc, execution.trial_test_split)
 
 
 @TR.register(
@@ -1586,7 +1587,7 @@ class SelectNHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
@@ -1597,14 +1598,30 @@ class SelectNHandler(PrimitiveHandler):
             try:
                 cond_flat = cond_val.ravel().astype(int)
                 n_out = int(np.prod(oshp))
-                res_rows = []
-                for idx_out in range(n_out):
-                    sel = cond_flat[idx_out] if idx_out < len(cond_flat) else 0
-                    sel_clamped = max(0, min(sel, len(cases_d) - 1))
-                    case_dep = cases_d[sel_clamped].dep
-                    r_idx = idx_out % case_dep.shape[0] if case_dep.shape[0] > 0 else 0
-                    res_rows.append(case_dep[r_idx])
-                res_dep = sps.vstack(res_rows, format="csr")
+                # Gather each selected case in one sparse operation.  An earlier
+                # implementation sliced a CSR matrix once per output row and then
+                # called ``vstack``; a gathered array with O(N) entries therefore
+                # created O(N) temporary CSR matrices.
+                selected = np.zeros(n_out, dtype=np.intp)
+                selected[: min(n_out, cond_flat.size)] = cond_flat[:n_out]
+                np.clip(selected, 0, len(cases_d) - 1, out=selected)
+
+                blocks = []
+                output_rows = []
+                for case_index, case_dep_set in enumerate(cases_d):
+                    rows = np.flatnonzero(selected == case_index)
+                    if rows.size == 0:
+                        continue
+                    case_dep = case_dep_set.dep
+                    if case_dep.shape[0] == 0:
+                        raise ValueError("Cannot select from an empty dependency set")
+                    blocks.append(case_dep[rows % case_dep.shape[0]])
+                    output_rows.append(rows)
+
+                stacked = sps.vstack(blocks, format="csr")
+                # ``blocks`` are grouped by case; restore the original output order.
+                restore_order = np.argsort(np.concatenate(output_rows))
+                res_dep = stacked[restore_order]
                 state.set(eqn.outvars[0], SparseDepSet(res_dep, oshp))
                 return
             except (KeyError, IndexError, ValueError, TypeError, AttributeError):
@@ -1644,7 +1661,7 @@ class DotHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
@@ -1693,15 +1710,19 @@ class DotHandler(PrimitiveHandler):
 
             if A_active.nnz and B_active.nnz:
                 if state.is_nonlinear(eqn.invars[0]):
-                    acc.record_dep(A_active, trial_test_split)
+                    acc.record_dep(A_active, execution.trial_test_split)
                 if state.is_nonlinear(eqn.invars[1]):
-                    acc.record_dep(B_active, trial_test_split)
+                    acc.record_dep(B_active, execution.trial_test_split)
 
                 P_cross = (A_active.T @ B_active).tocsr()
                 r_c, c_c = P_cross.nonzero()
-                if trial_test_split is not None:
-                    mask_c = (r_c < trial_test_split) & (c_c >= trial_test_split)
-                    mask_c |= (r_c >= trial_test_split) & (c_c < trial_test_split)
+                if execution.trial_test_split is not None:
+                    mask_c = (r_c < execution.trial_test_split) & (
+                        c_c >= execution.trial_test_split
+                    )
+                    mask_c |= (r_c >= execution.trial_test_split) & (
+                        c_c < execution.trial_test_split
+                    )
                     r_c, c_c = r_c[mask_c], c_c[mask_c]
                 acc.add_coords(r_c, c_c)
                 acc.add_coords(c_c, r_c)
@@ -1717,15 +1738,19 @@ class DotHandler(PrimitiveHandler):
 
             if ia.size and ib.size:
                 if state.is_nonlinear(eqn.invars[0]):
-                    ua.record_couplings(acc, trial_test_split)
+                    ua.record_couplings(acc, execution.trial_test_split)
                 if state.is_nonlinear(eqn.invars[1]):
-                    ub.record_couplings(acc, trial_test_split)
+                    ub.record_couplings(acc, execution.trial_test_split)
 
                 r_c = np.repeat(ia, ib.size)
                 c_c = np.tile(ib, ia.size)
-                if trial_test_split is not None:
-                    mask = ((r_c < trial_test_split) & (c_c >= trial_test_split)) | (
-                        (r_c >= trial_test_split) & (c_c < trial_test_split)
+                if execution.trial_test_split is not None:
+                    mask = (
+                        (r_c < execution.trial_test_split)
+                        & (c_c >= execution.trial_test_split)
+                    ) | (
+                        (r_c >= execution.trial_test_split)
+                        & (c_c < execution.trial_test_split)
                     )
                     r_c, c_c = r_c[mask], c_c[mask]
                 acc.add_coords(r_c, c_c)
@@ -1761,7 +1786,7 @@ class ReductionHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = state.get(eqn.invars[0])
         oshp = _get_shape(eqn.outvars[0]) if eqn.outvars else ()
@@ -1826,7 +1851,7 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         if not eqn.outvars:
             return
@@ -1845,7 +1870,7 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             reduced = sps.csr_matrix(cols_active.reshape(1, -1))
             total = SparseDepSet(reduced, ())
             if self.record_couplings:
-                acc.record_dep(total.dep, trial_test_split)
+                acc.record_dep(total.dep, execution.trial_test_split)
 
         for ov in eqn.outvars:
             oshp = _get_shape(ov)
@@ -1874,7 +1899,7 @@ class SubJaxprHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         sub, sub_consts = _subjaxpr_and_consts(eqn)
         in_d = [state.get(v) for v in eqn.invars]
@@ -1897,7 +1922,7 @@ class SubJaxprHandler(PrimitiveHandler):
             sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
             sub_state.val_of[id(v)] = np.asarray(c)
 
-        sub_state.run_bound_eqns(sub_bound_eqns, acc, trial_test_split)
+        sub_state.run_bound_eqns(sub_bound_eqns, acc, execution.trial_test_split)
 
         for pv, sv in zip(eqn.outvars, sub.outvars):
             state.set(pv, sub_state.get(sv))
@@ -1907,8 +1932,11 @@ class SubJaxprHandler(PrimitiveHandler):
             if val is not None:
                 state.val_of[id(pv)] = val
 
+        # Propagating concrete values equation-by-equation is sufficient for
+        # most sub-jaxprs.  Evaluate the complete sub-jaxpr only when the
+        # backwards routing analysis explicitly demands an output value.
         in_vals = [state.get_val(v) for v in eqn.invars]
-        if not any(v is None for v in in_vals):
+        if execution.needs_concrete and not any(v is None for v in in_vals):
             try:
                 v_casted = []
                 for x, invar in zip(in_vals, sub.invars):
@@ -1958,7 +1986,7 @@ class CondHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         operands = eqn.invars[1:]
         in_d = [state.get(v) for v in operands]
@@ -1985,7 +2013,7 @@ class CondHandler(PrimitiveHandler):
                 sub_state.set(v, SparseDepSet.empty(_get_shape(v), n_dofs))
                 sub_state.val_of[id(v)] = np.asarray(c)
 
-            sub_state.run_bound_eqns(sub_bound_eqns, acc, trial_test_split)
+            sub_state.run_bound_eqns(sub_bound_eqns, acc, execution.trial_test_split)
 
             for ov, sv in zip(eqn.outvars, sub.outvars):
                 d = sub_state.get(sv)
@@ -2018,10 +2046,39 @@ class ScanMapHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         closed_sub = eqn.params["jaxpr"]
         sub, sub_consts = closed_sub.jaxpr, closed_sub.consts
+
+        # A scan's body jaxpr describes one iteration, so evaluating that jaxpr
+        # directly does not produce the scan outputs.  Index routing inside a
+        # surrounding jit (as generated by ``jnp.searchsorted`` in
+        # ``BinarySearchStrategy.lift``) needs the actual carry/output values.
+        # Evaluate the higher-order primitive itself when possible and retain all
+        # of its outputs for downstream gather/select handlers.
+        in_vals = [state.get_val(v) for v in eqn.invars]
+        if execution.needs_concrete and not any(v is None for v in in_vals):
+            try:
+                concrete_outs = eqn.primitive.bind(
+                    *[jnp.asarray(v) for v in in_vals], **eqn.params
+                )
+                if not isinstance(concrete_outs, tuple):
+                    concrete_outs = (concrete_outs,)
+                for ovar, value in zip(eqn.outvars, concrete_outs):
+                    state.val_of[id(ovar)] = np.asarray(value)
+            except (TypeError, ValueError, RuntimeError, KeyError, AttributeError):
+                pass
+
+        # The binary-search implementation lowers to a scan over only static
+        # index arrays.  Once its concrete outputs are available, tracing its
+        # symbolic body would merely lose the per-iteration branch choices and
+        # introduce spurious dependencies.  More generally, a higher-order
+        # primitive with no dependent inputs has no dependent outputs.
+        if all(state.is_inactive(v) for v in eqn.invars):
+            for ovar in eqn.outvars:
+                state.set(ovar, SparseDepSet.empty(_get_shape(ovar), state.n_dofs))
+            return
 
         num_const = eqn.params.get("num_consts", 0)
         num_carry = eqn.params.get("num_carry", 0)
@@ -2157,18 +2214,26 @@ class ScanMapHandler(PrimitiveHandler):
                 if np.any(active):
                     c_a = col_a.indices[col_a.indptr[:-1][active]]
                     c_b = col_b.indices[col_b.indptr[:-1][active]]
-                    if trial_test_split is not None:
-                        mask = (c_a < trial_test_split) & (c_b >= trial_test_split)
-                        mask |= (c_a >= trial_test_split) & (c_b < trial_test_split)
+                    if execution.trial_test_split is not None:
+                        mask = (c_a < execution.trial_test_split) & (
+                            c_b >= execution.trial_test_split
+                        )
+                        mask |= (c_a >= execution.trial_test_split) & (
+                            c_b < execution.trial_test_split
+                        )
                         c_a, c_b = c_a[mask], c_b[mask]
                     acc.add_coords(c_a, c_b)
                     acc.add_coords(c_b, c_a)
             else:
                 couplings = (col_a.T @ col_b).tocsr()
                 r, c = couplings.nonzero()
-                if trial_test_split is not None:
-                    mask = (r < trial_test_split) & (c >= trial_test_split)
-                    mask |= (r >= trial_test_split) & (c < trial_test_split)
+                if execution.trial_test_split is not None:
+                    mask = (r < execution.trial_test_split) & (
+                        c >= execution.trial_test_split
+                    )
+                    mask |= (r >= execution.trial_test_split) & (
+                        c < execution.trial_test_split
+                    )
                     r, c = r[mask], c[mask]
                 acc.add_coords(r, c)
                 acc.add_coords(c, r)
@@ -2183,22 +2248,6 @@ class ScanMapHandler(PrimitiveHandler):
             c_val = sub_state.get_val(sub.outvars[i])
             if c_val is not None:
                 state.val_of[id(eqn.outvars[i])] = c_val
-
-        in_vals = [state.get_val(v) for v in eqn.invars]
-        if not any(v is None for v in in_vals):
-            try:
-                v_casted = []
-                for x, invar in zip(in_vals, sub.invars):
-                    target_dtype = getattr(invar.aval, "dtype", None)
-                    x_arr = np.asarray(x)
-                    if target_dtype is not None and x_arr.dtype != target_dtype:
-                        x_arr = x_arr.astype(target_dtype)
-                    v_casted.append(x_arr)
-                res = jax.core.eval_jaxpr(sub, sub_consts, *v_casted)
-                for i in range(len(eqn.outvars)):
-                    state.val_of[id(eqn.outvars[i])] = np.asarray(res[i])
-            except (TypeError, ValueError, RuntimeError, KeyError):
-                pass
 
         if len(eqn.outvars) > num_carry:
             dep_inputs = [
@@ -2262,7 +2311,7 @@ class ScanMapHandler(PrimitiveHandler):
                 if sub_state.is_nonlinear(sub_y):
                     state.nonlinear_ids.add(id(y))
                 sub_y_val = sub_state.get_val(sub_y)
-                if sub_y_val is not None:
+                if sub_y_val is not None and id(y) not in state.val_of:
                     try:
                         state.val_of[id(y)] = np.broadcast_to(sub_y_val, y_shape).copy()
                     except (TypeError, ValueError, RuntimeError, KeyError):
@@ -2280,7 +2329,7 @@ class FFICallHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         acc: CouplingAccumulator,
-        trial_test_split: int | None,
+        execution: TraceExecution,
     ) -> None:
         in_d = [state.get(v) for v in eqn.invars]
         target = eqn.params.get("target_name")
@@ -2295,7 +2344,7 @@ class FFICallHandler(PrimitiveHandler):
 
         if not lead:
             OpaqueBlackBoxHandler(record_couplings=True).propagate_deps(
-                eqn, state, acc, trial_test_split
+                eqn, state, acc, execution
             )
             return
 
@@ -2313,7 +2362,7 @@ class FFICallHandler(PrimitiveHandler):
                     cols_active[blk.indices] = True
             row = sps.csr_matrix(cols_active.reshape(1, -1))
             if row.nnz:
-                acc.record_dep(row, trial_test_split)
+                acc.record_dep(row, execution.trial_test_split)
             slice_rows.append(row)
 
         for ovar in eqn.outvars:

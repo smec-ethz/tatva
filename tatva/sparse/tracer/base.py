@@ -63,6 +63,7 @@ class ParsedJaxpr:
         self.vars: dict[int, Var] = {}
         self.tags: dict[int, int] = {}
         self.sub_info: SubInfoDict = {}
+        self._main_id = self.get_var_id(jaxpr.jaxpr.invars[0])
 
         # prepopulate invars, constvars, and outvars with their IDs
         for var in chain(
@@ -75,11 +76,11 @@ class ParsedJaxpr:
 
     def main(self) -> Var:
         """Return the main input variable (the first DOF vector) of the JAXpr."""
-        return self.vars[0]
+        return self.vars[self._main_id]
 
     def main_id(self) -> int:
         """Return the ID of the main input variable (the first DOF vector) of the JAXpr."""
-        return 0
+        return self._main_id
 
     def shape_of(self, var: Var | int) -> tuple[int, ...]:
         """Return the shape of a JAXpr variable."""
@@ -450,7 +451,7 @@ def pattern_from_energy(
         skip_cache: if True, skip the custom sparsity cache and recompute.
     """
 
-    _tracer_fn = persistent_tracer_cache(skip_cache=skip_cache)(_trace_hessian_sparsity)
+    # _tracer_fn = persistent_tracer_cache(skip_cache=skip_cache)(_trace_hessian_sparsity)
 
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> sps.csr_matrix:
         # Unwrap any outer @jax.jit so static slice indices stay static during tracing
@@ -466,7 +467,7 @@ def pattern_from_energy(
         closed = jax.make_jaxpr(fn)(*args, **kwargs)
         flat_args, _ = jax.tree_util.tree_flatten((args, kwargs))
 
-        return _tracer_fn(
+        return _trace_hessian_sparsity(
             closed,
             concrete_vals=flat_args,
             trial_test_split=None,

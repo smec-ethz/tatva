@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import builtins
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ParamSpec, TypeAlias
 
 import numpy as np
 import scipy.sparse as sps
-from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
+from jax.extend.core import ClosedJaxpr, JaxprEqn, Literal
 from numpy.typing import NDArray
 
 from tatva.sparse.tracer.common import _get_shape
@@ -32,6 +33,14 @@ if TYPE_CHECKING:
     from tatva.sparse.tracer.handlers import PrimitiveHandler
 
 P = ParamSpec("P")
+
+
+@dataclass(frozen=True)
+class TraceExecution:
+    """Per-equation execution controls supplied to primitive handlers."""
+
+    trial_test_split: int | None = None
+    needs_concrete: bool = False
 
 
 class CouplingAccumulator:
@@ -95,8 +104,7 @@ class CouplingAccumulator:
         cols = np.concatenate(self._col_chunks)
         data = np.ones(rows.shape[0], dtype=np.int8)
         pat = sps.csr_matrix((data, (rows, cols)), shape=(self.n_dofs, self.n_dofs))
-        if hasattr(pat, "sum_duplicates"):
-            pat.sum_duplicates()
+        pat.sum_duplicates()
         pat.data[:] = 1
         return pat
 
@@ -302,12 +310,26 @@ class TraceState:
         for eqn, handler, is_active, needs_concrete in bound_eqns:
             ovars = eqn.outvars
 
-            if is_active:
-                handler.propagate_deps(eqn, self, acc, trial_test_split)
-                self.mark_nonlinear(eqn, handler)
-            else:
+            if ovars and not is_active:
                 for v in ovars:
                     self.set(v, SparseDepSet.empty(_get_shape(v), self.n_dofs))
+                if needs_concrete:
+                    in_vals = [self.get_val(v) for v in eqn.invars]
+                    cv = handler.safe_eval_concrete(eqn.primitive, in_vals, eqn.params)
+                    if cv is not None:
+                        self.val_of[id(ovars[0])] = cv
+                continue
+
+            handler.propagate_deps(
+                eqn,
+                self,
+                acc,
+                TraceExecution(
+                    trial_test_split=trial_test_split,
+                    needs_concrete=needs_concrete,
+                ),
+            )
+            self.mark_nonlinear(eqn, handler)
 
             if ovars and needs_concrete:
                 if eqn.primitive.name in ("pjit", "jit", "scan", "map", "remat2"):
