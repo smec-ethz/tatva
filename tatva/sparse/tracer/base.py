@@ -35,7 +35,10 @@ from tatva.sparse.tracer.common import (
     _unwrap_jit,
 )
 from tatva.sparse.tracer.handlers import PrimitiveHandler
-from tatva.sparse.tracer.partitioning import find_contribution_roots
+from tatva.sparse.tracer.partitioning import (
+    EnergyPartitionPlan,
+    build_partition_plan,
+)
 from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import (
     BoundEqn,
@@ -364,9 +367,18 @@ class EnergyTrace:
     plan: JaxprTracePlan
     state: TraceState
 
+    def partition(self, part_map: NDArray[np.integer]) -> EnergyPartitionPlan:
+        """Build the distributed contribution and DOF partitioning plan."""
+        return build_partition_plan(
+            jaxpr=self.closed_jaxpr.jaxpr,
+            bound_eqns=self.plan.bound_eqns,
+            state=self.state,
+            part_map=part_map,
+        )
+
     def ghost_dofs(self, part_map: NDArray[np.integer]) -> dict[int, NDArray[np.int64]]:
         """Return the ghost DOFs read by each rank's contributions."""
-        return _ghost_dofs_from_trace(self, part_map)
+        return self.partition(part_map).ghost_dofs_by_rank()
 
 
 def _trace_hessian_sparsity(
@@ -469,70 +481,6 @@ def pattern_from_energy(
         ).pattern
 
     return wrapper
-
-
-def _validate_partition_map(part_map: NDArray[np.integer], n_dofs: int) -> np.ndarray:
-    """Return a validated, contiguous rank map for a global DOF vector."""
-    partition = np.asarray(part_map, dtype=np.int64)
-    if partition.ndim != 1:
-        raise ValueError("part_map must be a one-dimensional array of rank IDs.")
-    if partition.size != n_dofs:
-        raise ValueError(
-            f"part_map has {partition.size} entries, but the functional has {n_dofs} DOFs."
-        )
-    if partition.size and np.any(partition < 0):
-        raise ValueError("part_map rank IDs must be non-negative.")
-    if partition.size:
-        ranks = np.unique(partition)
-        expected = np.arange(ranks[-1] + 1, dtype=np.int64)
-        if not np.array_equal(ranks, expected):
-            raise ValueError("part_map rank IDs must be contiguous and start at zero.")
-    return partition
-
-
-def _ghost_dofs_from_trace(
-    trace: EnergyTrace, part_map: NDArray[np.integer]
-) -> dict[int, NDArray[np.int64]]:
-    """Return the ghost DOFs read by each rank's contributions.
-
-    A scalar reduction is split into the dependency rows of its input: each row is an
-    energy contribution and is assigned to the owner of its smallest global DOF.  The
-    returned array for rank ``r`` contains the sorted *global* IDs read by its assigned
-    contributions but owned by another rank.
-
-    This is a first-order read-support trace, not a Hessian trace.  It consequently
-    retains affine functional reads that have no Hessian entry.  This deliberately does
-    not inspect integer constants as if they were connectivity; concrete values are used
-    only to resolve routing for recognised dynamic indexing primitives.
-    """
-    n_dofs = trace.plan.n_dofs
-    roots = find_contribution_roots(
-        trace.closed_jaxpr.jaxpr, trace.plan.bound_eqns, trace.state
-    )
-    contribution_deps = [trace.state.get(root.var).dep[root.rows] for root in roots]
-
-    partition = _validate_partition_map(part_map, n_dofs)
-
-    n_ranks = int(partition.max()) + 1 if n_dofs else 1
-    ghost_sets: dict[int, set[int]] = {rank: set() for rank in range(n_ranks)}
-    for dep in contribution_deps:
-        row_sizes = np.diff(dep.indptr)
-        nonempty_rows = np.flatnonzero(row_sizes)
-        if nonempty_rows.size == 0:
-            continue
-        row_starts = dep.indptr[nonempty_rows]
-        owner_dofs = np.minimum.reduceat(dep.indices, row_starts)
-        row_owners = partition[owner_dofs]
-
-        for rank in np.unique(row_owners):
-            rank_rows = nonempty_rows[row_owners == rank]
-            read_dofs = np.unique(dep[rank_rows].indices)
-            ghost_sets[int(rank)].update(read_dofs[partition[read_dofs] != rank])
-
-    ghost_dofs: dict[int, NDArray[np.int64]] = {}
-    for rank in range(n_ranks):
-        ghost_dofs[rank] = np.asarray(sorted(ghost_sets[rank]), dtype=np.int64)
-    return ghost_dofs
 
 
 def pattern_from_virtual_work(

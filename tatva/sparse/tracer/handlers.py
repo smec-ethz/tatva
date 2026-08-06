@@ -20,7 +20,6 @@ from __future__ import annotations
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from typing import Any, cast
 
 import jax.core
@@ -37,6 +36,13 @@ from tatva.sparse.tracer.common import (
     _get_shape,
     _reduce_union_over_axes,
     _subjaxpr_and_consts,
+)
+from tatva.sparse.tracer.partitioning import (
+    ContributionDemand,
+    ContributionPropagation,
+    ContributionRoot,
+    _demand,
+    _invalid_contribution,
 )
 from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import (
@@ -143,36 +149,6 @@ def _dot_general_out_dep(
 # =============================================================================
 # Base Interface
 # =============================================================================
-
-
-@dataclass
-class ContributionDemand:
-    rows: NDArray[np.int64]
-
-
-@dataclass
-class ContributionRoot:
-    var: Any
-    rows: NDArray[np.int64]
-
-
-@dataclass
-class ContributionPropagation:
-    in_demands: list[ContributionDemand | None]
-    roots: list[ContributionRoot]
-    valid: bool = True
-
-
-def _demand(rows: NDArray[np.integer]) -> ContributionDemand | None:
-    """Build a canonical demand, dropping rows with no source element."""
-    rows = np.asarray(rows, dtype=np.int64)
-    rows = rows[rows >= 0]
-    return ContributionDemand(np.unique(rows)) if rows.size else None
-
-
-def _invalid_contribution(eqn: JaxprEqn) -> ContributionPropagation:
-    """Conservatively stop decomposition at the demanded output."""
-    return ContributionPropagation([None] * len(eqn.invars), [], valid=False)
 
 
 def _inverse_elementwise_rows(
