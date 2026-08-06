@@ -1,8 +1,7 @@
 from tatva.sparse.tracer.base import (
-    ghost_dofs_from_energy,
-    ghost_dofs_from_jaxpr,
     pattern_from_energy,
     pattern_from_virtual_work,
+    trace_energy,
 )
 from tatva.sparse.tracer.common import (
     _ELEMENTWISE_FFI_TARGETS,
@@ -19,9 +18,8 @@ __all__ = [
     "CouplingAccumulator",
     "SparseDepSet",
     "_unwrap_jit",
-    "ghost_dofs_from_energy",
-    "ghost_dofs_from_jaxpr",
     "pattern_from_energy",
     "pattern_from_virtual_work",
     "register_elementwise_ffi",
+    "trace_energy",
 ]

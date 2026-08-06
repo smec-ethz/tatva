@@ -4,10 +4,10 @@ from ._extraction import (
 )
 from .base import ColoredMatrix, jacfwd, linearized_jacfwd
 from .tracer import (
-    ghost_dofs_from_energy,
     pattern_from_energy,
     pattern_from_virtual_work,
     register_elementwise_ffi,
+    trace_energy,
 )
 
 
@@ -30,7 +30,6 @@ def __getattr__(name):
 
 __all__ = [
     "ColoredMatrix",
-    "ghost_dofs_from_energy",
     "jacfwd",
     "linearized_jacfwd",
     "pattern_from_compound",
@@ -38,4 +37,5 @@ __all__ = [
     "pattern_from_mesh",
     "pattern_from_virtual_work",
     "register_elementwise_ffi",
+    "trace_energy",
 ]

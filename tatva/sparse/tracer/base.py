@@ -16,8 +16,9 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 import inspect
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, Concatenate, ParamSpec, cast
 
 import jax
@@ -356,11 +357,23 @@ class _JaxprAnalyzer:
         return pruned_eqns
 
 
+@dataclass(frozen=True)
+class EnergyTrace:
+    pattern: sps.csr_matrix
+    closed_jaxpr: ClosedJaxpr
+    plan: JaxprTracePlan
+    state: TraceState
+
+    def ghost_dofs(self, part_map: NDArray[np.integer]) -> dict[int, NDArray[np.int64]]:
+        """Return the ghost DOFs read by each rank's contributions."""
+        return _ghost_dofs_from_trace(self, part_map)
+
+
 def _trace_hessian_sparsity(
     closed_jaxpr: ClosedJaxpr,
     concrete_vals: list[Any],
     trial_test_split: int | None = None,
-) -> sps.csr_matrix:
+) -> EnergyTrace:
     """Return the sparsity pattern of d²E/du² (or tangent stiffness matrix K for virtual
     work formulations) as a CSR matrix."""
     plan = _JaxprAnalyzer(closed_jaxpr, trial_test_split).analyze()
@@ -385,7 +398,40 @@ def _trace_hessian_sparsity(
     pat = acc.finalize()
     if pat.nnz == 0:
         return sps.eye(plan.n_dofs, format="csr", dtype=np.int8)
-    return pat
+    return EnergyTrace(pat, closed_jaxpr, plan, state)
+
+
+def trace_energy(energy_fn: Callable[P, Array]) -> Callable[P, EnergyTrace]:
+    """Trace the sparsity pattern of d²E/du² for a scalar energy function E(u) where u has
+    n_dofs degrees of freedom.
+
+    Args:
+        energy_fn: scalar JAX array energy function E(u, *static_args) as a function of
+            input variable u and optional static arguments
+    """
+
+    @wraps(energy_fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> EnergyTrace:
+        # Unwrap any outer @jax.jit so static slice indices stay static during tracing
+        fn = _unwrap_jit(energy_fn)
+
+        u = cast(Array, args[0])
+        assert isinstance(args[0], Array), (
+            "First argument to energy_fn must be a JAX array (the input variable u)."
+        )
+        assert u.ndim == 1, (
+            "Input variable u must be a 1D JAX array (flattened degrees of freedom)."
+        )
+        closed = jax.make_jaxpr(fn)(*args, **kwargs)
+        flat_args, _ = jax.tree_util.tree_flatten((args, kwargs))
+
+        return _trace_hessian_sparsity(
+            closed,
+            concrete_vals=flat_args,
+            trial_test_split=None,
+        )
+
+    return wrapper
 
 
 def pattern_from_energy(
@@ -420,7 +466,7 @@ def pattern_from_energy(
             closed,
             concrete_vals=flat_args,
             trial_test_split=None,
-        )
+        ).pattern
 
     return wrapper
 
@@ -444,14 +490,11 @@ def _validate_partition_map(part_map: NDArray[np.integer], n_dofs: int) -> np.nd
     return partition
 
 
-def ghost_dofs_from_jaxpr(
-    closed_jaxpr: ClosedJaxpr,
-    part_map: NDArray[np.integer],
-    concrete_vals: Sequence[Any],
+def _ghost_dofs_from_trace(
+    trace: EnergyTrace, part_map: NDArray[np.integer]
 ) -> dict[int, NDArray[np.int64]]:
-    """Find the remote DOFs read by rank-owned energy contributions.
+    """Return the ghost DOFs read by each rank's contributions.
 
-    The first Jaxpr input is interpreted as the global one-dimensional DOF vector.
     A scalar reduction is split into the dependency rows of its input: each row is an
     energy contribution and is assigned to the owner of its smallest global DOF.  The
     returned array for rank ``r`` contains the sorted *global* IDs read by its assigned
@@ -462,23 +505,11 @@ def ghost_dofs_from_jaxpr(
     not inspect integer constants as if they were connectivity; concrete values are used
     only to resolve routing for recognised dynamic indexing primitives.
     """
-    jaxpr = closed_jaxpr.jaxpr
-    if not jaxpr.invars:
-        raise ValueError("The functional Jaxpr must have a first DOF-vector input.")
-
-    plan = _JaxprAnalyzer(closed_jaxpr).analyze()
-    n_dofs = plan.n_dofs
-    state = TraceState(
-        plan.n_dofs,
-        plan.active_ids,
-        plan.sub_info,
+    n_dofs = trace.plan.n_dofs
+    roots = find_contribution_roots(
+        trace.closed_jaxpr.jaxpr, trace.plan.bound_eqns, trace.state
     )
-    state.attach_concrete_values(closed_jaxpr, list(concrete_vals))
-    state.seed_input_dependencies(closed_jaxpr)
-    state.run_bound_eqns(plan.bound_eqns, CouplingAccumulator(n_dofs))
-
-    roots = find_contribution_roots(jaxpr, plan.bound_eqns, state)
-    contribution_deps = [state.get(root.var).dep[root.rows] for root in roots]
+    contribution_deps = [trace.state.get(root.var).dep[root.rows] for root in roots]
 
     partition = _validate_partition_map(part_map, n_dofs)
 
@@ -502,34 +533,6 @@ def ghost_dofs_from_jaxpr(
     for rank in range(n_ranks):
         ghost_dofs[rank] = np.asarray(sorted(ghost_sets[rank]), dtype=np.int64)
     return ghost_dofs
-
-
-def ghost_dofs_from_energy(
-    energy_fn: Callable[P, Array],
-    part_map: NDArray[np.integer],
-) -> Callable[P, dict[int, NDArray[np.int64]]]:
-    """Build a callable that traces the per-rank ghost-DOF layout of an energy.
-
-    ``part_map[i]`` is the MPI rank owning global DOF ``i``.  The returned callable
-    accepts exactly the arguments of ``energy_fn`` and returns ``{rank: ghost_dofs}``.
-    The first energy argument must be the global, one-dimensional DOF array.
-    """
-
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> dict[int, NDArray[np.int64]]:
-        fn = _unwrap_jit(energy_fn)
-        if not args or not isinstance(args[0], Array):
-            raise TypeError("The first energy argument must be a JAX DOF array.")
-        u = args[0]
-        if u.ndim != 1:
-            raise ValueError(
-                "The first energy argument must be a one-dimensional DOF array."
-            )
-
-        closed = jax.make_jaxpr(fn)(*args, **kwargs)
-        flat_args, _ = jax.tree_util.tree_flatten((args, kwargs))
-        return ghost_dofs_from_jaxpr(closed, part_map, flat_args)
-
-    return wrapper
 
 
 def pattern_from_virtual_work(
