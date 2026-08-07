@@ -6,18 +6,15 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, overload
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-from jax import lax
-from jax.core import AbstractValue, Atom, ShapedArray
+from jax.core import AbstractValue, ShapedArray
 from jax.extend.core import (
     Jaxpr,
     JaxprEqn,
     Literal,
     Var,
-    check_jaxpr,
-    gensym,
-    new_jaxpr_eqn,
-    no_effects,
 )
 from numpy.typing import NDArray
 
@@ -1067,10 +1064,177 @@ class OutputSpec:
 
 @dataclass
 class LocalProgram:
-    jaxpr: Jaxpr
-    consts: tuple[Any, ...]
+    fun: Any
     input_specs: tuple[InputSpec, ...]
     output_specs: tuple[OutputSpec, ...]
+
+
+class LocalJaxprInterpreter:
+    """Execute a compact plan using ordinary JAX operations.
+
+    This deliberately is an interpreter for *values*, not a JAXPR builder:
+    JAX traces this callable when a local JAXPR is wanted.
+    """
+
+    def __init__(self, plan: JaxprPlan, original_consts: Sequence[Any]):
+        self.plan = plan
+        self.original_consts = tuple(original_consts)
+
+    def take_global_rows(
+        self, value: Any, layout: VarLayout, global_rows: NDArray[np.int64]
+    ):
+        rows = np.asarray(global_rows, dtype=np.int64)
+        if not layout.original_shape:
+            return value
+        if np.array_equal(rows, layout.rows.to_array()):
+            return value
+        local_rows = layout.rows.localize(rows)
+        if local_rows.size and np.array_equal(
+            local_rows, np.arange(local_rows[0], local_rows[0] + local_rows.size)
+        ):
+            return value[local_rows[0] : local_rows[0] + local_rows.size]
+        return jnp.take(value, jnp.asarray(local_rows), axis=0)
+
+    def flatten_result(self, value: Any, layout: VarLayout):
+        if not layout.original_shape:
+            return value
+        flat = jnp.ravel(value)
+        rows = layout.rows.to_array()
+        if layout.is_full:
+            return flat
+        return jnp.take(flat, jnp.asarray(rows), axis=0)
+
+    def run_subplan(
+        self,
+        subplan: JaxprPlan,
+        sub_consts: Sequence[Any],
+        parent_values,
+        parent_layouts,
+    ):
+        args = []
+        for child_index in subplan.kept_invar_indices:
+            value = parent_values[child_index]
+            layout = parent_layouts[child_index]
+            child = subplan.layouts[subplan.original_jaxpr.invars[child_index]]
+            if value is None or layout is None:
+                raise NotImplementedError(
+                    "Nested local plan needs an eliminated parent operand"
+                )
+            args.append(self.take_global_rows(value, layout, child.rows.to_array()))
+        return LocalJaxprInterpreter(subplan, sub_consts).make_function()(*args)
+
+    def make_function(self):
+        plan = self.plan
+        compact_consts = {
+            var: jnp.asarray(compact_value(self.original_consts[i], plan.layouts[var]))
+            for i, var in enumerate(plan.original_jaxpr.constvars)
+            if i in plan.kept_constvar_indices
+        }
+
+        def local_function(*local_inputs):
+            if len(local_inputs) != len(plan.kept_invar_indices):
+                raise TypeError(
+                    f"Expected {len(plan.kept_invar_indices)} local inputs, got {len(local_inputs)}"
+                )
+            env = dict(compact_consts)
+            env.update(
+                {
+                    plan.original_jaxpr.invars[i]: value
+                    for i, value in zip(plan.kept_invar_indices, local_inputs)
+                }
+            )
+            for eqn, eqn_plan in zip(plan.original_jaxpr.eqns, plan.eqn_plans):
+                if eqn_plan is None:
+                    continue
+                values = tuple(
+                    jnp.asarray(v.val) if isinstance(v, Literal) else env.get(v)
+                    for v in eqn.invars
+                )
+                in_layouts = tuple(
+                    None if isinstance(v, Literal) else plan.layouts.get(v)
+                    for v in eqn.invars
+                )
+                out_layouts = tuple(
+                    plan.layouts.get(v) if live else None
+                    for v, live in zip(eqn.outvars, eqn_plan.live_output_mask)
+                )
+                result = eqn_plan.handler.eval_local(
+                    eqn=eqn,
+                    plan=eqn_plan,
+                    in_values=values,
+                    in_layouts=in_layouts,
+                    out_layouts=out_layouts,
+                    interpreter=self,
+                )
+                if len(result) != len(eqn.outvars):
+                    raise RuntimeError(
+                        f"{eqn.primitive.name} returned an invalid local output count"
+                    )
+                env.update(
+                    {
+                        var: value
+                        for var, value in zip(eqn.outvars, result)
+                        if value is not None
+                    }
+                )
+            return tuple(env[var] for var in plan.requested_outputs)
+
+        return local_function
+
+
+def make_local_function(plan: JaxprPlan, original_consts: Sequence[Any]):
+    return LocalJaxprInterpreter(plan, original_consts).make_function()
+
+
+def build_local_program(
+    plan: JaxprPlan, original_consts: Sequence[Any]
+) -> LocalProgram:
+    return LocalProgram(
+        fun=make_local_function(plan, original_consts),
+        input_specs=tuple(
+            InputSpec(i, plan.layouts[plan.original_jaxpr.invars[i]])
+            for i in plan.kept_invar_indices
+        ),
+        output_specs=tuple(
+            OutputSpec(v, plan.layouts[v]) for v in plan.requested_outputs
+        ),
+    )
+
+
+def trace_local_program(program: LocalProgram, *example_local_inputs: Any):
+    return jax.make_jaxpr(program.fun)(*example_local_inputs)
+
+
+def report_localization_coverage(plan: JaxprPlan) -> list[str]:
+    """Return a compact recursive summary of local execution support."""
+    report: list[str] = []
+    exact = {
+        "gather",
+        "dynamic_slice",
+        "scatter",
+        "scatter-add",
+        "scatter-sub",
+        "scatter-mul",
+        "scatter-min",
+        "scatter-max",
+        "reduce_sum",
+        "jit",
+        "pjit",
+        "remat2",
+    }
+    for eqn, eqn_plan in zip(plan.original_jaxpr.eqns, plan.eqn_plans):
+        if eqn_plan is None:
+            continue
+        name = eqn.primitive.name
+        kind = (
+            "exact specialized"
+            if name in exact
+            else "exact shared/local-or-full fallback"
+        )
+        report.append(f"{name:<20} {type(eqn_plan.handler).__name__:<28} {kind}")
+        for subplan in eqn_plan.subplans:
+            report.extend("  " + line for line in report_localization_coverage(subplan))
+    return report
 
 
 def compact_value(value: Any, layout: VarLayout) -> Any:
@@ -1089,3 +1253,7 @@ def pack_runtime_inputs(
         compact_value(global_inputs[spec.original_index], spec.layout)
         for spec in program.input_specs
     )
+
+
+# Compatibility name retained while callers migrate from the manual JAXPR API.
+materialize_local_jaxpr = build_local_program

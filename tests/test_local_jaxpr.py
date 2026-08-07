@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.core import eval_jaxpr
 from jax import lax
 
 from tatva.compound import Compound, field
@@ -16,6 +15,7 @@ from tatva.sparse.tracer.partitioning import (
     RangeRows,
     materialize_local_jaxpr,
     pack_runtime_inputs,
+    trace_local_program,
 )
 from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import CouplingAccumulator, TraceState
@@ -36,9 +36,7 @@ def _local_result(fn, value, rows, *, root_index=-1):
         [root],
     )
     program = materialize_local_jaxpr(plan, closed.consts)
-    (result,) = eval_jaxpr(
-        program.jaxpr, program.consts, *pack_runtime_inputs(program, [value])
-    )
+    (result,) = program.fun(*pack_runtime_inputs(program, [value]))
     return np.asarray(result), plan, program
 
 
@@ -84,11 +82,10 @@ def test_local_jaxpr_routes_transpose_slice_and_scalar_broadcast():
     )
     np.testing.assert_allclose(result, [0.0, 0.0, 0.0])
 
-    # This requires a non-contiguous compact selection, exercising generated
-    # gather-index constvars in LocalJaxprBuilder.
+    # This requires a non-contiguous compact selection in the traced callable.
     result, _, program = _local_result(lambda x: x[::-1], jnp.arange(6.0), [0, 2])
     np.testing.assert_allclose(result, [5.0, 3.0])
-    assert len(program.consts) == 1
+    assert jax.make_jaxpr(program.fun)(*pack_runtime_inputs(program, [jnp.arange(6.0)]))
 
 
 def test_local_jaxpr_lifter_literal():
@@ -113,8 +110,6 @@ def test_local_jaxpr_lifter_periodic_fail():
 
     bottom = np.where(np.isclose(mesh.coords[:, 1], 0))[0]
     top = np.where(np.isclose(mesh.coords[:, 1], 1))[0]
-    right = np.where(mesh.coords[:, 0] == 1)[0]
-    left = np.where(mesh.coords[:, 0] == 0)[0]
     corner_0 = np.where((mesh.coords[:, 0] == 0) & (mesh.coords[:, 1] == 0))[0]
 
     lifter = Lifter.make(
@@ -153,7 +148,7 @@ def test_local_jaxpr_emits_compact_iota_and_elementwise_predicates():
         lambda x: x + jnp.arange(x.size), jnp.ones(8), [2, 6]
     )
     np.testing.assert_allclose(result, [3.0, 7.0])
-    assert len(program.consts) == 1  # specialized compact iota values
+    assert jax.make_jaxpr(program.fun)(*pack_runtime_inputs(program, [jnp.ones(8)]))
 
     result, _, _ = _local_result(lambda x: x > 3, jnp.arange(8), [2, 6])
     np.testing.assert_array_equal(result, [False, True])
@@ -198,3 +193,16 @@ def test_local_jaxpr_rewrites_nested_jit():
 
     result, _, _ = _local_result(lambda x: inner(x), jnp.arange(6.0), [1, 4])
     np.testing.assert_allclose(result, np.sin(np.array([2.0, 8.0])))
+
+
+def test_local_callable_traces_jits_and_differentiates():
+    _, _, program = _local_result(lambda x: jnp.sin(x) * 2, jnp.arange(6.0), [1, 4])
+    local_x = pack_runtime_inputs(program, [jnp.arange(6.0)])[0]
+    assert trace_local_program(program, local_x)
+    np.testing.assert_allclose(
+        jax.jit(program.fun)(local_x)[0], [2 * np.sin(1), 2 * np.sin(4)]
+    )
+    np.testing.assert_allclose(
+        jax.grad(lambda x: jnp.sum(program.fun(x)[0]))(local_x),
+        2 * np.cos(np.array([1.0, 4.0])),
+    )

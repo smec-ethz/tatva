@@ -27,7 +27,6 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
 import scipy.special as sp
-from jax.core import Atom
 from jax.extend.core import JaxprEqn, Literal, Primitive
 from numpy.typing import NDArray
 
@@ -214,6 +213,176 @@ class PrimitiveHandler(ABC):
     def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
         """Return invar indices that are used as index arrays (e.g. gather/scatter index)."""
         return []
+
+    def eval_local(
+        self,
+        *,
+        eqn: JaxprEqn,
+        plan: EqnPlan,
+        in_values: tuple[Any | None, ...],
+        in_layouts: tuple[VarLayout | None, ...],
+        out_layouts: tuple[VarLayout | None, ...],
+        interpreter: Any,
+    ) -> tuple[Any | None, ...]:
+        """Default compact evaluator plus shared elementwise/routing rules."""
+        live = [layout for layout in out_layouts if layout is not None]
+        if not live:
+            return tuple(None for _ in eqn.outvars)
+        out = live[0]
+        name = eqn.primitive.name
+
+        # Concrete indexing was specialized during planning; its index operands
+        # intentionally do not survive into the compact ABI.
+        if name in {"gather", "dynamic_slice"} and plan.aux is not None:
+            return (
+                interpreter.take_global_rows(in_values[0], in_layouts[0], plan.aux),
+            )
+
+        # Route-only tensor operations.  They become compact gathers, rather
+        # than global-shaped primitive calls.
+        if len(eqn.invars) == 1 and name in {
+            "reshape",
+            "squeeze",
+            "convert_element_type",
+            "copy",
+            "stop_gradient",
+            "device_put",
+            "neg",
+            "abs",
+            "sin",
+            "cos",
+            "exp",
+            "log",
+            "sqrt",
+            "integer_pow",
+            "transpose",
+            "slice",
+            "rev",
+            "broadcast_in_dim",
+        }:
+            source_layout = in_layouts[0]
+            source_rows = out.rows.to_array()
+            if name == "transpose":
+                in_shape = _get_shape(eqn.invars[0])
+                coords = np.unravel_index(source_rows, _get_shape(eqn.outvars[0]))
+                remapped = [None] * len(in_shape)
+                for out_axis, in_axis in enumerate(eqn.params["permutation"]):
+                    remapped[in_axis] = coords[out_axis]
+                source_rows = np.ravel_multi_index(tuple(remapped), in_shape)
+            elif name == "slice":
+                coords = np.unravel_index(source_rows, _get_shape(eqn.outvars[0]))
+                strides = eqn.params["strides"] or (1,) * len(coords)
+                source_rows = np.ravel_multi_index(
+                    tuple(
+                        s + c * t
+                        for s, c, t in zip(eqn.params["start_indices"], coords, strides)
+                    ),
+                    _get_shape(eqn.invars[0]),
+                )
+            elif name == "rev":
+                shape = _get_shape(eqn.invars[0])
+                coords = list(np.unravel_index(source_rows, shape))
+                for axis in eqn.params["dimensions"]:
+                    coords[axis] = shape[axis] - 1 - coords[axis]
+                source_rows = np.ravel_multi_index(tuple(coords), shape)
+            elif name == "broadcast_in_dim":
+                source_rows = _inverse_broadcast_rows(
+                    source_rows,
+                    _get_shape(eqn.invars[0]),
+                    _get_shape(eqn.outvars[0]),
+                    eqn.params["broadcast_dimensions"],
+                )
+            value = (
+                in_values[0]
+                if source_layout is None
+                else interpreter.take_global_rows(
+                    in_values[0], source_layout, source_rows
+                )
+            )
+            if name == "broadcast_in_dim" and (
+                source_layout is None or not source_layout.original_shape
+            ):
+                value = jnp.broadcast_to(value, (out.local_size,))
+            # Shape-preserving unary primitives still need their numerical op.
+            if name not in {
+                "reshape",
+                "squeeze",
+                "transpose",
+                "slice",
+                "rev",
+                "broadcast_in_dim",
+                "copy",
+                "stop_gradient",
+                "device_put",
+            }:
+                value = eqn.primitive.bind(value, **eqn.params)
+            return (value,)
+
+        # Ordinary elementwise operations align every operand to output rows.
+        if name in {
+            "add",
+            "add_any",
+            "sub",
+            "mul",
+            "div",
+            "rem",
+            "pow",
+            "atan2",
+            "max",
+            "min",
+            "select_n",
+            "eq",
+            "ne",
+            "ge",
+            "gt",
+            "le",
+            "lt",
+            "and",
+            "or",
+            "xor",
+        }:
+            aligned = []
+            for var, value, layout in zip(eqn.invars, in_values, in_layouts):
+                if isinstance(var, Literal):
+                    aligned.append(value)
+                    continue
+                if value is None or layout is None:
+                    raise NotImplementedError(
+                        f"No local execution rule for eliminated {name} operand"
+                    )
+                if not layout.original_shape:
+                    aligned.append(value)
+                    continue
+                rows = _inverse_elementwise_rows(
+                    out.rows.to_array(), _get_shape(var), _get_shape(eqn.outvars[0])
+                )
+                aligned.append(interpreter.take_global_rows(value, layout, rows))
+            return (eqn.primitive.bind(*aligned, **eqn.params),)
+
+        # A safe fallback: only full tensors may be restored to global shape.
+        restored = []
+        for var, value, layout in zip(eqn.invars, in_values, in_layouts):
+            if isinstance(var, Literal):
+                restored.append(value)
+                continue
+            if value is None:
+                raise NotImplementedError(
+                    f"No local execution rule for eliminated {name} operand"
+                )
+            if layout is not None and layout.original_shape:
+                if not layout.is_full:
+                    raise NotImplementedError(
+                        f"No local execution rule for partial {name}"
+                    )
+                restored.append(jnp.reshape(value, layout.original_shape))
+            else:
+                restored.append(value)
+        result = eqn.primitive.bind(*restored, **eqn.params)
+        results = result if isinstance(result, (tuple, list)) else (result,)
+        return tuple(
+            None if layout is None else interpreter.flatten_result(value, layout)
+            for value, layout in zip(results, out_layouts)
+        )
 
 
 # =============================================================================
@@ -1730,6 +1899,39 @@ class ScatterHandler(PrimitiveHandler):
             aux=(update_rows, targets[update_rows]),
         )
 
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        if plan.aux is None:
+            return super().eval_local(
+                eqn=eqn,
+                plan=plan,
+                in_values=in_values,
+                in_layouts=in_layouts,
+                out_layouts=out_layouts,
+                interpreter=interpreter,
+            )
+        base, _indices, updates = in_values[:3]
+        out = _live_output_layout(out_layouts)
+        if base is None or updates is None:
+            raise NotImplementedError(
+                f"No local execution rule for partial {eqn.primitive.name}"
+            )
+        _update_rows, target_rows = plan.aux
+        target_local = out.rows.localize(np.asarray(target_rows, dtype=np.int64))
+        index = jnp.asarray(target_local)
+        if eqn.primitive.name == "scatter-add":
+            result = base.at[index].add(updates)
+        elif eqn.primitive.name == "scatter-sub":
+            result = base.at[index].add(-updates)
+        elif eqn.primitive.name == "scatter-mul":
+            result = base.at[index].multiply(updates)
+        elif eqn.primitive.name == "scatter-min":
+            result = base.at[index].min(updates)
+        elif eqn.primitive.name == "scatter-max":
+            result = base.at[index].max(updates)
+        else:
+            result = base.at[index].set(updates)
+        return (result,)
+
 
 @TR.register(
     "select_n",
@@ -1830,6 +2032,43 @@ class DotHandler(PrimitiveHandler):
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         return sum(invar_active) >= 2
+
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        """Execute complete retained contraction blocks in compact batch form."""
+        lhs, rhs = in_values[:2]
+        lhs_layout, rhs_layout = in_layouts[:2]
+        if lhs is None or rhs is None or lhs_layout is None or rhs_layout is None:
+            return super().eval_local(
+                eqn=eqn,
+                plan=plan,
+                in_values=in_values,
+                in_layouts=in_layouts,
+                out_layouts=out_layouts,
+                interpreter=interpreter,
+            )
+        dn = eqn.params["dimension_numbers"]
+        lhs_contract = tuple(dn[0][0])
+        rhs_contract = tuple(dn[0][1])
+        # The initial local path supports the usual matrix/vector cases where
+        # liveness retained whole contraction blocks for selected output rows.
+        if (
+            lhs_contract == (len(lhs_layout.original_shape) - 1,)
+            and rhs_contract == (0,)
+            and rhs_layout.is_full
+        ):
+            width = lhs_layout.original_shape[-1]
+            if lhs_layout.local_size % width == 0:
+                local_lhs = jnp.reshape(lhs, (lhs_layout.local_size // width, width))
+                local_rhs = jnp.reshape(rhs, rhs_layout.original_shape)
+                return (eqn.primitive.bind(local_lhs, local_rhs, **eqn.params),)
+        return super().eval_local(
+            eqn=eqn,
+            plan=plan,
+            in_values=in_values,
+            in_layouts=in_layouts,
+            out_layouts=out_layouts,
+            interpreter=interpreter,
+        )
 
     def propagate_deps(
         self,
@@ -2096,6 +2335,42 @@ class ReductionHandler(PrimitiveHandler):
                 match &= grid[axis] == out_coords[out_axis][i]
             selected |= match
         return [_demand(np.flatnonzero(selected))]
+
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        out = _live_output_layout(out_layouts)
+        if (
+            eqn.primitive.name != "reduce_sum"
+            or in_values[0] is None
+            or in_layouts[0] is None
+        ):
+            return super().eval_local(
+                eqn=eqn,
+                plan=plan,
+                in_values=in_values,
+                in_layouts=in_layouts,
+                out_layouts=out_layouts,
+                interpreter=interpreter,
+            )
+        in_shape = _get_shape(eqn.invars[0])
+        axes = set(eqn.params["axes"])
+        kept = [axis for axis in range(len(in_shape)) if axis not in axes]
+        out_shape = _get_shape(eqn.outvars[0])
+        groups = []
+        for row in out.rows.to_array():
+            coords = np.unravel_index(row, out_shape) if out_shape else ()
+            grid = np.indices(in_shape).reshape(len(in_shape), -1)
+            mask = np.ones(grid.shape[1], dtype=bool)
+            for j, axis in enumerate(kept):
+                mask &= grid[axis] == coords[j]
+            groups.append(np.flatnonzero(mask).astype(np.int64))
+        if not groups or len({len(group) for group in groups}) != 1:
+            raise NotImplementedError(
+                "Local reduce_sum needs rectangular reduction groups"
+            )
+        selected = interpreter.take_global_rows(
+            in_values[0], in_layouts[0], np.concatenate(groups)
+        )
+        return (jnp.sum(selected.reshape(len(groups), len(groups[0])), axis=1),)
 
 
 # =============================================================================
@@ -2559,6 +2834,18 @@ class SubJaxprHandler(PrimitiveHandler):
         return BackwardResult(
             in_demands=subplan.invar_demands,
             subplans=(subplan,),
+        )
+
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        if not plan.subplans:
+            raise NotImplementedError(f"No nested local plan for {eqn.primitive.name}")
+        _sub, sub_consts = _subjaxpr_and_consts(eqn)
+        outputs = interpreter.run_subplan(
+            plan.subplans[0], sub_consts, in_values, in_layouts
+        )
+        return tuple(
+            value if layout is not None else None
+            for value, layout in zip(outputs, out_layouts)
         )
 
 
