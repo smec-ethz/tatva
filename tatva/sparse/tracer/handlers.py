@@ -49,13 +49,13 @@ from tatva.sparse.tracer.partitioning import (
     ContributionPropagation,
     ContributionRoot,
     EqnPlan,
-    LocalJaxprPlanner,
     RangeRows,
     VarLayout,
     _demand,
     _invalid_contribution,
     demand_rows,
     merge_demands,
+    plan_local_jaxpr,
     propagate_demands_backward,
 )
 from tatva.sparse.tracer.registry import TR
@@ -164,7 +164,6 @@ class PrimitiveHandler(ABC):
         eqn: JaxprEqn,
         state: TraceState,
         out_demands: tuple[ContributionDemand | None, ...],
-        planner: LocalJaxprPlanner,
     ) -> BackwardResult:
         in_demands = self.propagate_liveness_demand(eqn, state, list(out_demands))
         return BackwardResult(in_demands=tuple(in_demands))
@@ -1607,7 +1606,6 @@ class GatherHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         out_demands: tuple[ContributionDemand | None, ...],
-        planner: LocalJaxprPlanner,
     ) -> BackwardResult:
         demand = out_demands[0]
         if demand is None:
@@ -1723,7 +1721,6 @@ class DynamicSliceHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         out_demands: tuple[ContributionDemand | None, ...],
-        planner: LocalJaxprPlanner,
     ) -> BackwardResult:
         demand = out_demands[0]
         if demand is None:
@@ -1871,7 +1868,6 @@ class ScatterHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         out_demands: tuple[ContributionDemand | None, ...],
-        planner: LocalJaxprPlanner,
     ) -> BackwardResult:
         in_demands = self.propagate_liveness_demand(eqn, state, list(out_demands))
         demand = out_demands[0]
@@ -2802,7 +2798,6 @@ class SubJaxprHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         out_demands: tuple[ContributionDemand | None, ...],
-        planner: LocalJaxprPlanner,
     ) -> BackwardResult:
         sub, sub_consts = _subjaxpr_and_consts(eqn)
         sub_active, _sub_indices, _sub_bound = cast(SubEqnInfo, state.sub_info[id(eqn)])
@@ -2830,7 +2825,7 @@ class SubJaxprHandler(PrimitiveHandler):
             if demand is not None
         }
         requested_outputs = tuple(seed_demands)
-        subplan = planner.plan_jaxpr(sub, sub_state, seed_demands, requested_outputs)
+        subplan = plan_local_jaxpr(sub, sub_state, seed_demands, requested_outputs)
         return BackwardResult(
             in_demands=subplan.invar_demands,
             subplans=(subplan,),
@@ -2958,7 +2953,6 @@ class CondHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         out_demands: tuple[ContributionDemand | None, ...],
-        planner: LocalJaxprPlanner,
     ) -> BackwardResult:
         # TODO: implement this
         # For cond, create one subplan per branch and union branch input demands.
@@ -2986,7 +2980,7 @@ class CondHandler(PrimitiveHandler):
         #     in_demands=tuple(parent_input_demands),
         #     subplans=(subplan,),
         # )
-        return super().plan_backward(eqn, state, out_demands, planner)
+        return super().plan_backward(eqn, state, out_demands)
 
 
 @TR.register(
@@ -3413,7 +3407,6 @@ class ScanMapHandler(PrimitiveHandler):
         eqn: JaxprEqn,
         state: TraceState,
         out_demands: tuple[ContributionDemand | None, ...],
-        planner: LocalJaxprPlanner,
     ) -> BackwardResult:
         # TODO: implement this
         # For scan, the handler must decide whether to:
@@ -3444,7 +3437,7 @@ class ScanMapHandler(PrimitiveHandler):
         #     in_demands=tuple(parent_input_demands),
         #     subplans=(subplan,),
         # )
-        return super().plan_backward(eqn, state, out_demands, planner)
+        return super().plan_backward(eqn, state, out_demands)
 
 
 @TR.register(

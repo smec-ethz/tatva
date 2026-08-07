@@ -19,7 +19,7 @@ import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Concatenate, ParamSpec, cast
+from typing import Any, Concatenate, Generic, ParamSpec, cast
 
 import jax
 import numpy as np
@@ -42,6 +42,7 @@ from tatva.sparse.tracer.partitioning import (
 from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import (
     BoundEqn,
+    ConcreteJaxpr,
     CouplingAccumulator,
     SubInfoDict,
     TraceState,
@@ -67,8 +68,13 @@ class _JaxprAnalyzer:
     resulting plan is the only object consumed by dependency propagation.
     """
 
-    def __init__(self, jaxpr: ClosedJaxpr, trial_test_split: int | None = None):
+    def __init__(
+        self,
+        jaxpr: ClosedJaxpr,
+        trial_test_split: int | None = None,
+    ):
         self.jaxpr = jaxpr
+        self.registry = TR
         self.trial_test_split = trial_test_split
 
         if not jaxpr.jaxpr.invars:
@@ -138,7 +144,7 @@ class _JaxprAnalyzer:
 
         for eqn in jaxpr.eqns:
             p = eqn.primitive.name
-            handler = TR.get(p)
+            handler = self.registry.get(p)
 
             # identify indexing variable IDs via handler
             for idx_pos in handler.get_index_invar_indices(eqn):
@@ -361,34 +367,34 @@ class _JaxprAnalyzer:
 
 
 @dataclass(frozen=True)
-class EnergyTrace:
+class EnergyTrace[**P]:
     pattern: sps.csr_matrix
-    closed_jaxpr: ClosedJaxpr
+    concrete_jaxpr: ConcreteJaxpr
     plan: JaxprTracePlan
     state: TraceState
 
     def partition(self, part_map: NDArray[np.integer]) -> EnergyPartitionPlan:
         """Build the distributed contribution and DOF partitioning plan."""
-        return build_partition_plan(
-            jaxpr=self.closed_jaxpr.jaxpr,
-            bound_eqns=self.plan.bound_eqns,
-            state=self.state,
-            part_map=part_map,
-        )
+        return build_partition_plan(self, part_map=part_map)
 
-    def ghost_dofs(self, part_map: NDArray[np.integer]) -> dict[int, NDArray[np.int64]]:
-        """Return the ghost DOFs read by each rank's contributions."""
-        return self.partition(part_map).ghost_dofs_by_rank()
+
+def make_partition_plan[**P](
+    energy_trace: EnergyTrace[P], part_map: NDArray[np.integer]
+) -> EnergyPartitionPlan[P]:
+    """Build the distributed contribution and DOF partitioning plan."""
+    return build_partition_plan(
+        energy_trace=energy_trace,
+        part_map=part_map,
+    )
 
 
 def _trace_hessian_sparsity(
-    closed_jaxpr: ClosedJaxpr,
-    concrete_vals: list[Any],
+    concrete_jaxpr: ConcreteJaxpr,
     trial_test_split: int | None = None,
 ) -> EnergyTrace:
     """Return the sparsity pattern of d²E/du² (or tangent stiffness matrix K for virtual
     work formulations) as a CSR matrix."""
-    plan = _JaxprAnalyzer(closed_jaxpr, trial_test_split).analyze()
+    plan = _JaxprAnalyzer(ConcreteJaxpr.closed_jaxpr, trial_test_split).analyze()
 
     # initialize tracing state
     state = TraceState(
@@ -401,8 +407,8 @@ def _trace_hessian_sparsity(
     )
 
     # Concrete values resolve dynamic gather/scatter routing; dependencies seed the DOFs.
-    state.attach_concrete_values(closed_jaxpr, concrete_vals)
-    state.seed_input_dependencies(closed_jaxpr)
+    state.attach_concrete_values(concrete_jaxpr.closed_jaxpr, concrete_jaxpr.flat_args)
+    state.seed_input_dependencies(concrete_jaxpr.closed_jaxpr)
 
     # forward pass: propagate dep-sets through the jaxpr, recording pairs at nonlinear primitives
     state.run_bound_eqns(plan.bound_eqns, acc, trial_test_split)
@@ -410,10 +416,10 @@ def _trace_hessian_sparsity(
     pat = acc.finalize()
     if pat.nnz == 0:
         return sps.eye(plan.n_dofs, format="csr", dtype=np.int8)
-    return EnergyTrace(pat, closed_jaxpr, plan, state)
+    return EnergyTrace(pat, concrete_jaxpr, plan, state)
 
 
-def trace_energy(energy_fn: Callable[P, Array]) -> Callable[P, EnergyTrace]:
+def trace_energy[**P](energy_fn: Callable[P, Array]) -> Callable[P, EnergyTrace[P]]:
     """Trace the sparsity pattern of d²E/du² for a scalar energy function E(u) where u has
     n_dofs degrees of freedom.
 
@@ -423,7 +429,7 @@ def trace_energy(energy_fn: Callable[P, Array]) -> Callable[P, EnergyTrace]:
     """
 
     @wraps(energy_fn)
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> EnergyTrace:
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> EnergyTrace[P]:
         # Unwrap any outer @jax.jit so static slice indices stay static during tracing
         fn = _unwrap_jit(energy_fn)
 
@@ -434,14 +440,30 @@ def trace_energy(energy_fn: Callable[P, Array]) -> Callable[P, EnergyTrace]:
         assert u.ndim == 1, (
             "Input variable u must be a 1D JAX array (flattened degrees of freedom)."
         )
-        closed = jax.make_jaxpr(fn)(*args, **kwargs)
-        flat_args, _ = jax.tree_util.tree_flatten((args, kwargs))
+        concrete_jaxpr = ConcreteJaxpr.from_fn(fn, *args, **kwargs)
+        plan = _JaxprAnalyzer(concrete_jaxpr.closed_jaxpr, None).analyze()
 
-        return _trace_hessian_sparsity(
-            closed,
-            concrete_vals=flat_args,
-            trial_test_split=None,
+        # initialize tracing state
+        state = TraceState(
+            plan.n_dofs,
+            plan.active_ids,
+            plan.sub_info,
         )
+        acc = CouplingAccumulator(
+            plan.n_dofs,
+        )
+
+        # Concrete values resolve dynamic gather/scatter routing; dependencies seed the DOFs.
+        state.attach_concrete_values(
+            concrete_jaxpr.closed_jaxpr, concrete_jaxpr.flat_args
+        )
+        state.seed_input_dependencies(concrete_jaxpr.closed_jaxpr)
+
+        # forward pass: propagate dep-sets through the jaxpr, recording pairs at nonlinear primitives
+        state.run_bound_eqns(plan.bound_eqns, acc, None)
+
+        pat = acc.finalize()
+        return EnergyTrace(pat, concrete_jaxpr, plan, state)
 
     return wrapper
 
@@ -471,12 +493,10 @@ def pattern_from_energy(
         assert u.ndim == 1, (
             "Input variable u must be a 1D JAX array (flattened degrees of freedom)."
         )
-        closed = jax.make_jaxpr(fn)(*args, **kwargs)
-        flat_args, _ = jax.tree_util.tree_flatten((args, kwargs))
+        concrete_jaxpr = ConcreteJaxpr.from_fn(fn, *args, **kwargs)
 
         return _trace_hessian_sparsity(
-            closed,
-            concrete_vals=flat_args,
+            concrete_jaxpr,
             trial_test_split=None,
         ).pattern
 

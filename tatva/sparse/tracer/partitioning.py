@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, overload
 
@@ -19,9 +19,10 @@ from jax.extend.core import (
 from numpy.typing import NDArray
 
 from tatva.sparse.tracer.common import _get_shape
-from tatva.sparse.tracer.registry import TracerRegistry
+from tatva.sparse.tracer.registry import TR
 
 if TYPE_CHECKING:
+    from tatva.sparse.tracer.base import EnergyTrace
     from tatva.sparse.tracer.handlers import PrimitiveHandler
     from tatva.sparse.tracer.state import BoundEqn, TraceState
 
@@ -215,7 +216,7 @@ class EqnPlan:
 
 
 @dataclass
-class JaxprPlan:
+class JaxprPlan[**P]:
     original_jaxpr: Jaxpr
     requested_outputs: tuple[Var, ...]
 
@@ -357,10 +358,11 @@ class RankPartitionPlan:
 
 
 @dataclass(frozen=True)
-class EnergyPartitionPlan:
+class EnergyPartitionPlan[**P]:
     part_map: NDArray[np.int64]
     roots: tuple[ContributionRoot, ...]
     ranks: tuple[RankPartitionPlan, ...]
+    energy_trace: EnergyTrace
 
     def ghost_dofs_by_rank(self) -> dict[int, NDArray[np.int64]]:
         return {rank_plan.rank: rank_plan.ghost_dofs for rank_plan in self.ranks}
@@ -572,18 +574,17 @@ def find_contribution_roots(
     return merge_contribution_roots(roots)
 
 
-def build_partition_plan(
-    jaxpr: Jaxpr,
-    bound_eqns: list[BoundEqn],
-    state: TraceState,
+def build_partition_plan[**P](
+    energy_trace: EnergyTrace[P],
     part_map: NDArray[np.integer],
-) -> EnergyPartitionPlan:
+) -> EnergyPartitionPlan[P]:
     """Build contribution ownership, halo, and local DOF layouts."""
+    state = energy_trace.state
     partition = _validate_partition_map(part_map, state.n_dofs)
 
     roots = find_contribution_roots(
-        jaxpr=jaxpr,
-        bound_eqns=bound_eqns,
+        jaxpr=energy_trace.concrete_jaxpr.jaxpr,
+        bound_eqns=energy_trace.plan.bound_eqns,
         state=state,
     )
 
@@ -668,6 +669,7 @@ def build_partition_plan(
         part_map=partition,
         roots=tuple(roots),
         ranks=tuple(rank_plans),
+        energy_trace=energy_trace,
     )
 
     _validate_energy_partition_plan(result)
@@ -866,145 +868,18 @@ def build_rank_liveness(
     )
 
 
-class LocalJaxprPlanner:
-    def __init__(self, registry: TracerRegistry):
-        self.registry = registry
-
-    def plan_jaxpr(
-        self,
-        jaxpr: Jaxpr,
-        state: TraceState,
-        seed_demands: Mapping[Var, ContributionDemand],
-        requested_outputs: Sequence[Var],
-    ) -> JaxprPlan:
-        if jaxpr.effects:
-            raise NotImplementedError(
-                "First implementation supports effect-free JAXPRs only"
-            )
-
-        pending: dict[Var, ContributionDemand] = {}
-        layouts: dict[Var, VarLayout] = {}
-        eqn_plans: list[EqnPlan | None] = [None] * len(jaxpr.eqns)
-
-        known_vars = set(jaxpr.constvars) | set(jaxpr.invars)
-        known_vars.update(outvar for eqn in jaxpr.eqns for outvar in eqn.outvars)
-        for var, demand in seed_demands.items():
-            if var not in known_vars:
-                raise ValueError(f"Seed variable is not part of this JAXPR: {var}")
-            self._merge_pending(pending, var, demand)
-
-        requested_outputs = tuple(requested_outputs)
-        for var in requested_outputs:
-            if var not in seed_demands:
-                raise ValueError(f"Requested output has no seed demand: {var}")
-
-        for eqn_index in range(len(jaxpr.eqns) - 1, -1, -1):
-            eqn = jaxpr.eqns[eqn_index]
-
-            if eqn.effects:
-                raise NotImplementedError(
-                    f"Effectful equation cannot currently be rewritten: "
-                    f"{eqn.primitive.name}"
-                )
-
-            out_demands = tuple(pending.pop(outvar, None) for outvar in eqn.outvars)
-
-            if not any(demand is not None for demand in out_demands):
-                continue
-
-            # At this point every consumer of each output has been visited.
-            # Therefore each non-None output demand is final.
-            for outvar, demand in zip(eqn.outvars, out_demands):
-                if demand is None:
-                    continue
-
-                if outvar in layouts:
-                    raise AssertionError(f"Layout finalized twice for {outvar}")
-
-                layouts[outvar] = finalize_layout(outvar, demand)
-
-            handler = self.registry.get(eqn.primitive.name)
-
-            result = handler.plan_backward(
-                eqn=eqn,
-                state=state,
-                out_demands=out_demands,
-                planner=self,
-            )
-
-            if len(result.in_demands) != len(eqn.invars):
-                raise ValueError(
-                    f"{eqn.primitive.name} returned "
-                    f"{len(result.in_demands)} input demands for "
-                    f"{len(eqn.invars)} inputs"
-                )
-
-            for invar, demand in zip(eqn.invars, result.in_demands):
-                if demand is None:
-                    continue
-
-                if isinstance(invar, Literal):
-                    # Literals remain embedded in the generated JAXPR, so
-                    # they do not acquire a compact VarLayout or enter the
-                    # pending map.  A liveness handler can still report a
-                    # demand for one (notably a scalar being broadcast); it
-                    # means the literal is numerically required, not that it
-                    # needs runtime storage.
-                    self._validate_literal_input(invar, demand)
-                    continue
-
-                if invar in layouts:
-                    raise AssertionError(
-                        "Demand reached a variable whose layout was already "
-                        "finalized. The traversal is not reverse-topological "
-                        "or a handler propagated to the wrong variable."
-                    )
-
-                self._merge_pending(pending, invar, demand)
-
-            eqn_plans[eqn_index] = EqnPlan(
-                handler=handler,
-                live_output_mask=tuple(demand is not None for demand in out_demands),
-                aux=result.aux,
-                subplans=result.subplans,
-            )
-
-        constvar_demands = self._finalize_inputs(
-            jaxpr.constvars,
-            pending,
-            layouts,
-        )
-        invar_demands = self._finalize_inputs(
-            jaxpr.invars,
-            pending,
-            layouts,
-        )
-
-        if pending:
-            dangling = list(pending)[:10]
-            raise ValueError(
-                f"Demands remain for variables without producers or inputs: {dangling}"
-            )
-
-        kept_constvars = tuple(
-            i for i, demand in enumerate(constvar_demands) if demand is not None
-        )
-        kept_invars = tuple(
-            i for i, demand in enumerate(invar_demands) if demand is not None
-        )
-        return JaxprPlan(
-            original_jaxpr=jaxpr,
-            requested_outputs=requested_outputs,
-            eqn_plans=tuple(eqn_plans),
-            layouts=layouts,
-            kept_constvar_indices=kept_constvars,
-            kept_invar_indices=kept_invars,
-            constvar_demands=constvar_demands,
-            invar_demands=invar_demands,
+def plan_local_jaxpr(
+    jaxpr: Jaxpr,
+    state: TraceState,
+    seed_demands: Mapping[Var, ContributionDemand],
+    requested_outputs: Sequence[Var],
+) -> JaxprPlan:
+    if jaxpr.effects:
+        raise NotImplementedError(
+            "First implementation supports effect-free JAXPRs only"
         )
 
     def _finalize_inputs(
-        self,
         variables: Sequence[Var],
         pending: dict[Var, ContributionDemand],
         layouts: dict[Var, VarLayout],
@@ -1020,7 +895,6 @@ class LocalJaxprPlanner:
 
         return tuple(demands)
 
-    @staticmethod
     def _merge_pending(
         pending: dict[Var, ContributionDemand],
         var: Var,
@@ -1029,7 +903,6 @@ class LocalJaxprPlanner:
         old = pending.get(var)
         pending[var] = demand if old is None else merge_demands(old, demand)
 
-    @staticmethod
     def _validate_literal_output(
         literal: Literal,
         demand: ContributionDemand,
@@ -1041,13 +914,132 @@ class LocalJaxprPlanner:
         if not rows.is_full(total):
             raise NotImplementedError("Partial literal JAXPR outputs are not supported")
 
-    @staticmethod
     def _validate_literal_input(
         literal: Literal,
         demand: ContributionDemand,
     ) -> None:
         if not _demand_in_bounds(demand, aval_size(literal.aval)):
             raise ValueError(f"Demand outside literal bounds: {literal}")
+
+    pending: dict[Var, ContributionDemand] = {}
+    layouts: dict[Var, VarLayout] = {}
+    eqn_plans: list[EqnPlan | None] = [None] * len(jaxpr.eqns)
+
+    known_vars = set(jaxpr.constvars) | set(jaxpr.invars)
+    known_vars.update(outvar for eqn in jaxpr.eqns for outvar in eqn.outvars)
+    for var, demand in seed_demands.items():
+        if var not in known_vars:
+            raise ValueError(f"Seed variable is not part of this JAXPR: {var}")
+        _merge_pending(pending, var, demand)
+
+    requested_outputs = tuple(requested_outputs)
+    for var in requested_outputs:
+        if var not in seed_demands:
+            raise ValueError(f"Requested output has no seed demand: {var}")
+
+    for eqn_index in range(len(jaxpr.eqns) - 1, -1, -1):
+        eqn = jaxpr.eqns[eqn_index]
+
+        if eqn.effects:
+            raise NotImplementedError(
+                f"Effectful equation cannot currently be rewritten: "
+                f"{eqn.primitive.name}"
+            )
+
+        out_demands = tuple(pending.pop(outvar, None) for outvar in eqn.outvars)
+
+        if not any(demand is not None for demand in out_demands):
+            continue
+
+        # At this point every consumer of each output has been visited.
+        # Therefore each non-None output demand is final.
+        for outvar, demand in zip(eqn.outvars, out_demands):
+            if demand is None:
+                continue
+
+            if outvar in layouts:
+                raise AssertionError(f"Layout finalized twice for {outvar}")
+
+            layouts[outvar] = finalize_layout(outvar, demand)
+
+        handler = TR.get(eqn.primitive.name)
+
+        result = handler.plan_backward(
+            eqn=eqn,
+            state=state,
+            out_demands=out_demands,
+        )
+
+        if len(result.in_demands) != len(eqn.invars):
+            raise ValueError(
+                f"{eqn.primitive.name} returned "
+                f"{len(result.in_demands)} input demands for "
+                f"{len(eqn.invars)} inputs"
+            )
+
+        for invar, demand in zip(eqn.invars, result.in_demands):
+            if demand is None:
+                continue
+
+            if isinstance(invar, Literal):
+                # Literals remain embedded in the generated JAXPR, so
+                # they do not acquire a compact VarLayout or enter the
+                # pending map.  A liveness handler can still report a
+                # demand for one (notably a scalar being broadcast); it
+                # means the literal is numerically required, not that it
+                # needs runtime storage.
+                _validate_literal_input(invar, demand)
+                continue
+
+            if invar in layouts:
+                raise AssertionError(
+                    "Demand reached a variable whose layout was already "
+                    "finalized. The traversal is not reverse-topological "
+                    "or a handler propagated to the wrong variable."
+                )
+
+            _merge_pending(pending, invar, demand)
+
+        eqn_plans[eqn_index] = EqnPlan(
+            handler=handler,
+            live_output_mask=tuple(demand is not None for demand in out_demands),
+            aux=result.aux,
+            subplans=result.subplans,
+        )
+
+    constvar_demands = _finalize_inputs(
+        jaxpr.constvars,
+        pending,
+        layouts,
+    )
+    invar_demands = _finalize_inputs(
+        jaxpr.invars,
+        pending,
+        layouts,
+    )
+
+    if pending:
+        dangling = list(pending)[:10]
+        raise ValueError(
+            f"Demands remain for variables without producers or inputs: {dangling}"
+        )
+
+    kept_constvars = tuple(
+        i for i, demand in enumerate(constvar_demands) if demand is not None
+    )
+    kept_invars = tuple(
+        i for i, demand in enumerate(invar_demands) if demand is not None
+    )
+    return JaxprPlan(
+        original_jaxpr=jaxpr,
+        requested_outputs=requested_outputs,
+        eqn_plans=tuple(eqn_plans),
+        layouts=layouts,
+        kept_constvar_indices=kept_constvars,
+        kept_invar_indices=kept_invars,
+        constvar_demands=constvar_demands,
+        invar_demands=invar_demands,
+    )
 
 
 @dataclass
@@ -1063,10 +1055,13 @@ class OutputSpec:
 
 
 @dataclass
-class LocalProgram:
-    fun: Any
+class LocalProgram[**P]:
+    fn: Callable[P, tuple[Any, ...]]
     input_specs: tuple[InputSpec, ...]
     output_specs: tuple[OutputSpec, ...]
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> tuple[Any, ...]:
+        return self.fn(*args, **kwargs)
 
 
 class LocalJaxprInterpreter:
@@ -1123,7 +1118,7 @@ class LocalJaxprInterpreter:
             args.append(self.take_global_rows(value, layout, child.rows.to_array()))
         return LocalJaxprInterpreter(subplan, sub_consts).make_function()(*args)
 
-    def make_function(self):
+    def make_function(self) -> Callable[..., tuple[Any, ...]]:
         plan = self.plan
         compact_consts = {
             var: jnp.asarray(compact_value(self.original_consts[i], plan.layouts[var]))
@@ -1131,7 +1126,7 @@ class LocalJaxprInterpreter:
             if i in plan.kept_constvar_indices
         }
 
-        def local_function(*local_inputs):
+        def local_function(*local_inputs) -> tuple[Any, ...]:
             if len(local_inputs) != len(plan.kept_invar_indices):
                 raise TypeError(
                     f"Expected {len(plan.kept_invar_indices)} local inputs, got {len(local_inputs)}"
@@ -1182,15 +1177,17 @@ class LocalJaxprInterpreter:
         return local_function
 
 
-def make_local_function(plan: JaxprPlan, original_consts: Sequence[Any]):
+def make_local_interpreter(
+    plan: JaxprPlan, original_consts: Sequence[Any]
+) -> Callable[..., tuple[Any, ...]]:
     return LocalJaxprInterpreter(plan, original_consts).make_function()
 
 
-def build_local_program(
+def _build_local_program(
     plan: JaxprPlan, original_consts: Sequence[Any]
 ) -> LocalProgram:
     return LocalProgram(
-        fun=make_local_function(plan, original_consts),
+        fn=make_local_interpreter(plan, original_consts),
         input_specs=tuple(
             InputSpec(i, plan.layouts[plan.original_jaxpr.invars[i]])
             for i in plan.kept_invar_indices
@@ -1201,8 +1198,27 @@ def build_local_program(
     )
 
 
+def build_local_program[**P](
+    partition_plan: EnergyPartitionPlan[P], rank: int
+) -> LocalProgram[P]:
+    """Return a compact local JAXPR for a single rank's contributions."""
+    state = partition_plan.energy_trace.state
+    seed_demands, requested_outputs = rank_seed_demands(partition_plan, rank)
+
+    jaxpr_plan = plan_local_jaxpr(
+        jaxpr=partition_plan.energy_trace.concrete_jaxpr.jaxpr,
+        state=state,
+        seed_demands=seed_demands,
+        requested_outputs=requested_outputs,
+    )
+    return _build_local_program(
+        jaxpr_plan,
+        partition_plan.energy_trace.concrete_jaxpr.consts,
+    )
+
+
 def trace_local_program(program: LocalProgram, *example_local_inputs: Any):
-    return jax.make_jaxpr(program.fun)(*example_local_inputs)
+    return jax.make_jaxpr(program.fn)(*example_local_inputs)
 
 
 def report_localization_coverage(plan: JaxprPlan) -> list[str]:
@@ -1256,4 +1272,4 @@ def pack_runtime_inputs(
 
 
 # Compatibility name retained while callers migrate from the manual JAXPR API.
-materialize_local_jaxpr = build_local_program
+materialize_local_jaxpr = _build_local_program

@@ -18,13 +18,15 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ParamSpec, TypeAlias
+from typing import TYPE_CHECKING, Any, ParamSpec, Self, TypeAlias
 
+import jax
 import numpy as np
 import scipy.sparse as sps
-from jax.extend.core import ClosedJaxpr, JaxprEqn, Literal
+from jax import Array
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
 from numpy.typing import NDArray
 
 from tatva.sparse.tracer.common import _get_shape
@@ -176,6 +178,42 @@ class SparseDepSet:
     ) -> None:
         """Record all active self- and cross-coupling variable pairs via the global accumulator."""
         acc.record_dep(self.dep, trial_test_split)
+
+
+@dataclass(frozen=True)
+class ConcreteJaxpr:
+    closed_jaxpr: ClosedJaxpr
+    flat_args: list[Any]
+    pytree_def: jax.tree_util.PyTreeDef
+
+    @classmethod
+    def from_fn(cls, fn: Callable[P, Array], *args: P.args, **kwargs: P.kwargs) -> Self:
+        closed = jax.make_jaxpr(fn)(*args, **kwargs)
+        flat_args, pytree_def = jax.tree_util.tree_flatten((args, kwargs))
+        return cls(closed, flat_args, pytree_def)
+
+    def tree_unflatten(self, flat_outs: Sequence[Any]) -> Any:
+        return jax.tree_util.tree_unflatten(self.pytree_def, flat_outs)
+
+    @property
+    def jaxpr(self) -> Jaxpr:
+        return self.closed_jaxpr.jaxpr
+
+    @property
+    def consts(self) -> tuple[Any, ...]:
+        return self.closed_jaxpr.consts
+
+    @property
+    def constvars(self) -> list[Any]:
+        return self.closed_jaxpr.constvars
+
+    @property
+    def invars(self) -> list[Any]:
+        return self.closed_jaxpr.invars
+
+    @property
+    def outvars(self) -> list[Any]:
+        return self.closed_jaxpr.outvars
 
 
 # A bound equation tuple: (eqn, handler, is_active, needs_concrete)

@@ -11,13 +11,12 @@ from tatva.sparse.tracer.partitioning import (
     AllRows,
     ArrayRows,
     ContributionDemand,
-    LocalJaxprPlanner,
     RangeRows,
     materialize_local_jaxpr,
     pack_runtime_inputs,
+    plan_local_jaxpr,
     trace_local_program,
 )
-from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import CouplingAccumulator, TraceState
 
 
@@ -29,14 +28,14 @@ def _local_result(fn, value, rows, *, root_index=-1):
     state.seed_input_dependencies(closed)
     state.run_bound_eqns(analysis.bound_eqns, CouplingAccumulator(analysis.n_dofs))
     root = closed.jaxpr.outvars[root_index]
-    plan = LocalJaxprPlanner(TR).plan_jaxpr(
+    plan = plan_local_jaxpr(
         closed.jaxpr,
         state,
         {root: ContributionDemand(ArrayRows(np.asarray(rows, dtype=np.int64)))},
         [root],
     )
     program = materialize_local_jaxpr(plan, closed.consts)
-    (result,) = program.fun(*pack_runtime_inputs(program, [value]))
+    (result,) = program.fn(*pack_runtime_inputs(program, [value]))
     return np.asarray(result), plan, program
 
 
