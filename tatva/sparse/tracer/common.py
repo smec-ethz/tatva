@@ -294,8 +294,12 @@ def gather_routes(
         offset_dims = tuple(int(d) for d in dnums.offset_dims)
         collapsed_dims = tuple(int(d) for d in dnums.collapsed_slice_dims)
         start_index_map = tuple(int(d) for d in dnums.start_index_map)
-        operand_batching_dims = tuple(int(d) for d in dnums.operand_batching_dims)
-        indices_batching_dims = tuple(int(d) for d in dnums.start_indices_batching_dims)
+        operand_batching_dims = tuple(
+            int(d) for d in getattr(dnums, "operand_batching_dims", ())
+        )
+        indices_batching_dims = tuple(
+            int(d) for d in getattr(dnums, "start_indices_batching_dims", ())
+        )
     except (KeyError, TypeError, AttributeError):
         return None
 
@@ -467,15 +471,19 @@ def gather_routes(
             valid &= values <= upper_starts[operand_axis]
 
     elif mode_name == "PROMISE_IN_BOUNDS":
+        # 07.08.26 florez: current JAX clips out-of-bounds indices in PROMISE_IN_BOUNDS mode, so
+        # we will do the same!
+        starts = np.minimum(np.maximum(starts, 0), upper_starts)
         # The program promises these are valid. If the concrete values violate
         # that promise, fall back conservatively rather than routing incorrectly.
-        for component, operand_axis in enumerate(start_index_map):
-            values = index_vectors[:, component]
-            if np.any(values < 0) or np.any(values > upper_starts[operand_axis]):
-                return None
+        # for component, operand_axis in enumerate(start_index_map):
+        #     values = index_vectors[:, component]
+        #     if np.any(values < 0) or np.any(values > upper_starts[operand_axis]):
+        #         return None
 
     else:
         # For example ONE_HOT, which has different semantics.
+        # TODO: implement ONE_HOT routing if needed.
         return None
 
     source_coords = starts + offsets
