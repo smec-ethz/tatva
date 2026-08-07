@@ -2,18 +2,100 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias, overload
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, overload
 
 import numpy as np
-from jax.extend.core import Jaxpr, JaxprEqn
+from jax import lax
+from jax.core import AbstractValue, Atom, ShapedArray
+from jax.extend.core import (
+    Jaxpr,
+    JaxprEqn,
+    Literal,
+    Var,
+    check_jaxpr,
+    gensym,
+    new_jaxpr_eqn,
+    no_effects,
+)
 from numpy.typing import NDArray
 
 from tatva.sparse.tracer.common import _get_shape
+from tatva.sparse.tracer.registry import TracerRegistry
 
 if TYPE_CHECKING:
+    from tatva.sparse.tracer.handlers import PrimitiveHandler
     from tatva.sparse.tracer.state import BoundEqn, TraceState
+
+
+class RowSet(Protocol):
+    def __len__(self) -> int: ...
+    def to_array(self) -> NDArray: ...
+    def is_full(self, total_size: int) -> bool: ...
+    def localize(self, global_rows: NDArray) -> NDArray:
+        """Map original flat rows to compact local rows."""
+
+
+@dataclass(frozen=True)
+class ArrayRows:
+    values: NDArray[np.int64]
+
+    def __post_init__(self) -> None:
+        values = np.asarray(self.values, dtype=np.int64)
+
+        if values.ndim != 1:
+            raise ValueError("Rows must be one-dimensional")
+        if len(values) > 1 and np.any(values[1:] <= values[:-1]):
+            raise ValueError("Rows must be sorted and unique")
+
+        object.__setattr__(self, "values", values)
+
+    def __len__(self) -> int:
+        return self.values.size
+
+    def to_array(self) -> NDArray[np.int64]:
+        return self.values
+
+    # Compatibility with the older ndarray-backed demand API.  These do not
+    # change the stored representation: callers still receive a RowSet.
+    @property
+    def size(self) -> int:
+        return self.values.size
+
+    def __array__(self, dtype=None, copy=None) -> NDArray[np.int64]:
+        result = np.asarray(self.values, dtype=dtype)
+        return result.copy() if copy else result
+
+    def __getitem__(self, key: Any) -> Any:
+        return self.values[key]
+
+    def is_full(self, total_size: int) -> bool:
+        return self.values.size == total_size and (
+            total_size == 0
+            or (self.values[0] == 0 and self.values[-1] == total_size - 1)
+        )
+
+    def localize(self, global_rows: NDArray[np.int64]) -> NDArray[np.int64]:
+        global_rows = np.asarray(global_rows, dtype=np.int64)
+        if self.values.size == 0:
+            if global_rows.size:
+                raise ValueError("Rows are not present in the local layout.")
+            return global_rows
+        local_rows = np.searchsorted(self.values, global_rows)
+
+        valid = local_rows < self.values.size
+        valid &= (
+            self.values[np.minimum(local_rows, max(self.values.size - 1, 0))]
+            == global_rows
+        )
+        if not np.all(valid):
+            missing = global_rows[~valid]
+            raise ValueError(
+                f"Rows are not present in the local layout: {missing[:10]}"
+            )
+
+        return local_rows
 
 
 @dataclass(frozen=True)
@@ -25,8 +107,21 @@ class AllRows:
     def __len__(self) -> int:
         return self.size
 
-    def __array__(self, dtype=None) -> NDArray[np.int64]:
-        return np.arange(self.size, dtype=dtype or np.int64)
+    def __array__(self, dtype=None, copy=None) -> NDArray[np.int64]:
+        result = np.arange(self.size, dtype=dtype or np.int64)
+        return result.copy() if copy else result
+
+    def to_array(self) -> NDArray[np.int64]:
+        return np.arange(self.size, dtype=np.int64)
+
+    def is_full(self, total_size: int) -> bool:
+        return self.size == total_size
+
+    def localize(self, global_rows: NDArray[np.int64]) -> NDArray[np.int64]:
+        global_rows = np.asarray(global_rows, dtype=np.int64)
+        if np.any(global_rows < 0) or np.any(global_rows >= self.size):
+            raise ValueError("Rows are not present in the local layout.")
+        return global_rows
 
     def __getitem__(self, key):
         return key
@@ -34,8 +129,6 @@ class AllRows:
 
 @dataclass(frozen=True)
 class RangeRows:
-    """A contiguous half-open range of flat entries without materialization."""
-
     start: int
     stop: int
 
@@ -48,27 +141,167 @@ class RangeRows:
 
     @property
     def size(self) -> int:
-        return self.stop - self.start
+        return len(self)
 
-    def __array__(self, dtype=None) -> NDArray[np.int64]:
-        return np.arange(self.start, self.stop, dtype=dtype or np.int64)
+    def __array__(self, dtype=None, copy=None) -> NDArray[np.int64]:
+        result = np.arange(self.start, self.stop, dtype=dtype or np.int64)
+        return result.copy() if copy else result
 
-    def __getitem__(self, key):
-        return key + self.start
+    def to_array(self) -> NDArray[np.int64]:
+        return np.arange(self.start, self.stop, dtype=np.int64)
+
+    def is_full(self, total_size: int) -> bool:
+        return self.start == 0 and self.stop == total_size
+
+    def localize(self, global_rows: NDArray[np.int64]) -> NDArray[np.int64]:
+        global_rows = np.asarray(global_rows, dtype=np.int64)
+        if np.any(global_rows < self.start) or np.any(global_rows >= self.stop):
+            raise ValueError("Rows are not present in the local layout.")
+        return global_rows - self.start
 
 
-RowSelection: TypeAlias = NDArray[np.int64] | AllRows | RangeRows
+# @dataclass(frozen=True)
+# class RangeRows:
+#     """A contiguous half-open range of flat entries without materialization."""
+#
+#     start: int
+#     stop: int
+#
+#     def __post_init__(self) -> None:
+#         if self.start < 0 or self.stop < self.start:
+#             raise ValueError("RangeRows must be a non-negative half-open range.")
+#
+#     def __len__(self) -> int:
+#         return self.stop - self.start
+#
+#     @property
+#     def size(self) -> int:
+#         return self.stop - self.start
+#
+#     def __array__(self, dtype=None) -> NDArray[np.int64]:
+#         return np.arange(self.start, self.stop, dtype=dtype or np.int64)
+#
+#     def __getitem__(self, key):
+#         return key + self.start
+
+
+RowSelection: TypeAlias = ArrayRows | AllRows | RangeRows
+
+
+@dataclass(frozen=True)
+class VarLayout:
+    original_var: Var
+    original_shape: tuple[int, ...]
+    rows: RowSet
+    local_aval: AbstractValue
+    original_size: int
+    is_full: bool
+
+    @property
+    def local_size(self) -> int:
+        return len(self.rows)
 
 
 @dataclass
+class BackwardResult:
+    in_demands: tuple[ContributionDemand | None, ...]
+    aux: Any = None
+    subplans: tuple[JaxprPlan, ...] = ()
+
+
+@dataclass
+class EqnPlan:
+    handler: PrimitiveHandler
+    live_output_mask: tuple[bool, ...]
+    aux: Any = None
+    subplans: tuple[JaxprPlan, ...] = ()
+
+
+@dataclass
+class JaxprPlan:
+    original_jaxpr: Jaxpr
+    requested_outputs: tuple[Var, ...]
+
+    eqn_plans: tuple[EqnPlan | None, ...]
+    """aligned one-to-one with the original jaxpr eqns"""
+    layouts: dict[Var, VarLayout]
+    """contains exactly one finalized layout per live orig var"""
+    kept_constvar_indices: tuple[int, ...]
+    kept_invar_indices: tuple[int, ...]
+    constvar_demands: tuple[ContributionDemand | None, ...]
+    invar_demands: tuple[ContributionDemand | None, ...]
+
+
+def aval_size(aval: AbstractValue) -> int:
+    """Return the total number of flat entries in an abstract value."""
+    shape = getattr(aval, "shape", ())
+    return int(np.prod(shape, dtype=np.int64))
+
+
+def replace_aval_shape(
+    aval: AbstractValue,
+    shape: tuple[int, ...],
+) -> AbstractValue:
+    # Pin this helper to your supported JAX version.
+    #
+    # Prefer aval.update(shape=shape) if supported by the concrete aval type.
+    update = getattr(aval, "update", None)
+    if update is not None:
+        return update(shape=shape)
+
+    return ShapedArray(
+        shape,
+        aval.dtype,  # ty: ignore[unresolved-attribute]
+        weak_type=getattr(aval, "weak_type", False),
+    )
+
+
+def finalize_layout(
+    var: Var,
+    demand: ContributionDemand,
+) -> VarLayout:
+    total = aval_size(var.aval)
+    # rows = normalize_row_set(demand.rows)
+    rows = demand.rows
+
+    if len(rows) == 0:
+        raise ValueError("A live layout cannot contain zero rows.")
+
+    if not _demand_in_bounds(demand, total):
+        raise ValueError(f"Demand outside variable bounds: {var}, size={total}")
+
+    full = rows.is_full(total)
+    original_shape = tuple(getattr(var.aval, "shape", ()))
+    # The local ABI deliberately does not retain tensor shapes.  Scalars are
+    # scalar; every other value is a compact flat vector, even when all rows
+    # happen to be live.
+    local_aval = (
+        var.aval if not original_shape else replace_aval_shape(var.aval, (len(rows),))
+    )
+    return VarLayout(
+        original_var=var,
+        original_shape=original_shape,
+        rows=rows,
+        local_aval=local_aval,
+        original_size=total,
+        is_full=full,
+    )
+
+
+@dataclass(frozen=True)
 class ContributionDemand:
     """Demanded entries, stored explicitly or with a compact row selector."""
 
-    rows: RowSelection
+    rows: RowSet
+
+    def __post_init__(self) -> None:
+        # Keep the public constructor forgiving during the transition, while
+        # making the representation invariant absolute.
+        if not isinstance(self.rows, (ArrayRows, AllRows, RangeRows)):
+            object.__setattr__(self, "rows", ArrayRows(np.asarray(self.rows)))
 
     def __len__(self) -> int:
-        rows = self.rows
-        return len(rows) if isinstance(rows, (AllRows, RangeRows)) else rows.size
+        return len(self.rows)
 
     def is_all_rows(self) -> bool:
         return isinstance(self.rows, AllRows)
@@ -84,7 +317,7 @@ def demand_rows(demand: ContributionDemand) -> NDArray[np.int64]:
         return np.arange(rows.size, dtype=np.int64)
     if isinstance(rows, RangeRows):
         return np.arange(rows.start, rows.stop, dtype=np.int64)
-    return rows
+    return rows.to_array()
 
 
 @dataclass
@@ -160,8 +393,8 @@ def _demand(rows: NDArray[np.integer]) -> ContributionDemand | None:
     if rows.size == 1 or np.all(rows[1:] > rows[:-1]):
         if rows.size > 1 and rows[-1] - rows[0] + 1 == rows.size:
             return ContributionDemand(RangeRows(int(rows[0]), int(rows[-1]) + 1))
-        return ContributionDemand(rows)
-    return ContributionDemand(np.unique(rows))
+        return ContributionDemand(ArrayRows(rows))
+    return ContributionDemand(ArrayRows(np.unique(rows)))
 
 
 def _demand_in_bounds(demand: ContributionDemand, size: int) -> bool:
@@ -170,7 +403,8 @@ def _demand_in_bounds(demand: ContributionDemand, size: int) -> bool:
         return demand.rows.size == size
     if isinstance(demand.rows, RangeRows):
         return demand.rows.stop <= size
-    return not np.any((demand.rows < 0) | (demand.rows >= size))
+    rows = demand.rows.to_array()
+    return not np.any((rows < 0) | (rows >= size))
 
 
 def _invalid_contribution(eqn: JaxprEqn) -> ContributionPropagation:
@@ -278,7 +512,8 @@ def merge_contribution_roots(
             merged[id(root.var)] = root
         else:
             demand = merge_demands(
-                ContributionDemand(previous.rows), ContributionDemand(root.rows)
+                ContributionDemand(ArrayRows(previous.rows)),
+                ContributionDemand(ArrayRows(root.rows)),
             )
             assert demand is not None
             merged[id(root.var)] = ContributionRoot(root.var, demand_rows(demand))
@@ -299,7 +534,9 @@ def find_contribution_roots(
     demand_of: dict[int, ContributionDemand | None] = {}
     for outvar in jaxpr.outvars:
         if state.is_scalar(outvar):
-            demand_of[id(outvar)] = ContributionDemand(np.array([0], dtype=np.int64))
+            demand_of[id(outvar)] = ContributionDemand(
+                ArrayRows(np.array([0], dtype=np.int64))
+            )
 
     if not demand_of:
         raise ValueError(
@@ -509,9 +746,30 @@ def seed_rank_demands(
     for root_index, rows in rank_plan.contribution_rows.items():
         root = partition_plan.roots[root_index]
         existing = demand_of.get(id(root.var))
-        demand_of[id(root.var)] = merge_demands(existing, ContributionDemand(rows))
+        demand_of[id(root.var)] = merge_demands(
+            existing, ContributionDemand(ArrayRows(rows))
+        )
 
     return demand_of
+
+
+def rank_seed_demands(
+    partition_plan: EnergyPartitionPlan,
+    rank: int,
+) -> tuple[dict[Var, ContributionDemand], tuple[Var, ...]]:
+    """Turn a rank's contribution assignments into planner seed variables."""
+    rank_plan = partition_plan.ranks[rank]
+    seeds: dict[Var, ContributionDemand] = {}
+    requested: list[Var] = []
+    for root_index, rows in rank_plan.contribution_rows.items():
+        var = partition_plan.roots[root_index].var
+        if not isinstance(var, Var):
+            raise TypeError("Contribution roots for local JAXPRs must be Vars")
+        demand = ContributionDemand(ArrayRows(rows))
+        seeds[var] = merge_demands(seeds.get(var), demand)
+        if var not in requested:
+            requested.append(var)
+    return seeds, tuple(requested)
 
 
 def _propagate_demands_backward(
@@ -608,4 +866,226 @@ def build_rank_liveness(
         rank=rank,
         all_demands=all_demands,
         live_eqn_ids=frozenset(live_eqn_ids),
+    )
+
+
+class LocalJaxprPlanner:
+    def __init__(self, registry: TracerRegistry):
+        self.registry = registry
+
+    def plan_jaxpr(
+        self,
+        jaxpr: Jaxpr,
+        state: TraceState,
+        seed_demands: Mapping[Var, ContributionDemand],
+        requested_outputs: Sequence[Var],
+    ) -> JaxprPlan:
+        if jaxpr.effects:
+            raise NotImplementedError(
+                "First implementation supports effect-free JAXPRs only"
+            )
+
+        pending: dict[Var, ContributionDemand] = {}
+        layouts: dict[Var, VarLayout] = {}
+        eqn_plans: list[EqnPlan | None] = [None] * len(jaxpr.eqns)
+
+        known_vars = set(jaxpr.constvars) | set(jaxpr.invars)
+        known_vars.update(outvar for eqn in jaxpr.eqns for outvar in eqn.outvars)
+        for var, demand in seed_demands.items():
+            if var not in known_vars:
+                raise ValueError(f"Seed variable is not part of this JAXPR: {var}")
+            self._merge_pending(pending, var, demand)
+
+        requested_outputs = tuple(requested_outputs)
+        for var in requested_outputs:
+            if var not in seed_demands:
+                raise ValueError(f"Requested output has no seed demand: {var}")
+
+        for eqn_index in range(len(jaxpr.eqns) - 1, -1, -1):
+            eqn = jaxpr.eqns[eqn_index]
+
+            if eqn.effects:
+                raise NotImplementedError(
+                    f"Effectful equation cannot currently be rewritten: "
+                    f"{eqn.primitive.name}"
+                )
+
+            out_demands = tuple(pending.pop(outvar, None) for outvar in eqn.outvars)
+
+            if not any(demand is not None for demand in out_demands):
+                continue
+
+            # At this point every consumer of each output has been visited.
+            # Therefore each non-None output demand is final.
+            for outvar, demand in zip(eqn.outvars, out_demands):
+                if demand is None:
+                    continue
+
+                if outvar in layouts:
+                    raise AssertionError(f"Layout finalized twice for {outvar}")
+
+                layouts[outvar] = finalize_layout(outvar, demand)
+
+            handler = self.registry.get(eqn.primitive.name)
+
+            result = handler.plan_backward(
+                eqn=eqn,
+                state=state,
+                out_demands=out_demands,
+                planner=self,
+            )
+
+            if len(result.in_demands) != len(eqn.invars):
+                raise ValueError(
+                    f"{eqn.primitive.name} returned "
+                    f"{len(result.in_demands)} input demands for "
+                    f"{len(eqn.invars)} inputs"
+                )
+
+            for invar, demand in zip(eqn.invars, result.in_demands):
+                if demand is None:
+                    continue
+
+                if isinstance(invar, Literal):
+                    # Literals remain embedded in the generated JAXPR, so
+                    # they do not acquire a compact VarLayout or enter the
+                    # pending map.  A liveness handler can still report a
+                    # demand for one (notably a scalar being broadcast); it
+                    # means the literal is numerically required, not that it
+                    # needs runtime storage.
+                    self._validate_literal_input(invar, demand)
+                    continue
+
+                if invar in layouts:
+                    raise AssertionError(
+                        "Demand reached a variable whose layout was already "
+                        "finalized. The traversal is not reverse-topological "
+                        "or a handler propagated to the wrong variable."
+                    )
+
+                self._merge_pending(pending, invar, demand)
+
+            eqn_plans[eqn_index] = EqnPlan(
+                handler=handler,
+                live_output_mask=tuple(demand is not None for demand in out_demands),
+                aux=result.aux,
+                subplans=result.subplans,
+            )
+
+        constvar_demands = self._finalize_inputs(
+            jaxpr.constvars,
+            pending,
+            layouts,
+        )
+        invar_demands = self._finalize_inputs(
+            jaxpr.invars,
+            pending,
+            layouts,
+        )
+
+        if pending:
+            dangling = list(pending)[:10]
+            raise ValueError(
+                f"Demands remain for variables without producers or inputs: {dangling}"
+            )
+
+        kept_constvars = tuple(
+            i for i, demand in enumerate(constvar_demands) if demand is not None
+        )
+        kept_invars = tuple(
+            i for i, demand in enumerate(invar_demands) if demand is not None
+        )
+        return JaxprPlan(
+            original_jaxpr=jaxpr,
+            requested_outputs=requested_outputs,
+            eqn_plans=tuple(eqn_plans),
+            layouts=layouts,
+            kept_constvar_indices=kept_constvars,
+            kept_invar_indices=kept_invars,
+            constvar_demands=constvar_demands,
+            invar_demands=invar_demands,
+        )
+
+    def _finalize_inputs(
+        self,
+        variables: Sequence[Var],
+        pending: dict[Var, ContributionDemand],
+        layouts: dict[Var, VarLayout],
+    ) -> tuple[ContributionDemand | None, ...]:
+        demands: list[ContributionDemand | None] = []
+
+        for var in variables:
+            demand = pending.pop(var, None)
+            demands.append(demand)
+
+            if demand is not None:
+                layouts[var] = finalize_layout(var, demand)
+
+        return tuple(demands)
+
+    @staticmethod
+    def _merge_pending(
+        pending: dict[Var, ContributionDemand],
+        var: Var,
+        demand: ContributionDemand,
+    ) -> None:
+        old = pending.get(var)
+        pending[var] = demand if old is None else merge_demands(old, demand)
+
+    @staticmethod
+    def _validate_literal_output(
+        literal: Literal,
+        demand: ContributionDemand,
+    ) -> None:
+        total = aval_size(literal.aval)
+        # rows = normalize_row_set(demand.rows)
+        rows = demand.rows
+
+        if not rows.is_full(total):
+            raise NotImplementedError("Partial literal JAXPR outputs are not supported")
+
+    @staticmethod
+    def _validate_literal_input(
+        literal: Literal,
+        demand: ContributionDemand,
+    ) -> None:
+        if not _demand_in_bounds(demand, aval_size(literal.aval)):
+            raise ValueError(f"Demand outside literal bounds: {literal}")
+
+
+@dataclass
+class InputSpec:
+    original_index: int
+    layout: VarLayout
+
+
+@dataclass
+class OutputSpec:
+    original_var: Var
+    layout: VarLayout
+
+
+@dataclass
+class LocalProgram:
+    jaxpr: Jaxpr
+    consts: tuple[Any, ...]
+    input_specs: tuple[InputSpec, ...]
+    output_specs: tuple[OutputSpec, ...]
+
+
+def compact_value(value: Any, layout: VarLayout) -> Any:
+    if not layout.original_shape:
+        return value
+    flat = np.asarray(value).reshape(-1)
+    return flat[layout.rows.to_array()]
+
+
+def pack_runtime_inputs(
+    program: LocalProgram,
+    global_inputs: Sequence[Any],
+) -> tuple[Any, ...]:
+    """Pack global inputs into the local JAXPR's expected layout."""
+    return tuple(
+        compact_value(global_inputs[spec.original_index], spec.layout)
+        for spec in program.input_specs
     )

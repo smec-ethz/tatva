@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
 import scipy.special as sp
+from jax.core import Atom
 from jax.extend.core import JaxprEqn, Literal, Primitive
 from numpy.typing import NDArray
 
@@ -44,10 +45,14 @@ from tatva.sparse.tracer.common import (
 )
 from tatva.sparse.tracer.partitioning import (
     AllRows,
+    BackwardResult,
     ContributionDemand,
     ContributionPropagation,
     ContributionRoot,
+    EqnPlan,
+    LocalJaxprPlanner,
     RangeRows,
+    VarLayout,
     _demand,
     _invalid_contribution,
     demand_rows,
@@ -62,6 +67,13 @@ from tatva.sparse.tracer.state import (
     TraceExecution,
     TraceState,
 )
+
+
+def _live_output_layout(out_layouts: tuple[VarLayout | None, ...]) -> VarLayout:
+    layout = next((layout for layout in out_layouts if layout is not None), None)
+    if layout is None:
+        raise ValueError("A live equation has no output layout")
+    return layout
 
 
 def _eval_reshape(x, params):
@@ -147,6 +159,16 @@ class PrimitiveHandler(ABC):
             size = int(np.prod(_get_shape(var)))
             result.append(ContributionDemand(AllRows(size)) if size else None)
         return result
+
+    def plan_backward(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: tuple[ContributionDemand | None, ...],
+        planner: LocalJaxprPlanner,
+    ) -> BackwardResult:
+        in_demands = self.propagate_liveness_demand(eqn, state, list(out_demands))
+        return BackwardResult(in_demands=tuple(in_demands))
 
     def safe_eval_concrete(
         self,
@@ -289,7 +311,10 @@ class ZeroDependencyHandler(PrimitiveHandler):
 )
 class ElementWiseZeroDependencyHandler(ZeroDependencyHandler):
     def propagate_liveness_demand(
-        self, eqn: JaxprEqn, state: TraceState, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
@@ -385,7 +410,10 @@ class ElementwiseUnary(PrimitiveHandler):
             dep_out.record_couplings(acc, execution.trial_test_split)
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -407,7 +435,10 @@ class ElementwiseUnary(PrimitiveHandler):
         return ContributionPropagation([_demand(demand.rows)], [])
 
     def propagate_liveness_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
@@ -490,7 +521,10 @@ class ElementwiseBinary(PrimitiveHandler):
                 res.record_couplings(acc, execution.trial_test_split)
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -522,7 +556,10 @@ class ElementwiseBinary(PrimitiveHandler):
         return _invalid_contribution(eqn)
 
     def propagate_liveness_demand(
-        self, eqn: JaxprEqn, state: TraceState, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
@@ -577,7 +614,10 @@ class IntegerPowHandler(PrimitiveHandler):
             in_d.record_couplings(acc, execution.trial_test_split)
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -589,7 +629,12 @@ class IntegerPowHandler(PrimitiveHandler):
             return ContributionPropagation([None], [])
         return _invalid_contribution(eqn)
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         return [out_demands[0]]
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
@@ -643,7 +688,10 @@ class BroadcastHandler(PrimitiveHandler):
         return np.broadcast_to(x.reshape(newshape), shape).copy()
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -656,7 +704,12 @@ class BroadcastHandler(PrimitiveHandler):
         )
         return ContributionPropagation([_demand(rows)], [])
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
@@ -703,7 +756,10 @@ class TransposeHandler(PrimitiveHandler):
         return np.transpose(np.asarray(in_vals[0]), params["permutation"])
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -789,7 +845,10 @@ class SliceHandler(PrimitiveHandler):
         return np.asarray(in_vals[0])[sl]
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -807,7 +866,12 @@ class SliceHandler(PrimitiveHandler):
             [_demand(np.ravel_multi_index(in_coords, in_shape))], []
         )
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
@@ -868,7 +932,10 @@ class ReverseHandler(PrimitiveHandler):
         return np.flip(np.asarray(in_vals[0]), axis=params["dimensions"])
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -881,7 +948,12 @@ class ReverseHandler(PrimitiveHandler):
             [_demand(np.ravel_multi_index(tuple(coords), shape))], []
         )
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand.is_all_rows():
             return [
@@ -948,7 +1020,10 @@ class PadHandler(PrimitiveHandler):
         )
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -974,7 +1049,12 @@ class PadHandler(PrimitiveHandler):
             )
         return ContributionPropagation([_demand(rows), None], [])
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         result = self.propagate_contribution_demand(eqn, state, out_demands)
         # Padding values are numerical inputs for padding-only output entries;
         # retain them conservatively whenever padding output is demanded.
@@ -1030,7 +1110,10 @@ class ConcatenateHandler(PrimitiveHandler):
         return np.concatenate(in_vals, axis=params.get("dimension", 0))
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -1058,7 +1141,12 @@ class ConcatenateHandler(PrimitiveHandler):
             offset += size
         return ContributionPropagation(in_demands, [])
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -1141,7 +1229,10 @@ class StackHandler(PrimitiveHandler):
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep[stack_idx], oshp))
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -1164,7 +1255,12 @@ class StackHandler(PrimitiveHandler):
             [],
         )
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         if out_demands[0] is not None and out_demands[0].is_all_rows():
             return [
                 None
@@ -1214,7 +1310,10 @@ class SplitHandler(PrimitiveHandler):
             offset += size
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         source_shape = _get_shape(eqn.invars[0])
         source_ids = np.arange(int(np.prod(source_shape))).reshape(source_shape)
@@ -1235,7 +1334,12 @@ class SplitHandler(PrimitiveHandler):
             )
         return ContributionPropagation([None], roots)
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         return self.propagate_contribution_demand(eqn, state, out_demands).in_demands
 
 
@@ -1329,6 +1433,38 @@ class GatherHandler(PrimitiveHandler):
             _demand(np.arange(state.get(indices_var).dep.shape[0], dtype=np.int64)),
         ]
 
+    def plan_backward(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: tuple[ContributionDemand | None, ...],
+        planner: LocalJaxprPlanner,
+    ) -> BackwardResult:
+        demand = out_demands[0]
+        if demand is None:
+            return BackwardResult(in_demands=(None, None))
+        indices = eqn.invars[1]
+        concrete_indices = (
+            np.asarray(indices.val)
+            if isinstance(indices, Literal)
+            else state.get_val(indices)
+        )
+        if concrete_indices is not None:
+            routes = gather_routes(eqn, concrete_indices, demand_rows(demand))
+            if routes is not None:
+                source_rows, _index_rows = routes
+                # The generated JAXPR gathers the concrete selected source
+                # rows directly, so the original routing tensor is not a
+                # runtime dependency in this specialization.
+                return BackwardResult(
+                    in_demands=(_demand(source_rows), None), aux=source_rows
+                )
+        return BackwardResult(
+            in_demands=tuple(
+                self.propagate_liveness_demand(eqn, state, list(out_demands))
+            )
+        )
+
 
 @TR.register(
     "dynamic_slice",
@@ -1380,7 +1516,12 @@ class DynamicSliceHandler(PrimitiveHandler):
         stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -1407,6 +1548,53 @@ class DynamicSliceHandler(PrimitiveHandler):
             return [_demand(np.ravel_multi_index(src_coords, sizes)), *index_demands]
         except (ValueError, TypeError):
             return [_demand(np.arange(state.get(source).dep.shape[0])), *index_demands]
+
+    def plan_backward(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: tuple[ContributionDemand | None, ...],
+        planner: LocalJaxprPlanner,
+    ) -> BackwardResult:
+        demand = out_demands[0]
+        if demand is None:
+            return BackwardResult(in_demands=tuple([None] * len(eqn.invars)))
+        if eqn.primitive.name != "dynamic_slice":
+            return BackwardResult(
+                in_demands=tuple(
+                    self.propagate_liveness_demand(eqn, state, list(out_demands))
+                )
+            )
+        source, starts = eqn.invars[0], eqn.invars[1:]
+        values = [
+            np.asarray(start.val)
+            if isinstance(start, Literal)
+            else state.get_val(start)
+            for start in starts
+        ]
+        if not all(value is not None for value in values):
+            return BackwardResult(
+                in_demands=tuple(
+                    self.propagate_liveness_demand(eqn, state, list(out_demands))
+                )
+            )
+        source_shape = _get_shape(source)
+        start = [
+            min(max(int(np.asarray(value)), 0), dim - extent)
+            for value, dim, extent in zip(
+                values, source_shape, eqn.params["slice_sizes"]
+            )
+        ]
+        out_rows = demand_rows(demand)
+        coords = np.unravel_index(out_rows, _get_shape(eqn.outvars[0]))
+        source_rows = np.ravel_multi_index(
+            tuple(coord + offset for coord, offset in zip(coords, start)), source_shape
+        )
+        # Concrete starts are specialization data, not local runtime inputs.
+        return BackwardResult(
+            in_demands=(_demand(source_rows), *([None] * len(starts))),
+            aux=source_rows,
+        )
 
 
 @TR.register(
@@ -1469,7 +1657,12 @@ class ScatterHandler(PrimitiveHandler):
         if nonlinear:
             res.record_couplings(acc, execution.trial_test_split)
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -1503,6 +1696,39 @@ class ScatterHandler(PrimitiveHandler):
             _demand(np.arange(int(np.prod(_get_shape(indices))), dtype=np.int64)),
             _demand(np.arange(int(np.prod(_get_shape(updates))), dtype=np.int64)),
         ]
+
+    def plan_backward(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: tuple[ContributionDemand | None, ...],
+        planner: LocalJaxprPlanner,
+    ) -> BackwardResult:
+        in_demands = self.propagate_liveness_demand(eqn, state, list(out_demands))
+        demand = out_demands[0]
+        if demand is None:
+            return BackwardResult(in_demands=tuple(in_demands))
+        indices = eqn.invars[1]
+        concrete_indices = (
+            np.asarray(indices.val)
+            if isinstance(indices, Literal)
+            else state.get_val(indices)
+        )
+        if concrete_indices is None:
+            return BackwardResult(in_demands=tuple(in_demands))
+        routes = scatter_routes(eqn, concrete_indices, include_index_rows=False)
+        if routes is None:
+            return BackwardResult(in_demands=tuple(in_demands))
+        targets, _ = routes
+        update_rows = np.flatnonzero(np.isin(targets, demand_rows(demand))).astype(
+            np.int64
+        )
+        return BackwardResult(
+            in_demands=tuple(in_demands),
+            # Routing depends on concrete index values, so it is deliberate
+            # specialization data for this first local rewriter.
+            aux=(update_rows, targets[update_rows]),
+        )
 
 
 @TR.register(
@@ -1578,7 +1804,12 @@ class SelectNHandler(PrimitiveHandler):
             result = np.where(cond == i, case, result)
         return result
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -1712,7 +1943,12 @@ class DotHandler(PrimitiveHandler):
             )
             state.set(eqn.outvars[0], out_dep)
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None, None]
@@ -1805,7 +2041,10 @@ class ReductionHandler(PrimitiveHandler):
         state.set(eqn.outvars[0], SparseDepSet(reduced_dep, oshp))
 
     def propagate_contribution_demand(
-        self, eqn, state, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -1828,7 +2067,10 @@ class ReductionHandler(PrimitiveHandler):
         return ContributionPropagation([None], [ContributionRoot(eqn.invars[0], rows)])
 
     def propagate_liveness_demand(
-        self, eqn: JaxprEqn, state: TraceState, out_demands
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
     ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
         if demand is None:
@@ -2246,7 +2488,12 @@ class SubJaxprHandler(PrimitiveHandler):
         except (TypeError, ValueError, KeyError, AttributeError):
             return None
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         """Run the ordinary reverse rules inside a call boundary."""
         sub, sub_consts = _subjaxpr_and_consts(eqn)
         info = cast(SubEqnInfo, state.sub_info[id(eqn)])
@@ -2274,6 +2521,45 @@ class SubJaxprHandler(PrimitiveHandler):
         # TODO: for rewriting the jaxpr later, the nested liveness demands must be
         # stored/retained! Likely in state.sub_liveness[id(eqn)] = SubJaxprLivenessPlan(...)
         return [demands.get(id(v)) for v in sub.invars]
+
+    def plan_backward(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: tuple[ContributionDemand | None, ...],
+        planner: LocalJaxprPlanner,
+    ) -> BackwardResult:
+        sub, sub_consts = _subjaxpr_and_consts(eqn)
+        sub_active, _sub_indices, _sub_bound = cast(SubEqnInfo, state.sub_info[id(eqn)])
+        sub_state = TraceState(
+            state.n_dofs, sub_active, state.sub_info, state.nonlinear_ids
+        )
+        for parent, child in zip(eqn.invars, sub.invars):
+            if isinstance(parent, Literal):
+                sub_state.set(
+                    child, SparseDepSet.empty(_get_shape(child), state.n_dofs)
+                )
+                sub_state.val_of[id(child)] = np.asarray(parent.val)
+            else:
+                sub_state.set(child, state.get(parent))
+                value = state.get_val(parent)
+                if value is not None:
+                    sub_state.val_of[id(child)] = value
+        for child, value in zip(sub.constvars, sub_consts):
+            sub_state.set(child, SparseDepSet.empty(_get_shape(child), state.n_dofs))
+            sub_state.val_of[id(child)] = np.asarray(value)
+
+        seed_demands = {
+            sub_out: demand
+            for sub_out, demand in zip(sub.outvars, out_demands)
+            if demand is not None
+        }
+        requested_outputs = tuple(seed_demands)
+        subplan = planner.plan_jaxpr(sub, sub_state, seed_demands, requested_outputs)
+        return BackwardResult(
+            in_demands=subplan.invar_demands,
+            subplans=(subplan,),
+        )
 
 
 @TR.register(
@@ -2334,7 +2620,12 @@ class CondHandler(PrimitiveHandler):
                 ov, d if d is not None else SparseDepSet.empty(_get_shape(ov), n_dofs)
             )
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
         if not any(out_demands):
             return [None] * len(eqn.invars)
         # Predicate is always required: both branches are retained because its
@@ -2374,6 +2665,41 @@ class CondHandler(PrimitiveHandler):
         if not branch_info:
             merged = super().propagate_liveness_demand(eqn, state, out_demands)[1:]
         return [predicate, *merged]
+
+    def plan_backward(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: tuple[ContributionDemand | None, ...],
+        planner: LocalJaxprPlanner,
+    ) -> BackwardResult:
+        # TODO: implement this
+        # For cond, create one subplan per branch and union branch input demands.
+        #
+        # sub_jaxpr, sub_state = get_subjaxpr_and_state(eqn, state)
+        #
+        # sub_output_demands = map_parent_outputs_to_sub_outputs(
+        #     eqn,
+        #     sub_jaxpr,
+        #     out_demands,
+        # )
+        #
+        # subplan = planner.plan_jaxpr(
+        #     sub_jaxpr,
+        #     sub_state,
+        #     sub_output_demands,
+        # )
+        #
+        # parent_input_demands = map_sub_inputs_to_parent_inputs(
+        #     eqn,
+        #     subplan.invar_demands,
+        # )
+        #
+        # return BackwardResult(
+        #     in_demands=tuple(parent_input_demands),
+        #     subplans=(subplan,),
+        # )
+        return super().plan_backward(eqn, state, out_demands, planner)
 
 
 @TR.register(
@@ -2794,6 +3120,44 @@ class ScanMapHandler(PrimitiveHandler):
             return in_demands
         except (KeyError, TypeError, ValueError, IndexError, AttributeError):
             return super().propagate_liveness_demand(eqn, state, out_demands)
+
+    def plan_backward(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: tuple[ContributionDemand | None, ...],
+        planner: LocalJaxprPlanner,
+    ) -> BackwardResult:
+        # TODO: implement this
+        # For scan, the handler must decide whether to:
+        # build one body plan from the union of all retained-iteration demands; or
+        # emit selected iterations explicitly.
+        # Keep that decision inside the scan handler.
+        #
+        # sub_jaxpr, sub_state = get_subjaxpr_and_state(eqn, state)
+        #
+        # sub_output_demands = map_parent_outputs_to_sub_outputs(
+        #     eqn,
+        #     sub_jaxpr,
+        #     out_demands,
+        # )
+        #
+        # subplan = planner.plan_jaxpr(
+        #     sub_jaxpr,
+        #     sub_state,
+        #     sub_output_demands,
+        # )
+        #
+        # parent_input_demands = map_sub_inputs_to_parent_inputs(
+        #     eqn,
+        #     subplan.invar_demands,
+        # )
+        #
+        # return BackwardResult(
+        #     in_demands=tuple(parent_input_demands),
+        #     subplans=(subplan,),
+        # )
+        return super().plan_backward(eqn, state, out_demands, planner)
 
 
 @TR.register(
