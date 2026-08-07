@@ -1,23 +1,92 @@
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import lax
+from jax import Array, lax
+from jax_autovmap import autovmap
 
 from tatva.compound import Compound, field
 from tatva.lifter import Fixed, Lifter, Periodic
 from tatva.mesh import Mesh
-from tatva.sparse.tracer.base import _JaxprAnalyzer
+from tatva.sparse.tracer.base import _JaxprAnalyzer, make_partition_plan
 from tatva.sparse.tracer.partitioning import (
     AllRows,
     ArrayRows,
     ContributionDemand,
     RangeRows,
+    build_local_program,
     materialize_local_jaxpr,
     pack_runtime_inputs,
     plan_local_jaxpr,
     trace_local_program,
 )
 from tatva.sparse.tracer.state import CouplingAccumulator, TraceState
+
+
+class Material(NamedTuple):
+    """Material properties for the elasticity operator."""
+
+    mu: float  # Diffusion coefficient
+    lmbda: float  # Diffusion coefficient
+
+    @classmethod
+    def from_youngs_poisson_2d(
+        cls, E: float, nu: float, plane_stress: bool = False
+    ) -> "Material":
+        mu = E / 2 / (1 + nu)
+        if plane_stress:
+            lmbda = 2 * nu * mu / (1 - nu)
+        else:
+            lmbda = E * nu / (1 - 2 * nu) / (1 + nu)
+        return cls(mu=mu, lmbda=lmbda)
+
+
+@autovmap(grad_u=2)
+def compute_deformation_gradient(grad_u: Array) -> Array:
+    return jnp.eye(2) + grad_u
+
+
+@autovmap(grad_u=2, mat=None)
+def strain_energy_density(grad_u: Array, mat: Material) -> Array:
+    F = compute_deformation_gradient(grad_u)
+    C = F.T @ F
+    J = jnp.linalg.det(F)
+    return (
+        mat.mu / 2 * (jnp.trace(C) - 2)  # 2D case
+        - mat.mu * jnp.log(J)
+        + (mat.lmbda / 2) * (jnp.log(J)) ** 2
+    )
+
+
+@autovmap(grad_u=2, mat=None)
+def get_cauchy_stress(grad_u: Array, mat: Material) -> Array:
+    F = compute_deformation_gradient(grad_u)
+    C = F.T @ F
+    J = jnp.linalg.det(F)
+
+    C_inv = jnp.linalg.inv(C)
+    S = mat.mu * (jnp.eye(2) - C_inv) + mat.lmbda * jnp.log(J) * C_inv  # 2nd PK
+    P = F @ S  # 1st PK
+
+    sigma = (P @ F.T) / J  # Cauchy
+    return sigma
+
+
+@autovmap(grad_u=2, mat=None)
+def get_stress(grad_u: Array, mat: Material) -> Array:
+    # 2nd Piola-Kirchhoff stress tensor
+    F = compute_deformation_gradient(grad_u)
+    C = F.T @ F
+    J = jnp.linalg.det(F)
+    C_inv = jnp.linalg.inv(C)
+    S = mat.mu * (jnp.eye(2) - C_inv) + mat.lmbda * jnp.log(J) * C_inv  # 2nd PK
+    return S
+
+
+def von_mises_stress(sig):
+    s_xx, s_yy, s_xy = sig[..., 0, 0], sig[..., 1, 1], sig[..., 0, 1]
+    return np.sqrt(s_xx**2 - s_xx * s_yy + s_yy**2 + 3 * s_xy**2)
 
 
 def _local_result(fn, value, rows, *, root_index=-1):
@@ -84,7 +153,7 @@ def test_local_jaxpr_routes_transpose_slice_and_scalar_broadcast():
     # This requires a non-contiguous compact selection in the traced callable.
     result, _, program = _local_result(lambda x: x[::-1], jnp.arange(6.0), [0, 2])
     np.testing.assert_allclose(result, [5.0, 3.0])
-    assert jax.make_jaxpr(program.fun)(*pack_runtime_inputs(program, [jnp.arange(6.0)]))
+    assert jax.make_jaxpr(program.fn)(*pack_runtime_inputs(program, [jnp.arange(6.0)]))
 
 
 def test_local_jaxpr_lifter_literal():
@@ -147,7 +216,7 @@ def test_local_jaxpr_emits_compact_iota_and_elementwise_predicates():
         lambda x: x + jnp.arange(x.size), jnp.ones(8), [2, 6]
     )
     np.testing.assert_allclose(result, [3.0, 7.0])
-    assert jax.make_jaxpr(program.fun)(*pack_runtime_inputs(program, [jnp.ones(8)]))
+    assert jax.make_jaxpr(program.fn)(*pack_runtime_inputs(program, [jnp.ones(8)]))
 
     result, _, _ = _local_result(lambda x: x > 3, jnp.arange(8), [2, 6])
     np.testing.assert_array_equal(result, [False, True])
@@ -174,6 +243,51 @@ def test_local_jaxpr_emits_selected_dot_general_rows():
     np.testing.assert_allclose(result, [43.0])
 
 
+def test_local_jaxpr_executes_selected_fem_dot_blocks():
+    reference_gradient = jnp.array([[1.0, 2.0, 3.0], [-1.0, 0.0, 1.0]])
+
+    def fn(x):
+        element_values = x.reshape(3, 5, 2)
+        return jax.lax.dot_general(
+            reference_gradient,
+            element_values,
+            dimension_numbers=(((1,), (0,)), ((), ())),
+        )
+
+    # Complete output blocks for non-contiguous elements 1 and 3.
+    rows = [2, 3, 6, 7, 12, 13, 16, 17]
+    x = jnp.arange(30.0)
+    result, _, program = _local_result(fn, x, rows)
+    np.testing.assert_allclose(result, np.asarray(fn(x)).reshape(-1)[rows])
+    local_x = pack_runtime_inputs(program, [x])[0]
+    assert trace_local_program(program, local_x)
+    np.testing.assert_allclose(
+        jax.jit(program.fn)(local_x)[0], np.asarray(fn(x)).reshape(-1)[rows]
+    )
+
+
+def test_local_jaxpr_executes_selected_leading_batch_dot_blocks():
+    shared = jnp.array([[1.0, 0.0], [0.0, 2.0], [3.0, 1.0]])
+
+    def fn(x):
+        return jax.lax.dot_general(
+            x.reshape(5, 2, 3),
+            shared,
+            dimension_numbers=(((2,), (0,)), ((), ())),
+        )
+
+    # Complete [2, 2] output blocks for non-contiguous batches 1 and 3.
+    rows = [4, 5, 6, 7, 12, 13, 14, 15]
+    x = jnp.arange(30.0)
+    result, _, program = _local_result(fn, x, rows)
+    np.testing.assert_allclose(result, np.asarray(fn(x)).reshape(-1)[rows])
+    local_x = pack_runtime_inputs(program, [x])[0]
+    assert trace_local_program(program, local_x)
+    np.testing.assert_allclose(
+        jax.jit(program.fn)(local_x)[0], np.asarray(fn(x)).reshape(-1)[rows]
+    )
+
+
 def test_local_jaxpr_specializes_dynamic_slice_starts():
     result, _, program = _local_result(
         lambda x: lax.dynamic_slice(x, (x[0].astype(jnp.int32),), (3,)),
@@ -194,14 +308,108 @@ def test_local_jaxpr_rewrites_nested_jit():
     np.testing.assert_allclose(result, np.sin(np.array([2.0, 8.0])))
 
 
+def test_local_jaxpr_executes_single_iteration_scan_without_carry():
+    def fn(x):
+        xs = x.reshape(1, 3)
+        _, ys = lax.scan(lambda _, value: ((), jnp.sin(value) * 2), (), xs)
+        return ys
+
+    result, _, program = _local_result(fn, jnp.arange(3.0), [1, 2])
+    np.testing.assert_allclose(result, 2 * np.sin([1.0, 2.0]))
+    local_x = pack_runtime_inputs(program, [jnp.arange(3.0)])[0]
+    assert trace_local_program(program, local_x)
+    np.testing.assert_allclose(jax.jit(program.fn)(local_x)[0], 2 * np.sin([1.0, 2.0]))
+
+
 def test_local_callable_traces_jits_and_differentiates():
     _, _, program = _local_result(lambda x: jnp.sin(x) * 2, jnp.arange(6.0), [1, 4])
     local_x = pack_runtime_inputs(program, [jnp.arange(6.0)])[0]
     assert trace_local_program(program, local_x)
     np.testing.assert_allclose(
-        jax.jit(program.fun)(local_x)[0], [2 * np.sin(1), 2 * np.sin(4)]
+        jax.jit(program.fn)(local_x)[0], [2 * np.sin(1), 2 * np.sin(4)]
     )
     np.testing.assert_allclose(
-        jax.grad(lambda x: jnp.sum(program.fun(x)[0]))(local_x),
+        jax.grad(lambda x: jnp.sum(program.fn(x)[0]))(local_x),
         2 * np.cos(np.array([1.0, 4.0])),
     )
+
+
+def test_minimal_fem_example():
+    n = 20
+    mesh = Mesh.unit_square(n, n)
+
+    class Solution(Compound, mesh=mesh):
+        u = field((-1, 2))
+
+    bottom = np.where(np.isclose(mesh.coords[:, 1], 0))[0]
+    top = np.where(np.isclose(mesh.coords[:, 1], 1))[0]
+    right = np.where(mesh.coords[:, 0] == 1)[0]
+    left = np.where(mesh.coords[:, 0] == 0)[0]
+    corner_0 = np.where((mesh.coords[:, 0] == 0) & (mesh.coords[:, 1] == 0))[0]
+
+    lifter = Lifter.make(
+        mesh.coords.shape[0] * 2,
+        Fixed(Solution.u[corner_0]),
+        Periodic(Solution.u[right, :], Solution.u[left, :]),
+        Periodic(Solution.u[top, :], Solution.u[bottom, :]),
+    )
+
+    import pymetis
+
+    from tatva import sparse
+    from tatva.element.base import Tri3
+    from tatva.operator import Operator
+    from tatva.sparse._coloring import csr_to_adjacency
+
+    def energy_functional(
+        z: Array,  # flat array of reduced dofs
+        op: Operator,  # fem operator
+        lifter: Lifter,  # lifting operator
+        mat: Material,
+    ) -> Array:
+        z_full = lifter.lift_from_zeros(z)  # lift operation
+        (u,) = Solution(z_full)  # reshape flat array into fields
+        grad_u = op.grad(u)
+        psi = strain_energy_density(grad_u, mat)
+        return op.integrate(psi)
+
+    def dummy(
+        z: Array,
+        lifter: Lifter,
+    ):
+        z_full = lifter.lift_from_zeros(z)
+        # z_full = z
+        return jnp.sum(z_full[4:] * z_full[:-4])
+
+    op = Operator(mesh, Tri3())
+    mat = Material.from_youngs_poisson_2d(2e3, 0.3)
+    trace = sparse.trace_energy(energy_functional)(
+        jnp.zeros(lifter.size_reduced), op=op, lifter=lifter, mat=mat
+    )
+
+    options = pymetis.Options(
+        contig=0,  # require each partition to be connected
+        minconn=1,  # reduce number of neighboring partitions
+        ncuts=5,  # try several initial partitions
+        niter=10,  # more refinement
+        seed=1,
+    )
+
+    sparsity = trace.pattern
+    adj = csr_to_adjacency(sparsity.shape[0], sparsity.indptr, sparsity.indices)
+
+    num_edges = sum(map(len, adj)) // 2
+    edgecut, parts = pymetis.part_graph(
+        2,
+        adjacency=adj,
+        recursive=False,  # direct k-way; contig/minconn apply here
+        options=options,
+    )
+    part_map = np.asarray(parts)
+    partition_plan = make_partition_plan(trace, part_map)
+    rank = 0
+    local_program = build_local_program(partition_plan, rank)
+
+    args = pack_runtime_inputs(local_program, trace.concrete_jaxpr.flat_args)
+    # this must run
+    local_result = local_program.fn(*args)[0]

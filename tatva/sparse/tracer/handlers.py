@@ -45,6 +45,7 @@ from tatva.sparse.tracer.common import (
 from tatva.sparse.tracer.partitioning import (
     AllRows,
     BackwardResult,
+    BatchLayout,
     ContributionDemand,
     ContributionPropagation,
     ContributionRoot,
@@ -1579,6 +1580,9 @@ class GatherHandler(PrimitiveHandler):
         demand = out_demands[0]
         if demand is None:
             return [None, None]
+        batched = self._batched_block_liveness(eqn, demand)
+        if batched is not None:
+            return batched
         # Use the same concrete routes understood by forward propagation.  The
         # remaining general gather forms deliberately retain the full operand.
         src, indices_var = eqn.invars[:2]
@@ -1600,6 +1604,50 @@ class GatherHandler(PrimitiveHandler):
             _demand(np.arange(state.get(src).dep.shape[0], dtype=np.int64)),
             _demand(np.arange(state.get(indices_var).dep.shape[0], dtype=np.int64)),
         ]
+
+    @staticmethod
+    def _batched_block_liveness(
+        eqn: JaxprEqn, demand: ContributionDemand
+    ) -> list[ContributionDemand | None] | None:
+        """Route complete leading batch blocks without needing runtime indices."""
+        dn = eqn.params.get("dimension_numbers")
+        operand_batches = tuple(getattr(dn, "operand_batching_dims", ()))
+        index_batches = tuple(getattr(dn, "start_indices_batching_dims", ()))
+        if operand_batches != (0,) or index_batches != (0,):
+            return None
+        source_shape = _get_shape(eqn.invars[0])
+        index_shape = _get_shape(eqn.invars[1])
+        output_shape = _get_shape(eqn.outvars[0])
+        if not source_shape or not index_shape or not output_shape:
+            return None
+        output_block = int(np.prod(output_shape[1:], dtype=np.int64))
+        source_block = int(np.prod(source_shape[1:], dtype=np.int64))
+        index_block = int(np.prod(index_shape[1:], dtype=np.int64))
+        rows = demand_rows(demand)
+        if rows.size % output_block:
+            return None
+        batches = np.unique(rows // output_block)
+        expected_output = np.concatenate(
+            [
+                batch * output_block + np.arange(output_block, dtype=np.int64)
+                for batch in batches
+            ]
+        )
+        if not np.array_equal(rows, expected_output):
+            return None
+        source_rows = np.concatenate(
+            [
+                batch * source_block + np.arange(source_block, dtype=np.int64)
+                for batch in batches
+            ]
+        )
+        index_rows = np.concatenate(
+            [
+                batch * index_block + np.arange(index_block, dtype=np.int64)
+                for batch in batches
+            ]
+        )
+        return [_demand(source_rows), _demand(index_rows)]
 
     def plan_backward(
         self,
@@ -1630,6 +1678,43 @@ class GatherHandler(PrimitiveHandler):
             in_demands=tuple(
                 self.propagate_liveness_demand(eqn, state, list(out_demands))
             )
+        )
+
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        source, indices = in_values[:2]
+        source_layout, index_layout = in_layouts[:2]
+        out_layout = _live_output_layout(out_layouts)
+        if (
+            source is not None
+            and indices is not None
+            and source_layout
+            and index_layout
+        ):
+            source_batch = BatchLayout.from_var_layout(source_layout)
+            index_batch = BatchLayout.from_var_layout(index_layout)
+            output_batch = BatchLayout.from_var_layout(out_layout)
+            dn = eqn.params.get("dimension_numbers")
+            if (
+                source_batch is not None
+                and index_batch is not None
+                and output_batch is not None
+                and source_batch.global_batch_ids.tolist()
+                == index_batch.global_batch_ids.tolist()
+                == output_batch.global_batch_ids.tolist()
+                and tuple(getattr(dn, "operand_batching_dims", ())) == (0,)
+                and tuple(getattr(dn, "start_indices_batching_dims", ())) == (0,)
+            ):
+                local_source, _ = interpreter.batch_value(source, source_layout)
+                local_indices, _ = interpreter.batch_value(indices, index_layout)
+                result = eqn.primitive.bind(local_source, local_indices, **eqn.params)
+                return (jnp.ravel(result),)
+        return super().eval_local(
+            eqn=eqn,
+            plan=plan,
+            in_values=in_values,
+            in_layouts=in_layouts,
+            out_layouts=out_layouts,
+            interpreter=interpreter,
         )
 
 
@@ -2045,18 +2130,50 @@ class DotHandler(PrimitiveHandler):
         dn = eqn.params["dimension_numbers"]
         lhs_contract = tuple(dn[0][0])
         rhs_contract = tuple(dn[0][1])
+        local = self._eval_matching_leading_batches(
+            eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts, interpreter
+        )
+        if local is not None:
+            return (local,)
+        local = self._eval_broadcast_batch_dot(
+            eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts
+        )
+        if local is not None:
+            return (local,)
+        local = self._eval_leading_batch_blocks(
+            eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts, interpreter
+        )
+        if local is not None:
+            return (local,)
         # The initial local path supports the usual matrix/vector cases where
         # liveness retained whole contraction blocks for selected output rows.
-        if (
-            lhs_contract == (len(lhs_layout.original_shape) - 1,)
-            and rhs_contract == (0,)
-            and rhs_layout.is_full
-        ):
+        if lhs_contract == (len(lhs_layout.original_shape) - 1,):
             width = lhs_layout.original_shape[-1]
-            if lhs_layout.local_size % width == 0:
+            if (
+                rhs_contract == (0,)
+                and rhs_layout.is_full
+                and lhs_layout.local_size % width == 0
+            ):
                 local_lhs = jnp.reshape(lhs, (lhs_layout.local_size // width, width))
                 local_rhs = jnp.reshape(rhs, rhs_layout.original_shape)
                 return (eqn.primitive.bind(local_lhs, local_rhs, **eqn.params),)
+            local = (
+                self._eval_selected_rhs_blocks(
+                    eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts
+                )
+                if rhs_contract == (0,)
+                else self._eval_selected_rhs_last_axis_blocks(
+                    eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts
+                )
+                if rhs_contract == (1,)
+                else None
+            )
+            if local is None and rhs_contract == (1,):
+                local = self._eval_selected_rhs_first_axis_blocks(
+                    eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts
+                )
+            if local is not None:
+                return (local,)
         return super().eval_local(
             eqn=eqn,
             plan=plan,
@@ -2065,6 +2182,328 @@ class DotHandler(PrimitiveHandler):
             out_layouts=out_layouts,
             interpreter=interpreter,
         )
+
+    @staticmethod
+    def _eval_leading_batch_blocks(
+        eqn: JaxprEqn,
+        lhs,
+        rhs,
+        lhs_layout: VarLayout,
+        rhs_layout: VarLayout,
+        out_layouts: tuple[VarLayout | None, ...],
+        interpreter,
+    ):
+        """Evaluate ``[batch,m,k] @ [k,n]`` on selected complete batches."""
+        out_layout = _live_output_layout(out_layouts)
+        lhs_shape = lhs_layout.original_shape
+        rhs_shape = rhs_layout.original_shape
+        out_shape = out_layout.original_shape
+        dn = eqn.params["dimension_numbers"]
+        if (
+            len(lhs_shape) != 3
+            or len(rhs_shape) != 2
+            or len(out_shape) != 3
+            or tuple(dn[0][0]) != (2,)
+            or tuple(dn[0][1]) != (0,)
+            or tuple(dn[1][0])
+            or tuple(dn[1][1])
+            or lhs_shape[2] != rhs_shape[0]
+            or out_shape != (lhs_shape[0], lhs_shape[1], rhs_shape[1])
+            or not rhs_layout.is_full
+        ):
+            return None
+        lhs_batch = BatchLayout.from_var_layout(lhs_layout)
+        out_batch = BatchLayout.from_var_layout(out_layout)
+        if (
+            lhs_batch is None
+            or out_batch is None
+            or not np.array_equal(
+                lhs_batch.global_batch_ids, out_batch.global_batch_ids
+            )
+            or lhs_batch.batch_shape != lhs_shape[1:]
+            or out_batch.batch_shape != out_shape[1:]
+        ):
+            return None
+        local_lhs, _ = interpreter.batch_value(lhs, lhs_layout)
+        local_rhs = jnp.reshape(rhs, rhs_shape)
+        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
+
+    @staticmethod
+    def _eval_matching_leading_batches(
+        eqn: JaxprEqn,
+        lhs,
+        rhs,
+        lhs_layout: VarLayout,
+        rhs_layout: VarLayout,
+        out_layouts: tuple[VarLayout | None, ...],
+        interpreter,
+    ):
+        """Bind a dot whose two compact operands share a leading batch axis."""
+        dn = eqn.params["dimension_numbers"]
+        lhs_batch_dims = tuple(dn[1][0])
+        rhs_batch_dims = tuple(dn[1][1])
+        if (
+            not lhs_batch_dims
+            or lhs_batch_dims[0] != 0
+            or lhs_batch_dims != rhs_batch_dims
+        ):
+            return None
+        out_layout = _live_output_layout(out_layouts)
+        lhs_batch = BatchLayout.from_var_layout(lhs_layout)
+        rhs_batch = BatchLayout.from_var_layout(rhs_layout)
+        out_batch = BatchLayout.from_var_layout(out_layout)
+        out_batch_ids = (
+            out_batch.global_batch_ids
+            if out_batch is not None
+            else out_layout.rows.to_array()
+            if len(out_layout.original_shape) == 1
+            else None
+        )
+        if (
+            lhs_batch is None
+            or rhs_batch is None
+            or out_batch_ids is None
+            or not np.array_equal(
+                lhs_batch.global_batch_ids, rhs_batch.global_batch_ids
+            )
+            or not np.array_equal(lhs_batch.global_batch_ids, out_batch_ids)
+        ):
+            return None
+        local_lhs, _ = interpreter.batch_value(lhs, lhs_layout)
+        local_rhs, _ = interpreter.batch_value(rhs, rhs_layout)
+        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
+
+    @staticmethod
+    def _eval_broadcast_batch_dot(
+        eqn: JaxprEqn,
+        lhs,
+        rhs,
+        lhs_layout: VarLayout,
+        rhs_layout: VarLayout,
+        out_layouts: tuple[VarLayout | None, ...],
+    ):
+        """Execute a length-one batch operand against selected trailing batches."""
+        out_layout = _live_output_layout(out_layouts)
+        dn = eqn.params["dimension_numbers"]
+        if (
+            lhs_layout.local_size == 1
+            and rhs_layout.local_size == out_layout.local_size
+            and not tuple(dn[0][0])
+            and not tuple(dn[0][1])
+        ):
+            # No contraction remains: in compact output order this is scalar
+            # multiplication, independent of where the singleton batch axis
+            # occurred in the original tensors.
+            return jnp.ravel(lhs) * jnp.ravel(rhs)
+        if (
+            lhs_layout.original_shape != (1,)
+            or not lhs_layout.is_full
+            or len(rhs_layout.original_shape) != 2
+            or rhs_layout.original_shape[0] != 1
+            or out_layout.original_shape != rhs_layout.original_shape
+            or tuple(dn[0][0])
+            or tuple(dn[0][1])
+            or tuple(dn[1][0]) != (0,)
+            or tuple(dn[1][1]) != (1,)
+            or not np.array_equal(
+                rhs_layout.rows.to_array(), out_layout.rows.to_array()
+            )
+        ):
+            return None
+        return jnp.ravel(
+            eqn.primitive.bind(
+                jnp.reshape(lhs, (1,)),
+                jnp.reshape(rhs, (1, rhs_layout.local_size)),
+                **eqn.params,
+            )
+        )
+
+    @staticmethod
+    def _eval_selected_rhs_blocks(
+        eqn: JaxprEqn,
+        lhs,
+        rhs,
+        lhs_layout: VarLayout,
+        rhs_layout: VarLayout,
+        out_layouts: tuple[VarLayout | None, ...],
+    ):
+        """Evaluate ``[i,k] @ [k,e,j]`` on complete selected element blocks.
+
+        FEM gradient assembly commonly contracts a small, full reference matrix
+        with a tensor whose middle (element) axis is partitioned.  The compact
+        layouts retain complete ``(k, j)`` blocks per selected element; checking
+        that invariant here makes reshaping exact rather than reconstructing a
+        global tensor.
+        """
+        out_layout = _live_output_layout(out_layouts)
+        lhs_shape = lhs_layout.original_shape
+        rhs_shape = rhs_layout.original_shape
+        out_shape = out_layout.original_shape
+        if (
+            len(lhs_shape) != 2
+            or len(rhs_shape) != 3
+            or len(out_shape) != 3
+            or not lhs_layout.is_full
+            or lhs_shape[1] != rhs_shape[0]
+            or out_shape != (lhs_shape[0], rhs_shape[1], rhs_shape[2])
+        ):
+            return None
+
+        contract, n_global_elements, components = rhs_shape
+        rhs_rows = rhs_layout.rows.to_array()
+        if rhs_rows.size % (contract * components):
+            return None
+        rhs_coords = np.unravel_index(rhs_rows, rhs_shape)
+        selected_elements = np.unique(rhs_coords[1])
+        expected_rhs = np.concatenate(
+            [
+                (
+                    contract_index * n_global_elements * components
+                    + selected_elements[:, None] * components
+                    + np.arange(components, dtype=np.int64)
+                ).ravel()
+                for contract_index in range(contract)
+            ]
+        )
+        if not np.array_equal(rhs_rows, expected_rhs):
+            return None
+
+        expected_out = np.concatenate(
+            [
+                (
+                    lhs_index * n_global_elements * components
+                    + selected_elements[:, None] * components
+                    + np.arange(components, dtype=np.int64)
+                ).ravel()
+                for lhs_index in range(lhs_shape[0])
+            ]
+        )
+        if not np.array_equal(out_layout.rows.to_array(), expected_out):
+            return None
+
+        local_lhs = jnp.reshape(lhs, lhs_shape)
+        local_rhs = jnp.reshape(rhs, (contract, selected_elements.size, components))
+        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
+
+    @staticmethod
+    def _eval_selected_rhs_last_axis_blocks(
+        eqn: JaxprEqn,
+        lhs,
+        rhs,
+        lhs_layout: VarLayout,
+        rhs_layout: VarLayout,
+        out_layouts: tuple[VarLayout | None, ...],
+    ):
+        """Evaluate ``[i,k] @ [j,k,e]`` for complete selected element blocks."""
+        out_layout = _live_output_layout(out_layouts)
+        lhs_shape = lhs_layout.original_shape
+        rhs_shape = rhs_layout.original_shape
+        out_shape = out_layout.original_shape
+        if (
+            len(lhs_shape) != 2
+            or len(rhs_shape) != 3
+            or len(out_shape) != 3
+            or not lhs_layout.is_full
+            or lhs_shape[1] != rhs_shape[1]
+            or out_shape != (lhs_shape[0], rhs_shape[0], rhs_shape[2])
+        ):
+            return None
+
+        rhs_outer, contract, n_global_elements = rhs_shape
+        rhs_rows = rhs_layout.rows.to_array()
+        if rhs_rows.size % (rhs_outer * contract):
+            return None
+        rhs_coords = np.unravel_index(rhs_rows, rhs_shape)
+        selected_elements = np.unique(rhs_coords[2])
+        expected_rhs = np.concatenate(
+            [
+                (
+                    outer_index * contract * n_global_elements
+                    + contract_index * n_global_elements
+                    + selected_elements
+                )
+                for outer_index in range(rhs_outer)
+                for contract_index in range(contract)
+            ]
+        )
+        if not np.array_equal(rhs_rows, expected_rhs):
+            return None
+
+        expected_out = np.concatenate(
+            [
+                (
+                    lhs_index * rhs_outer * n_global_elements
+                    + outer_index * n_global_elements
+                    + selected_elements
+                )
+                for lhs_index in range(lhs_shape[0])
+                for outer_index in range(rhs_outer)
+            ]
+        )
+        if not np.array_equal(out_layout.rows.to_array(), expected_out):
+            return None
+
+        local_lhs = jnp.reshape(lhs, lhs_shape)
+        local_rhs = jnp.reshape(rhs, (rhs_outer, contract, selected_elements.size))
+        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
+
+    @staticmethod
+    def _eval_selected_rhs_first_axis_blocks(
+        eqn: JaxprEqn,
+        lhs,
+        rhs,
+        lhs_layout: VarLayout,
+        rhs_layout: VarLayout,
+        out_layouts: tuple[VarLayout | None, ...],
+    ):
+        """Evaluate ``[i,k] @ [e,k,j]`` for complete selected element blocks."""
+        out_layout = _live_output_layout(out_layouts)
+        lhs_shape = lhs_layout.original_shape
+        rhs_shape = rhs_layout.original_shape
+        out_shape = out_layout.original_shape
+        if (
+            len(lhs_shape) != 2
+            or len(rhs_shape) != 3
+            or len(out_shape) != 3
+            or not lhs_layout.is_full
+            or lhs_shape[1] != rhs_shape[1]
+            or out_shape != (lhs_shape[0], rhs_shape[0], rhs_shape[2])
+        ):
+            return None
+
+        n_global_elements, contract, components = rhs_shape
+        rhs_rows = rhs_layout.rows.to_array()
+        if rhs_rows.size % (contract * components):
+            return None
+        selected_elements = np.unique(np.unravel_index(rhs_rows, rhs_shape)[0])
+        expected_rhs = np.concatenate(
+            [
+                (
+                    element * contract * components
+                    + np.arange(contract * components, dtype=np.int64)
+                )
+                for element in selected_elements
+            ]
+        )
+        if not np.array_equal(rhs_rows, expected_rhs):
+            return None
+
+        expected_out = np.concatenate(
+            [
+                (
+                    lhs_index * n_global_elements * components
+                    + selected_elements[:, None] * components
+                    + np.arange(components, dtype=np.int64)
+                ).ravel()
+                for lhs_index in range(lhs_shape[0])
+            ]
+        )
+        if not np.array_equal(out_layout.rows.to_array(), expected_out):
+            return None
+
+        local_lhs = jnp.reshape(lhs, lhs_shape)
+        local_rhs = jnp.reshape(rhs, (selected_elements.size, contract, components))
+        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
 
     def propagate_deps(
         self,
@@ -2429,6 +2868,191 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         return any(invar_active)
 
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        if eqn.primitive.name == "lu":
+            local = self._eval_local_lu(eqn, in_values, in_layouts, out_layouts)
+            if local is not None:
+                return local
+        if eqn.primitive.name == "triangular_solve":
+            local = self._eval_local_batched_primitive(
+                eqn, in_values, in_layouts, out_layouts
+            )
+            if local is not None:
+                return local
+        if eqn.primitive.name == "custom_linear_solve":
+            if plan.subplans:
+                parent_indices = plan.aux
+                outputs = interpreter.run_subplan(
+                    plan.subplans[0],
+                    (),
+                    tuple(in_values[index] for index in parent_indices),
+                    tuple(in_layouts[index] for index in parent_indices),
+                )
+                return tuple(
+                    value if layout is not None else None
+                    for value, layout in zip(outputs, out_layouts)
+                )
+            local = self._eval_local_lu_backed_solve(
+                eqn, in_values, in_layouts, out_layouts
+            )
+            if local is not None:
+                return local
+        return super().eval_local(
+            eqn=eqn,
+            plan=plan,
+            in_values=in_values,
+            in_layouts=in_layouts,
+            out_layouts=out_layouts,
+            interpreter=interpreter,
+        )
+
+    @staticmethod
+    def _eval_local_lu(eqn, in_values, in_layouts, out_layouts):
+        """Run LU over complete retained matrix batches without global padding."""
+        matrix = in_values[0]
+        matrix_layout = in_layouts[0]
+        if matrix is None or matrix_layout is None:
+            return None
+        shape = matrix_layout.original_shape
+        if len(shape) != 3 or shape[-2] != shape[-1]:
+            return None
+        n_global_batches, size, _ = shape
+        block_size = size * size
+        rows = matrix_layout.rows.to_array()
+        if rows.size % block_size:
+            return None
+        batch_ids = np.unique(rows // block_size)
+        expected_input = np.concatenate(
+            [
+                batch * block_size + np.arange(block_size, dtype=np.int64)
+                for batch in batch_ids
+            ]
+        )
+        if not np.array_equal(rows, expected_input):
+            return None
+
+        expected_output_rows = lambda output_shape: np.concatenate(
+            [
+                batch * int(np.prod(output_shape[1:]))
+                + np.arange(int(np.prod(output_shape[1:])), dtype=np.int64)
+                for batch in batch_ids
+            ]
+        )
+        for output_shape, layout in zip(
+            (_get_shape(var) for var in eqn.outvars), out_layouts
+        ):
+            if layout is not None and (
+                not output_shape
+                or output_shape[0] != n_global_batches
+                or not np.array_equal(
+                    layout.rows.to_array(), expected_output_rows(output_shape)
+                )
+            ):
+                return None
+
+        result = eqn.primitive.bind(
+            jnp.reshape(matrix, (batch_ids.size, size, size)), **eqn.params
+        )
+        values = result if isinstance(result, (tuple, list)) else (result,)
+        return tuple(
+            None if layout is None else jnp.ravel(value)
+            for value, layout in zip(values, out_layouts)
+        )
+
+    @staticmethod
+    def _eval_local_batched_primitive(eqn, in_values, in_layouts, out_layouts):
+        """Bind a primitive after verifying complete, matching batch blocks."""
+        out_layout = _live_output_layout(out_layouts)
+        out_shape = out_layout.original_shape
+        if len(out_shape) < 2:
+            return None
+        n_global_batches = out_shape[0]
+        out_block_size = int(np.prod(out_shape[1:]))
+        out_rows = out_layout.rows.to_array()
+        if out_rows.size % out_block_size:
+            return None
+        batch_ids = np.unique(out_rows // out_block_size)
+        expected_out = np.concatenate(
+            [
+                batch * out_block_size + np.arange(out_block_size, dtype=np.int64)
+                for batch in batch_ids
+            ]
+        )
+        if not np.array_equal(out_rows, expected_out):
+            return None
+
+        inputs = []
+        for value, layout in zip(in_values, in_layouts):
+            if layout is None:
+                inputs.append(value)
+                continue
+            shape = layout.original_shape
+            if not shape or shape[0] != n_global_batches:
+                return None
+            block_size = int(np.prod(shape[1:]))
+            expected = np.concatenate(
+                [
+                    batch * block_size + np.arange(block_size, dtype=np.int64)
+                    for batch in batch_ids
+                ]
+            )
+            if not np.array_equal(layout.rows.to_array(), expected):
+                return None
+            inputs.append(jnp.reshape(value, (batch_ids.size, *shape[1:])))
+        result = eqn.primitive.bind(*inputs, **eqn.params)
+        values = result if isinstance(result, (tuple, list)) else (result,)
+        return tuple(
+            None if layout is None else jnp.ravel(value)
+            for value, layout in zip(values, out_layouts)
+        )
+
+    @staticmethod
+    def _eval_local_lu_backed_solve(eqn, in_values, in_layouts, out_layouts):
+        """Local semantic replacement for JAX's fixed-shape LU solve callable."""
+        const_lengths = eqn.params.get("const_lengths")
+        if const_lengths is None or const_lengths.matvec != 1:
+            return None
+        rhs_index = sum(const_lengths)
+        if rhs_index >= len(in_values):
+            return None
+        matrix, rhs = in_values[0], in_values[rhs_index]
+        matrix_layout, rhs_layout = in_layouts[0], in_layouts[rhs_index]
+        out_layout = _live_output_layout(out_layouts)
+        if (
+            matrix is None
+            or rhs is None
+            or matrix_layout is None
+            or rhs_layout is None
+            or matrix_layout.original_shape != out_layout.original_shape
+            or rhs_layout.original_shape != out_layout.original_shape
+        ):
+            return None
+        shape = out_layout.original_shape
+        if len(shape) != 3 or shape[-2] != shape[-1]:
+            return None
+        block_size = int(np.prod(shape[1:]))
+        out_rows = out_layout.rows.to_array()
+        if out_rows.size % block_size:
+            return None
+        batch_ids = np.unique(out_rows // block_size)
+        expected = np.concatenate(
+            [
+                batch * block_size + np.arange(block_size, dtype=np.int64)
+                for batch in batch_ids
+            ]
+        )
+        if not all(
+            np.array_equal(layout.rows.to_array(), expected)
+            for layout in (matrix_layout, rhs_layout, out_layout)
+        ):
+            return None
+        local_shape = (batch_ids.size, *shape[1:])
+        return (
+            jnp.ravel(
+                jnp.linalg.solve(matrix.reshape(local_shape), rhs.reshape(local_shape))
+            ),
+        )
+
     def propagate_liveness_demand(
         self,
         eqn: JaxprEqn,
@@ -2453,6 +3077,75 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
                 return res
 
         return super().propagate_liveness_demand(eqn, state, out_demands)
+
+    def plan_backward(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: tuple[ContributionDemand | None, ...],
+    ) -> BackwardResult:
+        in_demands = tuple(
+            self.propagate_liveness_demand(eqn, state, list(out_demands))
+        )
+        if eqn.primitive.name != "custom_linear_solve":
+            return BackwardResult(in_demands=in_demands)
+
+        jaxprs = eqn.params["jaxprs"]
+        const_lengths = eqn.params["const_lengths"]
+        solve = jaxprs.solve
+        solve_start = const_lengths.matvec + const_lengths.vecmat
+        rhs_start = sum(const_lengths)
+        parent_indices = tuple(
+            range(solve_start, solve_start + const_lengths.solve)
+        ) + tuple(range(rhs_start, len(eqn.invars)))
+        if len(parent_indices) != len(solve.invars) or len(solve.outvars) != len(
+            eqn.outvars
+        ):
+            return BackwardResult(in_demands=in_demands)
+
+        sub_state = TraceState(state.n_dofs, set(), state.sub_info, state.nonlinear_ids)
+        for parent_index, child in zip(parent_indices, solve.invars):
+            parent = eqn.invars[parent_index]
+            if isinstance(parent, Literal):
+                sub_state.set(
+                    child, SparseDepSet.empty(_get_shape(child), state.n_dofs)
+                )
+                sub_state.val_of[id(child)] = np.asarray(parent.val)
+            else:
+                sub_state.set(child, state.get(parent))
+                value = state.get_val(parent)
+                if value is not None:
+                    sub_state.val_of[id(child)] = np.asarray(value)
+
+        def register_nested_jaxprs(jaxpr):
+            bound = []
+            for subeqn in jaxpr.eqns:
+                handler = TR.get(subeqn.primitive.name)
+                if subeqn.primitive.name in {"pjit", "jit", "remat2", "scan", "map"}:
+                    nested, _nested_consts = _subjaxpr_and_consts(subeqn)
+                    nested_bound = register_nested_jaxprs(nested)
+                    active = {
+                        id(var)
+                        for var in (*nested.constvars, *nested.invars, *nested.outvars)
+                    }
+                    state.sub_info[id(subeqn)] = (active, set(), nested_bound)
+                bound.append((subeqn, handler, True, False))
+            return bound
+
+        register_nested_jaxprs(solve)
+        seed_demands = {
+            sub_out: demand
+            for sub_out, demand in zip(solve.outvars, out_demands)
+            if demand is not None
+        }
+        if not seed_demands:
+            return BackwardResult(in_demands=in_demands)
+        subplan = plan_local_jaxpr(solve, sub_state, seed_demands, tuple(seed_demands))
+        return BackwardResult(
+            in_demands=in_demands,
+            aux=parent_indices,
+            subplans=(subplan,),
+        )
 
     @staticmethod
     def _lu_liveness(
@@ -3408,36 +4101,81 @@ class ScanMapHandler(PrimitiveHandler):
         state: TraceState,
         out_demands: tuple[ContributionDemand | None, ...],
     ) -> BackwardResult:
-        # TODO: implement this
-        # For scan, the handler must decide whether to:
-        # build one body plan from the union of all retained-iteration demands; or
-        # emit selected iterations explicitly.
-        # Keep that decision inside the scan handler.
-        #
-        # sub_jaxpr, sub_state = get_subjaxpr_and_state(eqn, state)
-        #
-        # sub_output_demands = map_parent_outputs_to_sub_outputs(
-        #     eqn,
-        #     sub_jaxpr,
-        #     out_demands,
-        # )
-        #
-        # subplan = planner.plan_jaxpr(
-        #     sub_jaxpr,
-        #     sub_state,
-        #     sub_output_demands,
-        # )
-        #
-        # parent_input_demands = map_sub_inputs_to_parent_inputs(
-        #     eqn,
-        #     subplan.invar_demands,
-        # )
-        #
-        # return BackwardResult(
-        #     in_demands=tuple(parent_input_demands),
-        #     subplans=(subplan,),
-        # )
-        return super().plan_backward(eqn, state, out_demands)
+        """Plan a map-style, single-iteration scan as a local body call."""
+        if (
+            eqn.primitive.name != "scan"
+            or eqn.params.get("num_carry", 0) != 0
+            or eqn.params.get("length") != 1
+        ):
+            return super().plan_backward(eqn, state, out_demands)
+
+        sub, sub_consts = _subjaxpr_and_consts(eqn)
+        num_consts = eqn.params.get("num_consts", 0)
+        if len(eqn.outvars) != len(sub.outvars) or len(eqn.invars) != len(sub.invars):
+            return super().plan_backward(eqn, state, out_demands)
+
+        sub_active, _sub_index_set, _sub_bound_eqns = cast(
+            SubEqnInfo, state.sub_info[id(eqn)]
+        )
+        sub_state = TraceState(
+            state.n_dofs, sub_active, state.sub_info, state.nonlinear_ids
+        )
+        for index, (parent, child) in enumerate(zip(eqn.invars, sub.invars)):
+            if isinstance(parent, Literal):
+                sub_state.set(
+                    child, SparseDepSet.empty(_get_shape(child), state.n_dofs)
+                )
+                sub_state.val_of[id(child)] = np.asarray(parent.val)
+                continue
+            parent_dep = state.get(parent)
+            if index < num_consts:
+                child_dep = parent_dep
+                value = state.get_val(parent)
+            else:
+                child_shape = _get_shape(child)
+                child_size = int(np.prod(child_shape))
+                child_dep = SparseDepSet(parent_dep.dep[:child_size], child_shape)
+                value = state.get_val(parent)
+                if value is not None:
+                    value = np.asarray(value)[0]
+            sub_state.set(child, child_dep)
+            if value is not None:
+                sub_state.val_of[id(child)] = np.asarray(value)
+        for child, value in zip(sub.constvars, sub_consts):
+            sub_state.set(child, SparseDepSet.empty(_get_shape(child), state.n_dofs))
+            sub_state.val_of[id(child)] = np.asarray(value)
+
+        seed_demands = {
+            body_out: demand
+            for body_out, demand in zip(sub.outvars, out_demands)
+            if demand is not None
+        }
+        subplan = plan_local_jaxpr(sub, sub_state, seed_demands, tuple(seed_demands))
+        return BackwardResult(in_demands=subplan.invar_demands, subplans=(subplan,))
+
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        if (
+            eqn.primitive.name != "scan"
+            or eqn.params.get("num_carry", 0) != 0
+            or eqn.params.get("length") != 1
+            or not plan.subplans
+        ):
+            return super().eval_local(
+                eqn=eqn,
+                plan=plan,
+                in_values=in_values,
+                in_layouts=in_layouts,
+                out_layouts=out_layouts,
+                interpreter=interpreter,
+            )
+        _sub, sub_consts = _subjaxpr_and_consts(eqn)
+        outputs = interpreter.run_subplan(
+            plan.subplans[0], sub_consts, in_values, in_layouts
+        )
+        return tuple(
+            value if layout is not None else None
+            for value, layout in zip(outputs, out_layouts)
+        )
 
 
 @TR.register(

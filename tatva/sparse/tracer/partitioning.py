@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, overload
+from typing import TYPE_CHECKING, Any, Protocol, overload
 
 import jax
 import jax.numpy as jnp
@@ -183,7 +183,7 @@ class RangeRows:
 #         return key + self.start
 
 
-RowSelection: TypeAlias = ArrayRows | AllRows | RangeRows
+type RowSelection = ArrayRows | AllRows | RangeRows
 
 
 @dataclass(frozen=True)
@@ -198,6 +198,34 @@ class VarLayout:
     @property
     def local_size(self) -> int:
         return len(self.rows)
+
+
+@dataclass(frozen=True)
+class BatchLayout:
+    """Complete leading-axis blocks retained by a compact :class:`VarLayout`."""
+
+    global_batch_ids: NDArray[np.int64]
+    batch_shape: tuple[int, ...]
+
+    @classmethod
+    def from_var_layout(cls, layout: VarLayout) -> BatchLayout | None:
+        shape = layout.original_shape
+        if len(shape) < 2:
+            return None
+        block_size = int(np.prod(shape[1:], dtype=np.int64))
+        rows = layout.rows.to_array()
+        if not block_size or rows.size % block_size:
+            return None
+        batch_ids = np.unique(rows // block_size).astype(np.int64)
+        expected = np.concatenate(
+            [
+                batch * block_size + np.arange(block_size, dtype=np.int64)
+                for batch in batch_ids
+            ]
+        )
+        if not np.array_equal(rows, expected):
+            return None
+        return cls(batch_ids, shape[1:])
 
 
 @dataclass
@@ -1098,6 +1126,14 @@ class LocalJaxprInterpreter:
         if layout.is_full:
             return flat
         return jnp.take(flat, jnp.asarray(rows), axis=0)
+
+    def batch_value(self, value: Any, layout: VarLayout) -> tuple[Any, BatchLayout]:
+        batch_layout = BatchLayout.from_var_layout(layout)
+        if batch_layout is None:
+            raise ValueError("Compact layout does not contain complete batch blocks")
+        return jnp.reshape(
+            value, (batch_layout.global_batch_ids.size, *batch_layout.batch_shape)
+        ), batch_layout
 
     def run_subplan(
         self,
