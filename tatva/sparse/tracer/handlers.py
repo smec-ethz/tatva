@@ -1992,11 +1992,17 @@ class ScatterHandler(PrimitiveHandler):
             )
         base, _indices, updates = in_values[:3]
         out = _live_output_layout(out_layouts)
-        if base is None or updates is None:
+        _update_rows, target_rows = plan.aux
+        if base is None:
             raise NotImplementedError(
                 f"No local execution rule for partial {eqn.primitive.name}"
             )
-        _update_rows, target_rows = plan.aux
+        if not len(target_rows):
+            return (base,)
+        if updates is None:
+            raise NotImplementedError(
+                f"No local execution rule for partial {eqn.primitive.name}"
+            )
         target_local = out.rows.localize(np.asarray(target_rows, dtype=np.int64))
         index = jnp.asarray(target_local)
         if eqn.primitive.name == "scatter-add":
