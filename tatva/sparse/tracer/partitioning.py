@@ -187,45 +187,178 @@ type RowSelection = ArrayRows | AllRows | RangeRows
 
 
 @dataclass(frozen=True)
-class VarLayout:
-    original_var: Var
-    original_shape: tuple[int, ...]
+class TensorSubset:
+    """Exact subset of a tensor's C-order index space.
+
+    ``Points`` is the universal representation and deliberately keeps the existing
+    compact ``RowSet`` implementation.  The other variants retain tensor
+    structure, but may always degrade to ``Points`` without changing meaning.
+    """
+
+    shape: tuple[int, ...]
+
+    @property
+    def local_shape(self) -> tuple[int, ...]:
+        raise NotImplementedError
+
+    def to_rows(self) -> RowSet:
+        raise NotImplementedError
+
+    @property
+    def size(self) -> int:
+        return len(self.to_rows())
+
+    @classmethod
+    def infer_from_rows(cls, shape: tuple[int, ...], rows: RowSet) -> TensorSubset:
+        """Compatibility inference for legacy row-oriented handlers.
+
+        New handlers must construct ``Full``, ``AxisProduct``, or ``Points``
+        directly.  This is intentionally only a migration/debugging utility.
+        """
+        shape = tuple(shape)
+        total = int(np.prod(shape, dtype=np.int64))
+        if rows.is_full(total):
+            return Full(shape)
+        if not shape:
+            return Points(shape, rows)
+        materialized = rows.to_array()
+        if shape and materialized.size:
+            coordinates = np.unravel_index(materialized, shape)
+            axes = tuple(
+                ArrayRows(np.unique(coordinate).astype(np.int64))
+                for coordinate in coordinates
+            )
+            if (
+                int(np.prod([len(axis) for axis in axes], dtype=np.int64))
+                == materialized.size
+            ):
+                candidate = AxisProduct(shape, axes)
+                if np.array_equal(candidate.to_rows().to_array(), materialized):
+                    return candidate
+        return Points(shape, rows)
+
+
+@dataclass(frozen=True)
+class Full(TensorSubset):
+    @property
+    def local_shape(self) -> tuple[int, ...]:
+        return self.shape
+
+    def to_rows(self) -> RowSet:
+        return AllRows(int(np.prod(self.shape, dtype=np.int64)))
+
+
+@dataclass(frozen=True)
+class Points(TensorSubset):
+    """Arbitrary correlated positions, represented by canonical flat rows."""
+
     rows: RowSet
-    local_aval: AbstractValue
-    original_size: int
-    is_full: bool
+
+    @property
+    def local_shape(self) -> tuple[int, ...]:
+        return () if not self.shape else (len(self.rows),)
+
+    def to_rows(self) -> RowSet:
+        return self.rows
+
+
+@dataclass(frozen=True)
+class AxisProduct(TensorSubset):
+    """Independent selections along every axis of a tensor."""
+
+    axes: tuple[RowSet, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.axes) != len(self.shape):
+            raise ValueError("AxisProduct needs one selection per tensor axis")
+        for axis, extent in zip(self.axes, self.shape):
+            if not axis.is_full(extent) and np.any(axis.to_array() >= extent):
+                raise ValueError("Axis selection is outside tensor bounds")
+
+    @property
+    def local_shape(self) -> tuple[int, ...]:
+        return tuple(len(axis) for axis in self.axes)
+
+    def to_rows(self) -> RowSet:
+        if not self.shape:
+            return AllRows(1)
+        coordinates = np.meshgrid(
+            *(axis.to_array() for axis in self.axes), indexing="ij"
+        )
+        return ArrayRows(
+            np.ravel_multi_index(
+                tuple(coord.reshape(-1) for coord in coordinates), self.shape
+            )
+        )
+
+
+def union_tensor_subsets(left: TensorSubset, right: TensorSubset) -> TensorSubset:
+    """Return the strongest exact representation of an index-space union."""
+    if left.shape != right.shape:
+        raise ValueError("Cannot union subsets of different tensor shapes")
+    if isinstance(left, Full) or isinstance(right, Full):
+        return Full(left.shape)
+    if isinstance(left, AxisProduct) and isinstance(right, AxisProduct):
+        different = [
+            i
+            for i, (a, b) in enumerate(zip(left.axes, right.axes))
+            if not np.array_equal(a.to_array(), b.to_array())
+        ]
+        if len(different) <= 1:
+            axes = list(left.axes)
+            if different:
+                axis = different[0]
+                axes[axis] = ArrayRows(
+                    np.union1d(left.axes[axis].to_array(), right.axes[axis].to_array())
+                )
+            return AxisProduct(left.shape, tuple(axes))
+    rows = ArrayRows(np.union1d(left.to_rows().to_array(), right.to_rows().to_array()))
+    return TensorSubset.infer_from_rows(left.shape, rows)
+
+
+@dataclass(frozen=True)
+class VarLayout:
+    """The finalized local representation of one original variable.
+
+    ``original_var`` and ``subset`` are the only stored state.  All row and
+    aval metadata is derived, keeping the tensor-index subset authoritative.
+    """
+
+    original_var: Var
+    subset: TensorSubset
+
+    @property
+    def original_shape(self) -> tuple[int, ...]:
+        return self.subset.shape
+
+    @property
+    def rows(self) -> RowSet:
+        return self.subset.to_rows()
+
+    @property
+    def local_aval(self) -> AbstractValue:
+        return (
+            self.original_var.aval
+            if not self.original_shape
+            else replace_aval_shape(self.original_var.aval, self.subset.local_shape)
+        )
+
+    @property
+    def original_size(self) -> int:
+        return aval_size(self.original_var.aval)
+
+    @property
+    def is_full(self) -> bool:
+        return isinstance(self.subset, Full)
 
     @property
     def local_size(self) -> int:
         return len(self.rows)
 
-
-@dataclass(frozen=True)
-class BatchLayout:
-    """Complete leading-axis blocks retained by a compact :class:`VarLayout`."""
-
-    global_batch_ids: NDArray[np.int64]
-    batch_shape: tuple[int, ...]
-
-    @classmethod
-    def from_var_layout(cls, layout: VarLayout) -> BatchLayout | None:
-        shape = layout.original_shape
-        if len(shape) < 2:
-            return None
-        block_size = int(np.prod(shape[1:], dtype=np.int64))
-        rows = layout.rows.to_array()
-        if not block_size or rows.size % block_size:
-            return None
-        batch_ids = np.unique(rows // block_size).astype(np.int64)
-        expected = np.concatenate(
-            [
-                batch * block_size + np.arange(block_size, dtype=np.int64)
-                for batch in batch_ids
-            ]
-        )
-        if not np.array_equal(rows, expected):
-            return None
-        return cls(batch_ids, shape[1:])
+    @property
+    def structured_local_shape(self) -> tuple[int, ...]:
+        """The semantic compact shape represented by the finalized subset."""
+        return self.subset.local_shape
 
 
 @dataclass
@@ -286,45 +419,56 @@ def finalize_layout(
     var: Var,
     demand: ContributionDemand,
 ) -> VarLayout:
-    total = aval_size(var.aval)
-    # rows = normalize_row_set(demand.rows)
-    rows = demand.rows
-
-    if len(rows) == 0:
+    subset = demand.subset
+    if subset is None:
+        raise ValueError("Cannot finalize an unshaped legacy demand")
+    if subset.shape != tuple(getattr(var.aval, "shape", ())):
+        raise ValueError("Demand shape does not match its variable")
+    if subset.size == 0:
         raise ValueError("A live layout cannot contain zero rows.")
-
-    if not _demand_in_bounds(demand, total):
-        raise ValueError(f"Demand outside variable bounds: {var}, size={total}")
-
-    full = rows.is_full(total)
-    original_shape = tuple(getattr(var.aval, "shape", ()))
-    # The local ABI deliberately does not retain tensor shapes.  Scalars are
-    # scalar; every other value is a compact flat vector, even when all rows
-    # happen to be live.
-    local_aval = (
-        var.aval if not original_shape else replace_aval_shape(var.aval, (len(rows),))
-    )
-    return VarLayout(
-        original_var=var,
-        original_shape=original_shape,
-        rows=rows,
-        local_aval=local_aval,
-        original_size=total,
-        is_full=full,
-    )
+    if not _demand_in_bounds(demand, aval_size(var.aval)):
+        raise ValueError(
+            f"Demand outside variable bounds: {var}, size={aval_size(var.aval)}"
+        )
+    return VarLayout(original_var=var, subset=subset)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ContributionDemand:
-    """Demanded entries, stored explicitly or with a compact row selector."""
+    """An exact tensor subset, plus a temporary unshaped legacy bridge."""
 
-    rows: RowSet
+    subset: TensorSubset | None
+    _legacy_rows: RowSet | None
 
-    def __post_init__(self) -> None:
-        # Keep the public constructor forgiving during the transition, while
-        # making the representation invariant absolute.
-        if not isinstance(self.rows, (ArrayRows, AllRows, RangeRows)):
-            object.__setattr__(self, "rows", ArrayRows(np.asarray(self.rows)))
+    def __init__(
+        self,
+        subset_or_rows: TensorSubset | RowSet | NDArray,
+        subset: TensorSubset | None = None,
+    ):
+        # The two-argument form is retained only while row-oriented handlers
+        # migrate.  Once shaped, ``subset`` is the sole source of truth.
+        if subset is not None:
+            subset_or_rows = subset
+        if isinstance(subset_or_rows, TensorSubset):
+            object.__setattr__(self, "subset", subset_or_rows)
+            object.__setattr__(self, "_legacy_rows", None)
+        else:
+            rows = subset_or_rows
+            if not isinstance(rows, (ArrayRows, AllRows, RangeRows)):
+                rows = ArrayRows(np.asarray(rows, dtype=np.int64))
+            object.__setattr__(self, "subset", None)
+            object.__setattr__(self, "_legacy_rows", rows)
+
+    @property
+    def rows(self) -> RowSet:
+        if self.subset is not None:
+            return self.subset.to_rows()
+        assert self._legacy_rows is not None
+        return self._legacy_rows
+
+    @property
+    def shape(self) -> tuple[int, ...] | None:
+        return None if self.subset is None else self.subset.shape
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -334,7 +478,6 @@ class ContributionDemand:
 
     def is_range_rows(self) -> bool:
         return isinstance(self.rows, RangeRows)
-
 
 def demand_rows(demand: ContributionDemand) -> NDArray[np.int64]:
     """Materialize rows only at handlers requiring arbitrary index routing."""
@@ -424,6 +567,16 @@ def _demand(rows: NDArray[np.integer]) -> ContributionDemand | None:
     return ContributionDemand(ArrayRows(np.unique(rows)))
 
 
+def seed_demand(var: Var, rows: NDArray[np.integer]) -> ContributionDemand:
+    """Build a shaped planner seed from externally supplied contribution rows."""
+    legacy = _demand(rows)
+    if legacy is None:
+        raise ValueError("A planner seed cannot be empty")
+    return ContributionDemand(
+        TensorSubset.infer_from_rows(_get_shape(var), legacy.rows)
+    )
+
+
 def _demand_in_bounds(demand: ContributionDemand, size: int) -> bool:
     """Check bounds without materializing compact full/range demands."""
     if isinstance(demand.rows, AllRows):
@@ -472,6 +625,7 @@ def _dependency_row_owners(
     """
     owners = np.full(dep.shape[0], static_owner, dtype=np.int64)
 
+    # TODO: Potential performance bottleneck!
     for row in range(dep.shape[0]):
         start = dep.indptr[row]
         end = dep.indptr[row + 1]
@@ -502,11 +656,18 @@ def merge_demands(
 def merge_demands(
     left: ContributionDemand | None, right: ContributionDemand | None
 ) -> ContributionDemand | None:
-    """Union two flat-entry demands, retaining canonical sorted row IDs."""
+    """Union demands, preserving an exact shared tensor-index representation."""
     if left is None:
         return right
     if right is None:
         return left
+    if (
+        left.subset is not None
+        and right.subset is not None
+        and left.subset.shape == right.subset.shape
+    ):
+        subset = union_tensor_subsets(left.subset, right.subset)
+        return ContributionDemand(subset.to_rows(), subset)
     if isinstance(left.rows, AllRows):
         return left
     if isinstance(right.rows, AllRows):
@@ -773,11 +934,25 @@ def seed_rank_demands(
     for root_index, rows in rank_plan.contribution_rows.items():
         root = partition_plan.roots[root_index]
         existing = demand_of.get(id(root.var))
-        demand_of[id(root.var)] = merge_demands(
-            existing, ContributionDemand(ArrayRows(rows))
+        demand = (
+            seed_demand(root.var, rows)
+            if isinstance(root.var, Var)
+            else ContributionDemand(ArrayRows(rows))
         )
+        demand_of[id(root.var)] = merge_demands(existing, demand)
 
     return demand_of
+
+
+def _validate_demand_for_var(var: Any, demand: ContributionDemand) -> ContributionDemand:
+    """Enforce the production invariant: every demand owns its tensor shape."""
+    if demand.subset is None:
+        raise NotImplementedError(
+            f"Unshaped liveness demand for {var}; handlers must return a TensorSubset"
+        )
+    if demand.subset.shape != _get_shape(var):
+        raise ValueError("Liveness subset shape does not match its variable")
+    return demand
 
 
 def rank_seed_demands(
@@ -792,7 +967,7 @@ def rank_seed_demands(
         var = partition_plan.roots[root_index].var
         if not isinstance(var, Var):
             raise TypeError("Contribution roots for local JAXPRs must be Vars")
-        demand = ContributionDemand(ArrayRows(rows))
+        demand = seed_demand(var, rows)
         seeds[var] = merge_demands(seeds.get(var), demand)
         if var not in requested:
             requested.append(var)
@@ -810,6 +985,7 @@ def _propagate_demands_backward(
     all_demands: dict[int, ContributionDemand] = dict(pending)
 
     def add_demand(var: Any, demand: ContributionDemand) -> None:
+        demand = _validate_demand_for_var(var, demand)
         var_id = id(var)
         previous_pending = pending.get(var_id)
         previous_all = all_demands.get(var_id)
@@ -824,7 +1000,12 @@ def _propagate_demands_backward(
         )
 
     for eqn, handler, _is_active, _needs_concrete in reversed(bound_eqns):
-        out_demands = [pending.pop(id(outvar), None) for outvar in eqn.outvars]
+        out_demands = [
+            None
+            if (demand := pending.pop(id(outvar), None)) is None
+            else _validate_demand_for_var(outvar, demand)
+            for outvar in eqn.outvars
+        ]
 
         if not any(demand is not None for demand in out_demands):
             continue
@@ -835,6 +1016,7 @@ def _propagate_demands_backward(
             )
         for var, demand in zip(eqn.outvars, out_demands):
             if demand is not None:
+                all_demands[id(var)] = demand
                 size = int(np.prod(_get_shape(var)))
                 if not _demand_in_bounds(demand, size):
                     raise ValueError(
@@ -875,25 +1057,37 @@ def propagate_demands_backward(
     return _propagate_demands_backward(bound_eqns, state, seed_demands)
 
 
+def rank_liveness_from_plan(rank: int, plan: JaxprPlan) -> RankLivenessPlan:
+    """Project the authoritative local JAXPR plan into rank-liveness metadata."""
+    return RankLivenessPlan(
+        rank=rank,
+        all_demands={
+            id(var): ContributionDemand(layout.subset)
+            for var, layout in plan.layouts.items()
+        },
+        live_eqn_ids=frozenset(
+            id(eqn)
+            for eqn, eqn_plan in zip(plan.original_jaxpr.eqns, plan.eqn_plans)
+            if eqn_plan is not None
+        ),
+    )
+
+
 def build_rank_liveness(
-    bound_eqns: list[BoundEqn],
+    jaxpr: Jaxpr,
     state: TraceState,
     partition_plan: EnergyPartitionPlan,
     rank: int,
 ) -> RankLivenessPlan:
-    live_eqn_ids: set[int] = set()
-    all_demands = _propagate_demands_backward(
-        bound_eqns,
-        state,
-        seed_rank_demands(partition_plan, rank),
-        live_eqn_ids,
+    """Build rank liveness from the same finalized plan used for execution."""
+    seeds, requested_outputs = rank_seed_demands(partition_plan, rank)
+    plan = plan_local_jaxpr(
+        jaxpr=jaxpr,
+        state=state,
+        seed_demands=seeds,
+        requested_outputs=requested_outputs,
     )
-
-    return RankLivenessPlan(
-        rank=rank,
-        all_demands=all_demands,
-        live_eqn_ids=frozenset(live_eqn_ids),
-    )
+    return rank_liveness_from_plan(rank, plan)
 
 
 def plan_local_jaxpr(
@@ -916,6 +1110,8 @@ def plan_local_jaxpr(
 
         for var in variables:
             demand = pending.pop(var, None)
+            if demand is not None:
+                demand = _validate_demand_for_var(var, demand)
             demands.append(demand)
 
             if demand is not None:
@@ -928,6 +1124,7 @@ def plan_local_jaxpr(
         var: Var,
         demand: ContributionDemand,
     ) -> None:
+        demand = _validate_demand_for_var(var, demand)
         old = pending.get(var)
         pending[var] = demand if old is None else merge_demands(old, demand)
 
@@ -974,7 +1171,12 @@ def plan_local_jaxpr(
                 f"{eqn.primitive.name}"
             )
 
-        out_demands = tuple(pending.pop(outvar, None) for outvar in eqn.outvars)
+        out_demands = tuple(
+            None
+            if (demand := pending.pop(outvar, None)) is None
+            else _validate_demand_for_var(outvar, demand)
+            for outvar in eqn.outvars
+        )
 
         if not any(demand is not None for demand in out_demands):
             continue
@@ -1103,12 +1305,17 @@ class LocalJaxprInterpreter:
         self.plan = plan
         self.original_consts = tuple(original_consts)
 
-    def take_global_rows(
+    def take_rows_from_local(
         self, value: Any, layout: VarLayout, global_rows: NDArray[np.int64]
     ):
+        """Compatibility bridge from a local tensor to requested global rows."""
         rows = np.asarray(global_rows, dtype=np.int64)
         if not layout.original_shape:
             return value
+        # Every structured local tensor has C-order storage corresponding to
+        # ``layout.rows``; flattening here is only the compatibility bridge for
+        # primitives that still request arbitrary points.
+        value = jnp.ravel(value)
         if np.array_equal(rows, layout.rows.to_array()):
             return value
         local_rows = layout.rows.localize(rows)
@@ -1118,22 +1325,18 @@ class LocalJaxprInterpreter:
             return value[local_rows[0] : local_rows[0] + local_rows.size]
         return jnp.take(value, jnp.asarray(local_rows), axis=0)
 
-    def flatten_result(self, value: Any, layout: VarLayout):
-        if not layout.original_shape:
+    @staticmethod
+    def normalize_local_result(value: Any, layout: VarLayout) -> Any:
+        """Return exactly ``layout.subset.local_shape`` or fail loudly."""
+        expected = layout.subset.local_shape
+        actual = tuple(getattr(value, "shape", ()))
+        if actual == expected:
             return value
-        flat = jnp.ravel(value)
-        rows = layout.rows.to_array()
-        if layout.is_full:
-            return flat
-        return jnp.take(flat, jnp.asarray(rows), axis=0)
-
-    def batch_value(self, value: Any, layout: VarLayout) -> tuple[Any, BatchLayout]:
-        batch_layout = BatchLayout.from_var_layout(layout)
-        if batch_layout is None:
-            raise ValueError("Compact layout does not contain complete batch blocks")
-        return jnp.reshape(
-            value, (batch_layout.global_batch_ids.size, *batch_layout.batch_shape)
-        ), batch_layout
+        if int(np.size(value)) != layout.local_size:
+            raise ValueError(
+                f"Local result has shape {actual}, expected {expected} for {layout.original_var}"
+            )
+        return jnp.reshape(value, expected)
 
     def run_subplan(
         self,
@@ -1151,13 +1354,16 @@ class LocalJaxprInterpreter:
                 raise NotImplementedError(
                     "Nested local plan needs an eliminated parent operand"
                 )
-            args.append(self.take_global_rows(value, layout, child.rows.to_array()))
+            localized = self.take_rows_from_local(value, layout, child.rows.to_array())
+            args.append(self.normalize_local_result(localized, child))
         return LocalJaxprInterpreter(subplan, sub_consts).make_function()(*args)
 
     def make_function(self) -> Callable[..., tuple[Any, ...]]:
         plan = self.plan
         compact_consts = {
-            var: jnp.asarray(compact_value(self.original_consts[i], plan.layouts[var]))
+            var: jnp.asarray(
+                extract_global_value(self.original_consts[i], plan.layouts[var].subset)
+            )
             for i, var in enumerate(plan.original_jaxpr.constvars)
             if i in plan.kept_constvar_indices
         }
@@ -1203,9 +1409,9 @@ class LocalJaxprInterpreter:
                     )
                 env.update(
                     {
-                        var: value
-                        for var, value in zip(eqn.outvars, result)
-                        if value is not None
+                        var: self.normalize_local_result(value, layout)
+                        for var, value, layout in zip(eqn.outvars, result, out_layouts)
+                        if value is not None and layout is not None
                     }
                 )
             return tuple(env[var] for var in plan.requested_outputs)
@@ -1289,11 +1495,18 @@ def report_localization_coverage(plan: JaxprPlan) -> list[str]:
     return report
 
 
-def compact_value(value: Any, layout: VarLayout) -> Any:
-    if not layout.original_shape:
-        return value
-    flat = np.asarray(value).reshape(-1)
-    return flat[layout.rows.to_array()]
+def extract_global_value(global_value: Any, subset: TensorSubset) -> Any:
+    """Extract an exact local tensor from a value in its original tensor shape."""
+    if not subset.shape:
+        return global_value
+    if isinstance(subset, Full):
+        return jnp.reshape(global_value, subset.shape)
+    if isinstance(subset, AxisProduct):
+        return jnp.reshape(global_value, subset.shape)[
+            jnp.ix_(*(jnp.asarray(axis.to_array()) for axis in subset.axes))
+        ]
+    flat = jnp.ravel(global_value)
+    return jnp.take(flat, jnp.asarray(subset.to_rows().to_array()), axis=0)
 
 
 def pack_runtime_inputs(
@@ -1302,7 +1515,7 @@ def pack_runtime_inputs(
 ) -> tuple[Any, ...]:
     """Pack global inputs into the local JAXPR's expected layout."""
     return tuple(
-        compact_value(global_inputs[spec.original_index], spec.layout)
+        extract_global_value(global_inputs[spec.original_index], spec.layout.subset)
         for spec in program.input_specs
     )
 

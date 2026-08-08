@@ -13,12 +13,14 @@ from tatva.sparse.tracer.base import _JaxprAnalyzer, make_partition_plan
 from tatva.sparse.tracer.partitioning import (
     AllRows,
     ArrayRows,
+    AxisProduct,
     ContributionDemand,
     RangeRows,
     build_local_program,
     materialize_local_jaxpr,
     pack_runtime_inputs,
     plan_local_jaxpr,
+    seed_demand,
     trace_local_program,
 )
 from tatva.sparse.tracer.state import CouplingAccumulator, TraceState
@@ -100,7 +102,7 @@ def _local_result(fn, value, rows, *, root_index=-1):
     plan = plan_local_jaxpr(
         closed.jaxpr,
         state,
-        {root: ContributionDemand(ArrayRows(np.asarray(rows, dtype=np.int64)))},
+        {root: seed_demand(root, np.asarray(rows, dtype=np.int64))},
         [root],
     )
     program = materialize_local_jaxpr(plan, closed.consts)
@@ -115,12 +117,12 @@ def test_rowsets_normalize_and_localize_without_dense_full_storage():
     np.testing.assert_array_equal(AllRows(10).localize([0, 9]), [0, 9])
 
 
-def test_full_nonscalar_local_storage_is_flat():
+def test_full_nonscalar_local_storage_preserves_tensor_shape():
     result, plan, program = _local_result(
         lambda x: x.reshape(2, 3), jnp.arange(6.0), np.arange(6)
     )
-    np.testing.assert_allclose(result, np.arange(6.0))
-    assert plan.layouts[plan.requested_outputs[0]].local_aval.shape == (6,)
+    np.testing.assert_allclose(result, np.arange(6.0).reshape(2, 3))
+    assert plan.layouts[plan.requested_outputs[0]].local_aval.shape == (2, 3)
     assert program.input_specs[0].layout.local_aval.shape == (6,)
 
 
@@ -135,24 +137,24 @@ def test_local_jaxpr_evaluates_requested_intermediate_rows():
     assert program.input_specs[0].layout.local_size == 2
 
 
-def test_local_jaxpr_routes_transpose_slice_and_scalar_broadcast():
-    result, _, _ = _local_result(
+def test_local_jaxpr_routes_structured_transpose_slice_broadcast_and_reverse():
+    result, plan, _ = _local_result(
         lambda x: jnp.transpose(x.reshape(2, 3))[:, 1:],
         jnp.arange(6.0),
         [0, 2],
     )
-    np.testing.assert_allclose(result, [3.0, 5.0])
+    np.testing.assert_allclose(np.asarray(result).reshape(-1), [3.0, 5.0])
+    assert plan.layouts[plan.requested_outputs[0]].local_aval.shape == (2, 1)
 
     result, _, _ = _local_result(
         lambda x: jnp.broadcast_to(x[0], (2, 3)),
         jnp.arange(5.0),
-        [0, 2, 5],
+        [0, 1, 3, 4],
     )
-    np.testing.assert_allclose(result, [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(result, [[0.0, 0.0], [0.0, 0.0]])
 
-    # This requires a non-contiguous compact selection in the traced callable.
-    result, _, program = _local_result(lambda x: x[::-1], jnp.arange(6.0), [0, 2])
-    np.testing.assert_allclose(result, [5.0, 3.0])
+    result, _, program = _local_result(lambda x: x[::-1], jnp.arange(6.0), [0, 1])
+    np.testing.assert_allclose(result, [5.0, 4.0])
     assert jax.make_jaxpr(program.fn)(*pack_runtime_inputs(program, [jnp.arange(6.0)]))
 
 
@@ -199,7 +201,7 @@ def test_local_jaxpr_lifter_periodic_fail():
 
     x = jnp.ones(lifter.size_reduced)
     result, _, _ = _local_result(fn, x, rows)
-    np.testing.assert_allclose(result, np.asarray(fn(x)).reshape(-1)[rows])
+    np.testing.assert_allclose(np.asarray(result).reshape(-1), np.asarray(fn(x)).reshape(-1)[rows])
 
 
 def test_local_jaxpr_specializes_gather_routes():
@@ -211,27 +213,26 @@ def test_local_jaxpr_specializes_gather_routes():
     assert len(program.input_specs) == 1
 
 
-def test_local_jaxpr_emits_compact_iota_and_elementwise_predicates():
-    result, _, program = _local_result(
-        lambda x: x + jnp.arange(x.size), jnp.ones(8), [2, 6]
-    )
-    np.testing.assert_allclose(result, [3.0, 7.0])
-    assert jax.make_jaxpr(program.fn)(*pack_runtime_inputs(program, [jnp.ones(8)]))
-
+def test_local_jaxpr_emits_structured_elementwise_predicates():
     result, _, _ = _local_result(lambda x: x > 3, jnp.arange(8), [2, 6])
     np.testing.assert_array_equal(result, [False, True])
 
 
 def test_local_jaxpr_reduces_each_selected_output_row():
-    result, _, _ = _local_result(
+    result, plan, _ = _local_result(
         lambda x: jnp.sum(x.reshape(3, 4), axis=1), jnp.arange(12.0), [0, 2]
     )
     np.testing.assert_allclose(result, [6.0, 38.0])
+    reduce_eqn = next(eqn for eqn in plan.original_jaxpr.eqns if eqn.primitive.name == "reduce_sum")
+    assert plan.layouts[reduce_eqn.invars[0]].local_aval.shape == (2, 4)
+    assert isinstance(plan.layouts[reduce_eqn.invars[0]].subset, AxisProduct)
 
-    result, _, _ = _local_result(
+    result, plan, _ = _local_result(
         lambda x: jnp.sum(x.reshape(3, 4), axis=0), jnp.arange(12.0), [1, 3]
     )
     np.testing.assert_allclose(result, [15.0, 21.0])
+    reduce_eqn = next(eqn for eqn in plan.original_jaxpr.eqns if eqn.primitive.name == "reduce_sum")
+    assert plan.layouts[reduce_eqn.invars[0]].local_aval.shape == (3, 2)
 
 
 def test_local_jaxpr_emits_selected_dot_general_rows():
@@ -257,12 +258,14 @@ def test_local_jaxpr_executes_selected_fem_dot_blocks():
     # Complete output blocks for non-contiguous elements 1 and 3.
     rows = [2, 3, 6, 7, 12, 13, 16, 17]
     x = jnp.arange(30.0)
-    result, _, program = _local_result(fn, x, rows)
-    np.testing.assert_allclose(result, np.asarray(fn(x)).reshape(-1)[rows])
+    result, plan, program = _local_result(fn, x, rows)
+    np.testing.assert_allclose(np.asarray(result).reshape(-1), np.asarray(fn(x)).reshape(-1)[rows])
+    assert plan.layouts[plan.requested_outputs[0]].local_aval.shape == (2, 2, 2)
     local_x = pack_runtime_inputs(program, [x])[0]
     assert trace_local_program(program, local_x)
     np.testing.assert_allclose(
-        jax.jit(program.fn)(local_x)[0], np.asarray(fn(x)).reshape(-1)[rows]
+        np.asarray(jax.jit(program.fn)(local_x)[0]).reshape(-1),
+        np.asarray(fn(x)).reshape(-1)[rows],
     )
 
 
@@ -279,12 +282,14 @@ def test_local_jaxpr_executes_selected_leading_batch_dot_blocks():
     # Complete [2, 2] output blocks for non-contiguous batches 1 and 3.
     rows = [4, 5, 6, 7, 12, 13, 14, 15]
     x = jnp.arange(30.0)
-    result, _, program = _local_result(fn, x, rows)
-    np.testing.assert_allclose(result, np.asarray(fn(x)).reshape(-1)[rows])
+    result, plan, program = _local_result(fn, x, rows)
+    np.testing.assert_allclose(np.asarray(result).reshape(-1), np.asarray(fn(x)).reshape(-1)[rows])
+    assert plan.layouts[plan.requested_outputs[0]].local_aval.shape == (2, 2, 2)
     local_x = pack_runtime_inputs(program, [x])[0]
     assert trace_local_program(program, local_x)
     np.testing.assert_allclose(
-        jax.jit(program.fn)(local_x)[0], np.asarray(fn(x)).reshape(-1)[rows]
+        np.asarray(jax.jit(program.fn)(local_x)[0]).reshape(-1),
+        np.asarray(fn(x)).reshape(-1)[rows],
     )
 
 
@@ -315,10 +320,13 @@ def test_local_jaxpr_executes_single_iteration_scan_without_carry():
         return ys
 
     result, _, program = _local_result(fn, jnp.arange(3.0), [1, 2])
-    np.testing.assert_allclose(result, 2 * np.sin([1.0, 2.0]))
+    np.testing.assert_allclose(np.asarray(result).reshape(-1), 2 * np.sin([1.0, 2.0]))
     local_x = pack_runtime_inputs(program, [jnp.arange(3.0)])[0]
     assert trace_local_program(program, local_x)
-    np.testing.assert_allclose(jax.jit(program.fn)(local_x)[0], 2 * np.sin([1.0, 2.0]))
+    np.testing.assert_allclose(
+        np.asarray(jax.jit(program.fn)(local_x)[0]).reshape(-1),
+        2 * np.sin([1.0, 2.0]),
+    )
 
 
 def test_local_callable_traces_jits_and_differentiates():

@@ -44,13 +44,18 @@ from tatva.sparse.tracer.common import (
 )
 from tatva.sparse.tracer.partitioning import (
     AllRows,
+    ArrayRows,
+    AxisProduct,
     BackwardResult,
-    BatchLayout,
     ContributionDemand,
     ContributionPropagation,
     ContributionRoot,
     EqnPlan,
+    Full,
+    Points,
     RangeRows,
+    RowSet,
+    TensorSubset,
     VarLayout,
     _demand,
     _invalid_contribution,
@@ -74,6 +79,18 @@ def _live_output_layout(out_layouts: tuple[VarLayout | None, ...]) -> VarLayout:
     if layout is None:
         raise ValueError("A live equation has no output layout")
     return layout
+
+
+def _leading_batches(layout: VarLayout) -> RowSet | None:
+    """Return a leading-axis batch selection encoded as an AxisProduct."""
+    subset = layout.subset
+    if not isinstance(subset, AxisProduct) or len(subset.shape) < 2:
+        return None
+    if not all(
+        axis.is_full(extent) for axis, extent in zip(subset.axes[1:], subset.shape[1:])
+    ):
+        return None
+    return subset.axes[0]
 
 
 def _eval_reshape(x, params):
@@ -102,8 +119,28 @@ def _inverse_elementwise_demand(demand, in_shape: tuple, out_shape: tuple):
     if in_shape == out_shape:
         return demand
     if int(np.prod(in_shape)) == 1:
-        return ContributionDemand(RangeRows(0, 1))
-    return _demand(_inverse_elementwise_rows(demand.rows, in_shape, out_shape))
+        return _subset_demand(Full(in_shape))
+    legacy = _demand(_inverse_elementwise_rows(demand.rows, in_shape, out_shape))
+    return (
+        None
+        if legacy is None
+        else _subset_demand(TensorSubset.infer_from_rows(in_shape, legacy.rows))
+    )
+
+
+def _subset_demand(subset):
+    """Construct a demand from its authoritative tensor-index subset."""
+    return ContributionDemand(subset)
+
+
+def _routed_demand(shape: tuple[int, ...], rows) -> ContributionDemand | None:
+    """Construct the strongest exact subset for rows routed by an index primitive."""
+    legacy = _demand(rows)
+    return (
+        None
+        if legacy is None
+        else _subset_demand(TensorSubset.infer_from_rows(shape, legacy.rows))
+    )
 
 
 # =============================================================================
@@ -156,8 +193,7 @@ class PrimitiveHandler(ABC):
             if isinstance(var, Literal):
                 result.append(None)
                 continue
-            size = int(np.prod(_get_shape(var)))
-            result.append(ContributionDemand(AllRows(size)) if size else None)
+            result.append(_subset_demand(Full(_get_shape(var))))
         return result
 
     def plan_backward(
@@ -224,163 +260,41 @@ class PrimitiveHandler(ABC):
         out_layouts: tuple[VarLayout | None, ...],
         interpreter: Any,
     ) -> tuple[Any | None, ...]:
-        """Default compact evaluator plus shared elementwise/routing rules."""
+        """Bind a primitive on finalized local tensor shapes.
+
+        Arbitrary ``Points`` are deliberately not a generic tensor ABI.  They
+        must be handled by an explicit irregular primitive family (currently
+        gather/scatter); all other calls require structurally valid subsets.
+        """
         live = [layout for layout in out_layouts if layout is not None]
         if not live:
             return tuple(None for _ in eqn.outvars)
         out = live[0]
         name = eqn.primitive.name
 
-        # Concrete indexing was specialized during planning; its index operands
-        # intentionally do not survive into the compact ABI.
-        if name in {"gather", "dynamic_slice"} and plan.aux is not None:
-            return (
-                interpreter.take_global_rows(in_values[0], in_layouts[0], plan.aux),
+        layouts = (*in_layouts, *out_layouts)
+        if any(
+            layout is not None
+            and layout.original_shape
+            and isinstance(layout.subset, Points)
+            for layout in layouts
+        ):
+            raise NotImplementedError(
+                f"{name} localization requires structured tensor subsets; "
+                "irregular Points are supported only by explicit handlers"
             )
 
-        # Route-only tensor operations.  They become compact gathers, rather
-        # than global-shaped primitive calls.
-        if len(eqn.invars) == 1 and name in {
-            "reshape",
-            "squeeze",
-            "convert_element_type",
-            "copy",
-            "stop_gradient",
-            "device_put",
-            "neg",
-            "abs",
-            "sin",
-            "cos",
-            "exp",
-            "log",
-            "sqrt",
-            "integer_pow",
-            "transpose",
-            "slice",
-            "rev",
-            "broadcast_in_dim",
-        }:
-            source_layout = in_layouts[0]
-            source_rows = out.rows.to_array()
-            if name == "transpose":
-                in_shape = _get_shape(eqn.invars[0])
-                coords = np.unravel_index(source_rows, _get_shape(eqn.outvars[0]))
-                remapped = [None] * len(in_shape)
-                for out_axis, in_axis in enumerate(eqn.params["permutation"]):
-                    remapped[in_axis] = coords[out_axis]
-                source_rows = np.ravel_multi_index(tuple(remapped), in_shape)
-            elif name == "slice":
-                coords = np.unravel_index(source_rows, _get_shape(eqn.outvars[0]))
-                strides = eqn.params["strides"] or (1,) * len(coords)
-                source_rows = np.ravel_multi_index(
-                    tuple(
-                        s + c * t
-                        for s, c, t in zip(eqn.params["start_indices"], coords, strides)
-                    ),
-                    _get_shape(eqn.invars[0]),
-                )
-            elif name == "rev":
-                shape = _get_shape(eqn.invars[0])
-                coords = list(np.unravel_index(source_rows, shape))
-                for axis in eqn.params["dimensions"]:
-                    coords[axis] = shape[axis] - 1 - coords[axis]
-                source_rows = np.ravel_multi_index(tuple(coords), shape)
-            elif name == "broadcast_in_dim":
-                source_rows = _inverse_broadcast_rows(
-                    source_rows,
-                    _get_shape(eqn.invars[0]),
-                    _get_shape(eqn.outvars[0]),
-                    eqn.params["broadcast_dimensions"],
-                )
-            value = (
-                in_values[0]
-                if source_layout is None
-                else interpreter.take_global_rows(
-                    in_values[0], source_layout, source_rows
-                )
+        if any(
+            value is None and not isinstance(var, Literal)
+            for var, value in zip(eqn.invars, in_values)
+        ):
+            raise NotImplementedError(
+                f"No local execution rule for eliminated {name} operand"
             )
-            if name == "broadcast_in_dim" and (
-                source_layout is None or not source_layout.original_shape
-            ):
-                value = jnp.broadcast_to(value, (out.local_size,))
-            # Shape-preserving unary primitives still need their numerical op.
-            if name not in {
-                "reshape",
-                "squeeze",
-                "transpose",
-                "slice",
-                "rev",
-                "broadcast_in_dim",
-                "copy",
-                "stop_gradient",
-                "device_put",
-            }:
-                value = eqn.primitive.bind(value, **eqn.params)
-            return (value,)
-
-        # Ordinary elementwise operations align every operand to output rows.
-        if name in {
-            "add",
-            "add_any",
-            "sub",
-            "mul",
-            "div",
-            "rem",
-            "pow",
-            "atan2",
-            "max",
-            "min",
-            "select_n",
-            "eq",
-            "ne",
-            "ge",
-            "gt",
-            "le",
-            "lt",
-            "and",
-            "or",
-            "xor",
-        }:
-            aligned = []
-            for var, value, layout in zip(eqn.invars, in_values, in_layouts):
-                if isinstance(var, Literal):
-                    aligned.append(value)
-                    continue
-                if value is None or layout is None:
-                    raise NotImplementedError(
-                        f"No local execution rule for eliminated {name} operand"
-                    )
-                if not layout.original_shape:
-                    aligned.append(value)
-                    continue
-                rows = _inverse_elementwise_rows(
-                    out.rows.to_array(), _get_shape(var), _get_shape(eqn.outvars[0])
-                )
-                aligned.append(interpreter.take_global_rows(value, layout, rows))
-            return (eqn.primitive.bind(*aligned, **eqn.params),)
-
-        # A safe fallback: only full tensors may be restored to global shape.
-        restored = []
-        for var, value, layout in zip(eqn.invars, in_values, in_layouts):
-            if isinstance(var, Literal):
-                restored.append(value)
-                continue
-            if value is None:
-                raise NotImplementedError(
-                    f"No local execution rule for eliminated {name} operand"
-                )
-            if layout is not None and layout.original_shape:
-                if not layout.is_full:
-                    raise NotImplementedError(
-                        f"No local execution rule for partial {name}"
-                    )
-                restored.append(jnp.reshape(value, layout.original_shape))
-            else:
-                restored.append(value)
-        result = eqn.primitive.bind(*restored, **eqn.params)
+        result = eqn.primitive.bind(*in_values, **eqn.params)
         results = result if isinstance(result, (tuple, list)) else (result,)
         return tuple(
-            None if layout is None else interpreter.flatten_result(value, layout)
+            None if layout is None else value
             for value, layout in zip(results, out_layouts)
         )
 
@@ -431,6 +345,31 @@ class ZeroDependencyHandler(PrimitiveHandler):
         for ov in eqn.outvars:
             oshp = _get_shape(ov)
             state.set(ov, SparseDepSet.empty(oshp, state.n_dofs))
+
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        out = _live_output_layout(out_layouts)
+        if eqn.primitive.name != "iota" or out.is_full:
+            return super().eval_local(
+                eqn=eqn,
+                plan=plan,
+                in_values=in_values,
+                in_layouts=in_layouts,
+                out_layouts=out_layouts,
+                interpreter=interpreter,
+            )
+        if not isinstance(out.subset, AxisProduct):
+            raise NotImplementedError(
+                "partial iota localization requires an AxisProduct subset"
+            )
+        dimension = eqn.params["dimension"]
+        coordinates = jnp.asarray(
+            out.subset.axes[dimension].to_array(), dtype=eqn.params["dtype"]
+        )
+        shape = [1] * len(out.subset.shape)
+        shape[dimension] = len(coordinates)
+        return (
+            jnp.broadcast_to(jnp.reshape(coordinates, shape), out.subset.local_shape),
+        )
 
     def eval_concrete(
         self, in_vals: list[NDArray | None], params: dict[str, Any]
@@ -513,8 +452,6 @@ class ElementWiseZeroDependencyHandler(ZeroDependencyHandler):
     ("conj", False),
     ("real", False),
     ("imag", False),
-    ("reshape", False, _eval_reshape),
-    ("squeeze", False, _eval_squeeze),
     ("convert_element_type", False, _eval_convert_dtype),
     ("sin", True, np.sin),
     ("cos", True, np.cos),
@@ -632,6 +569,82 @@ class ElementwiseUnary(PrimitiveHandler):
             except TypeError:
                 return self.eval_fn(in_vals[0])
         return None
+
+
+@TR.register("reshape")
+class ReshapeHandler(ElementwiseUnary):
+    """Reshape a compact tensor only after localizing its target shape."""
+
+    def __init__(self):
+        super().__init__(False, _eval_reshape)
+
+    def propagate_liveness_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionDemand | None],
+    ) -> list[ContributionDemand | None]:
+        demand = out_demands[0]
+        if demand is None:
+            return [None]
+        input_shape = _get_shape(eqn.invars[0])
+        if isinstance(demand.subset, Full):
+            return [_subset_demand(Full(input_shape))]
+        # Reshape preserves C-order flat positions.  The result may be an
+        # AxisProduct (the common case) or genuinely correlated Points.
+        return [_subset_demand(TensorSubset.infer_from_rows(input_shape, demand.rows))]
+
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        out = _live_output_layout(out_layouts)
+        source_layout = in_layouts[0]
+        if out.is_full:
+            return super().eval_local(
+                eqn=eqn,
+                plan=plan,
+                in_values=in_values,
+                in_layouts=in_layouts,
+                out_layouts=out_layouts,
+                interpreter=interpreter,
+            )
+        if (
+            source_layout is None
+            or isinstance(source_layout.subset, Points)
+            or isinstance(out.subset, Points)
+            or source_layout.local_size != out.local_size
+        ):
+            raise NotImplementedError(
+                "reshape localization requires equal-sized structured input/output subsets"
+            )
+        return (
+            eqn.primitive.bind(
+                in_values[0], **{**eqn.params, "new_sizes": out.subset.local_shape}
+            ),
+        )
+
+
+@TR.register("squeeze")
+class SqueezeHandler(ElementwiseUnary):
+    """Reinsert singleton axes when mapping a local squeeze demand backward."""
+
+    def __init__(self):
+        super().__init__(False, _eval_squeeze)
+
+    def propagate_liveness_demand(self, eqn, state, out_demands):
+        demand = out_demands[0]
+        if demand is None:
+            return [None]
+        input_shape = _get_shape(eqn.invars[0])
+        if isinstance(demand.subset, Full):
+            return [_subset_demand(Full(input_shape))]
+        if not isinstance(demand.subset, AxisProduct):
+            return [_routed_demand(input_shape, demand.rows)]
+        removed = set(eqn.params["dimensions"])
+        output_axes = iter(demand.subset.axes)
+        axes = tuple(
+            AllRows(extent) if axis in removed else next(output_axes)
+            for axis, extent in enumerate(input_shape)
+        )
+        return [_subset_demand(AxisProduct(input_shape, axes))]
 
 
 @TR.register(
@@ -829,6 +842,27 @@ class IntegerPowHandler(PrimitiveHandler):
 class BroadcastHandler(PrimitiveHandler):
     """Handler for `broadcast_in_dim` primitive."""
 
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        out = _live_output_layout(out_layouts)
+        if out.is_full:
+            return super().eval_local(
+                eqn=eqn,
+                plan=plan,
+                in_values=in_values,
+                in_layouts=in_layouts,
+                out_layouts=out_layouts,
+                interpreter=interpreter,
+            )
+        if isinstance(out.subset, Points):
+            raise NotImplementedError(
+                "broadcast_in_dim localization requires a structured tensor subset"
+            )
+        return (
+            eqn.primitive.bind(
+                *in_values, **{**eqn.params, "shape": out.subset.local_shape}
+            ),
+        )
+
     def propagate_deps(
         self,
         eqn: JaxprEqn,
@@ -882,18 +916,30 @@ class BroadcastHandler(PrimitiveHandler):
         demand = out_demands[0]
         if demand is None:
             return [None]
+        in_shape = _get_shape(eqn.invars[0])
+        if isinstance(demand.subset, Full):
+            return [_subset_demand(Full(in_shape))]
+        if isinstance(demand.subset, AxisProduct):
+            selections = []
+            for in_axis, out_axis in enumerate(eqn.params["broadcast_dimensions"]):
+                if in_shape[in_axis] == 1:
+                    selections.append(AllRows(1))
+                else:
+                    selections.append(demand.subset.axes[out_axis])
+            return [_subset_demand(AxisProduct(in_shape, tuple(selections)))]
         if _get_shape(eqn.invars[0]) == _get_shape(eqn.outvars[0]):
             return [demand]
         if int(np.prod(_get_shape(eqn.invars[0]))) == 1:
-            return [ContributionDemand(RangeRows(0, 1))]
+            return [_subset_demand(Full(in_shape))]
         return [
-            _demand(
+            _routed_demand(
+                in_shape,
                 _inverse_broadcast_rows(
                     demand.rows,
-                    _get_shape(eqn.invars[0]),
+                    in_shape,
                     _get_shape(eqn.outvars[0]),
                     eqn.params["broadcast_dimensions"],
-                )
+                ),
             )
         ]
 
@@ -952,24 +998,31 @@ class TransposeHandler(PrimitiveHandler):
         demand = out_demands[0]
         if demand is None:
             return [None]
+        if isinstance(demand.subset, Full):
+            return [_subset_demand(Full(_get_shape(eqn.invars[0])))]
+        if isinstance(demand.subset, AxisProduct):
+            in_shape = _get_shape(eqn.invars[0])
+            in_axes: list[Any] = [None] * len(in_shape)
+            for out_axis, in_axis in enumerate(eqn.params["permutation"]):
+                in_axes[in_axis] = demand.subset.axes[out_axis]
+            return [_subset_demand(AxisProduct(in_shape, tuple(in_axes)))]
         if tuple(eqn.params["permutation"]) == tuple(
             range(len(_get_shape(eqn.invars[0])))
         ):
             return [demand]
         if demand.is_all_rows():
-            return [
-                ContributionDemand(AllRows(int(np.prod(_get_shape(eqn.invars[0])))))
-            ]
+            return [_subset_demand(Full(_get_shape(eqn.invars[0])))]
         in_shape = _get_shape(eqn.invars[0])
         out_coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
         in_coords = [None] * len(in_shape)
         for out_axis, in_axis in enumerate(eqn.params["permutation"]):
             in_coords[in_axis] = out_coords[out_axis]
         return [
-            _demand(
+            _routed_demand(
+                in_shape,
                 np.ravel_multi_index(
                     tuple(cast(NDArray, coord) for coord in in_coords), in_shape
-                )
+                ),
             )
         ]
 
@@ -979,6 +1032,43 @@ class TransposeHandler(PrimitiveHandler):
 )
 class SliceHandler(PrimitiveHandler):
     """Handler for static `slice` primitive."""
+
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        source_layout = in_layouts[0]
+        out = _live_output_layout(out_layouts)
+        if not (
+            source_layout is not None
+            and isinstance(source_layout.subset, AxisProduct)
+            and isinstance(out.subset, AxisProduct)
+        ):
+            return super().eval_local(
+                eqn=eqn,
+                plan=plan,
+                in_values=in_values,
+                in_layouts=in_layouts,
+                out_layouts=out_layouts,
+                interpreter=interpreter,
+            )
+        strides = eqn.params["strides"] or (1,) * len(source_layout.subset.axes)
+        value = in_values[0]
+        try:
+            for axis, (source_selection, output_selection, start, stride) in enumerate(
+                zip(
+                    source_layout.subset.axes,
+                    out.subset.axes,
+                    eqn.params["start_indices"],
+                    strides,
+                )
+            ):
+                positions = source_selection.localize(
+                    start + output_selection.to_array() * stride
+                )
+                value = jnp.take(value, jnp.asarray(positions), axis=axis)
+            return (value,)
+        except ValueError as exc:
+            raise NotImplementedError(
+                "slice localization needs source/output AxisProducts with matching coordinates"
+            ) from exc
 
     def propagate_deps(
         self,
@@ -1045,6 +1135,35 @@ class SliceHandler(PrimitiveHandler):
         if demand is None:
             return [None]
         in_shape = _get_shape(eqn.invars[0])
+        if isinstance(demand.subset, Full):
+            starts = eqn.params["start_indices"]
+            limits = eqn.params["limit_indices"]
+            strides = eqn.params["strides"] or (1,) * len(in_shape)
+            subset = AxisProduct(
+                in_shape,
+                tuple(
+                    RangeRows(int(start), int(limit))
+                    if stride == 1
+                    else ArrayRows(np.arange(start, limit, stride, dtype=np.int64))
+                    for start, limit, stride in zip(starts, limits, strides)
+                ),
+            )
+            return [_subset_demand(subset)]
+        if isinstance(demand.subset, AxisProduct):
+            strides = eqn.params["strides"] or (1,) * len(in_shape)
+            subset = AxisProduct(
+                in_shape,
+                tuple(
+                    ArrayRows(
+                        np.asarray(selection.to_array(), dtype=np.int64) * stride
+                        + start
+                    )
+                    for selection, start, stride in zip(
+                        demand.subset.axes, eqn.params["start_indices"], strides
+                    )
+                ),
+            )
+            return [_subset_demand(subset)]
         if len(in_shape) == 1 and (demand.is_all_rows() or demand.is_range_rows()):
             stride = (eqn.params["strides"] or (1,))[0]
             start = (
@@ -1058,14 +1177,18 @@ class SliceHandler(PrimitiveHandler):
                 else eqn.params["limit_indices"][0]
             )
             if stride == 1:
-                return [ContributionDemand(RangeRows(int(start), int(stop)))]
+                return [
+                    _routed_demand(
+                        in_shape, np.arange(int(start), int(stop), dtype=np.int64)
+                    )
+                ]
         coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
         strides = eqn.params["strides"] or (1,) * len(in_shape)
         source = tuple(
             s + c * stride
             for s, c, stride in zip(eqn.params["start_indices"], coords, strides)
         )
-        return [_demand(np.ravel_multi_index(source, in_shape))]
+        return [_routed_demand(in_shape, np.ravel_multi_index(source, in_shape))]
 
 
 @TR.register(
@@ -1124,12 +1247,19 @@ class ReverseHandler(PrimitiveHandler):
         out_demands: list[ContributionDemand | None],
     ) -> list[ContributionDemand | None]:
         demand = out_demands[0]
-        if demand.is_all_rows():
-            return [
-                ContributionDemand(AllRows(int(np.prod(_get_shape(eqn.invars[0])))))
-            ]
-        result = self.propagate_contribution_demand(eqn, state, out_demands)
-        return result.in_demands
+        if demand is None:
+            return [None]
+        shape = _get_shape(eqn.invars[0])
+        if isinstance(demand.subset, Full):
+            return [_subset_demand(Full(shape))]
+        if isinstance(demand.subset, AxisProduct):
+            axes = list(demand.subset.axes)
+            for axis in eqn.params["dimensions"]:
+                axes[axis] = ArrayRows(np.sort(shape[axis] - 1 - axes[axis].to_array()))
+            return [_subset_demand(AxisProduct(shape, tuple(axes)))]
+        raise NotImplementedError(
+            "rev liveness requires Full or AxisProduct output demands"
+        )
 
 
 @TR.register(
@@ -1224,6 +1354,34 @@ class PadHandler(PrimitiveHandler):
         state: TraceState,
         out_demands: list[ContributionDemand | None],
     ) -> list[ContributionDemand | None]:
+        demand = out_demands[0]
+        if demand is None:
+            return [None] * len(eqn.invars)
+        source_shape = _get_shape(eqn.invars[0])
+        value_var = eqn.invars[1] if len(eqn.invars) > 1 else None
+        value_demand = (
+            None
+            if value_var is None or isinstance(value_var, Literal)
+            else _subset_demand(Full(_get_shape(value_var)))
+        )
+        if isinstance(demand.subset, Full):
+            return [_subset_demand(Full(source_shape)), value_demand]
+        if isinstance(demand.subset, AxisProduct):
+            source_axes: list[RowSet] = []
+            for selection, (low, _high, interior), extent in zip(
+                demand.subset.axes, eqn.params["padding_config"], source_shape
+            ):
+                shifted = selection.to_array() - low
+                stride = interior + 1
+                valid = (shifted >= 0) & (shifted < extent * stride)
+                valid &= shifted % stride == 0
+                source_axes.append(ArrayRows(shifted[valid] // stride))
+            if any(len(axis) == 0 for axis in source_axes):
+                return [None, value_demand]
+            return [
+                _subset_demand(AxisProduct(source_shape, tuple(source_axes))),
+                value_demand,
+            ]
         result = self.propagate_contribution_demand(eqn, state, out_demands)
         # Padding values are numerical inputs for padding-only output entries;
         # retain them conservatively whenever padding output is demanded.
@@ -1321,6 +1479,35 @@ class ConcatenateHandler(PrimitiveHandler):
             return [None] * len(eqn.invars)
         shapes = [_get_shape(v) for v in eqn.invars]
         axis = eqn.params.get("dimension", 0)
+        if isinstance(demand.subset, Full):
+            return [
+                None if isinstance(var, Literal) else _subset_demand(Full(shape))
+                for var, shape in zip(eqn.invars, shapes)
+            ]
+        if isinstance(demand.subset, AxisProduct):
+            selected_axis = demand.subset.axes[axis].to_array()
+            result: list[ContributionDemand | None] = []
+            offset = 0
+            for var, shape in zip(eqn.invars, shapes):
+                local_axis = (
+                    selected_axis[
+                        (selected_axis >= offset)
+                        & (selected_axis < offset + shape[axis])
+                    ]
+                    - offset
+                )
+                if isinstance(var, Literal) or not local_axis.size:
+                    result.append(None)
+                else:
+                    axes = list(demand.subset.axes)
+                    axes[axis] = ArrayRows(local_axis)
+                    result.append(_subset_demand(AxisProduct(shape, tuple(axes))))
+                offset += shape[axis]
+            return result
+        if isinstance(demand.subset, Points):
+            raise NotImplementedError(
+                "concatenate liveness requires Full or AxisProduct demands"
+            )
         # Axis-zero concatenation preserves each input's contiguous C-order
         # interval.  Keep full/range demands compact instead of constructing the
         # whole source-ID routing tensor.
@@ -1430,14 +1617,32 @@ class StackHandler(PrimitiveHandler):
         state: TraceState,
         out_demands: list[ContributionDemand | None],
     ) -> list[ContributionDemand | None]:
-        if out_demands[0] is not None and out_demands[0].is_all_rows():
+        demand = out_demands[0]
+        if demand is None:
+            return [None] * len(eqn.invars)
+        if isinstance(demand.subset, Full):
             return [
                 None
                 if isinstance(var, Literal)
-                else ContributionDemand(AllRows(int(np.prod(_get_shape(var)))))
+                else _subset_demand(Full(_get_shape(var)))
                 for var in eqn.invars
             ]
-        return self.propagate_contribution_demand(eqn, state, out_demands).in_demands
+        if isinstance(demand.subset, AxisProduct):
+            axis = eqn.params["axis"]
+            selected = set(demand.subset.axes[axis].to_array())
+            input_axes = tuple(
+                selection
+                for index, selection in enumerate(demand.subset.axes)
+                if index != axis
+            )
+            shape = _get_shape(eqn.invars[0])
+            return [
+                None
+                if isinstance(var, Literal) or index not in selected
+                else _subset_demand(AxisProduct(shape, input_axes))
+                for index, var in enumerate(eqn.invars)
+            ]
+        raise NotImplementedError("stack liveness requires Full or AxisProduct demands")
 
 
 @TR.register(
@@ -1509,7 +1714,30 @@ class SplitHandler(PrimitiveHandler):
         state: TraceState,
         out_demands: list[ContributionDemand | None],
     ) -> list[ContributionDemand | None]:
-        return self.propagate_contribution_demand(eqn, state, out_demands).in_demands
+        source_shape = _get_shape(eqn.invars[0])
+        axis = eqn.params["axis"]
+        merged: ContributionDemand | None = None
+        offset = 0
+        for size, demand in zip(eqn.params["sizes"], out_demands):
+            size = int(size)
+            if demand is None:
+                offset += size
+                continue
+            if isinstance(demand.subset, Full):
+                axes: list[RowSet] = [AllRows(extent) for extent in source_shape]
+                axes[axis] = RangeRows(offset, offset + size)
+            elif isinstance(demand.subset, AxisProduct):
+                axes = list(demand.subset.axes)
+                axes[axis] = ArrayRows(demand.subset.axes[axis].to_array() + offset)
+            else:
+                raise NotImplementedError(
+                    "split liveness requires Full or AxisProduct demands"
+                )
+            merged = merge_demands(
+                merged, _subset_demand(AxisProduct(source_shape, tuple(axes)))
+            )
+            offset += size
+        return [merged]
 
 
 # =============================================================================
@@ -1595,14 +1823,14 @@ class GatherHandler(PrimitiveHandler):
                 source_rows, index_rows = routes
                 # _demand removes the -1 sentinel used for FILL_OR_DROP outputs
                 return [
-                    _demand(source_rows),
-                    _demand(index_rows),
+                    _routed_demand(_get_shape(src), source_rows),
+                    _routed_demand(_get_shape(indices_var), index_rows),
                 ]
 
         # concrete indices unavailable or unsupported gather config
         return [
-            _demand(np.arange(state.get(src).dep.shape[0], dtype=np.int64)),
-            _demand(np.arange(state.get(indices_var).dep.shape[0], dtype=np.int64)),
+            _subset_demand(Full(_get_shape(src))),
+            _subset_demand(Full(_get_shape(indices_var))),
         ]
 
     @staticmethod
@@ -1647,7 +1875,20 @@ class GatherHandler(PrimitiveHandler):
                 for batch in batches
             ]
         )
-        return [_demand(source_rows), _demand(index_rows)]
+        return [
+            _subset_demand(
+                AxisProduct(
+                    source_shape,
+                    (ArrayRows(batches), *(AllRows(size) for size in source_shape[1:])),
+                )
+            ),
+            _subset_demand(
+                AxisProduct(
+                    index_shape,
+                    (ArrayRows(batches), *(AllRows(size) for size in index_shape[1:])),
+                )
+            ),
+        ]
 
     def plan_backward(
         self,
@@ -1672,7 +1913,11 @@ class GatherHandler(PrimitiveHandler):
                 # rows directly, so the original routing tensor is not a
                 # runtime dependency in this specialization.
                 return BackwardResult(
-                    in_demands=(_demand(source_rows), None), aux=source_rows
+                    in_demands=(
+                        _routed_demand(_get_shape(eqn.invars[0]), source_rows),
+                        None,
+                    ),
+                    aux=source_rows,
                 )
         return BackwardResult(
             in_demands=tuple(
@@ -1684,30 +1929,28 @@ class GatherHandler(PrimitiveHandler):
         source, indices = in_values[:2]
         source_layout, index_layout = in_layouts[:2]
         out_layout = _live_output_layout(out_layouts)
+        if plan.aux is not None and source is not None and source_layout is not None:
+            return (interpreter.take_rows_from_local(source, source_layout, plan.aux),)
         if (
             source is not None
             and indices is not None
             and source_layout
             and index_layout
         ):
-            source_batch = BatchLayout.from_var_layout(source_layout)
-            index_batch = BatchLayout.from_var_layout(index_layout)
-            output_batch = BatchLayout.from_var_layout(out_layout)
+            source_batch = _leading_batches(source_layout)
+            index_batch = _leading_batches(index_layout)
+            output_batch = _leading_batches(out_layout)
             dn = eqn.params.get("dimension_numbers")
             if (
                 source_batch is not None
                 and index_batch is not None
                 and output_batch is not None
-                and source_batch.global_batch_ids.tolist()
-                == index_batch.global_batch_ids.tolist()
-                == output_batch.global_batch_ids.tolist()
+                and np.array_equal(source_batch.to_array(), index_batch.to_array())
+                and np.array_equal(source_batch.to_array(), output_batch.to_array())
                 and tuple(getattr(dn, "operand_batching_dims", ())) == (0,)
                 and tuple(getattr(dn, "start_indices_batching_dims", ())) == (0,)
             ):
-                local_source, _ = interpreter.batch_value(source, source_layout)
-                local_indices, _ = interpreter.batch_value(indices, index_layout)
-                result = eqn.primitive.bind(local_source, local_indices, **eqn.params)
-                return (jnp.ravel(result),)
+                return (jnp.ravel(eqn.primitive.bind(source, indices, **eqn.params)),)
         return super().eval_local(
             eqn=eqn,
             plan=plan,
@@ -1782,13 +2025,11 @@ class DynamicSliceHandler(PrimitiveHandler):
         source, starts = eqn.invars[0], eqn.invars[1:]
         start_vals = [state.get_val(v) for v in starts]
         index_demands = [
-            None
-            if isinstance(v, Literal)
-            else _demand(np.arange(state.get(v).dep.shape[0]))
+            None if isinstance(v, Literal) else _subset_demand(Full(_get_shape(v)))
             for v in starts
         ]
         if not all(v is not None for v in start_vals):
-            return [_demand(np.arange(state.get(source).dep.shape[0])), *index_demands]
+            return [_subset_demand(Full(_get_shape(source))), *index_demands]
         try:
             coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
             sizes = _get_shape(source)
@@ -1797,9 +2038,12 @@ class DynamicSliceHandler(PrimitiveHandler):
                 for v, dim, extent in zip(start_vals, sizes, eqn.params["slice_sizes"])
             ]
             src_coords = tuple(c + s for c, s in zip(coords, start))
-            return [_demand(np.ravel_multi_index(src_coords, sizes)), *index_demands]
+            return [
+                _routed_demand(sizes, np.ravel_multi_index(src_coords, sizes)),
+                *index_demands,
+            ]
         except (ValueError, TypeError):
-            return [_demand(np.arange(state.get(source).dep.shape[0])), *index_demands]
+            return [_subset_demand(Full(_get_shape(source))), *index_demands]
 
     def plan_backward(
         self,
@@ -1843,8 +2087,29 @@ class DynamicSliceHandler(PrimitiveHandler):
         )
         # Concrete starts are specialization data, not local runtime inputs.
         return BackwardResult(
-            in_demands=(_demand(source_rows), *([None] * len(starts))),
+            in_demands=(
+                _routed_demand(source_shape, source_rows),
+                *([None] * len(starts)),
+            ),
             aux=source_rows,
+        )
+
+    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
+        if (
+            plan.aux is not None
+            and in_values[0] is not None
+            and in_layouts[0] is not None
+        ):
+            return (
+                interpreter.take_rows_from_local(in_values[0], in_layouts[0], plan.aux),
+            )
+        return super().eval_local(
+            eqn=eqn,
+            plan=plan,
+            in_values=in_values,
+            in_layouts=in_layouts,
+            out_layouts=out_layouts,
+            interpreter=interpreter,
         )
 
 
@@ -1939,13 +2204,13 @@ class ScatterHandler(PrimitiveHandler):
                     if selected_index_rows is not None:
                         return [
                             base,
-                            _demand(selected_index_rows),
-                            _demand(update_rows),
+                            _routed_demand(_get_shape(indices), selected_index_rows),
+                            _routed_demand(_get_shape(updates), update_rows),
                         ]
         return [
             base,
-            _demand(np.arange(int(np.prod(_get_shape(indices))), dtype=np.int64)),
-            _demand(np.arange(int(np.prod(_get_shape(updates))), dtype=np.int64)),
+            _subset_demand(Full(_get_shape(indices))),
+            _subset_demand(Full(_get_shape(updates))),
         ]
 
     def plan_backward(
@@ -1991,20 +2256,28 @@ class ScatterHandler(PrimitiveHandler):
                 interpreter=interpreter,
             )
         base, _indices, updates = in_values[:3]
+        base_layout, _index_layout, updates_layout = in_layouts[:3]
         out = _live_output_layout(out_layouts)
-        _update_rows, target_rows = plan.aux
+        update_rows, target_rows = plan.aux
         if base is None:
             raise NotImplementedError(
                 f"No local execution rule for partial {eqn.primitive.name}"
             )
-        if not len(target_rows):
-            return (base,)
-        if updates is None:
+        if base_layout is None:
             raise NotImplementedError(
                 f"No local execution rule for partial {eqn.primitive.name}"
             )
-        target_local = out.rows.localize(np.asarray(target_rows, dtype=np.int64))
-        index = jnp.asarray(target_local)
+        # A producer can retain more rows for another consumer.  Align it to
+        # the output layout before interpreting localized scatter targets.
+        base = interpreter.take_rows_from_local(base, base_layout, out.rows.to_array())
+        if not len(target_rows):
+            return (base,)
+        if updates is None or updates_layout is None:
+            raise NotImplementedError(
+                f"No local execution rule for partial {eqn.primitive.name}"
+            )
+        updates = interpreter.take_rows_from_local(updates, updates_layout, update_rows)
+        index = jnp.asarray(out.rows.localize(np.asarray(target_rows, dtype=np.int64)))
         if eqn.primitive.name == "scatter-add":
             result = base.at[index].add(updates)
         elif eqn.primitive.name == "scatter-sub":
@@ -2121,7 +2394,7 @@ class DotHandler(PrimitiveHandler):
         return sum(invar_active) >= 2
 
     def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
-        """Execute complete retained contraction blocks in compact batch form."""
+        """Bind directly whenever finalized subsets form valid local tensors."""
         lhs, rhs = in_values[:2]
         lhs_layout, rhs_layout = in_layouts[:2]
         if lhs is None or rhs is None or lhs_layout is None or rhs_layout is None:
@@ -2134,382 +2407,29 @@ class DotHandler(PrimitiveHandler):
                 interpreter=interpreter,
             )
         dn = eqn.params["dimension_numbers"]
-        lhs_contract = tuple(dn[0][0])
-        rhs_contract = tuple(dn[0][1])
-        local = self._eval_matching_leading_batches(
-            eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts, interpreter
-        )
-        if local is not None:
-            return (local,)
-        local = self._eval_broadcast_batch_dot(
-            eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts
-        )
-        if local is not None:
-            return (local,)
-        local = self._eval_leading_batch_blocks(
-            eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts, interpreter
-        )
-        if local is not None:
-            return (local,)
-        # The initial local path supports the usual matrix/vector cases where
-        # liveness retained whole contraction blocks for selected output rows.
-        if lhs_contract == (len(lhs_layout.original_shape) - 1,):
-            width = lhs_layout.original_shape[-1]
-            if (
-                rhs_contract == (0,)
-                and rhs_layout.is_full
-                and lhs_layout.local_size % width == 0
-            ):
-                local_lhs = jnp.reshape(lhs, (lhs_layout.local_size // width, width))
-                local_rhs = jnp.reshape(rhs, rhs_layout.original_shape)
-                return (eqn.primitive.bind(local_lhs, local_rhs, **eqn.params),)
-            local = (
-                self._eval_selected_rhs_blocks(
-                    eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts
-                )
-                if rhs_contract == (0,)
-                else self._eval_selected_rhs_last_axis_blocks(
-                    eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts
-                )
-                if rhs_contract == (1,)
-                else None
-            )
-            if local is None and rhs_contract == (1,):
-                local = self._eval_selected_rhs_first_axis_blocks(
-                    eqn, lhs, rhs, lhs_layout, rhs_layout, out_layouts
-                )
-            if local is not None:
-                return (local,)
-        return super().eval_local(
-            eqn=eqn,
-            plan=plan,
-            in_values=in_values,
-            in_layouts=in_layouts,
-            out_layouts=out_layouts,
-            interpreter=interpreter,
-        )
-
-    @staticmethod
-    def _eval_leading_batch_blocks(
-        eqn: JaxprEqn,
-        lhs,
-        rhs,
-        lhs_layout: VarLayout,
-        rhs_layout: VarLayout,
-        out_layouts: tuple[VarLayout | None, ...],
-        interpreter,
-    ):
-        """Evaluate ``[batch,m,k] @ [k,n]`` on selected complete batches."""
+        lhs_contract, rhs_contract = tuple(dn[0][0]), tuple(dn[0][1])
+        lhs_batch, rhs_batch = tuple(dn[1][0]), tuple(dn[1][1])
         out_layout = _live_output_layout(out_layouts)
-        lhs_shape = lhs_layout.original_shape
-        rhs_shape = rhs_layout.original_shape
-        out_shape = out_layout.original_shape
-        dn = eqn.params["dimension_numbers"]
-        if (
-            len(lhs_shape) != 3
-            or len(rhs_shape) != 2
-            or len(out_shape) != 3
-            or tuple(dn[0][0]) != (2,)
-            or tuple(dn[0][1]) != (0,)
-            or tuple(dn[1][0])
-            or tuple(dn[1][1])
-            or lhs_shape[2] != rhs_shape[0]
-            or out_shape != (lhs_shape[0], lhs_shape[1], rhs_shape[1])
-            or not rhs_layout.is_full
-        ):
-            return None
-        lhs_batch = BatchLayout.from_var_layout(lhs_layout)
-        out_batch = BatchLayout.from_var_layout(out_layout)
-        if (
-            lhs_batch is None
-            or out_batch is None
-            or not np.array_equal(
-                lhs_batch.global_batch_ids, out_batch.global_batch_ids
-            )
-            or lhs_batch.batch_shape != lhs_shape[1:]
-            or out_batch.batch_shape != out_shape[1:]
-        ):
-            return None
-        local_lhs, _ = interpreter.batch_value(lhs, lhs_layout)
-        local_rhs = jnp.reshape(rhs, rhs_shape)
-        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
 
-    @staticmethod
-    def _eval_matching_leading_batches(
-        eqn: JaxprEqn,
-        lhs,
-        rhs,
-        lhs_layout: VarLayout,
-        rhs_layout: VarLayout,
-        out_layouts: tuple[VarLayout | None, ...],
-        interpreter,
-    ):
-        """Bind a dot whose two compact operands share a leading batch axis."""
-        dn = eqn.params["dimension_numbers"]
-        lhs_batch_dims = tuple(dn[1][0])
-        rhs_batch_dims = tuple(dn[1][1])
-        if (
-            not lhs_batch_dims
-            or lhs_batch_dims[0] != 0
-            or lhs_batch_dims != rhs_batch_dims
-        ):
-            return None
-        out_layout = _live_output_layout(out_layouts)
-        lhs_batch = BatchLayout.from_var_layout(lhs_layout)
-        rhs_batch = BatchLayout.from_var_layout(rhs_layout)
-        out_batch = BatchLayout.from_var_layout(out_layout)
-        out_batch_ids = (
-            out_batch.global_batch_ids
-            if out_batch is not None
-            else out_layout.rows.to_array()
-            if len(out_layout.original_shape) == 1
-            else None
+        structured = all(
+            layout.subset is not None and not isinstance(layout.subset, Points)
+            for layout in (lhs_layout, rhs_layout, out_layout)
         )
-        if (
-            lhs_batch is None
-            or rhs_batch is None
-            or out_batch_ids is None
-            or not np.array_equal(
-                lhs_batch.global_batch_ids, rhs_batch.global_batch_ids
-            )
-            or not np.array_equal(lhs_batch.global_batch_ids, out_batch_ids)
-        ):
-            return None
-        local_lhs, _ = interpreter.batch_value(lhs, lhs_layout)
-        local_rhs, _ = interpreter.batch_value(rhs, rhs_layout)
-        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
-
-    @staticmethod
-    def _eval_broadcast_batch_dot(
-        eqn: JaxprEqn,
-        lhs,
-        rhs,
-        lhs_layout: VarLayout,
-        rhs_layout: VarLayout,
-        out_layouts: tuple[VarLayout | None, ...],
-    ):
-        """Execute a length-one batch operand against selected trailing batches."""
-        out_layout = _live_output_layout(out_layouts)
-        dn = eqn.params["dimension_numbers"]
-        if (
-            lhs_layout.local_size == 1
-            and rhs_layout.local_size == out_layout.local_size
-            and not tuple(dn[0][0])
-            and not tuple(dn[0][1])
-        ):
-            # No contraction remains: in compact output order this is scalar
-            # multiplication, independent of where the singleton batch axis
-            # occurred in the original tensors.
-            return jnp.ravel(lhs) * jnp.ravel(rhs)
-        if (
-            lhs_layout.original_shape != (1,)
-            or not lhs_layout.is_full
-            or len(rhs_layout.original_shape) != 2
-            or rhs_layout.original_shape[0] != 1
-            or out_layout.original_shape != rhs_layout.original_shape
-            or tuple(dn[0][0])
-            or tuple(dn[0][1])
-            or tuple(dn[1][0]) != (0,)
-            or tuple(dn[1][1]) != (1,)
-            or not np.array_equal(
-                rhs_layout.rows.to_array(), out_layout.rows.to_array()
-            )
-        ):
-            return None
-        return jnp.ravel(
-            eqn.primitive.bind(
-                jnp.reshape(lhs, (1,)),
-                jnp.reshape(rhs, (1, rhs_layout.local_size)),
-                **eqn.params,
+        dimensions_match = all(
+            lhs.shape[lhs_axis] == rhs.shape[rhs_axis]
+            for lhs_axis, rhs_axis in (
+                *zip(lhs_contract, rhs_contract),
+                *zip(lhs_batch, rhs_batch),
             )
         )
-
-    @staticmethod
-    def _eval_selected_rhs_blocks(
-        eqn: JaxprEqn,
-        lhs,
-        rhs,
-        lhs_layout: VarLayout,
-        rhs_layout: VarLayout,
-        out_layouts: tuple[VarLayout | None, ...],
-    ):
-        """Evaluate ``[i,k] @ [k,e,j]`` on complete selected element blocks.
-
-        FEM gradient assembly commonly contracts a small, full reference matrix
-        with a tensor whose middle (element) axis is partitioned.  The compact
-        layouts retain complete ``(k, j)`` blocks per selected element; checking
-        that invariant here makes reshaping exact rather than reconstructing a
-        global tensor.
-        """
-        out_layout = _live_output_layout(out_layouts)
-        lhs_shape = lhs_layout.original_shape
-        rhs_shape = rhs_layout.original_shape
-        out_shape = out_layout.original_shape
-        if (
-            len(lhs_shape) != 2
-            or len(rhs_shape) != 3
-            or len(out_shape) != 3
-            or not lhs_layout.is_full
-            or lhs_shape[1] != rhs_shape[0]
-            or out_shape != (lhs_shape[0], rhs_shape[1], rhs_shape[2])
-        ):
-            return None
-
-        contract, n_global_elements, components = rhs_shape
-        rhs_rows = rhs_layout.rows.to_array()
-        if rhs_rows.size % (contract * components):
-            return None
-        rhs_coords = np.unravel_index(rhs_rows, rhs_shape)
-        selected_elements = np.unique(rhs_coords[1])
-        expected_rhs = np.concatenate(
-            [
-                (
-                    contract_index * n_global_elements * components
-                    + selected_elements[:, None] * components
-                    + np.arange(components, dtype=np.int64)
-                ).ravel()
-                for contract_index in range(contract)
-            ]
+        if structured and dimensions_match:
+            local_result = eqn.primitive.bind(lhs, rhs, **eqn.params)
+            if tuple(local_result.shape) == tuple(out_layout.local_aval.shape):
+                return (local_result,)
+        raise NotImplementedError(
+            "dot_general localization requires structurally valid local tensors; "
+            "irregular Points demands are not supported"
         )
-        if not np.array_equal(rhs_rows, expected_rhs):
-            return None
-
-        expected_out = np.concatenate(
-            [
-                (
-                    lhs_index * n_global_elements * components
-                    + selected_elements[:, None] * components
-                    + np.arange(components, dtype=np.int64)
-                ).ravel()
-                for lhs_index in range(lhs_shape[0])
-            ]
-        )
-        if not np.array_equal(out_layout.rows.to_array(), expected_out):
-            return None
-
-        local_lhs = jnp.reshape(lhs, lhs_shape)
-        local_rhs = jnp.reshape(rhs, (contract, selected_elements.size, components))
-        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
-
-    @staticmethod
-    def _eval_selected_rhs_last_axis_blocks(
-        eqn: JaxprEqn,
-        lhs,
-        rhs,
-        lhs_layout: VarLayout,
-        rhs_layout: VarLayout,
-        out_layouts: tuple[VarLayout | None, ...],
-    ):
-        """Evaluate ``[i,k] @ [j,k,e]`` for complete selected element blocks."""
-        out_layout = _live_output_layout(out_layouts)
-        lhs_shape = lhs_layout.original_shape
-        rhs_shape = rhs_layout.original_shape
-        out_shape = out_layout.original_shape
-        if (
-            len(lhs_shape) != 2
-            or len(rhs_shape) != 3
-            or len(out_shape) != 3
-            or not lhs_layout.is_full
-            or lhs_shape[1] != rhs_shape[1]
-            or out_shape != (lhs_shape[0], rhs_shape[0], rhs_shape[2])
-        ):
-            return None
-
-        rhs_outer, contract, n_global_elements = rhs_shape
-        rhs_rows = rhs_layout.rows.to_array()
-        if rhs_rows.size % (rhs_outer * contract):
-            return None
-        rhs_coords = np.unravel_index(rhs_rows, rhs_shape)
-        selected_elements = np.unique(rhs_coords[2])
-        expected_rhs = np.concatenate(
-            [
-                (
-                    outer_index * contract * n_global_elements
-                    + contract_index * n_global_elements
-                    + selected_elements
-                )
-                for outer_index in range(rhs_outer)
-                for contract_index in range(contract)
-            ]
-        )
-        if not np.array_equal(rhs_rows, expected_rhs):
-            return None
-
-        expected_out = np.concatenate(
-            [
-                (
-                    lhs_index * rhs_outer * n_global_elements
-                    + outer_index * n_global_elements
-                    + selected_elements
-                )
-                for lhs_index in range(lhs_shape[0])
-                for outer_index in range(rhs_outer)
-            ]
-        )
-        if not np.array_equal(out_layout.rows.to_array(), expected_out):
-            return None
-
-        local_lhs = jnp.reshape(lhs, lhs_shape)
-        local_rhs = jnp.reshape(rhs, (rhs_outer, contract, selected_elements.size))
-        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
-
-    @staticmethod
-    def _eval_selected_rhs_first_axis_blocks(
-        eqn: JaxprEqn,
-        lhs,
-        rhs,
-        lhs_layout: VarLayout,
-        rhs_layout: VarLayout,
-        out_layouts: tuple[VarLayout | None, ...],
-    ):
-        """Evaluate ``[i,k] @ [e,k,j]`` for complete selected element blocks."""
-        out_layout = _live_output_layout(out_layouts)
-        lhs_shape = lhs_layout.original_shape
-        rhs_shape = rhs_layout.original_shape
-        out_shape = out_layout.original_shape
-        if (
-            len(lhs_shape) != 2
-            or len(rhs_shape) != 3
-            or len(out_shape) != 3
-            or not lhs_layout.is_full
-            or lhs_shape[1] != rhs_shape[1]
-            or out_shape != (lhs_shape[0], rhs_shape[0], rhs_shape[2])
-        ):
-            return None
-
-        n_global_elements, contract, components = rhs_shape
-        rhs_rows = rhs_layout.rows.to_array()
-        if rhs_rows.size % (contract * components):
-            return None
-        selected_elements = np.unique(np.unravel_index(rhs_rows, rhs_shape)[0])
-        expected_rhs = np.concatenate(
-            [
-                (
-                    element * contract * components
-                    + np.arange(contract * components, dtype=np.int64)
-                )
-                for element in selected_elements
-            ]
-        )
-        if not np.array_equal(rhs_rows, expected_rhs):
-            return None
-
-        expected_out = np.concatenate(
-            [
-                (
-                    lhs_index * n_global_elements * components
-                    + selected_elements[:, None] * components
-                    + np.arange(components, dtype=np.int64)
-                ).ravel()
-                for lhs_index in range(lhs_shape[0])
-            ]
-        )
-        if not np.array_equal(out_layout.rows.to_array(), expected_out):
-            return None
-
-        local_lhs = jnp.reshape(lhs, lhs_shape)
-        local_rhs = jnp.reshape(rhs, (selected_elements.size, contract, components))
-        return jnp.ravel(eqn.primitive.bind(local_lhs, local_rhs, **eqn.params))
 
     def propagate_deps(
         self,
@@ -2634,56 +2554,51 @@ class DotHandler(PrimitiveHandler):
             return [None, None]
         lhs, rhs = eqn.invars[:2]
         la, rb = _get_shape(lhs), _get_shape(rhs)
-        try:
-            dn = eqn.params["dimension_numbers"]
-            if hasattr(dn, "lhs_batch_dimensions"):
-                lb, rb_dims = (
-                    tuple(dn.lhs_batch_dimensions),
-                    tuple(dn.rhs_batch_dimensions),
-                )
-                lc, rc = (
-                    tuple(dn.lhs_contracting_dimensions),
-                    tuple(dn.rhs_contracting_dimensions),
-                )
-            else:
-                lc, rc = tuple(dn[0][0]), tuple(dn[0][1])
-                lb, rb_dims = tuple(dn[1][0]), tuple(dn[1][1])
-            lf = tuple(i for i in range(len(la)) if i not in lb and i not in lc)
-            rf = tuple(i for i in range(len(rb)) if i not in rb_dims and i not in rc)
-            out_coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
-            n_batch, n_lfree = len(lb), len(lf)
-            contract_shape = tuple(la[i] for i in lc)
-            contract_coords = (
-                np.indices(contract_shape).reshape(len(lc), -1)
-                if lc
-                else np.empty((0, 1), int)
+        if isinstance(demand.subset, Full):
+            return [_subset_demand(Full(la)), _subset_demand(Full(rb))]
+        if not isinstance(demand.subset, AxisProduct):
+            raise NotImplementedError(
+                "dot_general liveness requires Full or AxisProduct output demands"
             )
-            lhs_rows, rhs_rows = [], []
-            for col in range(len(demand.rows)):
-                lcoords = [0] * len(la)
-                rcoords = [0] * len(rb)
-                for j, axis in enumerate(lb):
-                    lcoords[axis] = out_coords[j][col]
-                for j, axis in enumerate(rb_dims):
-                    rcoords[axis] = out_coords[j][col]
-                for j, axis in enumerate(lf):
-                    lcoords[axis] = out_coords[n_batch + j][col]
-                for j, axis in enumerate(rf):
-                    rcoords[axis] = out_coords[n_batch + n_lfree + j][col]
-                for k in range(contract_coords.shape[1]):
-                    ll, rr = list(lcoords), list(rcoords)
-                    for j, axis in enumerate(lc):
-                        ll[axis] = contract_coords[j, k]
-                    for j, axis in enumerate(rc):
-                        rr[axis] = contract_coords[j, k]
-                    lhs_rows.append(np.ravel_multi_index(tuple(ll), la))
-                    rhs_rows.append(np.ravel_multi_index(tuple(rr), rb))
-            return [_demand(np.asarray(lhs_rows)), _demand(np.asarray(rhs_rows))]
-        except (KeyError, ValueError, AttributeError, TypeError):
-            return [
-                _demand(np.arange(state.get(lhs).dep.shape[0])),
-                _demand(np.arange(state.get(rhs).dep.shape[0])),
-            ]
+        dn = eqn.params["dimension_numbers"]
+        if hasattr(dn, "lhs_batch_dimensions"):
+            lb, rb_dims = tuple(dn.lhs_batch_dimensions), tuple(dn.rhs_batch_dimensions)
+            lc, rc = (
+                tuple(dn.lhs_contracting_dimensions),
+                tuple(dn.rhs_contracting_dimensions),
+            )
+        else:
+            lc, rc = tuple(dn[0][0]), tuple(dn[0][1])
+            lb, rb_dims = tuple(dn[1][0]), tuple(dn[1][1])
+        lf = tuple(axis for axis in range(len(la)) if axis not in (*lb, *lc))
+        rf = tuple(axis for axis in range(len(rb)) if axis not in (*rb_dims, *rc))
+        output_axes = demand.subset.axes
+        if len(output_axes) != len(lb) + len(lf) + len(rf):
+            raise NotImplementedError(
+                "dot_general output subset does not match dimension numbers"
+            )
+
+        def operand_subset(
+            shape: tuple[int, ...],
+            batch_axes: tuple[int, ...],
+            free_axes: tuple[int, ...],
+            free_output_offset: int,
+        ) -> AxisProduct:
+            axes: list[RowSet] = [AllRows(extent) for extent in shape]
+            for output_axis, operand_axis in enumerate(batch_axes):
+                axes[operand_axis] = (
+                    AllRows(shape[operand_axis])
+                    if shape[operand_axis] == 1
+                    else output_axes[output_axis]
+                )
+            for offset, operand_axis in enumerate(free_axes):
+                axes[operand_axis] = output_axes[free_output_offset + offset]
+            return AxisProduct(shape, tuple(axes))
+
+        return [
+            _subset_demand(operand_subset(la, lb, lf, len(lb))),
+            _subset_demand(operand_subset(rb, rb_dims, rf, len(lb) + len(lf))),
+        ]
 
 
 @TR.register(
@@ -2756,62 +2671,21 @@ class ReductionHandler(PrimitiveHandler):
         if demand is None:
             return [None]
         in_shape = _get_shape(eqn.invars[0])
-        if demand.is_all_rows():
-            return [ContributionDemand(AllRows(int(np.prod(in_shape))))]
-        if "axes" not in eqn.params:
-            # reduce_window_* has window geometry rather than reduction axes.
-            return [ContributionDemand(AllRows(int(np.prod(in_shape))))]
-        axes = set(eqn.params.get("axes", ()))
-        kept = [axis for axis in range(len(in_shape)) if axis not in axes]
-        out_shape = _get_shape(eqn.outvars[0])
-        out_coords = np.unravel_index(demand.rows, out_shape) if out_shape else ()
-        grid = np.indices(in_shape).reshape(len(in_shape), -1)
-        selected = np.zeros(grid.shape[1], dtype=bool)
-        for i in range(len(demand.rows)):
-            match = np.ones(grid.shape[1], dtype=bool)
-            for j, axis in enumerate(kept):
-                # JAX reduce_* removes reduced axes; retain this fallback for
-                # keepdims-compatible custom lowerings too.
-                out_axis = axis if len(out_shape) == len(in_shape) else j
-                match &= grid[axis] == out_coords[out_axis][i]
-            selected |= match
-        return [_demand(np.flatnonzero(selected))]
-
-    def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
-        out = _live_output_layout(out_layouts)
-        if (
-            eqn.primitive.name != "reduce_sum"
-            or in_values[0] is None
-            or in_layouts[0] is None
-        ):
-            return super().eval_local(
-                eqn=eqn,
-                plan=plan,
-                in_values=in_values,
-                in_layouts=in_layouts,
-                out_layouts=out_layouts,
-                interpreter=interpreter,
-            )
-        in_shape = _get_shape(eqn.invars[0])
-        axes = set(eqn.params["axes"])
-        kept = [axis for axis in range(len(in_shape)) if axis not in axes]
-        out_shape = _get_shape(eqn.outvars[0])
-        groups = []
-        for row in out.rows.to_array():
-            coords = np.unravel_index(row, out_shape) if out_shape else ()
-            grid = np.indices(in_shape).reshape(len(in_shape), -1)
-            mask = np.ones(grid.shape[1], dtype=bool)
-            for j, axis in enumerate(kept):
-                mask &= grid[axis] == coords[j]
-            groups.append(np.flatnonzero(mask).astype(np.int64))
-        if not groups or len({len(group) for group in groups}) != 1:
-            raise NotImplementedError(
-                "Local reduce_sum needs rectangular reduction groups"
-            )
-        selected = interpreter.take_global_rows(
-            in_values[0], in_layouts[0], np.concatenate(groups)
+        if isinstance(demand.subset, Full):
+            return [_subset_demand(Full(in_shape))]
+        if "axes" in eqn.params and isinstance(demand.subset, AxisProduct):
+            reduced = set(eqn.params["axes"])
+            kept = [axis for axis in range(len(in_shape)) if axis not in reduced]
+            if len(kept) == len(demand.subset.axes):
+                axes: list[Any] = [None] * len(in_shape)
+                for axis in reduced:
+                    axes[axis] = AllRows(in_shape[axis])
+                for axis, selection in zip(kept, demand.subset.axes):
+                    axes[axis] = selection
+                return [_subset_demand(AxisProduct(in_shape, tuple(axes)))]
+        raise NotImplementedError(
+            f"{eqn.primitive.name} liveness requires Full or AxisProduct output demands"
         )
-        return (jnp.sum(selected.reshape(len(groups), len(groups[0])), axis=1),)
 
 
 # =============================================================================
@@ -2875,19 +2749,10 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
         return any(invar_active)
 
     def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
-        if eqn.primitive.name == "lu":
-            local = self._eval_local_lu(eqn, in_values, in_layouts, out_layouts)
-            if local is not None:
-                return local
-        if eqn.primitive.name == "triangular_solve":
-            local = self._eval_local_batched_primitive(
-                eqn, in_values, in_layouts, out_layouts
-            )
-            if local is not None:
-                return local
-        if eqn.primitive.name == "custom_linear_solve":
-            if plan.subplans:
-                parent_indices = plan.aux
+        """Run batched dense kernels directly when complete blocks survived."""
+        if eqn.primitive.name == "custom_linear_solve" and plan.subplans:
+            parent_indices = plan.aux
+            if parent_indices is not None:
                 outputs = interpreter.run_subplan(
                     plan.subplans[0],
                     (),
@@ -2898,11 +2763,40 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
                     value if layout is not None else None
                     for value, layout in zip(outputs, out_layouts)
                 )
-            local = self._eval_local_lu_backed_solve(
-                eqn, in_values, in_layouts, out_layouts
-            )
-            if local is not None:
-                return local
+        if (
+            eqn.primitive.name == "lu"
+            and in_values[0] is not None
+            and in_layouts[0] is not None
+        ):
+            matrix_layout = in_layouts[0]
+            batch = _leading_batches(matrix_layout)
+            if batch is not None and len(matrix_layout.original_shape) >= 3:
+                results = eqn.primitive.bind(in_values[0], **eqn.params)
+                results = results if isinstance(results, (tuple, list)) else (results,)
+                return tuple(
+                    None if layout is None else jnp.ravel(result)
+                    for result, layout in zip(results, out_layouts)
+                )
+        if eqn.primitive.name == "triangular_solve":
+            layouts = [
+                layout
+                for value, layout in zip(in_values, in_layouts)
+                if value is not None and layout is not None
+            ]
+            batches = [_leading_batches(layout) for layout in layouts]
+            if batches and all(batch is not None for batch in batches):
+                batch_ids = batches[0].to_array()
+                if all(
+                    np.array_equal(batch.to_array(), batch_ids) for batch in batches[1:]
+                ):
+                    local_inputs = tuple(
+                        value for value, layout in zip(in_values, in_layouts)
+                    )
+                    result = eqn.primitive.bind(*local_inputs, **eqn.params)
+                    return tuple(
+                        None if layout is None else jnp.ravel(result)
+                        for layout in out_layouts
+                    )
         return super().eval_local(
             eqn=eqn,
             plan=plan,
@@ -2910,153 +2804,6 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             in_layouts=in_layouts,
             out_layouts=out_layouts,
             interpreter=interpreter,
-        )
-
-    @staticmethod
-    def _eval_local_lu(eqn, in_values, in_layouts, out_layouts):
-        """Run LU over complete retained matrix batches without global padding."""
-        matrix = in_values[0]
-        matrix_layout = in_layouts[0]
-        if matrix is None or matrix_layout is None:
-            return None
-        shape = matrix_layout.original_shape
-        if len(shape) != 3 or shape[-2] != shape[-1]:
-            return None
-        n_global_batches, size, _ = shape
-        block_size = size * size
-        rows = matrix_layout.rows.to_array()
-        if rows.size % block_size:
-            return None
-        batch_ids = np.unique(rows // block_size)
-        expected_input = np.concatenate(
-            [
-                batch * block_size + np.arange(block_size, dtype=np.int64)
-                for batch in batch_ids
-            ]
-        )
-        if not np.array_equal(rows, expected_input):
-            return None
-
-        expected_output_rows = lambda output_shape: np.concatenate(
-            [
-                batch * int(np.prod(output_shape[1:]))
-                + np.arange(int(np.prod(output_shape[1:])), dtype=np.int64)
-                for batch in batch_ids
-            ]
-        )
-        for output_shape, layout in zip(
-            (_get_shape(var) for var in eqn.outvars), out_layouts
-        ):
-            if layout is not None and (
-                not output_shape
-                or output_shape[0] != n_global_batches
-                or not np.array_equal(
-                    layout.rows.to_array(), expected_output_rows(output_shape)
-                )
-            ):
-                return None
-
-        result = eqn.primitive.bind(
-            jnp.reshape(matrix, (batch_ids.size, size, size)), **eqn.params
-        )
-        values = result if isinstance(result, (tuple, list)) else (result,)
-        return tuple(
-            None if layout is None else jnp.ravel(value)
-            for value, layout in zip(values, out_layouts)
-        )
-
-    @staticmethod
-    def _eval_local_batched_primitive(eqn, in_values, in_layouts, out_layouts):
-        """Bind a primitive after verifying complete, matching batch blocks."""
-        out_layout = _live_output_layout(out_layouts)
-        out_shape = out_layout.original_shape
-        if len(out_shape) < 2:
-            return None
-        n_global_batches = out_shape[0]
-        out_block_size = int(np.prod(out_shape[1:]))
-        out_rows = out_layout.rows.to_array()
-        if out_rows.size % out_block_size:
-            return None
-        batch_ids = np.unique(out_rows // out_block_size)
-        expected_out = np.concatenate(
-            [
-                batch * out_block_size + np.arange(out_block_size, dtype=np.int64)
-                for batch in batch_ids
-            ]
-        )
-        if not np.array_equal(out_rows, expected_out):
-            return None
-
-        inputs = []
-        for value, layout in zip(in_values, in_layouts):
-            if layout is None:
-                inputs.append(value)
-                continue
-            shape = layout.original_shape
-            if not shape or shape[0] != n_global_batches:
-                return None
-            block_size = int(np.prod(shape[1:]))
-            expected = np.concatenate(
-                [
-                    batch * block_size + np.arange(block_size, dtype=np.int64)
-                    for batch in batch_ids
-                ]
-            )
-            if not np.array_equal(layout.rows.to_array(), expected):
-                return None
-            inputs.append(jnp.reshape(value, (batch_ids.size, *shape[1:])))
-        result = eqn.primitive.bind(*inputs, **eqn.params)
-        values = result if isinstance(result, (tuple, list)) else (result,)
-        return tuple(
-            None if layout is None else jnp.ravel(value)
-            for value, layout in zip(values, out_layouts)
-        )
-
-    @staticmethod
-    def _eval_local_lu_backed_solve(eqn, in_values, in_layouts, out_layouts):
-        """Local semantic replacement for JAX's fixed-shape LU solve callable."""
-        const_lengths = eqn.params.get("const_lengths")
-        if const_lengths is None or const_lengths.matvec != 1:
-            return None
-        rhs_index = sum(const_lengths)
-        if rhs_index >= len(in_values):
-            return None
-        matrix, rhs = in_values[0], in_values[rhs_index]
-        matrix_layout, rhs_layout = in_layouts[0], in_layouts[rhs_index]
-        out_layout = _live_output_layout(out_layouts)
-        if (
-            matrix is None
-            or rhs is None
-            or matrix_layout is None
-            or rhs_layout is None
-            or matrix_layout.original_shape != out_layout.original_shape
-            or rhs_layout.original_shape != out_layout.original_shape
-        ):
-            return None
-        shape = out_layout.original_shape
-        if len(shape) != 3 or shape[-2] != shape[-1]:
-            return None
-        block_size = int(np.prod(shape[1:]))
-        out_rows = out_layout.rows.to_array()
-        if out_rows.size % block_size:
-            return None
-        batch_ids = np.unique(out_rows // block_size)
-        expected = np.concatenate(
-            [
-                batch * block_size + np.arange(block_size, dtype=np.int64)
-                for batch in batch_ids
-            ]
-        )
-        if not all(
-            np.array_equal(layout.rows.to_array(), expected)
-            for layout in (matrix_layout, rhs_layout, out_layout)
-        ):
-            return None
-        local_shape = (batch_ids.size, *shape[1:])
-        return (
-            jnp.ravel(
-                jnp.linalg.solve(matrix.reshape(local_shape), rhs.reshape(local_shape))
-            ),
         )
 
     def propagate_liveness_demand(
@@ -3198,7 +2945,7 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             )[None, :]
         ).ravel()
 
-        return [_demand(input_rows)]
+        return [_routed_demand(input_shape, input_rows)]
 
     @staticmethod
     def _batched_linalg_liveness(
@@ -3263,16 +3010,9 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
                     + np.arange(block_size, dtype=np.int64)[None, :]
                 ).ravel()
 
-                result.append(_demand(rows))
+                result.append(_routed_demand(in_shape, rows))
             else:
-                result.append(
-                    _demand(
-                        np.arange(
-                            int(np.prod(in_shape)),
-                            dtype=np.int64,
-                        )
-                    )
-                )
+                result.append(_subset_demand(Full(in_shape)))
 
         return result
 
@@ -3337,7 +3077,6 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
                 continue
 
             in_shape = _get_shape(invar)
-            in_size = int(np.prod(in_shape))
 
             # Inputs beginning with the same batch shape are interpreted as
             # per-system operands. Retain complete trailing blocks only for
@@ -3355,12 +3094,12 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
                     )[None, :]
                 ).ravel()
 
-                input_demands.append(_demand(rows))
+                input_demands.append(_routed_demand(in_shape, rows))
                 continue
 
             # Small shared coefficients or other unbatched operands are used
             # by every selected solve and must be retained completely.
-            input_demands.append(_demand(np.arange(in_size, dtype=np.int64)))
+            input_demands.append(_subset_demand(Full(in_shape)))
 
         return input_demands
 
@@ -3478,7 +3217,11 @@ class SubJaxprHandler(PrimitiveHandler):
         for child, value in zip(sub.constvars, sub_consts):
             sub_state.set(child, SparseDepSet.empty(_get_shape(child), state.n_dofs))
             sub_state.val_of[id(child)] = np.asarray(value)
-        demands = {id(v): d for v, d in zip(sub.outvars, out_demands) if d is not None}
+        demands = {
+            id(sub_out): _routed_demand(_get_shape(sub_out), demand_rows(demand))
+            for sub_out, demand in zip(sub.outvars, out_demands)
+            if demand is not None
+        }
         for subeqn, handler, _active, _concrete in reversed(bound):
             outgoing = [demands.pop(id(v), None) for v in subeqn.outvars]
             if not any(outgoing):
@@ -3490,7 +3233,12 @@ class SubJaxprHandler(PrimitiveHandler):
 
         # TODO: for rewriting the jaxpr later, the nested liveness demands must be
         # stored/retained! Likely in state.sub_liveness[id(eqn)] = SubJaxprLivenessPlan(...)
-        return [demands.get(id(v)) for v in sub.invars]
+        return [
+            None
+            if isinstance(parent, Literal) or (demand := demands.get(id(child))) is None
+            else _routed_demand(_get_shape(parent), demand_rows(demand))
+            for parent, child in zip(eqn.invars, sub.invars)
+        ]
 
     def plan_backward(
         self,
@@ -3519,16 +3267,19 @@ class SubJaxprHandler(PrimitiveHandler):
             sub_state.val_of[id(child)] = np.asarray(value)
 
         seed_demands = {
-            sub_out: demand
+            sub_out: _routed_demand(_get_shape(sub_out), demand_rows(demand))
             for sub_out, demand in zip(sub.outvars, out_demands)
             if demand is not None
         }
         requested_outputs = tuple(seed_demands)
         subplan = plan_local_jaxpr(sub, sub_state, seed_demands, requested_outputs)
-        return BackwardResult(
-            in_demands=subplan.invar_demands,
-            subplans=(subplan,),
+        in_demands = tuple(
+            None
+            if isinstance(parent, Literal) or demand is None
+            else _routed_demand(_get_shape(parent), demand_rows(demand))
+            for parent, demand in zip(eqn.invars, subplan.invar_demands)
         )
+        return BackwardResult(in_demands=in_demands, subplans=(subplan,))
 
     def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
         if not plan.subplans:
@@ -3614,7 +3365,7 @@ class CondHandler(PrimitiveHandler):
         predicate = (
             None
             if isinstance(eqn.invars[0], Literal)
-            else _demand(np.arange(state.get(eqn.invars[0]).dep.shape[0]))
+            else _subset_demand(Full(_get_shape(eqn.invars[0])))
         )
         merged: list[ContributionDemand | None] = [None] * (len(eqn.invars) - 1)
         branch_info = cast(list[SubEqnInfo], state.sub_info.get(id(eqn), []))
@@ -4027,7 +3778,7 @@ class ScanMapHandler(PrimitiveHandler):
                 iterations, body_rows = divmod(demand_rows(demand), body_size)
                 for iteration in np.unique(iterations):
                     rows = body_rows[iterations == iteration]
-                    seed = _demand(rows)
+                    seed = _routed_demand(_get_shape(body_out), rows)
                     if seed is not None:
                         bucket = seeds_by_iteration.setdefault(int(iteration), {})
                         bucket[id(body_out)] = merge_demands(
@@ -4093,7 +3844,9 @@ class ScanMapHandler(PrimitiveHandler):
                     input_index = xs_start + offset
                     body_size = int(np.prod(_get_shape(body_input)))
                     parent_rows = iteration * body_size + demand_rows(required)
-                    mapped = _demand(parent_rows)
+                    mapped = _routed_demand(
+                        _get_shape(eqn.invars[input_index]), parent_rows
+                    )
                     in_demands[input_index] = merge_demands(
                         in_demands[input_index], mapped
                     )
@@ -4152,12 +3905,22 @@ class ScanMapHandler(PrimitiveHandler):
             sub_state.val_of[id(child)] = np.asarray(value)
 
         seed_demands = {
-            body_out: demand
+            body_out: _routed_demand(
+                _get_shape(body_out),
+                demand_rows(demand) % int(np.prod(_get_shape(body_out))),
+            )
             for body_out, demand in zip(sub.outvars, out_demands)
             if demand is not None
         }
         subplan = plan_local_jaxpr(sub, sub_state, seed_demands, tuple(seed_demands))
-        return BackwardResult(in_demands=subplan.invar_demands, subplans=(subplan,))
+        in_demands = list(subplan.invar_demands)
+        for index in range(num_consts, len(in_demands)):
+            demand = in_demands[index]
+            if demand is not None:
+                in_demands[index] = _routed_demand(
+                    _get_shape(eqn.invars[index]), demand_rows(demand)
+                )
+        return BackwardResult(in_demands=tuple(in_demands), subplans=(subplan,))
 
     def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
         if (
