@@ -22,6 +22,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
+import tatva.tensor_kernels as tk
+
 
 class Element(ABC):
     """Abstract base class for all finite elements in tatva. Subclasses must implement
@@ -108,11 +110,11 @@ class Element(ABC):
             Gradient of the nodal values at the local coordinates (shape: (n_values, n_dim)).
         """
         # 'd': spatial dimension, 'n': number of nodes,
-        # '...': any additional dimensions (e.g., values per node)
         dNdr = self.shape_function_derivative(xi)  # (d, n)
-        J = dNdr @ nodal_coords  # (d, n) x (n, d) -> (d, d)
-        dNdX = jnp.linalg.inv(J) @ dNdr  # (d, d) x (d, n) -> (d, n)
-        return jnp.einsum("dn,n...->...d", dNdX, nodal_values)  # (..., d)
+        J = tk.matmul(dNdr, nodal_coords)  # (d, n) x (n, d) -> (d, d)
+        dNdX = tk.matmul(tk.inv(J), dNdr)  # (d, d) x (d, n) -> (d, n)
+        # matmul contracts the node axis and leaves d leading, we need to move it to the end
+        return jnp.moveaxis(tk.matmul(dNdX, nodal_values), 0, -1)  # (..., d)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -133,10 +135,11 @@ class Element(ABC):
         N = self.shape_function(xi)
         dNdr = self.shape_function_derivative(xi)
         J, detJ = self.get_jacobian(xi, nodal_coords)
-        dNdX = jnp.linalg.inv(J) @ dNdr
+        dNdX = tk.matmul(tk.inv(J), dNdr)
         return (
             jnp.einsum("n,n...->...", N, nodal_values),
-            jnp.einsum("dn,n...->...d", dNdX, nodal_values),
+            # matmul contracts the node axis and leaves d leading, we need to move it to the end
+            jnp.moveaxis(tk.matmul(dNdX, nodal_values), 0, -1),
             detJ,
         )
 
@@ -163,6 +166,8 @@ class Line2(Element):
 
     def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
         _N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
+        # dNdr is 1-D here: this is a vector-matrix product, not tk.matmul's
+        # (p, q) x (q, ...) contract, so it never reaches the GEMM path. Safe to use @ here.
         J = dNdr @ nodal_coords
         t = jnp.asarray([J[0], J[1]]) / jnp.linalg.norm(J)
         return jnp.dot(J, t), jnp.dot(J, t)
@@ -171,6 +176,7 @@ class Line2(Element):
         _N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
+        # we can use einsum here as it is reduction not matmul
         return jnp.einsum("n,n...->...", dNdX, nodal_values)
 
     def get_local_values(
