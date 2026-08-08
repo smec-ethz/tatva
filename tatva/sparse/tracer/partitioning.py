@@ -29,6 +29,9 @@ if TYPE_CHECKING:
 
 class RowSet(Protocol):
     def __len__(self) -> int: ...
+    def __array__(self, dtype=None, copy=None) -> NDArray: ...
+    @property
+    def size(self) -> int: ...
     def to_array(self) -> NDArray: ...
     def is_full(self, total_size: int) -> bool: ...
     def localize(self, global_rows: NDArray) -> NDArray:
@@ -158,34 +161,6 @@ class RangeRows:
         return global_rows - self.start
 
 
-# @dataclass(frozen=True)
-# class RangeRows:
-#     """A contiguous half-open range of flat entries without materialization."""
-#
-#     start: int
-#     stop: int
-#
-#     def __post_init__(self) -> None:
-#         if self.start < 0 or self.stop < self.start:
-#             raise ValueError("RangeRows must be a non-negative half-open range.")
-#
-#     def __len__(self) -> int:
-#         return self.stop - self.start
-#
-#     @property
-#     def size(self) -> int:
-#         return self.stop - self.start
-#
-#     def __array__(self, dtype=None) -> NDArray[np.int64]:
-#         return np.arange(self.start, self.stop, dtype=dtype or np.int64)
-#
-#     def __getitem__(self, key):
-#         return key + self.start
-
-
-type RowSelection = ArrayRows | AllRows | RangeRows
-
-
 @dataclass(frozen=True)
 class TensorSubset:
     """Exact subset of a tensor's C-order index space.
@@ -207,35 +182,6 @@ class TensorSubset:
     @property
     def size(self) -> int:
         return len(self.to_rows())
-
-    @classmethod
-    def infer_from_rows(cls, shape: tuple[int, ...], rows: RowSet) -> TensorSubset:
-        """Compatibility inference for legacy row-oriented handlers.
-
-        New handlers must construct ``Full``, ``AxisProduct``, or ``Points``
-        directly.  This is intentionally only a migration/debugging utility.
-        """
-        shape = tuple(shape)
-        total = int(np.prod(shape, dtype=np.int64))
-        if rows.is_full(total):
-            return Full(shape)
-        if not shape:
-            return Points(shape, rows)
-        materialized = rows.to_array()
-        if shape and materialized.size:
-            coordinates = np.unravel_index(materialized, shape)
-            axes = tuple(
-                ArrayRows(np.unique(coordinate).astype(np.int64))
-                for coordinate in coordinates
-            )
-            if (
-                int(np.prod([len(axis) for axis in axes], dtype=np.int64))
-                == materialized.size
-            ):
-                candidate = AxisProduct(shape, axes)
-                if np.array_equal(candidate.to_rows().to_array(), materialized):
-                    return candidate
-        return Points(shape, rows)
 
 
 @dataclass(frozen=True)
@@ -292,6 +238,79 @@ class AxisProduct(TensorSubset):
         )
 
 
+def subset_from_external_rows(shape: tuple[int, ...], rows: RowSet) -> TensorSubset:
+    """Factor externally supplied flat rows at the planner boundary.
+
+    Partitioning starts from additive contribution rows, not tensor semantics.
+    This is the sole deliberate boundary conversion: preserve a factorizable
+    selection as ``Full`` or ``AxisProduct`` so structured handlers can begin
+    planning, and otherwise retain the exact ``Points`` representation.  Local
+    handler propagation must construct subsets directly instead.
+    """
+    shape = tuple(shape)
+    total = int(np.prod(shape, dtype=np.int64))
+    if rows.is_full(total):
+        return Full(shape)
+    if not shape:
+        return Points(shape, rows)
+
+    materialized = rows.to_array()
+    if not materialized.size:
+        return Points(shape, rows)
+    coordinates = np.unravel_index(materialized, shape)
+    axes = tuple(
+        ArrayRows(np.unique(coordinate).astype(np.int64)) for coordinate in coordinates
+    )
+    candidate = AxisProduct(shape, axes)
+    if np.array_equal(candidate.to_rows().to_array(), materialized):
+        return candidate
+    return Points(shape, rows)
+
+
+def reshape_subset(
+    subset: TensorSubset,
+    old_shape: tuple[int, ...],
+    new_shape: tuple[int, ...],
+) -> TensorSubset:
+    """Map an exact subset through a C-order reshape.
+
+    C-order reshape preserves flat positions, but independent axis selections
+    need not stay independent after changing the tensor axes.  Preserve an
+    ``AxisProduct`` only when its selected flat positions factor exactly in the
+    target shape; otherwise use the exact irregular ``Points`` representation.
+    """
+    old_shape = tuple(old_shape)
+    new_shape = tuple(new_shape)
+    if subset.shape != old_shape:
+        raise ValueError("Subset shape must match the reshape source shape")
+    if np.prod(old_shape, dtype=np.int64) != np.prod(new_shape, dtype=np.int64):
+        raise ValueError("Reshape source and target must have equal sizes")
+    if isinstance(subset, Full):
+        return Full(new_shape)
+    if isinstance(subset, Points):
+        return Points(new_shape, subset.rows)
+
+    assert isinstance(subset, AxisProduct)
+    rows = subset.to_rows()
+    total = int(np.prod(new_shape, dtype=np.int64))
+    if rows.is_full(total):
+        return Full(new_shape)
+    if not new_shape:
+        return Points(new_shape, rows)
+
+    materialized = rows.to_array()
+    if not materialized.size:
+        return Points(new_shape, rows)
+    coordinates = np.unravel_index(materialized, new_shape)
+    axes = tuple(
+        ArrayRows(np.unique(coordinate).astype(np.int64)) for coordinate in coordinates
+    )
+    candidate = AxisProduct(new_shape, axes)
+    if np.array_equal(candidate.to_rows().to_array(), materialized):
+        return candidate
+    return Points(new_shape, rows)
+
+
 def union_tensor_subsets(left: TensorSubset, right: TensorSubset) -> TensorSubset:
     """Return the strongest exact representation of an index-space union."""
     if left.shape != right.shape:
@@ -313,7 +332,7 @@ def union_tensor_subsets(left: TensorSubset, right: TensorSubset) -> TensorSubse
                 )
             return AxisProduct(left.shape, tuple(axes))
     rows = ArrayRows(np.union1d(left.to_rows().to_array(), right.to_rows().to_array()))
-    return TensorSubset.infer_from_rows(left.shape, rows)
+    return Points(left.shape, rows)
 
 
 @dataclass(frozen=True)
@@ -363,7 +382,7 @@ class VarLayout:
 
 @dataclass
 class BackwardResult:
-    in_demands: tuple[ContributionDemand | None, ...]
+    in_demands: tuple[TensorDemand | None, ...]
     aux: Any = None
     subplans: tuple[JaxprPlan, ...] = ()
 
@@ -387,8 +406,8 @@ class JaxprPlan[**P]:
     """contains exactly one finalized layout per live orig var"""
     kept_constvar_indices: tuple[int, ...]
     kept_invar_indices: tuple[int, ...]
-    constvar_demands: tuple[ContributionDemand | None, ...]
-    invar_demands: tuple[ContributionDemand | None, ...]
+    constvar_demands: tuple[TensorDemand | None, ...]
+    invar_demands: tuple[TensorDemand | None, ...]
 
 
 def aval_size(aval: AbstractValue) -> int:
@@ -417,11 +436,9 @@ def replace_aval_shape(
 
 def finalize_layout(
     var: Var,
-    demand: ContributionDemand,
+    demand: TensorDemand,
 ) -> VarLayout:
     subset = demand.subset
-    if subset is None:
-        raise ValueError("Cannot finalize an unshaped legacy demand")
     if subset.shape != tuple(getattr(var.aval, "shape", ())):
         raise ValueError("Demand shape does not match its variable")
     if subset.size == 0:
@@ -433,54 +450,30 @@ def finalize_layout(
     return VarLayout(original_var=var, subset=subset)
 
 
-@dataclass(frozen=True, init=False)
-class ContributionDemand:
-    """An exact tensor subset, plus a temporary unshaped legacy bridge."""
+@dataclass(frozen=True)
+class ContributionRows:
+    """Flat additive contribution entries used only by decomposition."""
 
-    subset: TensorSubset | None
-    _legacy_rows: RowSet | None
+    rows: RowSet
 
-    def __init__(
-        self,
-        subset_or_rows: TensorSubset | RowSet | NDArray,
-        subset: TensorSubset | None = None,
-    ):
-        # The two-argument form is retained only while row-oriented handlers
-        # migrate.  Once shaped, ``subset`` is the sole source of truth.
-        if subset is not None:
-            subset_or_rows = subset
-        if isinstance(subset_or_rows, TensorSubset):
-            object.__setattr__(self, "subset", subset_or_rows)
-            object.__setattr__(self, "_legacy_rows", None)
-        else:
-            rows = subset_or_rows
-            if not isinstance(rows, (ArrayRows, AllRows, RangeRows)):
-                rows = ArrayRows(np.asarray(rows, dtype=np.int64))
-            object.__setattr__(self, "subset", None)
-            object.__setattr__(self, "_legacy_rows", rows)
+
+@dataclass(frozen=True)
+class TensorDemand:
+    """An exact, shaped tensor-index subset used by local planning."""
+
+    subset: TensorSubset
 
     @property
     def rows(self) -> RowSet:
-        if self.subset is not None:
-            return self.subset.to_rows()
-        assert self._legacy_rows is not None
-        return self._legacy_rows
-
-    @property
-    def shape(self) -> tuple[int, ...] | None:
-        return None if self.subset is None else self.subset.shape
+        """Compatibility view for irregular routing handlers."""
+        return self.subset.to_rows()
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return self.subset.size
 
-    def is_all_rows(self) -> bool:
-        return isinstance(self.rows, AllRows)
 
-    def is_range_rows(self) -> bool:
-        return isinstance(self.rows, RangeRows)
-
-def demand_rows(demand: ContributionDemand) -> NDArray[np.int64]:
-    """Materialize rows only at handlers requiring arbitrary index routing."""
+def demand_rows(demand: ContributionRows | TensorDemand) -> NDArray[np.int64]:
+    """Materialize flat entries at the explicit row-routing boundary."""
     rows = demand.rows
     if isinstance(rows, AllRows):
         return np.arange(rows.size, dtype=np.int64)
@@ -497,7 +490,7 @@ class ContributionRoot:
 
 @dataclass
 class ContributionPropagation:
-    in_demands: list[ContributionDemand | None]
+    in_demands: list[ContributionRows | None]
     roots: list[ContributionRoot]
     valid: bool = True
 
@@ -545,15 +538,26 @@ class RankLivenessPlan:
 
     # demanded_rows: dict[int, NDArray[np.int64]]
     # """var id -> demanded flat entries"""
-    all_demands: dict[int, ContributionDemand]
-    """var id -> demanded flat entries"""
+    all_demands: dict[int, TensorDemand]
+    """var id -> exact demanded tensor subsets"""
 
     live_eqn_ids: frozenset[int]
     """eqn ids needed by this rank"""
 
 
-def _demand(rows: NDArray[np.integer]) -> ContributionDemand | None:
-    """Build a canonical demand, dropping rows with no source element."""
+def _contribution_rows(rows: NDArray[np.integer] | RowSet) -> ContributionRows | None:
+    """Build canonical flat contribution entries, dropping invalid rows."""
+    cannoticalize = canonicalize_row_set(rows)
+    if cannoticalize is None:
+        return None
+    else:
+        return ContributionRows(cannoticalize)
+
+
+def canonicalize_row_set(rows: NDArray | RowSet) -> RowSet | None:
+    """Return a canonicalized RowSet, or None if empty."""
+    if isinstance(rows, (ArrayRows, AllRows, RangeRows)):
+        return rows
     rows = np.asarray(rows, dtype=np.int64)
     rows = rows[rows >= 0]
     if not rows.size:
@@ -562,22 +566,22 @@ def _demand(rows: NDArray[np.integer]) -> ContributionDemand | None:
     # ``arange``).  Avoid allocating a hash table/sorted copy on that hot path.
     if rows.size == 1 or np.all(rows[1:] > rows[:-1]):
         if rows.size > 1 and rows[-1] - rows[0] + 1 == rows.size:
-            return ContributionDemand(RangeRows(int(rows[0]), int(rows[-1]) + 1))
-        return ContributionDemand(ArrayRows(rows))
-    return ContributionDemand(ArrayRows(np.unique(rows)))
+            return RangeRows(int(rows[0]), int(rows[-1]) + 1)
+        return ArrayRows(rows)
+    return ArrayRows(np.unique(rows))
 
 
-def seed_demand(var: Var, rows: NDArray[np.integer]) -> ContributionDemand:
-    """Build a shaped planner seed from externally supplied contribution rows."""
-    legacy = _demand(rows)
-    if legacy is None:
+def seed_demand(var: Var, rows: NDArray[np.integer]) -> TensorDemand:
+    """Seed liveness by factoring externally partitioned contribution rows."""
+    contribution_rows = _contribution_rows(rows)
+    if contribution_rows is None:
         raise ValueError("A planner seed cannot be empty")
-    return ContributionDemand(
-        TensorSubset.infer_from_rows(_get_shape(var), legacy.rows)
+    return TensorDemand(
+        subset_from_external_rows(_get_shape(var), contribution_rows.rows)
     )
 
 
-def _demand_in_bounds(demand: ContributionDemand, size: int) -> bool:
+def _demand_in_bounds(demand: ContributionRows | TensorDemand, size: int) -> bool:
     """Check bounds without materializing compact full/range demands."""
     if isinstance(demand.rows, AllRows):
         return demand.rows.size == size
@@ -640,34 +644,39 @@ def _dependency_row_owners(
 
 
 @overload
-def merge_demands(
-    left: ContributionDemand, right: ContributionDemand
-) -> ContributionDemand: ...
+def merge_demands(left: TensorDemand, right: TensorDemand) -> TensorDemand: ...
+@overload
+def merge_demands(left: TensorDemand | None, right: TensorDemand) -> TensorDemand: ...
+@overload
+def merge_demands(left: TensorDemand, right: None) -> TensorDemand: ...
 @overload
 def merge_demands(
-    left: ContributionDemand | None, right: ContributionDemand
-) -> ContributionDemand: ...
-@overload
-def merge_demands(left: ContributionDemand, right: None) -> ContributionDemand: ...
-@overload
+    left: TensorDemand | None, right: TensorDemand | None
+) -> TensorDemand | None: ...
 def merge_demands(
-    left: ContributionDemand | None, right: ContributionDemand | None
-) -> ContributionDemand | None: ...
-def merge_demands(
-    left: ContributionDemand | None, right: ContributionDemand | None
-) -> ContributionDemand | None:
+    left: TensorDemand | None, right: TensorDemand | None
+) -> TensorDemand | None:
     """Union demands, preserving an exact shared tensor-index representation."""
     if left is None:
         return right
     if right is None:
         return left
-    if (
-        left.subset is not None
-        and right.subset is not None
-        and left.subset.shape == right.subset.shape
-    ):
+    if left.subset.shape != right.subset.shape:
+        raise ValueError("Cannot merge tensor demands with different shapes")
+    if left.subset.shape == right.subset.shape:
         subset = union_tensor_subsets(left.subset, right.subset)
-        return ContributionDemand(subset.to_rows(), subset)
+        return TensorDemand(subset)
+    raise AssertionError("unreachable")
+
+
+def merge_contribution_rows(
+    left: ContributionRows | None, right: ContributionRows | None
+) -> ContributionRows | None:
+    """Union flat decomposition entries without introducing tensor semantics."""
+    if left is None:
+        return right
+    if right is None:
+        return left
     if isinstance(left.rows, AllRows):
         return left
     if isinstance(right.rows, AllRows):
@@ -678,7 +687,7 @@ def merge_demands(
         and right.rows.start <= left.rows.stop
         and left.rows.start <= right.rows.stop
     ):
-        return ContributionDemand(
+        return ContributionRows(
             RangeRows(
                 min(left.rows.start, right.rows.start),
                 max(left.rows.stop, right.rows.stop),
@@ -686,7 +695,9 @@ def merge_demands(
         )
     if left is right or np.array_equal(demand_rows(left), demand_rows(right)):
         return left
-    return _demand(np.union1d(demand_rows(left), demand_rows(right)).astype(np.int64))
+    return _contribution_rows(
+        np.union1d(demand_rows(left), demand_rows(right)).astype(np.int64)
+    )
 
 
 def merge_contribution_roots(
@@ -699,9 +710,9 @@ def merge_contribution_roots(
         if previous is None:
             merged[id(root.var)] = root
         else:
-            demand = merge_demands(
-                ContributionDemand(ArrayRows(previous.rows)),
-                ContributionDemand(ArrayRows(root.rows)),
+            demand = merge_contribution_rows(
+                ContributionRows(ArrayRows(previous.rows)),
+                ContributionRows(ArrayRows(root.rows)),
             )
             assert demand is not None
             merged[id(root.var)] = ContributionRoot(root.var, demand_rows(demand))
@@ -719,10 +730,10 @@ def find_contribution_roots(
     fallback is conservative: later halo extraction uses the forward dependency rows of
     that output, so it cannot lose a data dependency merely because decomposition stops.
     """
-    demand_of: dict[int, ContributionDemand | None] = {}
+    demand_of: dict[int, ContributionRows | None] = {}
     for outvar in jaxpr.outvars:
         if state.is_scalar(outvar):
-            demand_of[id(outvar)] = ContributionDemand(
+            demand_of[id(outvar)] = ContributionRows(
                 ArrayRows(np.array([0], dtype=np.int64))
             )
 
@@ -753,7 +764,9 @@ def find_contribution_roots(
         for invar, demand in zip(eqn.invars, result.in_demands):
             if demand is None or state.is_inactive(invar):
                 continue
-            demand_of[id(invar)] = merge_demands(demand_of.get(id(invar)), demand)
+            demand_of[id(invar)] = merge_contribution_rows(
+                demand_of.get(id(invar)), demand
+            )
 
     for var in (*jaxpr.invars, *jaxpr.constvars):
         demand = demand_of.get(id(var))
@@ -927,28 +940,27 @@ def _validate_energy_partition_plan(
 def seed_rank_demands(
     partition_plan: EnergyPartitionPlan,
     rank: int,
-) -> dict[int, ContributionDemand]:
+) -> dict[int, TensorDemand]:
     rank_plan = partition_plan.ranks[rank]
-    demand_of: dict[int, ContributionDemand] = {}
+    demand_of: dict[int, TensorDemand] = {}
 
     for root_index, rows in rank_plan.contribution_rows.items():
         root = partition_plan.roots[root_index]
         existing = demand_of.get(id(root.var))
-        demand = (
-            seed_demand(root.var, rows)
-            if isinstance(root.var, Var)
-            else ContributionDemand(ArrayRows(rows))
-        )
+        if not isinstance(root.var, Var):
+            raise TypeError("Local liveness roots must be JAXPR variables")
+        demand = seed_demand(root.var, rows)
         demand_of[id(root.var)] = merge_demands(existing, demand)
 
     return demand_of
 
 
-def _validate_demand_for_var(var: Any, demand: ContributionDemand) -> ContributionDemand:
+def _validate_demand_for_var(var: Any, demand: TensorDemand) -> TensorDemand:
     """Enforce the production invariant: every demand owns its tensor shape."""
-    if demand.subset is None:
-        raise NotImplementedError(
-            f"Unshaped liveness demand for {var}; handlers must return a TensorSubset"
+    if not isinstance(demand, TensorDemand):
+        raise TypeError(
+            "Local planning requires TensorDemand; contribution decomposition "
+            "uses ContributionRows"
         )
     if demand.subset.shape != _get_shape(var):
         raise ValueError("Liveness subset shape does not match its variable")
@@ -958,10 +970,10 @@ def _validate_demand_for_var(var: Any, demand: ContributionDemand) -> Contributi
 def rank_seed_demands(
     partition_plan: EnergyPartitionPlan,
     rank: int,
-) -> tuple[dict[Var, ContributionDemand], tuple[Var, ...]]:
+) -> tuple[dict[Var, TensorDemand], tuple[Var, ...]]:
     """Turn a rank's contribution assignments into planner seed variables."""
     rank_plan = partition_plan.ranks[rank]
-    seeds: dict[Var, ContributionDemand] = {}
+    seeds: dict[Var, TensorDemand] = {}
     requested: list[Var] = []
     for root_index, rows in rank_plan.contribution_rows.items():
         var = partition_plan.roots[root_index].var
@@ -974,96 +986,12 @@ def rank_seed_demands(
     return seeds, tuple(requested)
 
 
-def _propagate_demands_backward(
-    bound_eqns: list[BoundEqn],
-    state: TraceState,
-    seed_demands: dict[int, ContributionDemand],
-    live_eqn_ids: set[int] | None = None,
-) -> dict[int, ContributionDemand]:
-    """Implementation shared by rank and nested-JAXPR liveness passes."""
-    pending = dict(seed_demands)
-    all_demands: dict[int, ContributionDemand] = dict(pending)
-
-    def add_demand(var: Any, demand: ContributionDemand) -> None:
-        demand = _validate_demand_for_var(var, demand)
-        var_id = id(var)
-        previous_pending = pending.get(var_id)
-        previous_all = all_demands.get(var_id)
-        merged_pending = merge_demands(previous_pending, demand)
-        pending[var_id] = merged_pending
-        # While a demand is pending, both maps normally reference the same
-        # object.  Reuse that one union instead of canonicalizing twice.
-        all_demands[var_id] = (
-            merged_pending
-            if previous_all is previous_pending
-            else merge_demands(previous_all, demand)
-        )
-
-    for eqn, handler, _is_active, _needs_concrete in reversed(bound_eqns):
-        out_demands = [
-            None
-            if (demand := pending.pop(id(outvar), None)) is None
-            else _validate_demand_for_var(outvar, demand)
-            for outvar in eqn.outvars
-        ]
-
-        if not any(demand is not None for demand in out_demands):
-            continue
-
-        if len(out_demands) != len(eqn.outvars):
-            raise RuntimeError(
-                f"{eqn.primitive.name} has an invalid output demand list."
-            )
-        for var, demand in zip(eqn.outvars, out_demands):
-            if demand is not None:
-                all_demands[id(var)] = demand
-                size = int(np.prod(_get_shape(var)))
-                if not _demand_in_bounds(demand, size):
-                    raise ValueError(
-                        f"{eqn.primitive.name} received out-of-range output rows."
-                    )
-
-        if live_eqn_ids is not None:
-            live_eqn_ids.add(id(eqn))
-        in_demands = handler.propagate_liveness_demand(eqn, state, out_demands)
-
-        if len(in_demands) != len(eqn.invars):
-            raise RuntimeError(
-                f"{eqn.primitive.name} returned "
-                f"{len(in_demands)} input demands for "
-                f"{len(eqn.invars)} inputs."
-            )
-
-        for invar, demand in zip(eqn.invars, in_demands):
-            if demand is None:
-                continue
-
-            size = int(np.prod(_get_shape(invar)))
-            if not _demand_in_bounds(demand, size):
-                raise ValueError(
-                    f"{eqn.primitive.name} produced out-of-range input rows."
-                )
-            add_demand(invar, demand)
-
-    return all_demands
-
-
-def propagate_demands_backward(
-    bound_eqns: list[BoundEqn],
-    state: TraceState,
-    seed_demands: dict[int, ContributionDemand],
-) -> dict[int, ContributionDemand]:
-    """Propagate arbitrary demanded entries backwards through a bound JAXPR."""
-    return _propagate_demands_backward(bound_eqns, state, seed_demands)
-
-
 def rank_liveness_from_plan(rank: int, plan: JaxprPlan) -> RankLivenessPlan:
     """Project the authoritative local JAXPR plan into rank-liveness metadata."""
     return RankLivenessPlan(
         rank=rank,
         all_demands={
-            id(var): ContributionDemand(layout.subset)
-            for var, layout in plan.layouts.items()
+            id(var): TensorDemand(layout.subset) for var, layout in plan.layouts.items()
         },
         live_eqn_ids=frozenset(
             id(eqn)
@@ -1093,7 +1021,7 @@ def build_rank_liveness(
 def plan_local_jaxpr(
     jaxpr: Jaxpr,
     state: TraceState,
-    seed_demands: Mapping[Var, ContributionDemand],
+    seed_demands: Mapping[Var, TensorDemand],
     requested_outputs: Sequence[Var],
 ) -> JaxprPlan:
     if jaxpr.effects:
@@ -1103,10 +1031,10 @@ def plan_local_jaxpr(
 
     def _finalize_inputs(
         variables: Sequence[Var],
-        pending: dict[Var, ContributionDemand],
+        pending: dict[Var, TensorDemand],
         layouts: dict[Var, VarLayout],
-    ) -> tuple[ContributionDemand | None, ...]:
-        demands: list[ContributionDemand | None] = []
+    ) -> tuple[TensorDemand | None, ...]:
+        demands: list[TensorDemand | None] = []
 
         for var in variables:
             demand = pending.pop(var, None)
@@ -1120,9 +1048,9 @@ def plan_local_jaxpr(
         return tuple(demands)
 
     def _merge_pending(
-        pending: dict[Var, ContributionDemand],
+        pending: dict[Var, TensorDemand],
         var: Var,
-        demand: ContributionDemand,
+        demand: TensorDemand,
     ) -> None:
         demand = _validate_demand_for_var(var, demand)
         old = pending.get(var)
@@ -1130,7 +1058,7 @@ def plan_local_jaxpr(
 
     def _validate_literal_output(
         literal: Literal,
-        demand: ContributionDemand,
+        demand: TensorDemand,
     ) -> None:
         total = aval_size(literal.aval)
         # rows = normalize_row_set(demand.rows)
@@ -1141,12 +1069,12 @@ def plan_local_jaxpr(
 
     def _validate_literal_input(
         literal: Literal,
-        demand: ContributionDemand,
+        demand: TensorDemand,
     ) -> None:
         if not _demand_in_bounds(demand, aval_size(literal.aval)):
             raise ValueError(f"Demand outside literal bounds: {literal}")
 
-    pending: dict[Var, ContributionDemand] = {}
+    pending: dict[Var, TensorDemand] = {}
     layouts: dict[Var, VarLayout] = {}
     eqn_plans: list[EqnPlan | None] = [None] * len(jaxpr.eqns)
 
@@ -1199,6 +1127,7 @@ def plan_local_jaxpr(
             state=state,
             out_demands=out_demands,
         )
+        print(f"Planned backward for {eqn.primitive.name}: {result}", flush=True)
 
         if len(result.in_demands) != len(eqn.invars):
             raise ValueError(

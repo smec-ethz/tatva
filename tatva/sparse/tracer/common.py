@@ -25,6 +25,7 @@ from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
+    from tatva.sparse.tracer.partitioning import RowSet
     from tatva.sparse.tracer.state import SparseDepSet
 
 # FFI targets whose vmapped (batched) call is elementwise along the leading (vmap) axis,
@@ -211,7 +212,7 @@ def _dot_general_out_dep(
 
 
 def _inverse_elementwise_rows(
-    rows: NDArray[np.integer], in_shape: tuple, out_shape: tuple
+    rows: NDArray[np.integer] | RowSet, in_shape: tuple, out_shape: tuple
 ) -> NDArray[np.int64]:
     """Map broadcasted output flat rows to the corresponding input flat rows."""
     if not in_shape:
@@ -226,7 +227,7 @@ def _inverse_elementwise_rows(
 
 
 def _inverse_broadcast_rows(
-    rows: NDArray[np.integer],
+    rows: NDArray[np.integer] | RowSet,
     in_shape: tuple,
     out_shape: tuple,
     dimensions: Sequence[int],

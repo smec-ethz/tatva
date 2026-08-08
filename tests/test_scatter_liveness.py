@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from tatva.sparse.tracer.base import _JaxprAnalyzer
-from tatva.sparse.tracer.partitioning import ContributionDemand
+from tatva.sparse.tracer.partitioning import ArrayRows, Points, TensorDemand
 from tatva.sparse.tracer.state import CouplingAccumulator, TraceState
 
 
@@ -19,9 +19,18 @@ def _scatter_demand(fn, *args, rows, concrete=True):
     )
     if not concrete:
         state.val_of.pop(id(eqn.invars[1]), None)
-    return handler.propagate_liveness_demand(
-        eqn, state, [ContributionDemand(np.asarray(rows, dtype=np.int64))]
-    )
+    return handler.plan_backward(
+        eqn,
+        state,
+        (
+            TensorDemand(
+                Points(
+                    tuple(eqn.outvars[0].aval.shape),
+                    ArrayRows(np.asarray(rows, dtype=np.int64)),
+                )
+            ),
+        ),
+    ).in_demands
 
 
 def test_scatter_add_routes_only_updates_and_indices_for_live_outputs():

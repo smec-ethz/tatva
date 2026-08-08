@@ -47,22 +47,24 @@ from tatva.sparse.tracer.partitioning import (
     ArrayRows,
     AxisProduct,
     BackwardResult,
-    ContributionDemand,
     ContributionPropagation,
     ContributionRoot,
+    ContributionRows,
     EqnPlan,
     Full,
     Points,
     RangeRows,
     RowSet,
+    TensorDemand,
     TensorSubset,
     VarLayout,
-    _demand,
+    _contribution_rows,
     _invalid_contribution,
+    canonicalize_row_set,
     demand_rows,
     merge_demands,
     plan_local_jaxpr,
-    propagate_demands_backward,
+    reshape_subset,
 )
 from tatva.sparse.tracer.registry import TR
 from tatva.sparse.tracer.state import (
@@ -114,33 +116,79 @@ def _eval_div(a, b, **_params):
     return np.true_divide(a_arr, b_arr)
 
 
-def _inverse_elementwise_demand(demand, in_shape: tuple, out_shape: tuple):
-    """Reverse broadcast mapping with compact identity/scalar fast paths."""
+def _inverse_elementwise_demand(
+    demand: TensorDemand, in_shape: tuple, out_shape: tuple
+) -> TensorDemand | None:
+    """Project an elementwise output subset through NumPy-style broadcasting.
+
+    Structured output demands stay structured: an ``AxisProduct`` projects onto
+    the trailing input axes, while broadcast input axes select their sole entry.
+    Arbitrary ``Points`` remain the explicit irregular-routing fallback.
+    """
     if in_shape == out_shape:
         return demand
     if int(np.prod(in_shape)) == 1:
-        return _subset_demand(Full(in_shape))
-    legacy = _demand(_inverse_elementwise_rows(demand.rows, in_shape, out_shape))
-    return (
-        None
-        if legacy is None
-        else _subset_demand(TensorSubset.infer_from_rows(in_shape, legacy.rows))
-    )
+        return TensorDemand(Full(in_shape))
+
+    subset = demand.subset
+    if isinstance(subset, Full):
+        return TensorDemand(Full(in_shape))
+    if isinstance(subset, AxisProduct):
+        leading_axes = len(out_shape) - len(in_shape)
+        axes = tuple(
+            AllRows(extent) if extent == 1 else subset.axes[leading_axes + axis]
+            for axis, extent in enumerate(in_shape)
+        )
+        return TensorDemand(AxisProduct(in_shape, axes))
+
+    assert isinstance(subset, Points)
+    rows = _inverse_elementwise_rows(subset.rows, in_shape, out_shape)
+    return _points_demand_from_rows(in_shape, rows)
 
 
-def _subset_demand(subset):
-    """Construct a demand from its authoritative tensor-index subset."""
-    return ContributionDemand(subset)
+def _reshape_demand(demand: TensorDemand, shape: tuple[int, ...]) -> TensorDemand:
+    """Carry a demand across an ABI boundary with a shape-only reshape."""
+    if demand.subset.shape == shape:
+        return demand
+    return TensorDemand(reshape_subset(demand.subset, demand.subset.shape, shape))
 
 
-def _routed_demand(shape: tuple[int, ...], rows) -> ContributionDemand | None:
+def _single_scan_body_demand(
+    demand: TensorDemand, body_shape: tuple[int, ...]
+) -> TensorDemand:
+    """Remove the sole iteration axis from a length-one scan output demand."""
+    subset = demand.subset
+    if isinstance(subset, Full):
+        return TensorDemand(Full(body_shape))
+    if isinstance(subset, AxisProduct) and subset.shape == (1, *body_shape):
+        return TensorDemand(AxisProduct(body_shape, subset.axes[1:]))
+    assert isinstance(subset, Points)
+    rows = demand_rows(demand) % int(np.prod(body_shape, dtype=np.int64))
+    return _points_demand_from_rows(body_shape, rows)
+
+
+def _single_scan_parent_demand(
+    demand: TensorDemand, parent_shape: tuple[int, ...]
+) -> TensorDemand:
+    """Reinsert the sole iteration axis for a length-one scan input demand."""
+    subset = demand.subset
+    if isinstance(subset, Full):
+        return TensorDemand(Full(parent_shape))
+    if isinstance(subset, AxisProduct) and parent_shape == (1, *subset.shape):
+        return TensorDemand(AxisProduct(parent_shape, (AllRows(1), *subset.axes)))
+    assert isinstance(subset, Points)
+    return _points_demand_from_rows(parent_shape, demand_rows(demand))
+
+
+def _points_demand_from_rows(
+    shape: tuple[int, ...], rows: RowSet | NDArray
+) -> TensorDemand | None:
     """Construct the strongest exact subset for rows routed by an index primitive."""
-    legacy = _demand(rows)
-    return (
-        None
-        if legacy is None
-        else _subset_demand(TensorSubset.infer_from_rows(shape, legacy.rows))
-    )
+    canonicalized = canonicalize_row_set(rows)
+    if canonicalized is None:
+        return
+    else:
+        return TensorDemand(Points(shape, canonicalized))
 
 
 # =============================================================================
@@ -166,7 +214,7 @@ class PrimitiveHandler(ABC):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         """Stop safely when this primitive has no additive inverse rule.
 
@@ -176,33 +224,33 @@ class PrimitiveHandler(ABC):
         """
         return _invalid_contribution(eqn)
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         """Map demanded output entries to required input entries."""
         # A missing rule must never make a value appear dead.  In particular,
         # inputs with an empty DOF dependency can still be numerical operands
         # (material data, masks, and routing indices).
         if not any(d is not None for d in out_demands):
             return [None] * len(eqn.invars)
-        result: list[ContributionDemand | None] = []
+        result: list[TensorDemand | None] = []
         for var in eqn.invars:
             if isinstance(var, Literal):
                 result.append(None)
                 continue
-            result.append(_subset_demand(Full(_get_shape(var))))
+            result.append(TensorDemand(Full(_get_shape(var))))
         return result
 
     def plan_backward(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: tuple[ContributionDemand | None, ...],
+        out_demands: tuple[TensorDemand | None, ...],
     ) -> BackwardResult:
-        in_demands = self.propagate_liveness_demand(eqn, state, list(out_demands))
+        in_demands = self._plan_input_demands(eqn, state, list(out_demands))
         return BackwardResult(in_demands=tuple(in_demands))
 
     def safe_eval_concrete(
@@ -418,12 +466,12 @@ class ZeroDependencyHandler(PrimitiveHandler):
     ("sign", np.sign),
 )
 class ElementWiseZeroDependencyHandler(ZeroDependencyHandler):
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -519,7 +567,7 @@ class ElementwiseUnary(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -538,21 +586,21 @@ class ElementwiseUnary(PrimitiveHandler):
         }
         if eqn.primitive.name not in transparent:
             return _invalid_contribution(eqn)
-        return ContributionPropagation([_demand(demand.rows)], [])
+        return ContributionPropagation([_contribution_rows(demand.rows)], [])
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
         if int(np.prod(_get_shape(eqn.invars[0]))) != int(
             np.prod(_get_shape(eqn.outvars[0]))
         ):
-            return super().propagate_liveness_demand(eqn, state, out_demands)
+            return super()._plan_input_demands(eqn, state, out_demands)
         return [demand]
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
@@ -578,21 +626,18 @@ class ReshapeHandler(ElementwiseUnary):
     def __init__(self):
         super().__init__(False, _eval_reshape)
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
         input_shape = _get_shape(eqn.invars[0])
-        if isinstance(demand.subset, Full):
-            return [_subset_demand(Full(input_shape))]
-        # Reshape preserves C-order flat positions.  The result may be an
-        # AxisProduct (the common case) or genuinely correlated Points.
-        return [_subset_demand(TensorSubset.infer_from_rows(input_shape, demand.rows))]
+        output_shape = _get_shape(eqn.outvars[0])
+        return [TensorDemand(reshape_subset(demand.subset, output_shape, input_shape))]
 
     def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
         out = _live_output_layout(out_layouts)
@@ -629,22 +674,22 @@ class SqueezeHandler(ElementwiseUnary):
     def __init__(self):
         super().__init__(False, _eval_squeeze)
 
-    def propagate_liveness_demand(self, eqn, state, out_demands):
+    def _plan_input_demands(self, eqn, state, out_demands):
         demand = out_demands[0]
         if demand is None:
             return [None]
         input_shape = _get_shape(eqn.invars[0])
         if isinstance(demand.subset, Full):
-            return [_subset_demand(Full(input_shape))]
+            return [TensorDemand(Full(input_shape))]
         if not isinstance(demand.subset, AxisProduct):
-            return [_routed_demand(input_shape, demand.rows)]
+            return [_points_demand_from_rows(input_shape, demand.rows)]
         removed = set(eqn.params["dimensions"])
         output_axes = iter(demand.subset.axes)
         axes = tuple(
             AllRows(extent) if axis in removed else next(output_axes)
             for axis, extent in enumerate(input_shape)
         )
-        return [_subset_demand(AxisProduct(input_shape, axes))]
+        return [TensorDemand(AxisProduct(input_shape, axes))]
 
 
 @TR.register(
@@ -706,17 +751,17 @@ class ElementwiseBinary(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
             return ContributionPropagation([None, None], [])
         lhs, rhs = eqn.invars[:2]
         out_shape = _get_shape(eqn.outvars[0])
-        lhs_demand = _demand(
+        lhs_demand = _contribution_rows(
             _inverse_elementwise_rows(demand.rows, _get_shape(lhs), out_shape)
         )
-        rhs_demand = _demand(
+        rhs_demand = _contribution_rows(
             _inverse_elementwise_rows(demand.rows, _get_shape(rhs), out_shape)
         )
         primitive = eqn.primitive.name
@@ -737,12 +782,12 @@ class ElementwiseBinary(PrimitiveHandler):
             return ContributionPropagation([lhs_demand, None], [])
         return _invalid_contribution(eqn)
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -799,24 +844,24 @@ class IntegerPowHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
             return ContributionPropagation([None], [])
         exponent = eqn.params.get("y", 0)
         if exponent == 1:
-            return ContributionPropagation([_demand(demand.rows)], [])
+            return ContributionPropagation([_contribution_rows(demand.rows)], [])
         if exponent == 0:
             return ContributionPropagation([None], [])
         return _invalid_contribution(eqn)
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         return [out_demands[0]]
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
@@ -894,7 +939,7 @@ class BroadcastHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -905,20 +950,20 @@ class BroadcastHandler(PrimitiveHandler):
             _get_shape(eqn.outvars[0]),
             eqn.params["broadcast_dimensions"],
         )
-        return ContributionPropagation([_demand(rows)], [])
+        return ContributionPropagation([_contribution_rows(rows)], [])
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
         in_shape = _get_shape(eqn.invars[0])
         if isinstance(demand.subset, Full):
-            return [_subset_demand(Full(in_shape))]
+            return [TensorDemand(Full(in_shape))]
         if isinstance(demand.subset, AxisProduct):
             selections = []
             for in_axis, out_axis in enumerate(eqn.params["broadcast_dimensions"]):
@@ -926,13 +971,13 @@ class BroadcastHandler(PrimitiveHandler):
                     selections.append(AllRows(1))
                 else:
                     selections.append(demand.subset.axes[out_axis])
-            return [_subset_demand(AxisProduct(in_shape, tuple(selections)))]
+            return [TensorDemand(AxisProduct(in_shape, tuple(selections)))]
         if _get_shape(eqn.invars[0]) == _get_shape(eqn.outvars[0]):
             return [demand]
         if int(np.prod(_get_shape(eqn.invars[0]))) == 1:
-            return [_subset_demand(Full(in_shape))]
+            return [TensorDemand(Full(in_shape))]
         return [
-            _routed_demand(
+            _points_demand_from_rows(
                 in_shape,
                 _inverse_broadcast_rows(
                     demand.rows,
@@ -974,7 +1019,7 @@ class TransposeHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -987,38 +1032,40 @@ class TransposeHandler(PrimitiveHandler):
         rows = np.ravel_multi_index(
             tuple(cast(NDArray, coord) for coord in in_coords), in_shape
         )
-        return ContributionPropagation([_demand(rows)], [])
+        return ContributionPropagation([_contribution_rows(rows)], [])
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
+
         if isinstance(demand.subset, Full):
-            return [_subset_demand(Full(_get_shape(eqn.invars[0])))]
+            return [TensorDemand(Full(_get_shape(eqn.invars[0])))]
+
         if isinstance(demand.subset, AxisProduct):
             in_shape = _get_shape(eqn.invars[0])
             in_axes: list[Any] = [None] * len(in_shape)
             for out_axis, in_axis in enumerate(eqn.params["permutation"]):
                 in_axes[in_axis] = demand.subset.axes[out_axis]
-            return [_subset_demand(AxisProduct(in_shape, tuple(in_axes)))]
+            return [TensorDemand(AxisProduct(in_shape, tuple(in_axes)))]
+
         if tuple(eqn.params["permutation"]) == tuple(
             range(len(_get_shape(eqn.invars[0])))
         ):
             return [demand]
-        if demand.is_all_rows():
-            return [_subset_demand(Full(_get_shape(eqn.invars[0])))]
+
         in_shape = _get_shape(eqn.invars[0])
         out_coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
         in_coords = [None] * len(in_shape)
         for out_axis, in_axis in enumerate(eqn.params["permutation"]):
             in_coords[in_axis] = out_coords[out_axis]
         return [
-            _routed_demand(
+            _points_demand_from_rows(
                 in_shape,
                 np.ravel_multi_index(
                     tuple(cast(NDArray, coord) for coord in in_coords), in_shape
@@ -1107,7 +1154,7 @@ class SliceHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -1122,15 +1169,15 @@ class SliceHandler(PrimitiveHandler):
             )
         )
         return ContributionPropagation(
-            [_demand(np.ravel_multi_index(in_coords, in_shape))], []
+            [_contribution_rows(np.ravel_multi_index(in_coords, in_shape))], []
         )
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
@@ -1148,7 +1195,7 @@ class SliceHandler(PrimitiveHandler):
                     for start, limit, stride in zip(starts, limits, strides)
                 ),
             )
-            return [_subset_demand(subset)]
+            return [TensorDemand(subset)]
         if isinstance(demand.subset, AxisProduct):
             strides = eqn.params["strides"] or (1,) * len(in_shape)
             subset = AxisProduct(
@@ -1163,7 +1210,7 @@ class SliceHandler(PrimitiveHandler):
                     )
                 ),
             )
-            return [_subset_demand(subset)]
+            return [TensorDemand(subset)]
         if len(in_shape) == 1 and (demand.is_all_rows() or demand.is_range_rows()):
             stride = (eqn.params["strides"] or (1,))[0]
             start = (
@@ -1178,7 +1225,7 @@ class SliceHandler(PrimitiveHandler):
             )
             if stride == 1:
                 return [
-                    _routed_demand(
+                    _points_demand_from_rows(
                         in_shape, np.arange(int(start), int(stop), dtype=np.int64)
                     )
                 ]
@@ -1188,7 +1235,9 @@ class SliceHandler(PrimitiveHandler):
             s + c * stride
             for s, c, stride in zip(eqn.params["start_indices"], coords, strides)
         )
-        return [_routed_demand(in_shape, np.ravel_multi_index(source, in_shape))]
+        return [
+            _points_demand_from_rows(in_shape, np.ravel_multi_index(source, in_shape))
+        ]
 
 
 @TR.register(
@@ -1227,7 +1276,7 @@ class ReverseHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -1237,26 +1286,26 @@ class ReverseHandler(PrimitiveHandler):
         for axis in eqn.params["dimensions"]:
             coords[axis] = shape[axis] - 1 - coords[axis]
         return ContributionPropagation(
-            [_demand(np.ravel_multi_index(tuple(coords), shape))], []
+            [_contribution_rows(np.ravel_multi_index(tuple(coords), shape))], []
         )
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
         shape = _get_shape(eqn.invars[0])
         if isinstance(demand.subset, Full):
-            return [_subset_demand(Full(shape))]
+            return [TensorDemand(Full(shape))]
         if isinstance(demand.subset, AxisProduct):
             axes = list(demand.subset.axes)
             for axis in eqn.params["dimensions"]:
                 axes[axis] = ArrayRows(np.sort(shape[axis] - 1 - axes[axis].to_array()))
-            return [_subset_demand(AxisProduct(shape, tuple(axes)))]
+            return [TensorDemand(AxisProduct(shape, tuple(axes)))]
         raise NotImplementedError(
             "rev liveness requires Full or AxisProduct output demands"
         )
@@ -1322,7 +1371,7 @@ class PadHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -1346,14 +1395,14 @@ class PadHandler(PrimitiveHandler):
             rows[valid] = np.ravel_multi_index(
                 tuple(coord[valid] for coord in in_coords), in_shape
             )
-        return ContributionPropagation([_demand(rows), None], [])
+        return ContributionPropagation([_contribution_rows(rows), None], [])
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -1362,10 +1411,10 @@ class PadHandler(PrimitiveHandler):
         value_demand = (
             None
             if value_var is None or isinstance(value_var, Literal)
-            else _subset_demand(Full(_get_shape(value_var)))
+            else TensorDemand(Full(_get_shape(value_var)))
         )
         if isinstance(demand.subset, Full):
-            return [_subset_demand(Full(source_shape)), value_demand]
+            return [TensorDemand(Full(source_shape)), value_demand]
         if isinstance(demand.subset, AxisProduct):
             source_axes: list[RowSet] = []
             for selection, (low, _high, interior), extent in zip(
@@ -1379,7 +1428,7 @@ class PadHandler(PrimitiveHandler):
             if any(len(axis) == 0 for axis in source_axes):
                 return [None, value_demand]
             return [
-                _subset_demand(AxisProduct(source_shape, tuple(source_axes))),
+                TensorDemand(AxisProduct(source_shape, tuple(source_axes))),
                 value_demand,
             ]
         result = self.propagate_contribution_demand(eqn, state, out_demands)
@@ -1390,10 +1439,15 @@ class PadHandler(PrimitiveHandler):
             and len(eqn.invars) > 1
             and not isinstance(eqn.invars[1], Literal)
         ):
-            result.in_demands[1] = _demand(
+            result.in_demands[1] = _contribution_rows(
                 np.arange(state.get(eqn.invars[1]).dep.shape[0])
             )
-        return result.in_demands
+        return [
+            None
+            if isinstance(var, Literal) or demand is None
+            else _points_demand_from_rows(_get_shape(var), demand.rows)
+            for var, demand in zip(eqn.invars, result.in_demands)
+        ]
 
 
 @TR.register(
@@ -1440,7 +1494,7 @@ class ConcatenateHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -1461,19 +1515,19 @@ class ConcatenateHandler(PrimitiveHandler):
         for shape in shapes:
             size = int(np.prod(shape))
             in_demands.append(
-                _demand(
+                _contribution_rows(
                     selected[(selected >= offset) & (selected < offset + size)] - offset
                 )
             )
             offset += size
         return ContributionPropagation(in_demands, [])
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -1481,12 +1535,12 @@ class ConcatenateHandler(PrimitiveHandler):
         axis = eqn.params.get("dimension", 0)
         if isinstance(demand.subset, Full):
             return [
-                None if isinstance(var, Literal) else _subset_demand(Full(shape))
+                None if isinstance(var, Literal) else TensorDemand(Full(shape))
                 for var, shape in zip(eqn.invars, shapes)
             ]
         if isinstance(demand.subset, AxisProduct):
             selected_axis = demand.subset.axes[axis].to_array()
-            result: list[ContributionDemand | None] = []
+            result: list[TensorDemand | None] = []
             offset = 0
             for var, shape in zip(eqn.invars, shapes):
                 local_axis = (
@@ -1501,7 +1555,7 @@ class ConcatenateHandler(PrimitiveHandler):
                 else:
                     axes = list(demand.subset.axes)
                     axes[axis] = ArrayRows(local_axis)
-                    result.append(_subset_demand(AxisProduct(shape, tuple(axes))))
+                    result.append(TensorDemand(AxisProduct(shape, tuple(axes))))
                 offset += shape[axis]
             return result
         if isinstance(demand.subset, Points):
@@ -1519,7 +1573,7 @@ class ConcatenateHandler(PrimitiveHandler):
                 if demand.is_range_rows()
                 else int(np.prod(_get_shape(eqn.outvars[0])))
             )
-            result: list[ContributionDemand | None] = []
+            result: list[TensorDemand | None] = []
             offset = 0
             for shape, var in zip(shapes, eqn.invars):
                 size = int(np.prod(shape))
@@ -1527,7 +1581,9 @@ class ConcatenateHandler(PrimitiveHandler):
                 result.append(
                     None
                     if isinstance(var, Literal) or lo >= hi
-                    else ContributionDemand(RangeRows(lo - offset, hi - offset))
+                    else _points_demand_from_rows(
+                        shape, RangeRows(lo - offset, hi - offset)
+                    )
                 )
                 offset += size
             return result
@@ -1545,8 +1601,10 @@ class ConcatenateHandler(PrimitiveHandler):
             result.append(
                 None
                 if isinstance(var, Literal)
-                else _demand(
-                    selected[(selected >= offset) & (selected < offset + size)] - offset
+                else _points_demand_from_rows(
+                    shape,
+                    selected[(selected >= offset) & (selected < offset + size)]
+                    - offset,
                 )
             )
             offset += size
@@ -1588,7 +1646,7 @@ class StackHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -1602,7 +1660,7 @@ class StackHandler(PrimitiveHandler):
         selected = source_ids[demand.rows]
         return ContributionPropagation(
             [
-                _demand(
+                _contribution_rows(
                     selected[(selected >= i * size) & (selected < (i + 1) * size)]
                     - i * size
                 )
@@ -1611,12 +1669,12 @@ class StackHandler(PrimitiveHandler):
             [],
         )
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -1624,7 +1682,7 @@ class StackHandler(PrimitiveHandler):
             return [
                 None
                 if isinstance(var, Literal)
-                else _subset_demand(Full(_get_shape(var)))
+                else TensorDemand(Full(_get_shape(var)))
                 for var in eqn.invars
             ]
         if isinstance(demand.subset, AxisProduct):
@@ -1639,7 +1697,7 @@ class StackHandler(PrimitiveHandler):
             return [
                 None
                 if isinstance(var, Literal) or index not in selected
-                else _subset_demand(AxisProduct(shape, input_axes))
+                else TensorDemand(AxisProduct(shape, input_axes))
                 for index, var in enumerate(eqn.invars)
             ]
         raise NotImplementedError("stack liveness requires Full or AxisProduct demands")
@@ -1687,7 +1745,7 @@ class SplitHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         source_shape = _get_shape(eqn.invars[0])
         source_ids = np.arange(int(np.prod(source_shape))).reshape(source_shape)
@@ -1704,19 +1762,19 @@ class SplitHandler(PrimitiveHandler):
             offset += int(size)
         if demanded_rows:
             return ContributionPropagation(
-                [_demand(np.concatenate(demanded_rows))], roots
+                [_contribution_rows(np.concatenate(demanded_rows))], roots
             )
         return ContributionPropagation([None], roots)
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         source_shape = _get_shape(eqn.invars[0])
         axis = eqn.params["axis"]
-        merged: ContributionDemand | None = None
+        merged: TensorDemand | None = None
         offset = 0
         for size, demand in zip(eqn.params["sizes"], out_demands):
             size = int(size)
@@ -1734,7 +1792,7 @@ class SplitHandler(PrimitiveHandler):
                     "split liveness requires Full or AxisProduct demands"
                 )
             merged = merge_demands(
-                merged, _subset_demand(AxisProduct(source_shape, tuple(axes)))
+                merged, TensorDemand(AxisProduct(source_shape, tuple(axes)))
             )
             offset += size
         return [merged]
@@ -1799,12 +1857,12 @@ class GatherHandler(PrimitiveHandler):
 
         state.set(eqn.outvars[0], SparseDepSet(output_dep, output_shape))
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None, None]
@@ -1823,20 +1881,20 @@ class GatherHandler(PrimitiveHandler):
                 source_rows, index_rows = routes
                 # _demand removes the -1 sentinel used for FILL_OR_DROP outputs
                 return [
-                    _routed_demand(_get_shape(src), source_rows),
-                    _routed_demand(_get_shape(indices_var), index_rows),
+                    _points_demand_from_rows(_get_shape(src), source_rows),
+                    _points_demand_from_rows(_get_shape(indices_var), index_rows),
                 ]
 
         # concrete indices unavailable or unsupported gather config
         return [
-            _subset_demand(Full(_get_shape(src))),
-            _subset_demand(Full(_get_shape(indices_var))),
+            TensorDemand(Full(_get_shape(src))),
+            TensorDemand(Full(_get_shape(indices_var))),
         ]
 
     @staticmethod
     def _batched_block_liveness(
-        eqn: JaxprEqn, demand: ContributionDemand
-    ) -> list[ContributionDemand | None] | None:
+        eqn: JaxprEqn, demand: TensorDemand
+    ) -> list[TensorDemand | None] | None:
         """Route complete leading batch blocks without needing runtime indices."""
         dn = eqn.params.get("dimension_numbers")
         operand_batches = tuple(getattr(dn, "operand_batching_dims", ()))
@@ -1876,13 +1934,13 @@ class GatherHandler(PrimitiveHandler):
             ]
         )
         return [
-            _subset_demand(
+            TensorDemand(
                 AxisProduct(
                     source_shape,
                     (ArrayRows(batches), *(AllRows(size) for size in source_shape[1:])),
                 )
             ),
-            _subset_demand(
+            TensorDemand(
                 AxisProduct(
                     index_shape,
                     (ArrayRows(batches), *(AllRows(size) for size in index_shape[1:])),
@@ -1894,7 +1952,7 @@ class GatherHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: tuple[ContributionDemand | None, ...],
+        out_demands: tuple[TensorDemand | None, ...],
     ) -> BackwardResult:
         demand = out_demands[0]
         if demand is None:
@@ -1914,15 +1972,15 @@ class GatherHandler(PrimitiveHandler):
                 # runtime dependency in this specialization.
                 return BackwardResult(
                     in_demands=(
-                        _routed_demand(_get_shape(eqn.invars[0]), source_rows),
+                        _points_demand_from_rows(
+                            _get_shape(eqn.invars[0]), source_rows
+                        ),
                         None,
                     ),
                     aux=source_rows,
                 )
         return BackwardResult(
-            in_demands=tuple(
-                self.propagate_liveness_demand(eqn, state, list(out_demands))
-            )
+            in_demands=tuple(self._plan_input_demands(eqn, state, list(out_demands)))
         )
 
     def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
@@ -2011,25 +2069,25 @@ class DynamicSliceHandler(PrimitiveHandler):
         stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep, oshp))
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
         if eqn.primitive.name != "dynamic_slice":
-            return super().propagate_liveness_demand(eqn, state, out_demands)
+            return super()._plan_input_demands(eqn, state, out_demands)
         source, starts = eqn.invars[0], eqn.invars[1:]
         start_vals = [state.get_val(v) for v in starts]
         index_demands = [
-            None if isinstance(v, Literal) else _subset_demand(Full(_get_shape(v)))
+            None if isinstance(v, Literal) else TensorDemand(Full(_get_shape(v)))
             for v in starts
         ]
         if not all(v is not None for v in start_vals):
-            return [_subset_demand(Full(_get_shape(source))), *index_demands]
+            return [TensorDemand(Full(_get_shape(source))), *index_demands]
         try:
             coords = np.unravel_index(demand.rows, _get_shape(eqn.outvars[0]))
             sizes = _get_shape(source)
@@ -2039,17 +2097,19 @@ class DynamicSliceHandler(PrimitiveHandler):
             ]
             src_coords = tuple(c + s for c, s in zip(coords, start))
             return [
-                _routed_demand(sizes, np.ravel_multi_index(src_coords, sizes)),
+                _points_demand_from_rows(
+                    sizes, np.ravel_multi_index(src_coords, sizes)
+                ),
                 *index_demands,
             ]
         except (ValueError, TypeError):
-            return [_subset_demand(Full(_get_shape(source))), *index_demands]
+            return [TensorDemand(Full(_get_shape(source))), *index_demands]
 
     def plan_backward(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: tuple[ContributionDemand | None, ...],
+        out_demands: tuple[TensorDemand | None, ...],
     ) -> BackwardResult:
         demand = out_demands[0]
         if demand is None:
@@ -2057,7 +2117,7 @@ class DynamicSliceHandler(PrimitiveHandler):
         if eqn.primitive.name != "dynamic_slice":
             return BackwardResult(
                 in_demands=tuple(
-                    self.propagate_liveness_demand(eqn, state, list(out_demands))
+                    self._plan_input_demands(eqn, state, list(out_demands))
                 )
             )
         source, starts = eqn.invars[0], eqn.invars[1:]
@@ -2070,7 +2130,7 @@ class DynamicSliceHandler(PrimitiveHandler):
         if not all(value is not None for value in values):
             return BackwardResult(
                 in_demands=tuple(
-                    self.propagate_liveness_demand(eqn, state, list(out_demands))
+                    self._plan_input_demands(eqn, state, list(out_demands))
                 )
             )
         source_shape = _get_shape(source)
@@ -2088,7 +2148,7 @@ class DynamicSliceHandler(PrimitiveHandler):
         # Concrete starts are specialization data, not local runtime inputs.
         return BackwardResult(
             in_demands=(
-                _routed_demand(source_shape, source_rows),
+                _points_demand_from_rows(source_shape, source_rows),
                 *([None] * len(starts)),
             ),
             aux=source_rows,
@@ -2173,12 +2233,12 @@ class ScatterHandler(PrimitiveHandler):
         if nonlinear:
             res.record_couplings(acc, execution.trial_test_split)
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -2204,22 +2264,24 @@ class ScatterHandler(PrimitiveHandler):
                     if selected_index_rows is not None:
                         return [
                             base,
-                            _routed_demand(_get_shape(indices), selected_index_rows),
-                            _routed_demand(_get_shape(updates), update_rows),
+                            _points_demand_from_rows(
+                                _get_shape(indices), selected_index_rows
+                            ),
+                            _points_demand_from_rows(_get_shape(updates), update_rows),
                         ]
         return [
             base,
-            _subset_demand(Full(_get_shape(indices))),
-            _subset_demand(Full(_get_shape(updates))),
+            TensorDemand(Full(_get_shape(indices))),
+            TensorDemand(Full(_get_shape(updates))),
         ]
 
     def plan_backward(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: tuple[ContributionDemand | None, ...],
+        out_demands: tuple[TensorDemand | None, ...],
     ) -> BackwardResult:
-        in_demands = self.propagate_liveness_demand(eqn, state, list(out_demands))
+        in_demands = self._plan_input_demands(eqn, state, list(out_demands))
         demand = out_demands[0]
         if demand is None:
             return BackwardResult(in_demands=tuple(in_demands))
@@ -2366,12 +2428,12 @@ class SelectNHandler(PrimitiveHandler):
             result = np.where(cond == i, case, result)
         return result
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None] * len(eqn.invars)
@@ -2543,22 +2605,23 @@ class DotHandler(PrimitiveHandler):
             )
             state.set(eqn.outvars[0], out_dep)
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None, None]
         lhs, rhs = eqn.invars[:2]
         la, rb = _get_shape(lhs), _get_shape(rhs)
         if isinstance(demand.subset, Full):
-            return [_subset_demand(Full(la)), _subset_demand(Full(rb))]
+            return [TensorDemand(Full(la)), TensorDemand(Full(rb))]
         if not isinstance(demand.subset, AxisProduct):
             raise NotImplementedError(
                 "dot_general liveness requires Full or AxisProduct output demands"
+                f" but got {type(demand.subset)}"
             )
         dn = eqn.params["dimension_numbers"]
         if hasattr(dn, "lhs_batch_dimensions"):
@@ -2596,8 +2659,8 @@ class DotHandler(PrimitiveHandler):
             return AxisProduct(shape, tuple(axes))
 
         return [
-            _subset_demand(operand_subset(la, lb, lf, len(lb))),
-            _subset_demand(operand_subset(rb, rb_dims, rf, len(lb) + len(lf))),
+            TensorDemand(operand_subset(la, lb, lf, len(lb))),
+            TensorDemand(operand_subset(rb, rb_dims, rf, len(lb) + len(lf))),
         ]
 
 
@@ -2639,7 +2702,7 @@ class ReductionHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
+        out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
         demand = out_demands[0]
         if demand is None:
@@ -2661,18 +2724,18 @@ class ReductionHandler(PrimitiveHandler):
         rows = np.flatnonzero(mask).astype(np.int64)
         return ContributionPropagation([None], [ContributionRoot(eqn.invars[0], rows)])
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         demand = out_demands[0]
         if demand is None:
             return [None]
         in_shape = _get_shape(eqn.invars[0])
         if isinstance(demand.subset, Full):
-            return [_subset_demand(Full(in_shape))]
+            return [TensorDemand(Full(in_shape))]
         if "axes" in eqn.params and isinstance(demand.subset, AxisProduct):
             reduced = set(eqn.params["axes"])
             kept = [axis for axis in range(len(in_shape)) if axis not in reduced]
@@ -2682,7 +2745,7 @@ class ReductionHandler(PrimitiveHandler):
                     axes[axis] = AllRows(in_shape[axis])
                 for axis, selection in zip(kept, demand.subset.axes):
                     axes[axis] = selection
-                return [_subset_demand(AxisProduct(in_shape, tuple(axes)))]
+                return [TensorDemand(AxisProduct(in_shape, tuple(axes)))]
         raise NotImplementedError(
             f"{eqn.primitive.name} liveness requires Full or AxisProduct output demands"
         )
@@ -2806,12 +2869,12 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             interpreter=interpreter,
         )
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         if not any(d is not None for d in out_demands):
             return [None] * len(eqn.invars)
 
@@ -2829,17 +2892,15 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             if res is not None:
                 return res
 
-        return super().propagate_liveness_demand(eqn, state, out_demands)
+        return super()._plan_input_demands(eqn, state, out_demands)
 
     def plan_backward(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: tuple[ContributionDemand | None, ...],
+        out_demands: tuple[TensorDemand | None, ...],
     ) -> BackwardResult:
-        in_demands = tuple(
-            self.propagate_liveness_demand(eqn, state, list(out_demands))
-        )
+        in_demands = tuple(self._plan_input_demands(eqn, state, list(out_demands)))
         if eqn.primitive.name != "custom_linear_solve":
             return BackwardResult(in_demands=in_demands)
 
@@ -2904,8 +2965,8 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
     def _lu_liveness(
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None] | None:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None] | None:
         input_var = eqn.invars[0]
         input_shape = _get_shape(input_var)
 
@@ -2945,14 +3006,14 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             )[None, :]
         ).ravel()
 
-        return [_routed_demand(input_shape, input_rows)]
+        return [_points_demand_from_rows(input_shape, input_rows)]
 
     @staticmethod
     def _batched_linalg_liveness(
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None] | None:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None] | None:
         batch_ids: list[np.ndarray] = []
         batch_shape: tuple[int, ...] | None = None
 
@@ -2990,7 +3051,7 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
         selected_batches = np.unique(np.concatenate(batch_ids))
         n_batches = int(np.prod(batch_shape))
 
-        result: list[ContributionDemand | None] = []
+        result: list[TensorDemand | None] = []
 
         for invar in eqn.invars:
             if isinstance(invar, Literal):
@@ -3010,9 +3071,9 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
                     + np.arange(block_size, dtype=np.int64)[None, :]
                 ).ravel()
 
-                result.append(_routed_demand(in_shape, rows))
+                result.append(_points_demand_from_rows(in_shape, rows))
             else:
-                result.append(_subset_demand(Full(in_shape)))
+                result.append(TensorDemand(Full(in_shape)))
 
         return result
 
@@ -3020,8 +3081,8 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
     def _custom_linear_solve_liveness(
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None] | None:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None] | None:
         """Preserve independent leading batch systems.
 
         This handles layouts such as:
@@ -3069,7 +3130,7 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
         if np.any(batch_ids < 0) or np.any(batch_ids >= n_batches):
             return None
 
-        input_demands: list[ContributionDemand | None] = []
+        input_demands: list[TensorDemand | None] = []
 
         for invar in eqn.invars:
             if isinstance(invar, Literal):
@@ -3094,12 +3155,12 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
                     )[None, :]
                 ).ravel()
 
-                input_demands.append(_routed_demand(in_shape, rows))
+                input_demands.append(_points_demand_from_rows(in_shape, rows))
                 continue
 
             # Small shared coefficients or other unbatched operands are used
             # by every selected solve and must be retained completely.
-            input_demands.append(_subset_demand(Full(in_shape)))
+            input_demands.append(TensorDemand(Full(in_shape)))
 
         return input_demands
 
@@ -3197,12 +3258,12 @@ class SubJaxprHandler(PrimitiveHandler):
         except (TypeError, ValueError, KeyError, AttributeError):
             return None
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         """Run the ordinary reverse rules inside a call boundary."""
         sub, sub_consts = _subjaxpr_and_consts(eqn)
         info = cast(SubEqnInfo, state.sub_info[id(eqn)])
@@ -3218,7 +3279,7 @@ class SubJaxprHandler(PrimitiveHandler):
             sub_state.set(child, SparseDepSet.empty(_get_shape(child), state.n_dofs))
             sub_state.val_of[id(child)] = np.asarray(value)
         demands = {
-            id(sub_out): _routed_demand(_get_shape(sub_out), demand_rows(demand))
+            id(sub_out): _reshape_demand(demand, _get_shape(sub_out))
             for sub_out, demand in zip(sub.outvars, out_demands)
             if demand is not None
         }
@@ -3226,7 +3287,9 @@ class SubJaxprHandler(PrimitiveHandler):
             outgoing = [demands.pop(id(v), None) for v in subeqn.outvars]
             if not any(outgoing):
                 continue
-            incoming = handler.propagate_liveness_demand(subeqn, sub_state, outgoing)
+            incoming = handler.plan_backward(
+                subeqn, sub_state, tuple(outgoing)
+            ).in_demands
             for var, required in zip(subeqn.invars, incoming):
                 if required is not None:
                     demands[id(var)] = merge_demands(demands.get(id(var)), required)
@@ -3236,7 +3299,7 @@ class SubJaxprHandler(PrimitiveHandler):
         return [
             None
             if isinstance(parent, Literal) or (demand := demands.get(id(child))) is None
-            else _routed_demand(_get_shape(parent), demand_rows(demand))
+            else _reshape_demand(demand, _get_shape(parent))
             for parent, child in zip(eqn.invars, sub.invars)
         ]
 
@@ -3244,7 +3307,7 @@ class SubJaxprHandler(PrimitiveHandler):
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: tuple[ContributionDemand | None, ...],
+        out_demands: tuple[TensorDemand | None, ...],
     ) -> BackwardResult:
         sub, sub_consts = _subjaxpr_and_consts(eqn)
         sub_active, _sub_indices, _sub_bound = cast(SubEqnInfo, state.sub_info[id(eqn)])
@@ -3267,7 +3330,7 @@ class SubJaxprHandler(PrimitiveHandler):
             sub_state.val_of[id(child)] = np.asarray(value)
 
         seed_demands = {
-            sub_out: _routed_demand(_get_shape(sub_out), demand_rows(demand))
+            sub_out: _reshape_demand(demand, _get_shape(sub_out))
             for sub_out, demand in zip(sub.outvars, out_demands)
             if demand is not None
         }
@@ -3276,7 +3339,7 @@ class SubJaxprHandler(PrimitiveHandler):
         in_demands = tuple(
             None
             if isinstance(parent, Literal) or demand is None
-            else _routed_demand(_get_shape(parent), demand_rows(demand))
+            else _reshape_demand(demand, _get_shape(parent))
             for parent, demand in zip(eqn.invars, subplan.invar_demands)
         )
         return BackwardResult(in_demands=in_demands, subplans=(subplan,))
@@ -3352,12 +3415,12 @@ class CondHandler(PrimitiveHandler):
                 ov, d if d is not None else SparseDepSet.empty(_get_shape(ov), n_dofs)
             )
 
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         if not any(out_demands):
             return [None] * len(eqn.invars)
         # Predicate is always required: both branches are retained because its
@@ -3365,9 +3428,9 @@ class CondHandler(PrimitiveHandler):
         predicate = (
             None
             if isinstance(eqn.invars[0], Literal)
-            else _subset_demand(Full(_get_shape(eqn.invars[0])))
+            else TensorDemand(Full(_get_shape(eqn.invars[0])))
         )
-        merged: list[ContributionDemand | None] = [None] * (len(eqn.invars) - 1)
+        merged: list[TensorDemand | None] = [None] * (len(eqn.invars) - 1)
         branch_info = cast(list[SubEqnInfo], state.sub_info.get(id(eqn), []))
         for info, closed in zip(branch_info, eqn.params["branches"]):
             bound = info[2]
@@ -3385,7 +3448,9 @@ class CondHandler(PrimitiveHandler):
                 if any(outgoing):
                     for var, required in zip(
                         subeqn.invars,
-                        handler.propagate_liveness_demand(subeqn, sub_state, outgoing),
+                        handler.plan_backward(
+                            subeqn, sub_state, tuple(outgoing)
+                        ).in_demands,
                     ):
                         if required is not None:
                             demands[id(var)] = merge_demands(
@@ -3395,14 +3460,14 @@ class CondHandler(PrimitiveHandler):
                 merged[i] = merge_demands(merged[i], demands.get(id(var)))
         # Missing sub-info should still be sound.
         if not branch_info:
-            merged = super().propagate_liveness_demand(eqn, state, out_demands)[1:]
+            merged = super()._plan_input_demands(eqn, state, out_demands)[1:]
         return [predicate, *merged]
 
     def plan_backward(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: tuple[ContributionDemand | None, ...],
+        out_demands: tuple[TensorDemand | None, ...],
     ) -> BackwardResult:
         # TODO: implement this
         # For cond, create one subplan per branch and union branch input demands.
@@ -3716,26 +3781,12 @@ class ScanMapHandler(PrimitiveHandler):
                     except (TypeError, ValueError, RuntimeError, KeyError):
                         pass
 
-    # def propagate_liveness_demand(
-    #     self, eqn: JaxprEqn, state: TraceState, out_demands
-    # ) -> list[ContributionDemand | None]:
-    #     if not any(out_demands):
-    #         return [None] * len(eqn.invars)
-    #     # Conservative by design: a live scan output may depend on every carry
-    #     # state and every iteration of each xs input.  Iteration compaction needs
-    #     # a fixed-point body analysis and is intentionally deferred.
-    #     return [
-    #         None
-    #         if isinstance(v, Literal)
-    #         else _demand(np.arange(state.get(v).dep.shape[0], dtype=np.int64))
-    #         for v in eqn.invars
-    #     ]
-    def propagate_liveness_demand(
+    def _plan_input_demands(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: list[ContributionDemand | None],
-    ) -> list[ContributionDemand | None]:
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
         if not any(d is not None for d in out_demands):
             return [None] * len(eqn.invars)
 
@@ -3745,7 +3796,7 @@ class ScanMapHandler(PrimitiveHandler):
         # carries.  Carries need a reverse fixed point across iterations, so retain
         # the established conservative all-input rule for now.
         if num_carry:
-            return super().propagate_liveness_demand(eqn, state, out_demands)
+            return super()._plan_input_demands(eqn, state, out_demands)
 
         try:
             length = int(eqn.params["length"])
@@ -3761,7 +3812,7 @@ class ScanMapHandler(PrimitiveHandler):
                     raise ValueError("missing concrete values for scan body routing")
 
             # parent output -> iteration -> body output rows
-            seeds_by_iteration: dict[int, dict[int, ContributionDemand]] = {}
+            seeds_by_iteration: dict[int, dict[int, TensorDemand]] = {}
             for parent_out, body_out, demand in zip(
                 eqn.outvars, sub.outvars, out_demands
             ):
@@ -3778,14 +3829,14 @@ class ScanMapHandler(PrimitiveHandler):
                 iterations, body_rows = divmod(demand_rows(demand), body_size)
                 for iteration in np.unique(iterations):
                     rows = body_rows[iterations == iteration]
-                    seed = _routed_demand(_get_shape(body_out), rows)
+                    seed = _points_demand_from_rows(_get_shape(body_out), rows)
                     if seed is not None:
                         bucket = seeds_by_iteration.setdefault(int(iteration), {})
                         bucket[id(body_out)] = merge_demands(
                             bucket.get(id(body_out)), seed
                         )
 
-            in_demands: list[ContributionDemand | None] = [None] * len(eqn.invars)
+            in_demands: list[TensorDemand | None] = [None] * len(eqn.invars)
             xs_start = num_consts
             if not seeds_by_iteration:
                 return in_demands
@@ -3829,22 +3880,29 @@ class ScanMapHandler(PrimitiveHandler):
                 sub_state.run_bound_eqns(
                     sub_bound_eqns, CouplingAccumulator(state.n_dofs)
                 )
-                body_demands = propagate_demands_backward(
-                    sub_bound_eqns, sub_state, seeds
+                body_outputs = {id(var): var for var in sub.outvars}
+                body_seed_demands = {
+                    body_outputs[var_id]: demand for var_id, demand in seeds.items()
+                }
+                body_plan = plan_local_jaxpr(
+                    sub,
+                    sub_state,
+                    body_seed_demands,
+                    tuple(body_seed_demands),
                 )
 
                 for i, body_input in enumerate(sub.invars[:num_consts]):
-                    required = body_demands.get(id(body_input))
+                    required = body_plan.invar_demands[i]
                     if required is not None:
                         in_demands[i] = merge_demands(in_demands[i], required)
                 for offset, body_input in enumerate(sub.invars[xs_start:]):
-                    required = body_demands.get(id(body_input))
+                    required = body_plan.invar_demands[xs_start + offset]
                     if required is None:
                         continue
                     input_index = xs_start + offset
                     body_size = int(np.prod(_get_shape(body_input)))
                     parent_rows = iteration * body_size + demand_rows(required)
-                    mapped = _routed_demand(
+                    mapped = _points_demand_from_rows(
                         _get_shape(eqn.invars[input_index]), parent_rows
                     )
                     in_demands[input_index] = merge_demands(
@@ -3852,13 +3910,13 @@ class ScanMapHandler(PrimitiveHandler):
                     )
             return in_demands
         except (KeyError, TypeError, ValueError, IndexError, AttributeError):
-            return super().propagate_liveness_demand(eqn, state, out_demands)
+            return super()._plan_input_demands(eqn, state, out_demands)
 
     def plan_backward(
         self,
         eqn: JaxprEqn,
         state: TraceState,
-        out_demands: tuple[ContributionDemand | None, ...],
+        out_demands: tuple[TensorDemand | None, ...],
     ) -> BackwardResult:
         """Plan a map-style, single-iteration scan as a local body call."""
         if (
@@ -3905,10 +3963,7 @@ class ScanMapHandler(PrimitiveHandler):
             sub_state.val_of[id(child)] = np.asarray(value)
 
         seed_demands = {
-            body_out: _routed_demand(
-                _get_shape(body_out),
-                demand_rows(demand) % int(np.prod(_get_shape(body_out))),
-            )
+            body_out: _single_scan_body_demand(demand, _get_shape(body_out))
             for body_out, demand in zip(sub.outvars, out_demands)
             if demand is not None
         }
@@ -3917,8 +3972,8 @@ class ScanMapHandler(PrimitiveHandler):
         for index in range(num_consts, len(in_demands)):
             demand = in_demands[index]
             if demand is not None:
-                in_demands[index] = _routed_demand(
-                    _get_shape(eqn.invars[index]), demand_rows(demand)
+                in_demands[index] = _single_scan_parent_demand(
+                    demand, _get_shape(eqn.invars[index])
                 )
         return BackwardResult(in_demands=tuple(in_demands), subplans=(subplan,))
 

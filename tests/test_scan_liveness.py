@@ -4,7 +4,7 @@ import numpy as np
 from jax import lax
 
 from tatva.sparse.tracer.base import _JaxprAnalyzer
-from tatva.sparse.tracer.partitioning import ContributionDemand
+from tatva.sparse.tracer.partitioning import ArrayRows, Points, TensorDemand
 from tatva.sparse.tracer.state import CouplingAccumulator, TraceState
 
 
@@ -27,10 +27,13 @@ def test_scan_liveness_routes_selected_body_rows_to_parent_xs():
     scan_eqn, scan_handler, *_ = next(
         bound for bound in plan.bound_eqns if bound[0].primitive.name == "scan"
     )
-    demand = ContributionDemand(np.array([0, 17, 4999], dtype=np.int64))
-    in_demands = scan_handler.propagate_liveness_demand(
-        scan_eqn, state, [demand]
+    demand = TensorDemand(
+        Points(
+            tuple(scan_eqn.outvars[0].aval.shape),
+            ArrayRows(np.array([0, 17, 4999], dtype=np.int64)),
+        )
     )
+    in_demands = scan_handler.plan_backward(scan_eqn, state, (demand,)).in_demands
 
     np.testing.assert_array_equal(in_demands[0].rows, [0, 102, 29994])
     assert in_demands[0].rows.size < 30_000

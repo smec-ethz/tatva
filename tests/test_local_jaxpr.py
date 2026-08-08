@@ -14,7 +14,7 @@ from tatva.sparse.tracer.partitioning import (
     AllRows,
     ArrayRows,
     AxisProduct,
-    ContributionDemand,
+    ContributionRows,
     RangeRows,
     build_local_program,
     materialize_local_jaxpr,
@@ -111,7 +111,7 @@ def _local_result(fn, value, rows, *, root_index=-1):
 
 
 def test_rowsets_normalize_and_localize_without_dense_full_storage():
-    assert isinstance(ContributionDemand(np.array([1, 3])).rows, ArrayRows)
+    assert isinstance(ContributionRows(ArrayRows(np.array([1, 3]))).rows, ArrayRows)
     np.testing.assert_array_equal(ArrayRows(np.array([2, 5])).localize([5, 2]), [1, 0])
     np.testing.assert_array_equal(RangeRows(4, 7).localize([4, 6]), [0, 2])
     np.testing.assert_array_equal(AllRows(10).localize([0, 9]), [0, 9])
