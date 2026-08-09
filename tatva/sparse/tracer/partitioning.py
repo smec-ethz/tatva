@@ -183,6 +183,19 @@ class TensorSubset:
     def size(self) -> int:
         return len(self.to_rows())
 
+    @property
+    def is_irregular(self) -> bool:
+        """Whether this subset has lost separable tensor structure."""
+        return False
+
+    def reshape(self, new_shape: tuple[int, ...]) -> TensorSubset:
+        """Return the exact image of this subset under a C-order reshape."""
+        return reshape_subset(self, self.shape, new_shape)
+
+    def union(self, other: TensorSubset) -> TensorSubset:
+        """Return the strongest exact representation of this union."""
+        return union_tensor_subsets(self, other)
+
 
 @dataclass(frozen=True)
 class Full(TensorSubset):
@@ -206,6 +219,10 @@ class Points(TensorSubset):
 
     def to_rows(self) -> RowSet:
         return self.rows
+
+    @property
+    def is_irregular(self) -> bool:
+        return True
 
 
 @dataclass(frozen=True)
@@ -663,10 +680,7 @@ def merge_demands(
         return left
     if left.subset.shape != right.subset.shape:
         raise ValueError("Cannot merge tensor demands with different shapes")
-    if left.subset.shape == right.subset.shape:
-        subset = union_tensor_subsets(left.subset, right.subset)
-        return TensorDemand(subset)
-    raise AssertionError("unreachable")
+    return TensorDemand(left.subset.union(right.subset))
 
 
 def merge_contribution_rows(
@@ -1127,8 +1141,6 @@ def plan_local_jaxpr(
             state=state,
             out_demands=out_demands,
         )
-        print(f"Planned backward for {eqn.primitive.name}: {result}", flush=True)
-
         if len(result.in_demands) != len(eqn.invars):
             raise ValueError(
                 f"{eqn.primitive.name} returned "
@@ -1395,30 +1407,12 @@ def trace_local_program(program: LocalProgram, *example_local_inputs: Any):
 def report_localization_coverage(plan: JaxprPlan) -> list[str]:
     """Return a compact recursive summary of local execution support."""
     report: list[str] = []
-    exact = {
-        "gather",
-        "dynamic_slice",
-        "scatter",
-        "scatter-add",
-        "scatter-sub",
-        "scatter-mul",
-        "scatter-min",
-        "scatter-max",
-        "reduce_sum",
-        "jit",
-        "pjit",
-        "remat2",
-    }
     for eqn, eqn_plan in zip(plan.original_jaxpr.eqns, plan.eqn_plans):
         if eqn_plan is None:
             continue
         name = eqn.primitive.name
-        kind = (
-            "exact specialized"
-            if name in exact
-            else "exact shared/local-or-full fallback"
-        )
-        report.append(f"{name:<20} {type(eqn_plan.handler).__name__:<28} {kind}")
+        kind = eqn_plan.handler.local_execution_support(eqn).value
+        report.append(f"{name:<20} {eqn_plan.handler.implementation:<28} {kind}")
         for subplan in eqn_plan.subplans:
             report.extend("  " + line for line in report_localization_coverage(subplan))
     return report

@@ -34,7 +34,11 @@ from tatva.sparse.tracer.common import (
     _subjaxpr_and_consts,
     _unwrap_jit,
 )
-from tatva.sparse.tracer.handlers import PrimitiveHandler
+from tatva.sparse.tracer.handlers import (
+    PrimitiveHandler,
+    is_branch_subjaxpr_primitive,
+    is_carried_subjaxpr_primitive,
+)
 from tatva.sparse.tracer.partitioning import (
     EnergyPartitionPlan,
     build_partition_plan,
@@ -168,7 +172,7 @@ class _JaxprAnalyzer:
 
             # Sub-jaxpr recursion (unified for both trial_test_split modes)
             sub_res = None
-            if p in ("pjit", "jit", "scan", "map", "remat2"):
+            if is_carried_subjaxpr_primitive(p):
                 sub_jaxpr, _ = _subjaxpr_and_consts(eqn)
                 for pv, sv in zip(eqn.invars, sub_jaxpr.invars):
                     tags[self.get_var_id(sv)] = tags.get(self.get_var_id(pv), 0)
@@ -187,7 +191,7 @@ class _JaxprAnalyzer:
                     for v in eqn.outvars:
                         tags[self.get_var_id(v)] = mask
 
-            elif p == "cond":
+            elif is_branch_subjaxpr_primitive(p):
                 operands, sub_res = eqn.invars[1:], []
                 for branch in eqn.params["branches"]:
                     bj = branch.jaxpr
@@ -261,7 +265,7 @@ class _JaxprAnalyzer:
             is_active = False
             needs_concrete = False
 
-            if p in ("pjit", "jit", "scan", "map", "remat2"):
+            if is_carried_subjaxpr_primitive(p):
                 outvars_active = any(
                     self.get_var_id(v) in active_set for v in eqn.outvars
                 )
@@ -298,7 +302,7 @@ class _JaxprAnalyzer:
 
                     # Store sub-info for this jit equation
                     sub_info[id(eqn)] = (sub_active_set, sub_index_set, sub_eqns_pruned)
-            elif p == "cond":
+            elif is_branch_subjaxpr_primitive(p):
                 outvars_active = any(
                     self.get_var_id(v) in active_set for v in eqn.outvars
                 )
@@ -394,7 +398,7 @@ def _trace_hessian_sparsity(
 ) -> EnergyTrace:
     """Return the sparsity pattern of d²E/du² (or tangent stiffness matrix K for virtual
     work formulations) as a CSR matrix."""
-    plan = _JaxprAnalyzer(ConcreteJaxpr.closed_jaxpr, trial_test_split).analyze()
+    plan = _JaxprAnalyzer(concrete_jaxpr.closed_jaxpr, trial_test_split).analyze()
 
     # initialize tracing state
     state = TraceState(

@@ -18,8 +18,9 @@
 from __future__ import annotations
 
 import warnings
-from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, cast
 
 import jax.core
@@ -56,7 +57,6 @@ from tatva.sparse.tracer.partitioning import (
     RangeRows,
     RowSet,
     TensorDemand,
-    TensorSubset,
     VarLayout,
     _contribution_rows,
     _invalid_contribution,
@@ -150,7 +150,7 @@ def _reshape_demand(demand: TensorDemand, shape: tuple[int, ...]) -> TensorDeman
     """Carry a demand across an ABI boundary with a shape-only reshape."""
     if demand.subset.shape == shape:
         return demand
-    return TensorDemand(reshape_subset(demand.subset, demand.subset.shape, shape))
+    return TensorDemand(demand.subset.reshape(shape))
 
 
 def _single_scan_body_demand(
@@ -192,14 +192,168 @@ def _points_demand_from_rows(
 
 
 # =============================================================================
-# Base Interface
+# Primitive structure and composition
 # =============================================================================
 
 
-class PrimitiveHandler(ABC):
-    """Abstract base class for all JAX primitive tracer handlers."""
+CARRIED_SUBJAXPR_PRIMITIVES = frozenset({"pjit", "jit", "scan", "map", "remat2"})
+BRANCH_SUBJAXPR_PRIMITIVES = frozenset({"cond"})
 
-    @abstractmethod
+
+def is_carried_subjaxpr_primitive(name: str) -> bool:
+    """Return whether a primitive carries one directly mapped child JAXPR."""
+    return name in CARRIED_SUBJAXPR_PRIMITIVES
+
+
+def is_branch_subjaxpr_primitive(name: str) -> bool:
+    """Return whether a primitive carries alternative branch JAXPRs."""
+    return name in BRANCH_SUBJAXPR_PRIMITIVES
+
+
+class LocalExecutionSupport(Enum):
+    """How a primitive executes after localization."""
+
+    GENERIC = "generic local bind"
+    SPECIALIZED = "specialized local rule"
+
+
+# Callable signatures are intentionally structural. A rule may be a plain function,
+# a bound method, functools.partial, or any callable object with the same contract.
+DependencyRule = Callable[
+    [JaxprEqn, TraceState, CouplingAccumulator, TraceExecution], None
+]
+ContributionRule = Callable[
+    [JaxprEqn, TraceState, list[ContributionRows | None]], ContributionPropagation
+]
+BackwardRule = Callable[
+    [JaxprEqn, TraceState, tuple[TensorDemand | None, ...]], BackwardResult
+]
+ConcreteRule = Callable[[list[NDArray | None], dict[str, Any]], NDArray | None]
+NonlinearityRule = Callable[[JaxprEqn, list[bool]], bool]
+TagRule = Callable[[JaxprEqn, list[int]], int]
+IndexInputRule = Callable[[JaxprEqn], list[int]]
+LocalEvalRule = Callable[..., tuple[Any | None, ...]]
+
+
+def conservative_contribution_rule(
+    eqn: JaxprEqn,
+    state: TraceState,
+    out_demands: list[ContributionRows | None],
+) -> ContributionPropagation:
+    """Stop additive decomposition at an unsupported primitive."""
+    del state, out_demands
+    return _invalid_contribution(eqn)
+
+
+def conservative_input_demands(
+    eqn: JaxprEqn,
+    state: TraceState,
+    out_demands: list[TensorDemand | None],
+) -> list[TensorDemand | None]:
+    """Keep every non-literal operand of a live equation."""
+    del state
+    if not any(demand is not None for demand in out_demands):
+        return [None] * len(eqn.invars)
+    return [
+        None if isinstance(var, Literal) else TensorDemand(Full(_get_shape(var)))
+        for var in eqn.invars
+    ]
+
+
+def conservative_backward_rule(
+    eqn: JaxprEqn,
+    state: TraceState,
+    out_demands: tuple[TensorDemand | None, ...],
+) -> BackwardResult:
+    return BackwardResult(
+        in_demands=tuple(conservative_input_demands(eqn, state, list(out_demands)))
+    )
+
+
+def no_concrete_rule(
+    in_vals: list[NDArray | None], params: dict[str, Any]
+) -> NDArray | None:
+    del in_vals, params
+    return None
+
+
+def linear_rule(eqn: JaxprEqn, invar_active: list[bool]) -> bool:
+    del eqn, invar_active
+    return False
+
+
+def union_tags_rule(eqn: JaxprEqn, invar_tags: list[int]) -> int:
+    del eqn
+    mask = 0
+    for tag in invar_tags:
+        mask |= tag
+    return mask
+
+
+def no_index_inputs_rule(eqn: JaxprEqn) -> list[int]:
+    del eqn
+    return []
+
+
+def generic_local_eval(
+    *,
+    eqn: JaxprEqn,
+    plan: EqnPlan,
+    in_values: tuple[Any | None, ...],
+    in_layouts: tuple[VarLayout | None, ...],
+    out_layouts: tuple[VarLayout | None, ...],
+    interpreter: Any,
+) -> tuple[Any | None, ...]:
+    """Bind a primitive when all live values retain a valid tensor ABI."""
+    del plan, interpreter
+    if not any(layout is not None for layout in out_layouts):
+        return tuple(None for _ in eqn.outvars)
+
+    layouts = (*in_layouts, *out_layouts)
+    if any(
+        layout is not None and layout.original_shape and layout.subset.is_irregular
+        for layout in layouts
+    ):
+        raise NotImplementedError(
+            f"{eqn.primitive.name} localization requires structured tensor subsets; "
+            "irregular Points require an explicit local-evaluation rule"
+        )
+
+    if any(
+        value is None and not isinstance(var, Literal)
+        for var, value in zip(eqn.invars, in_values)
+    ):
+        raise NotImplementedError(
+            f"No local execution rule for eliminated {eqn.primitive.name} operand"
+        )
+
+    result = eqn.primitive.bind(*in_values, **eqn.params)
+    results = result if isinstance(result, (tuple, list)) else (result,)
+    return tuple(
+        None if layout is None else value for value, layout in zip(results, out_layouts)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PrimitiveHandler:
+    """Composition root for the independent semantics of one JAX primitive.
+
+    Every field is a callable. Rules can therefore be plain functions, bound methods,
+    ``functools.partial`` objects, or stateful callable objects. The small methods below
+    are only the stable facade consumed by the analyzer/planner/interpreter.
+    """
+
+    dependency_rule: DependencyRule
+    contribution_rule: ContributionRule = conservative_contribution_rule
+    backward_rule: BackwardRule = conservative_backward_rule
+    local_eval_rule: LocalEvalRule = generic_local_eval
+    concrete_rule: ConcreteRule = no_concrete_rule
+    nonlinearity_rule: NonlinearityRule = linear_rule
+    tag_rule: TagRule = union_tags_rule
+    index_input_rule: IndexInputRule = no_index_inputs_rule
+    local_support: LocalExecutionSupport = LocalExecutionSupport.GENERIC
+    implementation: str = "composed"
+
     def propagate_deps(
         self,
         eqn: JaxprEqn,
@@ -207,8 +361,7 @@ class PrimitiveHandler(ABC):
         acc: CouplingAccumulator,
         execution: TraceExecution,
     ) -> None:
-        """Forward dependency set propagation & coupling accumulation."""
-        raise NotImplementedError
+        self.dependency_rule(eqn, state, acc, execution)
 
     def propagate_contribution_demand(
         self,
@@ -216,33 +369,7 @@ class PrimitiveHandler(ABC):
         state: TraceState,
         out_demands: list[ContributionRows | None],
     ) -> ContributionPropagation:
-        """Stop safely when this primitive has no additive inverse rule.
-
-        ``find_contribution_roots`` turns a non-valid result into roots at the
-        demanded output entries.  Keeping the fallback here deliberately small makes
-        unsupported primitives conservative instead of silently losing a read.
-        """
-        return _invalid_contribution(eqn)
-
-    def _plan_input_demands(
-        self,
-        eqn: JaxprEqn,
-        state: TraceState,
-        out_demands: list[TensorDemand | None],
-    ) -> list[TensorDemand | None]:
-        """Map demanded output entries to required input entries."""
-        # A missing rule must never make a value appear dead.  In particular,
-        # inputs with an empty DOF dependency can still be numerical operands
-        # (material data, masks, and routing indices).
-        if not any(d is not None for d in out_demands):
-            return [None] * len(eqn.invars)
-        result: list[TensorDemand | None] = []
-        for var in eqn.invars:
-            if isinstance(var, Literal):
-                result.append(None)
-                continue
-            result.append(TensorDemand(Full(_get_shape(var))))
-        return result
+        return self.contribution_rule(eqn, state, out_demands)
 
     def plan_backward(
         self,
@@ -250,8 +377,10 @@ class PrimitiveHandler(ABC):
         state: TraceState,
         out_demands: tuple[TensorDemand | None, ...],
     ) -> BackwardResult:
-        in_demands = self._plan_input_demands(eqn, state, list(out_demands))
-        return BackwardResult(in_demands=tuple(in_demands))
+        return self.backward_rule(eqn, state, out_demands)
+
+    def eval_local(self, **kwargs: Any) -> tuple[Any | None, ...]:
+        return self.local_eval_rule(**kwargs)
 
     def safe_eval_concrete(
         self,
@@ -259,92 +388,154 @@ class PrimitiveHandler(ABC):
         in_vals: list[NDArray | None],
         params: dict[str, Any],
     ) -> NDArray | None:
-        """Evaluate concrete numpy values for this primitive. If the primitive is not
-        implemented, fall back to jax itself."""
-        if any(v is None for v in in_vals):
+        if any(value is None for value in in_vals):
             return None
         try:
-            res = self.eval_concrete(in_vals, params)
-            if res is not None:
-                return res
-
-            # For other primitives, use jax itself to evaluate the primitive on concrete numpy
-            # values. This is a fallback for primitives that don't have a specific
-            # implementation above.
-            v = [np.asarray(x) for x in in_vals]
-            res = np.asarray(primitive.bind(*[jnp.asarray(x) for x in v], **params))
-            return res
+            result = self.concrete_rule(in_vals, params)
+            if result is not None:
+                return result
+            values = [np.asarray(value) for value in in_vals]
+            return np.asarray(
+                primitive.bind(*[jnp.asarray(value) for value in values], **params)
+            )
         except (TypeError, ValueError, KeyError, AttributeError):
             warnings.warn(f"Concrete evaluation failed for {primitive.name}")
+            return None
+
+    def eval_concrete(
+        self,
+        in_vals: list[NDArray | None],
+        params: dict[str, Any],
+    ) -> NDArray | None:
+        return self.concrete_rule(in_vals, params)
+
+    def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
+        return self.nonlinearity_rule(eqn, invar_active)
+
+    def propagate_tags(self, eqn: JaxprEqn, invar_tags: list[int]) -> int:
+        return self.tag_rule(eqn, invar_tags)
+
+    def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
+        return self.index_input_rule(eqn)
+
+    def local_execution_support(self, eqn: JaxprEqn) -> LocalExecutionSupport:
+        del eqn
+        return self.local_support
+
+
+class RuleDefaults:
+    """Reusable defaults for bundled rule implementations.
+
+    This is not a primitive-handler base class. It merely lets a rule bundle reuse
+    conservative behavior while the actual registered ``PrimitiveHandler`` is composed
+    from its bound callables.
+    """
+
+    def propagate_deps(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        acc: CouplingAccumulator,
+        execution: TraceExecution,
+    ) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not define dependency propagation"
+        )
+
+    def propagate_contribution_demand(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[ContributionRows | None],
+    ) -> ContributionPropagation:
+        return conservative_contribution_rule(eqn, state, out_demands)
+
+    def _plan_input_demands(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: list[TensorDemand | None],
+    ) -> list[TensorDemand | None]:
+        return conservative_input_demands(eqn, state, out_demands)
+
+    def plan_backward(
+        self,
+        eqn: JaxprEqn,
+        state: TraceState,
+        out_demands: tuple[TensorDemand | None, ...],
+    ) -> BackwardResult:
+        return BackwardResult(
+            in_demands=tuple(self._plan_input_demands(eqn, state, list(out_demands)))
+        )
+
+    def eval_local(self, **kwargs: Any) -> tuple[Any | None, ...]:
+        return generic_local_eval(**kwargs)
 
     def eval_concrete(
         self, in_vals: list[NDArray | None], params: dict[str, Any]
     ) -> NDArray | None:
-        """Evaluate concrete numpy values for routing indices (returns None if unknown)."""
-        return None
+        return no_concrete_rule(in_vals, params)
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
-        """Determine if this primitive introduces non-affine behavior on active inputs."""
-        return False
+        return linear_rule(eqn, invar_active)
 
     def propagate_tags(self, eqn: JaxprEqn, invar_tags: list[int]) -> int:
-        """Forward tag propagation (default: bitwise OR of all input tags)."""
-        mask = 0
-        for t in invar_tags:
-            mask |= t
-        return mask
+        return union_tags_rule(eqn, invar_tags)
 
     def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
-        """Return invar indices that are used as index arrays (e.g. gather/scatter index)."""
-        return []
+        return no_index_inputs_rule(eqn)
 
-    def eval_local(
-        self,
-        *,
-        eqn: JaxprEqn,
-        plan: EqnPlan,
-        in_values: tuple[Any | None, ...],
-        in_layouts: tuple[VarLayout | None, ...],
-        out_layouts: tuple[VarLayout | None, ...],
-        interpreter: Any,
-    ) -> tuple[Any | None, ...]:
-        """Bind a primitive on finalized local tensor shapes.
 
-        Arbitrary ``Points`` are deliberately not a generic tensor ABI.  They
-        must be handled by an explicit irregular primitive family (currently
-        gather/scatter); all other calls require structurally valid subsets.
-        """
-        live = [layout for layout in out_layouts if layout is not None]
-        if not live:
-            return tuple(None for _ in eqn.outvars)
-        out = live[0]
-        name = eqn.primitive.name
+def _is_default_method(rules: RuleDefaults, name: str) -> bool:
+    method = getattr(rules, name)
+    implementation = getattr(method, "__func__", method)
+    return implementation is getattr(RuleDefaults, name)
 
-        layouts = (*in_layouts, *out_layouts)
-        if any(
-            layout is not None
-            and layout.original_shape
-            and isinstance(layout.subset, Points)
-            for layout in layouts
-        ):
-            raise NotImplementedError(
-                f"{name} localization requires structured tensor subsets; "
-                "irregular Points are supported only by explicit handlers"
-            )
 
-        if any(
-            value is None and not isinstance(var, Literal)
-            for var, value in zip(eqn.invars, in_values)
-        ):
-            raise NotImplementedError(
-                f"No local execution rule for eliminated {name} operand"
-            )
-        result = eqn.primitive.bind(*in_values, **eqn.params)
-        results = result if isinstance(result, (tuple, list)) else (result,)
-        return tuple(
-            None if layout is None else value
-            for value, layout in zip(results, out_layouts)
+def compose_handler(rules: RuleDefaults) -> PrimitiveHandler:
+    """Compose a registered handler from a rule bundle's bound callables."""
+    if _is_default_method(rules, "propagate_deps"):
+        raise TypeError(
+            f"{type(rules).__name__} must provide a dependency propagation rule"
         )
+    local_specialized = not _is_default_method(rules, "eval_local")
+    return PrimitiveHandler(
+        dependency_rule=rules.propagate_deps,
+        contribution_rule=rules.propagate_contribution_demand,
+        backward_rule=rules.plan_backward,
+        local_eval_rule=rules.eval_local,
+        concrete_rule=rules.eval_concrete,
+        nonlinearity_rule=rules.introduces_nonlinearity,
+        tag_rule=rules.propagate_tags,
+        index_input_rule=rules.get_index_invar_indices,
+        local_support=(
+            LocalExecutionSupport.SPECIALIZED
+            if local_specialized
+            else LocalExecutionSupport.GENERIC
+        ),
+        implementation=type(rules).__name__,
+    )
+
+
+def register_rules(*specs: str | tuple[Any, ...]):
+    """Register rule bundles using the compact primitive specification syntax.
+
+    ``"neg"`` constructs the bundle with no arguments; ``("sin", True, np.sin)``
+    constructs it with ``(True, np.sin)``. The registry always stores a composed
+    ``PrimitiveHandler``, never the bundle itself.
+    """
+
+    def decorator(rule_type):
+        for spec in specs:
+            if isinstance(spec, str):
+                name, args = spec, ()
+            else:
+                name, *args = spec
+            rules = rule_type(*args)
+            TR.add(name, compose_handler(rules))
+        return rule_type
+
+    return decorator
 
 
 # =============================================================================
@@ -352,11 +543,11 @@ class PrimitiveHandler(ABC):
 # =============================================================================
 
 
-@TR.register(
+@register_rules(
     "debug_print",
     "debug_callback",
 )
-class NoOpHandler(PrimitiveHandler):
+class NoOpRules(RuleDefaults):
     """Handler for effect-only primitives (debug_print, debug_callback)."""
 
     def propagate_deps(
@@ -369,7 +560,7 @@ class NoOpHandler(PrimitiveHandler):
         return
 
 
-@TR.register(
+@register_rules(
     ("shift_left", np.left_shift),
     ("shift_right_arithmetic", np.right_shift),
     "iota",
@@ -377,7 +568,7 @@ class NoOpHandler(PrimitiveHandler):
     "ones",
     "full",
 )
-class ZeroDependencyHandler(PrimitiveHandler):
+class ZeroDependencyRules(RuleDefaults):
     """Handler for primitives with zero input dependency (iota, zeros, ones, full)."""
 
     def __init__(self, eval_fn: Callable[..., NDArray] | None = None):
@@ -443,7 +634,7 @@ class ZeroDependencyHandler(PrimitiveHandler):
         return None
 
 
-@TR.register(
+@register_rules(
     ("lt", np.less),
     ("lt_to", np.less),
     ("le", np.less_equal),
@@ -465,7 +656,7 @@ class ZeroDependencyHandler(PrimitiveHandler):
     ("round", np.round),
     ("sign", np.sign),
 )
-class ElementWiseZeroDependencyHandler(ZeroDependencyHandler):
+class ElementwiseZeroDependencyRules(ZeroDependencyRules):
     def _plan_input_demands(
         self,
         eqn: JaxprEqn,
@@ -491,7 +682,7 @@ class ElementWiseZeroDependencyHandler(ZeroDependencyHandler):
 # =============================================================================
 
 
-@TR.register(
+@register_rules(
     ("neg", False),
     ("abs", False),
     ("copy", False),
@@ -529,7 +720,7 @@ class ElementWiseZeroDependencyHandler(ZeroDependencyHandler):
     ("digamma", True, sp.psi),
     ("logistic", True, sp.expit),
 )
-class ElementwiseUnary(PrimitiveHandler):
+class ElementwiseUnaryRules(RuleDefaults):
     """Handler for elementwise unary operations (1 input -> 1 output).
 
     Covers both:
@@ -619,8 +810,8 @@ class ElementwiseUnary(PrimitiveHandler):
         return None
 
 
-@TR.register("reshape")
-class ReshapeHandler(ElementwiseUnary):
+@register_rules("reshape")
+class ReshapeRules(ElementwiseUnaryRules):
     """Reshape a compact tensor only after localizing its target shape."""
 
     def __init__(self):
@@ -667,8 +858,8 @@ class ReshapeHandler(ElementwiseUnary):
         )
 
 
-@TR.register("squeeze")
-class SqueezeHandler(ElementwiseUnary):
+@register_rules("squeeze")
+class SqueezeRules(ElementwiseUnaryRules):
     """Reinsert singleton axes when mapping a local squeeze demand backward."""
 
     def __init__(self):
@@ -692,7 +883,7 @@ class SqueezeHandler(ElementwiseUnary):
         return [TensorDemand(AxisProduct(input_shape, axes))]
 
 
-@TR.register(
+@register_rules(
     ("add", False, np.add),
     ("add_any", False, np.add),
     ("sub", False, np.subtract),
@@ -705,7 +896,7 @@ class SqueezeHandler(ElementwiseUnary):
     ("pow", True, np.power),
     ("atan2", True, np.arctan2),
 )
-class ElementwiseBinary(PrimitiveHandler):
+class ElementwiseBinaryRules(RuleDefaults):
     """Handler for elementwise binary operations (2 inputs -> 1 output).
 
     Covers both:
@@ -822,10 +1013,10 @@ class ElementwiseBinary(PrimitiveHandler):
         return None
 
 
-@TR.register(
+@register_rules(
     "integer_pow",
 )
-class IntegerPowHandler(PrimitiveHandler):
+class IntegerPowRules(RuleDefaults):
     """Handler for integer power operations (x ** n)."""
 
     def propagate_deps(
@@ -881,10 +1072,10 @@ class IntegerPowHandler(PrimitiveHandler):
 # =============================================================================
 
 
-@TR.register(
+@register_rules(
     "broadcast_in_dim",
 )
-class BroadcastHandler(PrimitiveHandler):
+class BroadcastRules(RuleDefaults):
     """Handler for `broadcast_in_dim` primitive."""
 
     def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
@@ -989,10 +1180,10 @@ class BroadcastHandler(PrimitiveHandler):
         ]
 
 
-@TR.register(
+@register_rules(
     "transpose",
 )
-class TransposeHandler(PrimitiveHandler):
+class TransposeRules(RuleDefaults):
     """Handler for `transpose` primitive."""
 
     def propagate_deps(
@@ -1074,10 +1265,10 @@ class TransposeHandler(PrimitiveHandler):
         ]
 
 
-@TR.register(
+@register_rules(
     "slice",
 )
-class SliceHandler(PrimitiveHandler):
+class SliceRules(RuleDefaults):
     """Handler for static `slice` primitive."""
 
     def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
@@ -1240,10 +1431,10 @@ class SliceHandler(PrimitiveHandler):
         ]
 
 
-@TR.register(
+@register_rules(
     "rev",
 )
-class ReverseHandler(PrimitiveHandler):
+class ReverseRules(RuleDefaults):
     """Handler for `rev` (reverse/flip axes) primitive."""
 
     def propagate_deps(
@@ -1311,10 +1502,10 @@ class ReverseHandler(PrimitiveHandler):
         )
 
 
-@TR.register(
+@register_rules(
     "pad",
 )
-class PadHandler(PrimitiveHandler):
+class PadRules(RuleDefaults):
     """Handler for `pad` primitive."""
 
     def propagate_deps(
@@ -1450,10 +1641,10 @@ class PadHandler(PrimitiveHandler):
         ]
 
 
-@TR.register(
+@register_rules(
     "concatenate",
 )
-class ConcatenateHandler(PrimitiveHandler):
+class ConcatenateRules(RuleDefaults):
     """Handler for `concatenate` primitive."""
 
     def propagate_deps(
@@ -1611,10 +1802,10 @@ class ConcatenateHandler(PrimitiveHandler):
         return result
 
 
-@TR.register(
+@register_rules(
     "stack",
 )
-class StackHandler(PrimitiveHandler):
+class StackRules(RuleDefaults):
     """Handler for `stack` primitive."""
 
     def propagate_deps(
@@ -1703,10 +1894,10 @@ class StackHandler(PrimitiveHandler):
         raise NotImplementedError("stack liveness requires Full or AxisProduct demands")
 
 
-@TR.register(
+@register_rules(
     "split",
 )
-class SplitHandler(PrimitiveHandler):
+class SplitRules(RuleDefaults):
     """Handler for `split` primitive."""
 
     def propagate_deps(
@@ -1803,10 +1994,10 @@ class SplitHandler(PrimitiveHandler):
 # =============================================================================
 
 
-@TR.register(
+@register_rules(
     "gather",
 )
-class GatherHandler(PrimitiveHandler):
+class GatherRules(RuleDefaults):
     """Handler for `gather` primitive."""
 
     def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
@@ -2019,11 +2210,11 @@ class GatherHandler(PrimitiveHandler):
         )
 
 
-@TR.register(
+@register_rules(
     "dynamic_slice",
     "dynamic_update_slice",
 )
-class DynamicSliceHandler(PrimitiveHandler):
+class DynamicSliceRules(RuleDefaults):
     """Handler for `dynamic_slice` and `dynamic_update_slice` primitive."""
 
     def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
@@ -2173,7 +2364,7 @@ class DynamicSliceHandler(PrimitiveHandler):
         )
 
 
-@TR.register(
+@register_rules(
     "scatter",
     "scatter-add",
     "scatter-sub",
@@ -2181,7 +2372,7 @@ class DynamicSliceHandler(PrimitiveHandler):
     "scatter-min",
     "scatter-max",
 )
-class ScatterHandler(PrimitiveHandler):
+class ScatterRules(RuleDefaults):
     """Handler for `scatter` family primitives."""
 
     def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
@@ -2355,10 +2546,10 @@ class ScatterHandler(PrimitiveHandler):
         return (result,)
 
 
-@TR.register(
+@register_rules(
     "select_n",
 )
-class SelectNHandler(PrimitiveHandler):
+class SelectNRules(RuleDefaults):
     """Handler for `select_n` primitive."""
 
     def get_index_invar_indices(self, eqn: JaxprEqn) -> list[int]:
@@ -2446,10 +2637,10 @@ class SelectNHandler(PrimitiveHandler):
         ]
 
 
-@TR.register(
+@register_rules(
     "dot_general",
 )
-class DotHandler(PrimitiveHandler):
+class DotRules(RuleDefaults):
     """Handler for bilinear contraction `dot_general` primitive."""
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
@@ -2664,7 +2855,7 @@ class DotHandler(PrimitiveHandler):
         ]
 
 
-@TR.register(
+@register_rules(
     "reduce_sum",
     "reduce_window_sum",
     "reduce_max",
@@ -2673,7 +2864,7 @@ class DotHandler(PrimitiveHandler):
     "reduce_and",
     "reduce_or",
 )
-class ReductionHandler(PrimitiveHandler):
+class ReductionRules(RuleDefaults):
     """Handler for reduction primitives (reduce_sum, reduce_max, etc.)."""
 
     def propagate_deps(
@@ -2756,23 +2947,8 @@ class ReductionHandler(PrimitiveHandler):
 # =============================================================================
 
 
-@TR.register(
-    "lu",
-    "triangular_solve",
-    "custom_linear_solve",
-    "lu_solve",
-    "cholesky",
-    "eig",
-    "eigh",
-    "custom_vjp_call",
-    "custom_jvp_call",
-    "pure_callback",
-    "io_callback",
-    ("while", False),
-    ("switch", False),
-)
-class OpaqueBlackBoxHandler(PrimitiveHandler):
-    """Handler for opaque black-box primitives (callbacks, dense linalg, fallback)."""
+class _OpaqueDependencyRules(RuleDefaults):
+    """Conservative dependency semantics shared by genuinely opaque operations."""
 
     def __init__(self, record_couplings: bool = True):
         self.record_couplings = record_couplings
@@ -2786,15 +2962,13 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
     ) -> None:
         if not eqn.outvars:
             return
-
         in_d = [state.get(v) for v in eqn.invars]
         cols_active = np.zeros(state.n_dofs, dtype=bool)
         has_active = False
-        for d in in_d:
-            if isinstance(d, SparseDepSet) and d.dep.shape[0] > 0:
-                cols_active[d.dep.indices] = True
+        for dep in in_d:
+            if isinstance(dep, SparseDepSet) and dep.dep.shape[0] > 0:
+                cols_active[dep.dep.indices] = True
                 has_active = True
-
         if not has_active:
             total = SparseDepSet.empty((), state.n_dofs)
         else:
@@ -2802,14 +2976,42 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             total = SparseDepSet(reduced, ())
             if self.record_couplings:
                 acc.record_dep(total.dep, execution.trial_test_split)
-
-        for ov in eqn.outvars:
-            oshp = _get_shape(ov)
-            stacked_dep = _broadcast_single_row(total.dep, int(np.prod(oshp)))
-            state.set(ov, SparseDepSet(stacked_dep, oshp))
+        for outvar in eqn.outvars:
+            shape = _get_shape(outvar)
+            dep = _broadcast_single_row(total.dep, int(np.prod(shape)))
+            state.set(outvar, SparseDepSet(dep, shape))
 
     def introduces_nonlinearity(self, eqn: JaxprEqn, invar_active: list[bool]) -> bool:
         return any(invar_active)
+
+
+@register_rules(
+    "custom_vjp_call",
+    "custom_jvp_call",
+    "pure_callback",
+    "io_callback",
+    ("while", False),
+    ("switch", False),
+)
+class OpaqueBlackBoxRules(_OpaqueDependencyRules):
+    """Conservative fallback for operations without exploitable local structure."""
+
+
+# Unknown primitives use the same conservative dependency semantics as an opaque call.
+TR.set_default(compose_handler(_OpaqueDependencyRules()))
+
+
+@register_rules(
+    "lu",
+    "triangular_solve",
+    "custom_linear_solve",
+    "lu_solve",
+    "cholesky",
+    "eig",
+    "eigh",
+)
+class DenseLinalgRules(_OpaqueDependencyRules):
+    """Dense linear-algebra semantics with batch-aware localization rules."""
 
     def eval_local(self, *, eqn, plan, in_values, in_layouts, out_layouts, interpreter):
         """Run batched dense kernels directly when complete blocks survived."""
@@ -2935,7 +3137,7 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
             bound = []
             for subeqn in jaxpr.eqns:
                 handler = TR.get(subeqn.primitive.name)
-                if subeqn.primitive.name in {"pjit", "jit", "remat2", "scan", "map"}:
+                if is_carried_subjaxpr_primitive(subeqn.primitive.name):
                     nested, _nested_consts = _subjaxpr_and_consts(subeqn)
                     nested_bound = register_nested_jaxprs(nested)
                     active = {
@@ -3170,12 +3372,12 @@ class OpaqueBlackBoxHandler(PrimitiveHandler):
 # =============================================================================
 
 
-@TR.register(
+@register_rules(
     "pjit",
     "jit",
     "remat2",
 )
-class SubJaxprHandler(PrimitiveHandler):
+class SubJaxprRules(RuleDefaults):
     """Handler for carried sub-jaxprs (pjit, jit, remat2)."""
 
     def propagate_deps(
@@ -3357,10 +3559,10 @@ class SubJaxprHandler(PrimitiveHandler):
         )
 
 
-@TR.register(
+@register_rules(
     "cond",
 )
-class CondHandler(PrimitiveHandler):
+class CondRules(RuleDefaults):
     """Handler for branching sub-jaxprs (cond, switch)."""
 
     def propagate_deps(
@@ -3498,11 +3700,11 @@ class CondHandler(PrimitiveHandler):
         return super().plan_backward(eqn, state, out_demands)
 
 
-@TR.register(
+@register_rules(
     "scan",
     "map",
 )
-class ScanMapHandler(PrimitiveHandler):
+class ScanMapRules(RuleDefaults):
     """Handler for looping/batched sub-jaxprs (scan, map)."""
 
     def propagate_deps(
@@ -4002,10 +4204,10 @@ class ScanMapHandler(PrimitiveHandler):
         )
 
 
-@TR.register(
+@register_rules(
     "ffi_call",
 )
-class FFICallHandler(PrimitiveHandler):
+class FFICallRules(RuleDefaults):
     """Handler for `ffi_call` primitive."""
 
     def propagate_deps(
@@ -4027,7 +4229,7 @@ class FFICallHandler(PrimitiveHandler):
                     lead = leads.pop()
 
         if not lead:
-            OpaqueBlackBoxHandler(record_couplings=True).propagate_deps(
+            OpaqueBlackBoxRules(record_couplings=True).propagate_deps(
                 eqn, state, acc, execution
             )
             return
