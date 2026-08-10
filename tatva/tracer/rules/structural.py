@@ -7,9 +7,9 @@ import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
+from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian, no_prepare
-from tatva.tracer.dependencies import DependencySet
 
 if TYPE_CHECKING:
     from tatva.tracer.semantics import RuleContext
@@ -26,27 +26,27 @@ def reshape_like_dependencies(
 
 
 @dataclass(frozen=True)
-class UnaryRowRoute:
+class UnaryRowMap:
     source_rows: NDArray
     output_shape: tuple[int, ...]
 
 
 @dataclass(frozen=True)
-class MultiInputRowRoute:
+class MultiInputRowMap:
     operand_indices: NDArray
     source_rows: NDArray
     output_shape: tuple[int, ...]
 
 
 @dataclass(frozen=True)
-class MultiOutputUnaryRoute:
+class MultiOutputUnaryMap:
     source_rows: tuple[NDArray[np.int64], ...]
     output_shapes: tuple[tuple[int, ...], ...]
 
 
 def unary_routed_dependencies(
     ctx: RuleContext,
-    prepared: UnaryRowRoute,
+    prepared: UnaryRowMap,
 ) -> tuple[DependencySet, ...]:
     if len(ctx.input_deps) != 1:
         raise ValueError(
@@ -63,7 +63,7 @@ def unary_routed_dependencies(
 
 def multi_input_routed_dependencies(
     ctx: RuleContext,
-    prepared: MultiInputRowRoute,
+    prepared: MultiInputRowMap,
 ) -> tuple[DependencySet, ...]:
     if len(ctx.input_deps) == 0:
         raise ValueError(f"{ctx.eqn.primitive.name} expected at least one input")
@@ -81,7 +81,7 @@ def multi_input_routed_dependencies(
 
 def multi_output_unary_routed_dependencies(
     ctx: RuleContext,
-    prepared: MultiOutputUnaryRoute,
+    prepared: MultiOutputUnaryMap,
 ) -> tuple[DependencySet, ...]:
     source = ctx.input_deps[0]
 
@@ -91,7 +91,7 @@ def multi_output_unary_routed_dependencies(
     )
 
 
-def prepare_broadcast(ctx: RuleContext) -> UnaryRowRoute:
+def prepare_broadcast(ctx: RuleContext) -> UnaryRowMap:
     eqn = ctx.eqn
 
     if len(ctx.input_deps) != 1 or len(eqn.outvars) != 1:
@@ -114,13 +114,13 @@ def prepare_broadcast(ctx: RuleContext) -> UnaryRowRoute:
         source_rows.reshape(expanded_shape), output_shape
     ).ravel()
 
-    return UnaryRowRoute(
+    return UnaryRowMap(
         source_rows=source_rows,
         output_shape=output_shape,
     )
 
 
-def prepare_transpose(ctx: RuleContext) -> UnaryRowRoute:
+def prepare_transpose(ctx: RuleContext) -> UnaryRowMap:
     eqn = ctx.eqn
 
     input_shape = ctx.input_deps[0].shape
@@ -130,13 +130,13 @@ def prepare_transpose(ctx: RuleContext) -> UnaryRowRoute:
 
     source_rows = np.transpose(rows, axes=eqn.params["permutation"]).ravel()
 
-    return UnaryRowRoute(
+    return UnaryRowMap(
         source_rows=source_rows,
         output_shape=output_shape,
     )
 
 
-def prepare_slice(ctx: RuleContext) -> UnaryRowRoute:
+def prepare_slice(ctx: RuleContext) -> UnaryRowMap:
     eqn = ctx.eqn
 
     input_shape = ctx.input_deps[0].shape
@@ -156,13 +156,13 @@ def prepare_slice(ctx: RuleContext) -> UnaryRowRoute:
         for start, limit, stride in zip(starts, limits, strides)
     )
 
-    return UnaryRowRoute(
+    return UnaryRowMap(
         source_rows=rows[slices].ravel(),
         output_shape=output_shape,
     )
 
 
-def prepare_rev(ctx: RuleContext) -> UnaryRowRoute:
+def prepare_rev(ctx: RuleContext) -> UnaryRowMap:
     eqn = ctx.eqn
 
     input_shape = ctx.input_deps[0].shape
@@ -172,13 +172,13 @@ def prepare_rev(ctx: RuleContext) -> UnaryRowRoute:
 
     source_rows = np.flip(rows, axis=tuple(eqn.params["dimensions"])).ravel()
 
-    return UnaryRowRoute(
+    return UnaryRowMap(
         source_rows=source_rows,
         output_shape=output_shape,
     )
 
 
-def prepare_concatenate(ctx: RuleContext) -> MultiInputRowRoute:
+def prepare_concatenate(ctx: RuleContext) -> MultiInputRowMap:
     eqn = ctx.eqn
 
     axis = int(eqn.params["dimension"])
@@ -195,14 +195,14 @@ def prepare_concatenate(ctx: RuleContext) -> MultiInputRowRoute:
 
         source_parts.append(np.arange(size, dtype=np.int64).reshape(shape))
 
-    return MultiInputRowRoute(
+    return MultiInputRowMap(
         operand_indices=np.concatenate(operand_parts, axis=axis).ravel(),
         source_rows=np.concatenate(source_parts, axis=axis).ravel(),
         output_shape=output_shape,
     )
 
 
-def prepare_stack(ctx: RuleContext) -> MultiInputRowRoute:
+def prepare_stack(ctx: RuleContext) -> MultiInputRowMap:
     eqn = ctx.eqn
 
     axis = int(eqn.params["axis"])
@@ -219,14 +219,14 @@ def prepare_stack(ctx: RuleContext) -> MultiInputRowRoute:
 
         source_parts.append(np.arange(size, dtype=np.int64).reshape(shape))
 
-    return MultiInputRowRoute(
+    return MultiInputRowMap(
         operand_indices=np.stack(operand_parts, axis=axis).ravel(),
         source_rows=np.stack(source_parts, axis=axis).ravel(),
         output_shape=output_shape,
     )
 
 
-def prepare_pad(ctx: RuleContext) -> MultiInputRowRoute:
+def prepare_pad(ctx: RuleContext) -> MultiInputRowMap:
     eqn = ctx.eqn
 
     if len(ctx.input_deps) != 2:
@@ -276,14 +276,14 @@ def prepare_pad(ctx: RuleContext) -> MultiInputRowRoute:
             tuple(source_coords[valid_source].T), source_shape
         )
 
-    return MultiInputRowRoute(
+    return MultiInputRowMap(
         operand_indices=operand_indices,
         source_rows=source_rows,
         output_shape=output_shape,
     )
 
 
-def prepare_split(ctx: RuleContext) -> MultiOutputUnaryRoute:
+def prepare_split(ctx: RuleContext) -> MultiOutputUnaryMap:
     if len(ctx.input_deps) != 1:
         raise ValueError("split expects one input")
 
@@ -312,7 +312,7 @@ def prepare_split(ctx: RuleContext) -> MultiOutputUnaryRoute:
 
         offset += size
 
-    return MultiOutputUnaryRoute(source_rows=tuple(routes), output_shapes=tuple(shapes))
+    return MultiOutputUnaryMap(source_rows=tuple(routes), output_shapes=tuple(shapes))
 
 
 RESHAPE_LIKE = PrimitiveRule(
