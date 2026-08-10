@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import jax.numpy as jnp
 import numpy as np
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
@@ -159,25 +158,171 @@ def resolve_dynamic_update_slice_route(
 
 
 def _compute_gather_route(
-    eqn: JaxprEqn, indices: NDArray[np.int64]
-) -> GatherRoute | None:
-    if len(eqn.invars) < 2 or not eqn.outvars:
-        return None
+    eqn: JaxprEqn,
+    indices: NDArray,
+) -> GatherRoute:
+    operand_shape = _shape_of(eqn.invars[0])
+    output_shape = _shape_of(eqn.outvars[0])
 
-    operand_shape = tuple(_shape_of(eqn.invars[0]))
+    indices = np.asarray(indices)
 
-    row_ids = np.arange(np.prod(operand_shape), dtype=np.int64).reshape(operand_shape)
-    params = dict(eqn.params)
+    dnums = eqn.params["dimension_numbers"]
+    slice_sizes = tuple(int(x) for x in eqn.params["slice_sizes"])
 
-    try:
-        gathered = eqn.primitive.bind(
-            jnp.asarray(row_ids), jnp.asarray(indices), **params
+    offset_dims = tuple(int(x) for x in dnums.offset_dims)
+    collapsed_dims = tuple(int(x) for x in dnums.collapsed_slice_dims)
+    start_index_map = tuple(int(x) for x in dnums.start_index_map)
+
+    operand_batching_dims = tuple(
+        int(x) for x in getattr(dnums, "operand_batching_dims", ())
+    )
+    indices_batching_dims = tuple(
+        int(x) for x in getattr(dnums, "start_indices_batching_dims", ())
+    )
+
+    operand_rank = len(operand_shape)
+    output_rank = len(output_shape)
+
+    if indices.ndim < 1:
+        raise NotImplementedError("gather scalar index arrays are not supported")
+
+    if len(slice_sizes) != operand_rank:
+        raise ValueError("gather slice_sizes rank does not match operand rank")
+
+    index_vector_size = indices.shape[-1]
+
+    if index_vector_size != len(start_index_map):
+        raise ValueError("gather index-vector size does not match start_index_map")
+
+    if len(operand_batching_dims) != len(indices_batching_dims):
+        raise ValueError("gather operand/index batching dimensions do not match")
+
+    # Output coordinates
+    n_output = int(np.prod(output_shape, dtype=np.int64))
+
+    output_rows = np.arange(n_output, dtype=np.int64)
+
+    if output_shape:
+        output_coords = np.stack(
+            np.unravel_index(output_rows, output_shape),
+            axis=1,
+        ).astype(np.int64)
+    else:
+        output_coords = np.empty((n_output, 0), dtype=np.int64)
+
+    # ------------------------------------------------------------------
+    # Gather batch coordinates
+    #
+    # Output axes not present in offset_dims correspond to
+    # indices.shape[:-1].
+    # ------------------------------------------------------------------
+    offset_set = set(offset_dims)
+    output_batch_dims = tuple(
+        axis for axis in range(output_rank) if axis not in offset_set
+    )
+    expected_batch_rank = indices.ndim - 1
+
+    if len(output_batch_dims) != expected_batch_rank:
+        raise NotImplementedError("unsupported gather output/index batch geometry")
+
+    if output_batch_dims:
+        batch_coords = output_coords[:, output_batch_dims]
+    else:
+        batch_coords = np.empty((n_output, 0), dtype=np.int64)
+
+    # Index vector for every output row
+    if index_vector_size:
+        if indices.ndim == 1:
+            index_vectors = np.broadcast_to(
+                indices.reshape(1, index_vector_size),
+                (n_output, index_vector_size),
+            )
+        else:
+            key = tuple(batch_coords[:, axis] for axis in range(indices.ndim - 1))
+
+            index_vectors = np.asarray(indices[key], dtype=np.int64).reshape(
+                n_output, index_vector_size
+            )
+    else:
+        index_vectors = np.empty((n_output, 0), dtype=np.int64)
+
+    # Start coordinate in operand space
+    starts = np.zeros(
+        (n_output, operand_rank),
+        dtype=np.int64,
+    )
+
+    for component, operand_axis in enumerate(start_index_map):
+        starts[:, operand_axis] = index_vectors[:, component]
+
+    # Explicit batching dimensions get their coordinates from the
+    # corresponding index batch dimension.
+    for operand_axis, index_axis in zip(
+        operand_batching_dims,
+        indices_batching_dims,
+    ):
+        starts[:, operand_axis] = batch_coords[:, index_axis]
+
+    # Window offsets
+    excluded = set(collapsed_dims) | set(operand_batching_dims)
+    window_operand_dims = tuple(
+        axis for axis in range(operand_rank) if axis not in excluded
+    )
+    if len(window_operand_dims) != len(offset_dims):
+        raise NotImplementedError("unsupported gather window geometry")
+
+    offsets = np.zeros_like(starts)
+
+    for output_axis, operand_axis in zip(offset_dims, window_operand_dims):
+        offsets[:, operand_axis] = output_coords[:, output_axis]
+
+    # Out-of-bounds policy
+    upper_starts = np.asarray(operand_shape, dtype=np.int64) - np.asarray(
+        slice_sizes, dtype=np.int64
+    )
+
+    if np.any(upper_starts < 0):
+        raise ValueError("gather slice is larger than operand")
+
+    mode = eqn.params.get("mode")
+    mode_name = (
+        "PROMISE_IN_BOUNDS"
+        if mode is None
+        else getattr(mode, "name", str(mode)).rsplit(".", 1)[-1].upper()
+    )
+
+    if mode_name in {"FILL", "DROP"}:
+        mode_name = "FILL_OR_DROP"
+
+    valid = np.ones(n_output, dtype=bool)
+
+    if mode_name in {"CLIP", "PROMISE_IN_BOUNDS"}:
+        starts = np.minimum(
+            np.maximum(starts, 0),
+            upper_starts,
         )
-    except (TypeError, ValueError, RuntimeError):
-        return None
+    elif mode_name == "FILL_OR_DROP":
+        for component, operand_axis in enumerate(start_index_map):
+            values = index_vectors[:, component]
+            valid &= values >= 0
+            valid &= values <= upper_starts[operand_axis]
+    else:
+        raise NotImplementedError(f"unsupported gather mode {mode_name!r}")
+
+    # Final source rows
+    source_coords = starts + offsets
+    source_rows = np.full(n_output, -1, dtype=np.int64)
+
+    if np.any(valid):
+        coords = source_coords[valid]
+        operand_bounds = np.asarray(operand_shape, dtype=np.int64)
+        if np.any(coords < 0) or np.any(coords >= operand_bounds):
+            raise ValueError("computed gather source coordinates are outside operand")
+
+        source_rows[valid] = np.ravel_multi_index(tuple(coords.T), operand_shape)
 
     return GatherRoute(
-        source_rows=np.asarray(gathered, dtype=np.int64).ravel(),
+        source_rows=source_rows,
     )
 
 
