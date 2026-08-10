@@ -91,15 +91,12 @@ class Element(ABC):
 
     def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
         dNdr = self.shape_function_derivative(xi)
-        # same GEMM trap as in `gradient`: (d, n) x (n, d) vmapped over millions of
-        # elements. `jnp.linalg.det` needs no such treatment -- it already special-cases
-        # 2x2 and 3x3 in closed form, and no tatva element has a larger Jacobian.
-        J = tk.tensordot(dNdr, nodal_coords)  # (d, n) x (n, d) -> (d, d)
+        J = tk.contract("in,nj->ij", dNdr, nodal_coords)  # (d, n) x (n, d) -> (d, d)
         return J, jnp.linalg.det(J)
 
     def interpolate(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         N = self.shape_function(xi)
-        return tk.tensordot(N, nodal_values)
+        return tk.contract("n,n...->...", N, nodal_values)
 
     def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         """Returns the gradient of the nodal values at the local coordinates xi.
@@ -113,11 +110,14 @@ class Element(ABC):
             Gradient of the nodal values at the local coordinates (shape: (n_values, n_dim)).
         """
         # 'd': spatial dimension, 'n': number of nodes,
+        #
         dNdr = self.shape_function_derivative(xi)  # (d, n)
-        J = tk.tensordot(dNdr, nodal_coords)  # (d, n) x (n, d) -> (d, d)
-        dNdX = tk.tensordot(tk.inv(J), dNdr)  # (d, d) x (d, n) -> (d, n)
-        # tensordot contracts the node axis and leaves d leading; move it to the end
-        return jnp.moveaxis(tk.tensordot(dNdX, nodal_values), 0, -1)  # (..., d)
+        J = tk.contract("in,nj->ij", dNdr, nodal_coords)  # (d, n) x (n, d) -> (d, d)
+        dNdX = tk.contract("ij,jn->in", tk.inv(J), dNdr)  # (d, d) x (d, n) -> (d, n)
+        # the contraction leaves the node axis summed and d leading; move d to the end
+        return jnp.moveaxis(
+            tk.contract("in,n...->i...", dNdX, nodal_values), 0, -1
+        )  # (..., d)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -138,11 +138,11 @@ class Element(ABC):
         N = self.shape_function(xi)
         dNdr = self.shape_function_derivative(xi)
         J, detJ = self.get_jacobian(xi, nodal_coords)
-        dNdX = tk.tensordot(tk.inv(J), dNdr)
+        dNdX = tk.contract("ij,jn->in", tk.inv(J), dNdr)
         return (
-            tk.tensordot(N, nodal_values),
-            # tensordot contracts the node axis and leaves d leading; move it to the end
-            jnp.moveaxis(tk.tensordot(dNdX, nodal_values), 0, -1),
+            tk.contract("n,n...->...", N, nodal_values),
+            # the contraction leaves the node axis summed and d leading; move d to the end
+            jnp.moveaxis(tk.contract("in,n...->i...", dNdX, nodal_values), 0, -1),
             detJ,
         )
 
@@ -169,16 +169,7 @@ class Line2(Element):
 
     def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
         dNdr = self.shape_function_derivative(xi)
-        # Keep `@` here, even though tk.tensordot accepts this shape. XLA already
-        # lowers this contraction as a fused reduction -- the compiled HLO contains no
-        # `dot` at all, so there is nothing for tk.tensordot to remove, and routing it
-        # through there measured 60x slower on 400k elements (it materialises the
-        # (q, r) product before reducing). Rewrite a site only when its HLO shows a
-        # `dot`; here it does not.
-        Jvec = dNdr @ nodal_coords
-        # The tangent length is just |Jvec|; the previous form computed the unit
-        # tangent and dotted it back onto Jvec, which is the same number by way of an
-        # extra divide, and hardcoded two components so a Line2 embedded in 3D failed.
+        Jvec = tk.contract("n,nj->j", dNdr, nodal_coords)
         J = jnp.sqrt(jnp.sum(Jvec * Jvec))
         return J, J
 
@@ -186,9 +177,7 @@ class Line2(Element):
         _N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
-        # It reads like a reduction, but as an einsum XLA lowered it to a dot and it
-        # cost ~5x on 400k elements. See tk.tensordot.
-        return tk.tensordot(dNdX, nodal_values)
+        return tk.contract("n,n...->...", dNdX, nodal_values)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -197,8 +186,8 @@ class Line2(Element):
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
         return (
-            tk.tensordot(N, nodal_values),
-            tk.tensordot(dNdX, nodal_values),
+            tk.contract("n,n...->...", N, nodal_values),
+            tk.contract("n,n...->...", dNdX, nodal_values),
             detJ,
         )
 
@@ -232,8 +221,7 @@ class Line3(Element):
 
     def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
         dNdr = self.shape_function_derivative(xi)
-        # `@`, not tk.tensordot -- see the note in Line2.get_jacobian.
-        Jvec = dNdr @ nodal_coords
+        Jvec = tk.contract("n,nj->j", dNdr, nodal_coords)
         # dot(Jvec, Jvec / |Jvec|) is |Jvec| with an extra divide.
         J = jnp.sqrt(jnp.sum(Jvec * Jvec))
         return J, J
@@ -242,7 +230,7 @@ class Line3(Element):
         dNdr = self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdS = dNdr / J
-        return tk.tensordot(dNdS, nodal_values)
+        return tk.contract("n,n...->...", dNdS, nodal_values)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -253,8 +241,8 @@ class Line3(Element):
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdS = dNdr / J
         return (
-            tk.tensordot(N, nodal_values),
-            tk.tensordot(dNdS, nodal_values),
+            tk.contract("n,n...->...", N, nodal_values),
+            tk.contract("n,n...->...", dNdS, nodal_values),
             detJ,
         )
 

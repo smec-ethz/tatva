@@ -16,6 +16,9 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
+import pathlib
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -127,6 +130,202 @@ def test_tensordot_rejects_a_stack_of_matrices():
 
 
 # --------------------------------------------------------------------------------
+# contract
+# --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("spec", "a_shape", "b_shape", "einsum"),
+    [
+        ("in,nj->ij", (2, 4), (4, 2), "in,nj->ij"),
+        ("ij,jn->in", (3, 3), (3, 8), "ij,jn->in"),
+        ("in,n...->i...", (2, 4), (4,), "in,n->i"),
+        ("in,n...->i...", (2, 4), (4, 3), "in,nc->ic"),
+        ("in,n...->i...", (2, 4), (4, 3, 3), "in,ncd->icd"),
+        ("n,n...->...", (4,), (4,), "n,n->"),
+        ("n,n...->...", (4,), (4, 3), "n,nc->c"),
+        ("n,nj->j", (4,), (4, 2), "n,nj->j"),
+    ],
+)
+def test_contract_computes_what_the_spec_says(spec, a_shape, b_shape, einsum):
+    """The spec is a name, not an instruction -- but the name has to be honest. Every
+    supported contraction is checked against the einsum it claims to be.
+    """
+    rng = np.random.default_rng(9)
+    A = jnp.asarray(rng.random(a_shape))
+    B = jnp.asarray(rng.random(b_shape))
+    assert jnp.allclose(tk.contract(spec, A, B), jnp.einsum(einsum, A, B))
+
+
+def test_contract_is_indifferent_to_the_index_letters():
+    """Specs are canonicalised by order of first appearance, so a call site may use
+    letters that mean something without adding a table entry.
+    """
+    rng = np.random.default_rng(10)
+    A = jnp.asarray(rng.random((2, 4)))
+    B = jnp.asarray(rng.random((4, 3)))
+    assert jnp.allclose(
+        tk.contract("in,nj->ij", A, B), tk.contract("pq,qr->pr", A, B)
+    )
+    assert jnp.allclose(tk.contract("ab,bc->ac", A, B), A @ B)
+
+
+def test_contract_refuses_an_unmeasured_contraction():
+    """Not a gap to be filled with a general einsum fallback. Each entry is a measured
+    decision about how to spell the contraction so it does not lower to a `dot`; a spec
+    with no entry has had no such decision made.
+    """
+    A = jnp.zeros((2, 3))
+    B = jnp.zeros((3, 4))
+    with pytest.raises(ValueError, match="no implementation"):
+        tk.contract("ij,jk->ijk", A, B)  # no contraction at all
+    with pytest.raises(ValueError, match="no implementation"):
+        tk.contract("ij,jk->ki", A, B)  # transposed output
+
+
+@pytest.mark.parametrize("spec", ["in,nj->ij", "n,n...->...", "in,n...->i..."])
+def test_contract_rejects_a_batch_axis(spec):
+    """These take a single tensor each. The broadcast spelling materialises its
+    intermediate, so a hand-rolled batch axis allocates it in full -- use jax.vmap.
+    """
+    with pytest.raises(ValueError, match="ranks"):
+        tk.contract(spec, jnp.zeros((5, 2, 3)), jnp.zeros((3, 4)))
+
+
+def test_contract_rejects_a_mismatched_contraction_axis():
+    with pytest.raises(ValueError, match="contracts A's last axis"):
+        tk.contract("in,nj->ij", jnp.zeros((2, 3)), jnp.zeros((4, 2)))
+
+
+def test_contract_rejects_an_unparseable_spec():
+    A = jnp.zeros((2, 3))
+    B = jnp.zeros((3, 4))
+    for spec in ["ij->i", "ij,jk", "ij,jk->ik->ik", "i1,1k->ik"]:
+        with pytest.raises(ValueError, match="could not parse|no implementation"):
+            tk.contract(spec, A, B)
+
+
+def test_contract_dispatches_the_matmul_spec_on_the_lowering_platform():
+    """The one spec that consults the backend, and the reason it is
+    `jax.lax.platform_dependent` rather than `jax.default_backend()`.
+
+    `default_backend()` reports the highest-priority backend *available* in the process,
+    so on any machine with a GPU it answers "gpu" even for a computation placed on the
+    CPU -- the wrong branch, precisely on the mixed setups where the distinction matters.
+    Lowering the same function for two platforms shows the dispatch following the target,
+    and shows the branch not taken being pruned rather than kept behind a `conditional`.
+    """
+    A = jnp.ones((64, 2, 4))
+    B = jnp.ones((64, 4, 2))
+    fn = jax.jit(jax.vmap(lambda a, b: tk.contract("in,nj->ij", a, b)))
+    traced = fn.trace(A, B)
+
+    cpu = traced.lower(lowering_platforms=("cpu",)).as_text()
+    assert cpu.count("dot_general") == 1  # `@`
+    assert cpu.count("stablehlo.multiply") == 0
+
+    gpu = traced.lower(lowering_platforms=("cuda",)).as_text()
+    assert gpu.count("dot_general") == 0  # broadcast
+    assert gpu.count("stablehlo.multiply") == 1
+
+    for text in (cpu, gpu):
+        assert "conditional" not in text  # pruned, not selected at runtime
+
+
+@pytest.mark.parametrize("spec", ["in,n...->i...", "n,n...->..."])
+def test_contract_does_not_dispatch_the_node_contractions(spec):
+    """Broadcast on *both* backends, deliberately. On CPU the faster spelling at this
+    site reverses with the element type and the component count (see `contract`), and a
+    rule that reverses is not a rule -- so this spec does not get a platform branch.
+    """
+    A = jnp.ones((64, 2, 4)) if spec.startswith("in") else jnp.ones((64, 4))
+    B = jnp.ones((64, 4, 3))
+    traced = jax.jit(jax.vmap(lambda a, b: tk.contract(spec, a, b))).trace(A, B)
+
+    for platform in ("cpu", "cuda"):
+        text = traced.lower(lowering_platforms=(platform,)).as_text()
+        assert text.count("dot_general") == 0
+        assert text.count("stablehlo.multiply") == 1
+
+
+def test_contract_matmul_branches_agree_where_it_dispatches():
+    """A backend-dependent spelling is only safe if the spellings agree. They do at the
+    one spec that dispatches -- and would not for the node contractions, which is a
+    second reason those are pinned to one spelling.
+    """
+    rng = np.random.default_rng(11)
+    A = jnp.asarray(rng.random((2, 4)))
+    B = jnp.asarray(rng.random((4, 3)))
+    assert jnp.allclose(A @ B, tk.tensordot(A, B))
+
+
+def test_every_contract_spec_in_the_library_is_in_the_table():
+    """A spec is a string, so a typo in one is a runtime error on a path that may only
+    run for one element type in one dimension. This reads every ``tk.contract`` literal
+    in the package and resolves it, so a bad spec fails here rather than the first time
+    someone meshes with a Line3.
+    """
+    package = pathlib.Path(tk.__file__).parent
+    literals = {
+        match.group(1)
+        for path in package.rglob("*.py")
+        for match in re.finditer(r"""tk\.contract\(\s*["']([^"']+)["']""", path.read_text())
+    }
+    assert literals, "found no tk.contract call sites -- has the API been renamed?"
+
+    for spec in sorted(literals):
+        canonical = tk._canonicalise(spec)
+        assert canonical in tk._known_implementations, (
+            f"{spec!r} is used in the package but canonicalises to {canonical!r}, which "
+            "has no entry in _known_implementations"
+        )
+
+
+@pytest.mark.parametrize(
+    ("spec", "a_shape", "b_shape", "einsum"),
+    [
+        ("in,nj->ij", (2, 4), (4, 2), "in,nj->ij"),
+        ("in,n...->i...", (2, 4), (4, 3), "in,nc->ic"),
+        ("n,n...->...", (4,), (4, 3), "n,nc->c"),
+        ("n,nj->j", (4,), (4, 2), "n,nj->j"),
+    ],
+)
+def test_contract_differentiates_like_the_einsum_it_names(spec, a_shape, b_shape, einsum):
+    """The whole library reaches these through jax.grad, so agreeing on the primal is
+    only half the contract. `platform_dependent` in particular puts a branch between the
+    caller and the arithmetic, and that has to be transparent to AD.
+    """
+    rng = np.random.default_rng(12)
+    A = jnp.asarray(rng.random(a_shape))
+    B = jnp.asarray(rng.random(b_shape))
+
+    mine = jax.grad(lambda a, b: tk.contract(spec, a, b).sum(), argnums=(0, 1))(A, B)
+    reference = jax.grad(lambda a, b: jnp.einsum(einsum, a, b).sum(), argnums=(0, 1))(A, B)
+    for got, want in zip(mine, reference):
+        assert jnp.allclose(got, want)
+
+
+@pytest.mark.parametrize(
+    ("spec", "a_shape", "b_shape", "einsum"),
+    [
+        ("in,nj->ij", (2, 4), (4, 2), "ein,enj->eij"),
+        ("in,n...->i...", (2, 4), (4, 3), "ein,enc->eic"),
+        ("n,n...->...", (4,), (4, 3), "en,enc->ec"),
+        ("n,nj->j", (4,), (4, 2), "en,enj->ej"),
+    ],
+)
+def test_contract_vmaps_over_elements(spec, a_shape, b_shape, einsum):
+    """How every call site actually reaches it: one element's worth of arithmetic,
+    batched by vmap rather than by hand.
+    """
+    rng = np.random.default_rng(13)
+    A = jnp.asarray(rng.random((16, *a_shape)))
+    B = jnp.asarray(rng.random((16, *b_shape)))
+    batched = jax.vmap(lambda a, b: tk.contract(spec, a, b))(A, B)
+    assert jnp.allclose(batched, jnp.einsum(einsum, A, B))
+
+
+# --------------------------------------------------------------------------------
 # the regression that numerical tests cannot catch
 # --------------------------------------------------------------------------------
 
@@ -148,13 +347,19 @@ def _gemm_ops(hlo: str) -> dict[str, int]:
     "element, dim",
     [(Tri3(), 2), (Quad4(), 2), (Tetrahedron4(), 3), (Hexahedron8(), 3)],
 )
-def test_element_kernels_avoid_the_gemm_path(element, dim):
-    """`Element.gradient` and `get_jacobian`, vmapped over elements, must compile to
-    fused loops -- no dot_general, no cuBLAS, no LU.
+def test_element_kernels_avoid_lapack_and_cublas(element, dim):
+    """`Element.gradient` and `get_jacobian` must never reach LAPACK or cuBLAS.
 
-    If this fails, someone has replaced a `tk.tensordot` / `tk.inv` with `@`,
-    `jnp.einsum("dn,n...->...d", ...)` or `jnp.linalg.inv`. The numbers will still be
-    right; the code will just be far slower. See the module docstring.
+    If this fails, someone has put `jnp.linalg.inv` back in place of `tk.inv` -- an LU
+    factorisation plus a triangular solve, per element, measured 77x slower than the
+    closed form. The numbers stay correct, only the speed changes.
+
+    Note what is deliberately NOT asserted here: the `dot` count. Whether a given
+    contraction becomes a `dot_general` depends on the *call context*, not just the
+    source line. Vmapped directly over a contiguous array, as below, `dNdr @ coords`
+    compiles to a dot; reached through `Operator`, where the operands arrive from a
+    gather, the identical line fuses to none. The dot-free guarantee is therefore
+    asserted at the Operator level, in the test below, which is the path tatva uses.
     """
     rng = np.random.default_rng(4)
     n_nodes = element._reference_nodes().shape[0]
@@ -172,14 +377,24 @@ def test_element_kernels_avoid_the_gemm_path(element, dim):
         lambda c: jax.vmap(lambda b: element.get_jacobian(xi, b))(c), coords
     )
 
-    assert _gemm_ops(grad_hlo) == dict(dot=0, cublas=0, getrf=0, triangular_solve=0)
-    assert _gemm_ops(jac_hlo) == dict(dot=0, cublas=0, getrf=0, triangular_solve=0)
+    for hlo in (grad_hlo, jac_hlo):
+        ops = _gemm_ops(hlo)
+        assert ops["cublas"] == 0
+        assert ops["getrf"] == 0
+        assert ops["triangular_solve"] == 0
 
 
-def test_operator_grad_and_integrate_avoid_the_gemm_path():
-    """Same guarantee one level up, through the Operator entry points."""
-    mesh = Mesh.unit_square(16, 16, type="quad")
-    op = Operator(mesh, Quad4(), cache_weights=False)
+@pytest.mark.parametrize("kind, element", [("quad", Quad4()), ("triangle", Tri3())])
+def test_operator_entry_points_avoid_the_gemm_path(kind, element):
+    """The dot-free guarantee, asserted on the path tatva actually runs.
+
+    Every `Operator` entry point must compile to fused loops. A `dot` here means a
+    contraction slipped back to an einsum -- `Element.gradient`'s node contraction as
+    `jnp.einsum("dn,n...->...d", ...)` measured 54-90 ms against 4.7 ms, and
+    `_integrate_quad_array` as `jnp.einsum("eq...,eq->e...", ...)` cost 4x.
+    """
+    mesh = Mesh.unit_square(16, 16, type=kind)
+    op = Operator(mesh, element, cache_weights=False)
     u = jnp.asarray(np.random.default_rng(5).random((mesh.coords.shape[0], 2)))
 
     for hlo in (
