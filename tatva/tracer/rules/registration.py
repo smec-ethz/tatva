@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from jax import lax
+from jax import custom_derivatives, lax
 
 from tatva.tracer.routing import (
     resolve_dynamic_slice_route,
@@ -24,6 +24,7 @@ from . import (
     elementwise_binary,
     gather_scatter,
     indexing,
+    opaque,
     reductions,
     structural,
 )
@@ -358,6 +359,21 @@ def _register_dot_general(reg: PrimitiveRegistry) -> None:
     )
 
 
+def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
+    # Register rules for opaque primitives if needed
+    for primitive in (
+        lax.linalg.lu_p,
+        lax.linalg.cholesky_p,
+        lax.linalg.eig_p,
+        lax.linalg.eigh_p,
+        lax.linalg.triangular_solve_p,
+        lax.linear_solve_p,
+        custom_derivatives.custom_jvp_call_p,
+        custom_derivatives.custom_vjp_call_p,
+    ):
+        reg.register(primitive, opaque.OPAQUE_NONLINEAR)
+
+
 def _register_unstable_api_rules(reg: PrimitiveRegistry) -> None:
     from jax._src.ad_util import add_any_p
 
@@ -374,6 +390,8 @@ def register_builtin_rules(reg: PrimitiveRegistry) -> None:
     _register_structural_rules(reg)
     _register_routing_rules(reg)
     _register_reduction_rules(reg)
+    _register_dot_general(reg)
+    _register_opaque_rules(reg)
 
     # Register rules for unstable API primitives if enabled
     _register_unstable_api_rules(reg)
