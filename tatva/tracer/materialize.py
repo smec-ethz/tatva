@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,7 @@ from tatva.tracer.analysis import (
     JaxprPlan,
     ScanPlan,
 )
+from tatva.tracer.concrete import CONCRETE_EVALS
 from tatva.tracer.registry import SEMANTICS
 from tatva.tracer.routing import Route
 
@@ -112,28 +114,22 @@ def _execute_primitive(
 ) -> tuple[ConcreteValue, ...]:
     inputs = tuple(
         _required_value(
-            env,
-            atom,
-            context=f"concrete evaluation of {eqn.primitive.name}",
+            env, atom, context=f"concrete evaluation of {eqn.primitive.name}"
         )
         for atom in eqn.invars
     )
 
-    # Planning-time values are ordinary JAX values.
-    bound_inputs = tuple(
-        jnp.asarray(value) if isinstance(value, (np.ndarray, np.generic)) else value
-        for value in inputs
-    )
-
-    result = eqn.primitive.bind(
-        *bound_inputs,
-        **eqn.params,
-    )
-
-    if eqn.primitive.multiple_results:
-        outputs = tuple(result)
+    # these are numpy fast paths for some primitives, but not all. For the rest we fall
+    # back to the primitive's bind method.
+    evaluator = CONCRETE_EVALS.get(eqn.primitive)
+    if evaluator is not None:
+        outputs = evaluator(inputs, eqn.params)
     else:
-        outputs = (result,)
+        print(
+            f"Warning: no concrete evaluator for {eqn.primitive.name}, falling back to bind"
+        )
+        result = eqn.primitive.bind(*inputs, **eqn.params)
+        outputs = tuple(result) if eqn.primitive.multiple_results else (result,)
 
     if len(outputs) != len(eqn.outvars):
         raise RuntimeError(
