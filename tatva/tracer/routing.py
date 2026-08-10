@@ -1,50 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
 import jax.numpy as jnp
 import numpy as np
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
 from tatva.tracer.helpers import _shape_of
-
-if TYPE_CHECKING:
-    from tatva.tracer.rules import ConcreteEnv
-
-
-class Route:
-    pass
-
-
-@dataclass(frozen=True)
-class GatherRoute(Route):
-    source_rows: NDArray[np.int64]  # (n_output,)
-
-
-@dataclass(frozen=True)
-class ScatterRoute(Route):
-    # one entry per flattened update element
-    target_rows: NDArray[np.int64]
-    # optional: only needed if the orig index-producing graph remains live/runtime localized
-    index_rows: NDArray[np.int64] | None = None
+from tatva.tracer.model import (
+    ConcreteEnv,
+    GatherRoute,
+    Route,
+    RouteEnv,
+    ScatterRoute,
+)
 
 
 def resolve_routes(
     eqns: tuple[JaxprEqn, ...],
     concrete: ConcreteEnv,
-) -> dict[JaxprEqn, Route]:
+) -> RouteEnv:
     # Import lazily: rules import Route for their type signatures, while route
     # resolution needs the populated semantic registry only at execution time.
-    from tatva.tracer.rules import SEMANTICS
+    from tatva.tracer.registry import SEMANTICS
 
     routes: dict[JaxprEqn, Route] = {}
 
     for eqn in eqns:
         rule = SEMANTICS.get(eqn.primitive)
-        if rule is None:
-            raise ValueError(f"Primitive {eqn.primitive} has no registered rule.")
 
         route = rule.route(eqn, concrete)
 

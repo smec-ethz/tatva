@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
-from tatva.tracer.rules import SEMANTICS
+from tatva.tracer.registry import SEMANTICS
 
 
 @dataclass(frozen=True)
@@ -53,8 +53,6 @@ def backward_concrete_slice(
 
     for eqn in eqns:
         rule = SEMANTICS.get(eqn.primitive)
-        if rule is None:
-            raise ValueError(f"Primitive {eqn.primitive} has no registered rule.")
 
         for index in rule.concrete_inputs(eqn):
             atom = eqn.invars[index]
@@ -75,3 +73,52 @@ def backward_concrete_slice(
                 required.add(invar)
 
     return frozenset(required), frozenset(concrete_eqns)
+
+
+def dof_value_dependencies(jaxpr: Jaxpr) -> dict[Var, bool]:
+    """Conservative value provenance.
+
+    True means the concrete value may change when the DOF vector changes.
+    This is deliberately different from derivative dependence:
+    stop_gradient(u) is still value-dependent on u.
+    """
+    if not jaxpr.invars:
+        raise ValueError("Expected a DOF-vector input")
+
+    depends: dict[Var, bool] = {}
+
+    depends[jaxpr.invars[0]] = True
+
+    for var in jaxpr.invars[1:]:
+        depends[var] = False
+
+    for var in jaxpr.constvars:
+        depends[var] = False
+
+    for eqn in jaxpr.eqns:
+        output_depends = any(
+            depends[invar] for invar in eqn.invars if isinstance(invar, Var)
+        )
+
+        for outvar in eqn.outvars:
+            if isinstance(outvar, Var):
+                depends[outvar] = output_depends
+
+    return depends
+
+
+def validate_static_concrete_inputs(
+    plan: AnalysisPlan,
+    value_dependencies: dict[Var, bool],
+) -> None:
+    for eqn in plan.eqns:
+        rule = SEMANTICS.get(eqn.primitive)
+
+        for input_index in rule.concrete_inputs(eqn):
+            atom = eqn.invars[input_index]
+
+            if isinstance(atom, Var) and value_dependencies[atom]:
+                raise ValueError(
+                    f"{eqn.primitive.name} requires a static routing value, "
+                    f"but input {input_index} depends on the DOF vector: {atom}"
+                )

@@ -9,7 +9,21 @@ from jax.core import Atom
 from jax.extend.core import ClosedJaxpr, JaxprEqn, Literal, Var
 
 from tatva.tracer.analysis import AnalysisPlan
-from tatva.tracer.rules import ConcreteEnv, ConcreteValue
+from tatva.tracer.model import ConcreteValue
+
+# Separate “concrete” from “route-stable”. concrete.py currently seeds all function
+# inputs, including the DOF vector, so it can happily evaluate indices = f(u) and bake
+# those indices into a route. Numerically concrete does not mean safe to compile
+# statically. Add a tiny forward value-provenance analysis:
+#
+# depends_on_dofs[u] = True
+# depends_on_dofs[other_inputs] = False
+#
+# for eqn:
+#     depends_on_dofs[out] = any(depends_on_dofs[in] for in invars)
+#
+# Importantly, stop_gradient(u) is still value-dependent on u, even though its derivative
+# dependency is zero. Reject a routing operand when depends_on_dofs[index_var] is true.
 
 
 def evaluate_concrete(

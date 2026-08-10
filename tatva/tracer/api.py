@@ -5,14 +5,21 @@ from dataclasses import dataclass
 from typing import Any, Self
 
 import jax
+import scipy.sparse as sps
 from jax import Array
-from jax.core import Atom
-from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
+from jax.extend.core import ClosedJaxpr, Jaxpr
 
+from tatva.tracer.analysis import (
+    AnalysisPlan,
+    analyze,
+    dof_value_dependencies,
+    validate_static_concrete_inputs,
+)
+from tatva.tracer.concrete import evaluate_concrete
+from tatva.tracer.dependencies import DerivativeTrace, trace_derivatives
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.routing import Route
-from tatva.tracer.rules import SEMANTICS
-from tatva.tracer.types import DependencySet, HessianAccumulator
+from tatva.tracer.model import ConcreteEnv, RouteEnv
+from tatva.tracer.routing import resolve_routes
 
 
 @dataclass(frozen=True)
@@ -53,32 +60,66 @@ class CapturedJaxpr:
         return self.closed_jaxpr.outvars
 
 
-def trace_dependencies(captured_jaxpr: CapturedJaxpr) -> Any:
-    # this must seed the input vars with the correct dependency sets
-    dependencies: dict[Var, DependencySet] = {}
-    routes: dict[JaxprEqn, Route] = {}
-    # assume it has a leading dimension of n_dofs
-    n_dofs = _shape_of(captured_jaxpr.invars[0])[0]
-    acc = HessianAccumulator(n_dofs)
+@dataclass(frozen=True)
+class TraceResult:
+    captured: CapturedJaxpr
+    analysis: AnalysisPlan
 
-    def dependency_of(atom: Atom) -> DependencySet:
-        if type(atom) is Literal:
-            return DependencySet.empty(_shape_of(atom), n_dofs)
-        else:
-            return dependencies[atom]
+    concrete: ConcreteEnv
+    routes: RouteEnv
 
-    jaxpr = captured_jaxpr.jaxpr
+    derivatives: DerivativeTrace
 
-    for eqn in jaxpr.eqns:
-        rule = SEMANTICS[eqn.primitive]
-        # where is routes defined eventually? inside the pass?
-        route = routes.get(eqn)
+    @property
+    def hessian(self) -> sps.csr_matrix:
+        return self.derivatives.hessian
 
-        input_deps = tuple(dependency_of(v) for v in eqn.invars)
 
-        rule.hessian(eqn, input_deps, route, acc)
+def trace(captured: CapturedJaxpr) -> TraceResult:
+    jaxpr = captured.jaxpr
 
-        output_deps = rule.dependencies(eqn, input_deps, route)
+    if not jaxpr.invars:
+        raise ValueError("Functional JAXPR has no inputs")
 
-        for var, dep in zip(eqn.outvars, output_deps):
-            dependencies[var] = dep
+    dof_shape = _shape_of(jaxpr.invars[0])
+    if len(dof_shape) != 1:
+        raise ValueError(
+            f"First input must be a flat DOF vector, got shape {dof_shape}"
+        )
+    n_dofs = dof_shape[0]
+
+    # 1. Static structural analysis
+    plan = analyze(jaxpr)
+
+    # 2. Ensure anything baked into routing is independent of u
+    value_dependencies = dof_value_dependencies(jaxpr)
+    validate_static_concrete_inputs(plan, value_dependencies)
+
+    # 3. Evaluate exactly the concrete subgraph needed by routing
+    concrete = evaluate_concrete(
+        captured.closed_jaxpr,
+        captured.flat_args,
+        plan,
+    )
+
+    # 4. Resolve all global-coordinate structural routes
+    routes = resolve_routes(
+        plan.eqns,
+        concrete,
+    )
+
+    # 5. Forward derivative-structure propagation
+    derivatives = trace_derivatives(
+        jaxpr=jaxpr,
+        eqns=plan.eqns,
+        routes=routes,
+        n_dofs=n_dofs,
+    )
+
+    return TraceResult(
+        captured=captured,
+        analysis=plan,
+        concrete=concrete,
+        routes=routes,
+        derivatives=derivatives,
+    )
