@@ -8,10 +8,13 @@ from numpy.typing import NDArray
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import (
     ConcreteEnv,
+    DynamicSliceRoute,
+    DynamicUpdateSliceRoute,
     GatherRoute,
     Route,
     RouteEnv,
     ScatterRoute,
+    SelectNRoute,
 )
 
 
@@ -60,6 +63,99 @@ def resolve_scatter_route(
         return None
 
     return _compute_scatter_route(eqn, np.asarray(indices))
+
+
+def resolve_select_n_route(
+    eqn: JaxprEqn,
+    concrete: ConcreteEnv,
+) -> SelectNRoute | None:
+    if len(eqn.invars) < 2 or not eqn.outvars:
+        return None
+
+    selector = concrete.get(eqn.invars[0])
+    if selector is None:
+        return None
+
+    output_shape = _shape_of(eqn.outvars[0])
+
+    selected = np.broadcast_to(np.asarray(selector), output_shape).astype(
+        np.int64, copy=False
+    )
+    n_cases = len(eqn.invars) - 1
+
+    if np.any(selected < 0) or np.any(selected >= n_cases):
+        return None
+
+    return SelectNRoute(selected.ravel())
+
+
+def resolve_dynamic_slice_route(
+    eqn: JaxprEqn,
+    concrete: ConcreteEnv,
+) -> DynamicSliceRoute | None:
+    if len(eqn.invars) < 2 or len(eqn.outvars) != 1:
+        return None
+
+    operand_shape = _shape_of(eqn.invars[0])
+    output_shape = _shape_of(eqn.outvars[0])
+
+    starts = []
+    for var in eqn.invars[1:]:
+        value = concrete.get(var)
+        if value is None:
+            return None
+        starts.append(int(np.asarray(value)))
+
+    # JAX dynamic_slice clips starts into the valid range.
+    max_starts = tuple(dim - size for dim, size in zip(operand_shape, output_shape))
+
+    starts = tuple(
+        min(max(start, 0), max_start) for start, max_start in zip(starts, max_starts)
+    )
+
+    rows = np.arange(int(np.prod(operand_shape)), dtype=np.int64).reshape(operand_shape)
+
+    slices = tuple(
+        slice(start, start + size) for start, size in zip(starts, output_shape)
+    )
+
+    return DynamicSliceRoute(source_rows=rows[slices].ravel())
+
+
+def resolve_dynamic_update_slice_route(
+    eqn: JaxprEqn,
+    concrete: ConcreteEnv,
+) -> DynamicUpdateSliceRoute | None:
+    if len(eqn.invars) < 3 or len(eqn.outvars) != 1:
+        return None
+
+    operand_shape = _shape_of(eqn.invars[0])
+    update_shape = _shape_of(eqn.invars[1])
+
+    starts = []
+    for var in eqn.invars[2:]:
+        value = concrete.get(var)
+        if value is None:
+            return None
+        starts.append(int(np.asarray(value)))
+
+    max_starts = tuple(dim - size for dim, size in zip(operand_shape, update_shape))
+
+    starts = tuple(
+        min(max(start, 0), max_start) for start, max_start in zip(starts, max_starts)
+    )
+
+    update_rows = np.arange(int(np.prod(update_shape)), dtype=np.int64)
+
+    update_coords = np.stack(np.unravel_index(update_rows, update_shape), axis=1)
+
+    target_coords = update_coords + np.asarray(starts, dtype=np.int64)
+
+    target_rows = np.ravel_multi_index(tuple(target_coords.T), operand_shape).astype(
+        np.int64
+    )
+
+    return DynamicUpdateSliceRoute(target_rows=target_rows)
 
 
 def _compute_gather_route(

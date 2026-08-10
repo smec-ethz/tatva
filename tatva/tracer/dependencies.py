@@ -135,6 +135,36 @@ class HessianAccumulator:
             r, c = P.nonzero()
             self._add_coords(r, c)
 
+    def add_paired_cross(
+        self,
+        lhs: DependencySet,
+        lhs_rows: NDArray,
+        rhs: DependencySet,
+        rhs_rows: NDArray,
+    ) -> None:
+        lhs_rows = np.asarray(lhs_rows, dtype=np.int64).ravel()
+        rhs_rows = np.asarray(rhs_rows, dtype=np.int64).ravel()
+
+        if lhs_rows.shape != rhs_rows.shape:
+            raise ValueError(
+                f"lhs_rows shape {lhs_rows.shape} does not match rhs_rows shape "
+                f"{rhs_rows.shape}"
+            )
+
+        if lhs_rows.size == 0:
+            return
+
+        lhs_selected = lhs.csr[lhs_rows]
+        rhs_selected = rhs.csr[rhs_rows]
+
+        if lhs_selected.nnz == 0 or rhs_selected.nnz == 0:
+            return
+
+        cross = (lhs_selected.T @ rhs_selected).tocsr()
+        rows, cols = cross.nonzero()
+        self._add_coords(rows, cols)
+        self._add_coords(cols, rows)
+
     def _add_coords(self, rows: NDArray, cols: NDArray) -> None:
         """Append a chunk of coordinate pairs."""
         if rows.size == 0:

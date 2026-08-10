@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import GatherRoute, ScatterRoute, Shape
+from tatva.tracer.routing import resolve_scatter_route
 from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian
 
 if TYPE_CHECKING:
@@ -129,12 +130,16 @@ SCATTER_BASIC = PrimitiveRule(
         prepare=prepare_scatter,
         dependencies=scatter_accumulate_dependencies,
         hessian=no_hessian,
-    )
+    ),
+    concrete_inputs=scatter_concrete_inputs,
+    route=resolve_scatter_route,
 )
 SCATTER_MUL = PrimitiveRule(
     DerivativeRule(
         prepare=prepare_scatter,
         dependencies=scatter_accumulate_dependencies,
         hessian=scatter_mul_hessian,
-    )
+    ),
+    concrete_inputs=scatter_concrete_inputs,
+    route=resolve_scatter_route,
 )

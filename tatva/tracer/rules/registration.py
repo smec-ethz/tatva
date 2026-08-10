@@ -4,6 +4,12 @@ from typing import TYPE_CHECKING
 
 from jax import lax
 
+from tatva.tracer.routing import (
+    resolve_dynamic_slice_route,
+    resolve_dynamic_update_slice_route,
+    resolve_gather_route,
+    resolve_select_n_route,
+)
 from tatva.tracer.rules.elementwise_binary import ELEMENTWISE_BINARY_BASIC
 from tatva.tracer.rules.elementwise_unary import (
     INTEGER_POW,
@@ -13,7 +19,14 @@ from tatva.tracer.rules.elementwise_unary import (
 from tatva.tracer.rules.structural import RESHAPE_LIKE
 from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian
 
-from . import elementwise_binary, gather_scatter, reductions, structural
+from . import (
+    dot,
+    elementwise_binary,
+    gather_scatter,
+    indexing,
+    reductions,
+    structural,
+)
 from .zero_dependency import IOTA, ZERO_DEPENDENCY
 
 if TYPE_CHECKING:
@@ -262,7 +275,9 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 prepare=gather_scatter.prepare_gather,
                 dependencies=gather_scatter.gather_dependencies,
                 hessian=no_hessian,
-            )
+            ),
+            concrete_inputs=lambda _eqn: (1,),
+            route=resolve_gather_route,
         ),
     )
     for primitive in (
@@ -276,6 +291,46 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
 
     reg.register(lax.scatter_mul_p, gather_scatter.SCATTER_MUL)
 
+    # select_n
+    reg.register(
+        lax.select_n_p,
+        PrimitiveRule(
+            DerivativeRule(
+                indexing.prepare_select_n,
+                indexing.select_n_dependencies,
+                no_hessian,
+            ),
+            concrete_inputs=lambda _eqn: (0,),
+            route=resolve_select_n_route,
+        ),
+    )
+
+    # slicing dynamic
+    reg.register(
+        lax.dynamic_slice_p,
+        PrimitiveRule(
+            DerivativeRule(
+                prepare=indexing.prepare_dynamic_slice,
+                dependencies=indexing.dynamic_slice_dependencies,
+                hessian=no_hessian,
+            ),
+            concrete_inputs=lambda eqn: tuple(range(1, len(eqn.invars))),
+            route=resolve_dynamic_slice_route,
+        ),
+    )
+    reg.register(
+        lax.dynamic_update_slice_p,
+        PrimitiveRule(
+            DerivativeRule(
+                indexing.prepare_dynamic_update_slice,
+                indexing.dynamic_update_slice_dependencies,
+                no_hessian,
+            ),
+            concrete_inputs=lambda eqn: tuple(range(2, len(eqn.invars))),
+            route=resolve_dynamic_update_slice_route,
+        ),
+    )
+
 
 def _register_reduction_rules(reg: PrimitiveRegistry) -> None:
     for primitive in (
@@ -288,6 +343,19 @@ def _register_reduction_rules(reg: PrimitiveRegistry) -> None:
     reg.register(lax.reduce_prod_p, reductions.REDUCE_PROD)
     reg.register(lax.reduce_and_p, reductions.ZERO_REDUCTION)
     reg.register(lax.reduce_or_p, reductions.ZERO_REDUCTION)
+
+
+def _register_dot_general(reg: PrimitiveRegistry) -> None:
+    reg.register(
+        lax.dot_general_p,
+        PrimitiveRule(
+            DerivativeRule(
+                dot.prepare_dot_general,
+                dot.dot_general_dependencies,
+                dot.dot_general_hessian,
+            )
+        ),
+    )
 
 
 def _register_unstable_api_rules(reg: PrimitiveRegistry) -> None:

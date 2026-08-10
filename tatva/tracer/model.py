@@ -32,5 +32,28 @@ class ScatterRoute:
     index_rows: NDArray[np.int64] | None = None
 
 
-type Route = GatherRoute | ScatterRoute
+@dataclass(frozen=True, slots=True)
+class SelectNRoute:
+    # for each output row, which case operand is selected
+    # 0 means eqn.invars[1], 1 means eqn.invars[2], etc.
+    case_indices: NDArray[np.int64]
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicSliceRoute:
+    source_rows: NDArray[np.int64]
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicUpdateSliceRoute:
+    target_rows: NDArray[np.int64]
+
+
+type Route = (
+    GatherRoute
+    | ScatterRoute
+    | SelectNRoute
+    | DynamicSliceRoute
+    | DynamicUpdateSliceRoute
+)
 type RouteEnv = Mapping[JaxprEqn, Route]
