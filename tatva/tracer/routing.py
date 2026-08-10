@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
@@ -8,7 +9,9 @@ from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.rules import SEMANTICS, ConcreteEnv
+
+if TYPE_CHECKING:
+    from tatva.tracer.rules import ConcreteEnv
 
 
 class Route:
@@ -32,6 +35,10 @@ def resolve_routes(
     eqns: tuple[JaxprEqn, ...],
     concrete: ConcreteEnv,
 ) -> dict[JaxprEqn, Route]:
+    # Import lazily: rules import Route for their type signatures, while route
+    # resolution needs the populated semantic registry only at execution time.
+    from tatva.tracer.rules import SEMANTICS
+
     routes: dict[JaxprEqn, Route] = {}
 
     for eqn in eqns:
