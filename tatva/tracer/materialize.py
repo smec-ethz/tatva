@@ -1,3 +1,49 @@
+"""
+Planning-time concrete evaluation and structural route materialization.
+
+This module instantiates a static `JaxprPlan` using planning-time concrete
+values. The result is a hierarchical `JaxprInstance` tree containing the
+resolved structural information required by later tracing phases.
+
+Materialization performs two closely related tasks:
+
+1. Evaluate only those numerical values that static analysis marked as required
+   for planning.
+2. Resolve concrete-dependent structural routes, such as gather, scatter,
+   select, and dynamic-slice routing.
+
+The global DOF input is deliberately unavailable during this phase. Therefore
+any structural route that depends transitively on the current DOF values raises
+`DynamicRoutingError` rather than silently becoming value-dependent.
+
+Nested JAXPRs are materialized recursively:
+
+- call/remat bodies are instantiated once;
+- maps and carry-free scans create independent body instances for each mapped
+  leading-axis position;
+- scans with carry are instantiated in execution order so concrete carry values
+  can flow between iterations.
+
+Each invocation owns its resolved routes. This is necessary for nested repeated
+computations because the same lexical JAXPR equation may have different routes
+at different map or scan iterations.
+
+Cheap planner-native numerical evaluators may be registered in
+`CONCRETE_EVALS`. Unsupported primitives fall back to JAX primitive execution,
+and materialization statistics record native and fallback execution counts.
+
+This module does not propagate derivative sparsity. It produces the resolved
+invocation tree consumed by `derivatives.py`.
+
+Key invariants:
+
+- `None` means a value was not materialized because planning does not require it.
+- A value explicitly required by analysis must be present; otherwise
+  materialization fails.
+- Routes use global tensor coordinates.
+- Nested invocation identity is preserved explicitly in the instance tree.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

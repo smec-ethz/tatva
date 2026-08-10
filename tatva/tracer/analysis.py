@@ -1,3 +1,38 @@
+"""
+Static analysis and hierarchical planning for traced JAXPR programs.
+
+This module analyzes a JAXPR without executing numerical computations. Its main
+output is a tree of `JaxprPlan` objects describing which equations are relevant,
+which values must be available concretely during planning, and how nested JAXPR
+primitives should be interpreted.
+
+The analysis distinguishes ordinary primitives from higher-order/nested
+constructs such as calls, maps, and scans:
+
+- `CallPlan` represents transparent call-like wrappers such as `jit` and remat.
+- `MapPlan` represents independent repeated applications of a body JAXPR,
+  including carry-free scans.
+- `ScanPlan` represents recurrent scans whose carry creates dependencies between
+  iterations.
+
+Concrete requirements are propagated backwards. Primitive rules can request
+specific concrete inputs for route construction, while nested plans propagate
+concrete requirements across JAXPR boundaries. Stateful scans additionally
+solve a fixed point for concrete carry requirements.
+
+This module does not evaluate concrete values, resolve routes, or propagate
+derivative dependencies. Those phases are handled by `materialize.py` and
+`derivatives.py`.
+
+Key invariants:
+
+- Plans are hierarchical and follow the nesting structure of the source JAXPR.
+- Equation indices refer to positions in the original `jaxpr.eqns`.
+- Concrete requirements are expressed at JAXPR input/output boundaries.
+- Carry-free scans are represented as `MapPlan`; only scans with carry become
+  `ScanPlan`.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -265,7 +300,7 @@ def _analyze_scan(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
-) -> ScanPlan:
+) -> ScanPlan | MapPlan:
     nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
 
     num_consts = int(eqn.params.get("num_consts", 0))
