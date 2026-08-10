@@ -9,11 +9,10 @@ from jax import Array
 from jax.core import Atom
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
 
-from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.hessian import HessianAccumulator
 from tatva.tracer.routing import Route
 from tatva.tracer.rules import SEMANTICS
+from tatva.tracer.types import DependencySet, HessianAccumulator
 
 
 @dataclass(frozen=True)
