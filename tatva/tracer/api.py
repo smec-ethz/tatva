@@ -10,6 +10,7 @@ from jax import Array
 from jax.extend.core import ClosedJaxpr, Jaxpr
 
 from tatva.tracer.analysis import JaxprPlan, analyze
+from tatva.tracer.contributions import ContributionTrace, detect_contributions
 from tatva.tracer.derivatives import DerivativeTrace, trace_derivatives
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.materialize import JaxprInstance, materialize_plan
@@ -59,6 +60,7 @@ class TraceResult:
     analysis: JaxprPlan
     resolved: JaxprInstance
     derivatives: DerivativeTrace
+    contributions: ContributionTrace
 
     @property
     def hessian(self) -> sps.csr_matrix:
@@ -94,9 +96,14 @@ def trace(captured: CapturedJaxpr) -> TraceResult:
         n_dofs=n_dofs,
     )
 
+    contributions = detect_contributions(
+        resolved,
+    )
+
     return TraceResult(
         captured=captured,
         analysis=analysis,
         resolved=resolved,
         derivatives=derivatives,
+        contributions=contributions,
     )

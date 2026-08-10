@@ -46,6 +46,7 @@ Key invariants:
 
 from __future__ import annotations
 
+import typing
 from dataclasses import dataclass
 from typing import Any
 
@@ -124,6 +125,23 @@ class JaxprInstance:
     # Concrete values of this frame's outputs.
     # None means "not materialized / unavailable", not numerical None.
     output_values: tuple[ConcreteValue | None, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FrameStep:
+    """One step from a parent JaxprInstance into a nested invocation.
+
+    iteration is None for call-like wrappers and is the logical iteration index for
+    map/scan bodies.
+    """
+
+    eqn_index: int
+    kind: FrameKind
+    iteration: int | None = None
+
+
+type FrameKind = typing.Literal["call", "scan", "map"]
+type FramePath = tuple[FrameStep, ...]
 
 
 def _read(
@@ -574,3 +592,78 @@ def materialize_plan(
         input_values=input_values,
         const_values=tuple(closed_jaxpr.consts),
     )
+
+
+def resolved_eqn(
+    instance: JaxprInstance,
+    eqn_index: int,
+) -> ResolvedEqn:
+    for resolved in instance.eqns:
+        if resolved.plan.index == eqn_index:
+            return resolved
+
+    raise KeyError(f"equation index {eqn_index} is not present in this JaxprInstance")
+
+
+def resolve_frame(
+    root: JaxprInstance,
+    path: FramePath,
+) -> JaxprInstance:
+    """Resolve an invocation-qualified frame path into its JaxprInstance."""
+    current = root
+
+    for step in path:
+        resolved = resolved_eqn(current, step.eqn_index)
+        nested = resolved.nested
+
+        if step.kind == "call":
+            if not isinstance(nested, CallInstance):
+                raise ValueError(
+                    f"frame step expects call at equation {step.eqn_index}"
+                )
+
+            if step.iteration is not None:
+                raise ValueError("call frame step must not specify an iteration")
+
+            current = nested.body
+            continue
+
+        if step.kind == "map":
+            if not isinstance(nested, MapInstance):
+                raise ValueError(f"frame step expects map at equation {step.eqn_index}")
+
+            if step.iteration is None:
+                raise ValueError("map frame step requires an iteration")
+
+            iteration = next(
+                (item for item in nested.iterations if item.index == step.iteration),
+                None,
+            )
+            if iteration is None:
+                raise KeyError(f"map has no iteration {step.iteration}")
+
+            current = iteration.body
+            continue
+
+        if step.kind == "scan":
+            if not isinstance(nested, ScanInstance):
+                raise ValueError(
+                    f"frame step expects scan at equation {step.eqn_index}"
+                )
+
+            if step.iteration is None:
+                raise ValueError("scan frame step requires an iteration")
+
+            iteration = next(
+                (item for item in nested.iterations if item.index == step.iteration),
+                None,
+            )
+            if iteration is None:
+                raise KeyError(f"scan has no iteration {step.iteration}")
+
+            current = iteration.body
+            continue
+
+        raise ValueError(f"unknown frame kind {step.kind!r}")
+
+    return current
