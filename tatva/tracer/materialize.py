@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-import jax.numpy as jnp
 import numpy as np
 from jax.core import Atom
 from jax.extend.core import ClosedJaxpr, JaxprEqn, Literal, Var
@@ -13,6 +11,7 @@ from tatva.tracer.analysis import (
     CallPlan,
     EqnPlan,
     JaxprPlan,
+    MapPlan,
     ScanPlan,
 )
 from tatva.tracer.concrete import CONCRETE_EVALS
@@ -45,7 +44,18 @@ class ScanInstance:
     iterations: tuple[ScanIteration, ...]
 
 
-type NestedInstance = CallInstance | ScanInstance
+@dataclass(frozen=True)
+class MapIteration:
+    index: int
+    body: JaxprInstance
+
+
+@dataclass(frozen=True)
+class MapInstance:
+    iterations: tuple[MapIteration, ...]
+
+
+type NestedInstance = CallInstance | ScanInstance | MapInstance
 
 
 @dataclass(frozen=True)
@@ -261,7 +271,7 @@ def _materialize_call(
     )
 
 
-def _scan_step_value(
+def _leading_axis_value(
     value: ConcreteValue | None,
     index: int,
 ) -> ConcreteValue | None:
@@ -269,9 +279,8 @@ def _scan_step_value(
         return None
 
     array = np.asarray(value)
-
     if array.ndim == 0:
-        raise ValueError("scan input must have a leading scan dimension")
+        raise ValueError("mapped input must have a leading iteration axis")
 
     return array[index]
 
@@ -286,6 +295,9 @@ def _materialize_scan(
     num_consts = scan_plan.num_consts
     num_carry = scan_plan.num_carry
     length = scan_plan.length
+
+    if num_carry <= 0:
+        raise RuntimeError("carry-free scan should have been lowered to MapPlan")
 
     # Outer scan operand ordering:
     #
@@ -321,7 +333,7 @@ def _materialize_scan(
 
     for logical_index in execution_indices:
         x_step_values = tuple(
-            _scan_step_value(value, logical_index) for value in xs_values
+            _leading_axis_value(value, logical_index) for value in xs_values
         )
 
         body_inputs = tuple(const_values) + tuple(carry_values) + x_step_values
@@ -382,6 +394,67 @@ def _materialize_scan(
     )
 
 
+def _materialize_map(
+    eqn_plan: EqnPlan,
+    map_plan: MapPlan,
+    parent_env: ConcreteEnv,
+) -> ResolvedEqn:
+    eqn = eqn_plan.eqn
+
+    values = tuple(_read(parent_env, atom) for atom in eqn.invars)
+    num_consts = map_plan.num_consts
+    const_values = values[:num_consts]
+    mapped_values = values[num_consts:]
+
+    for input_index in map_plan.concrete_inputs:
+        if values[input_index] is None:
+            raise DynamicRoutingError(
+                f"map input {input_index} is required concretely "
+                "for routing inside the map body, but is unavailable"
+            )
+
+    execution_indices = (
+        range(map_plan.length - 1, -1, -1)
+        if map_plan.reverse
+        else range(map_plan.length)
+    )
+    iterations: list[MapIteration] = []
+    outputs_by_index: list[list[ConcreteValue | None]] = [
+        [None] * map_plan.length for _ in eqn.outvars
+    ]
+
+    for logical_index in execution_indices:
+        step_values = tuple(
+            _leading_axis_value(value, logical_index) for value in mapped_values
+        )
+        body_inputs = tuple(const_values) + step_values
+        body = _materialize_jaxpr(
+            map_plan.body, input_values=body_inputs, const_values=map_plan.consts
+        )
+        iterations.append(MapIteration(index=logical_index, body=body))
+
+        for output_index, value in enumerate(body.output_values):
+            if value is not None:
+                outputs_by_index[output_index][logical_index] = value
+
+    # only expose concrete outputs actually requested by parent
+    for output_index in eqn_plan.concrete_outputs:
+        values_for_output = outputs_by_index[output_index]
+        if any(value is None for value in values_for_output):
+            raise DynamicRoutingError(
+                f"map output {output_index} is required concretely "
+                "but one or more iterations did not materialize it"
+            )
+        value = np.stack(
+            [np.asarray(item) for item in values_for_output if item is not None], axis=0
+        )
+        _write(parent_env, eqn.outvars[output_index], value)
+
+    return ResolvedEqn(
+        eqn_plan, route=None, nested=MapInstance(iterations=tuple(iterations))
+    )
+
+
 def _materialize_eqn(
     eqn_plan: EqnPlan,
     env: ConcreteEnv,
@@ -393,6 +466,9 @@ def _materialize_eqn(
 
     if isinstance(nested, ScanPlan):
         return _materialize_scan(eqn_plan, nested, env)
+
+    if isinstance(nested, MapPlan):
+        return _materialize_map(eqn_plan, nested, env)
 
     return _materialize_ordinary(eqn_plan, env)
 

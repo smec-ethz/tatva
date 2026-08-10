@@ -5,7 +5,8 @@ from typing import Literal
 
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
-from tatva.tracer.nested import normalize_nested_jaxpr
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.nested import NestedJaxpr, normalize_nested_jaxpr
 from tatva.tracer.registry import SEMANTICS
 
 
@@ -32,7 +33,18 @@ class ScanPlan:
     concrete_inputs: frozenset[int]
 
 
-type NestedPlan = CallPlan | ScanPlan
+@dataclass(frozen=True)
+class MapPlan:
+    body: JaxprPlan
+    consts: tuple[object, ...]
+    num_consts: int
+    length: int
+    reverse: bool
+    # concrete requirements as seen from the outer map eqn
+    concrete_inputs: frozenset[int]
+
+
+type NestedPlan = CallPlan | ScanPlan | MapPlan
 
 
 @dataclass(frozen=True)
@@ -69,6 +81,10 @@ def _call_kind(eqn: JaxprEqn) -> Literal["jit", "remat"] | None:
 
 def _is_scan(eqn: JaxprEqn) -> bool:
     return eqn.primitive.name == "scan"
+
+
+def _is_map(eqn: JaxprEqn) -> bool:
+    return eqn.primitive.name == "map"
 
 
 def backward_output_slice(
@@ -257,6 +273,11 @@ def _analyze_scan(
     length = int(eqn.params["length"])
     reverse = bool(eqn.params["reverse"])
 
+    if num_carry == 0:
+        return _analyze_carry_free_scan(
+            eqn, nested, concrete_outputs, num_consts, length, reverse
+        )
+
     body = nested.jaxpr
 
     if len(body.invars) != len(eqn.invars):
@@ -371,6 +392,89 @@ def _analyze_scan(
     )
 
 
+def _analyze_carry_free_scan(
+    eqn: JaxprEqn,
+    nested: NestedJaxpr,
+    concrete_outputs: frozenset[int],
+    num_consts: int,
+    length: int,
+    reverse: bool,
+) -> MapPlan:
+    body = nested.jaxpr
+
+    # With no carry:
+    # outer inputs: consts..., xs...
+    # body inputs:  consts..., x_step...
+    # outer outputs: stacked ys...
+    # body outputs:  y_step...
+    if len(body.outvars) != len(eqn.outvars):
+        raise ValueError(
+            f"carry-free scan has {len(eqn.outvars)} outer outputs "
+            f"but body has {len(body.outvars)} outputs"
+        )
+
+    body_plan = analyze(
+        body,
+        concrete_outputs=concrete_outputs,
+    )
+
+    # Body and outer input ordering coincide:
+    # consts stay constant;
+    # every input after num_consts is sliced along leading axis.
+    concrete_inputs = body_plan.concrete_inputs
+
+    return MapPlan(
+        body=body_plan,
+        consts=nested.consts,
+        num_consts=num_consts,
+        length=length,
+        reverse=reverse,
+        concrete_inputs=concrete_inputs,
+    )
+
+
+def _analyze_map(
+    eqn: JaxprEqn,
+    *,
+    concrete_outputs: frozenset[int],
+) -> MapPlan:
+    nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
+
+    # Your historical map representation apparently used the same
+    # scan-style convention. Keep this isolated here because "map"
+    # is not something I would bake into generic code.
+    num_consts = int(eqn.params.get("num_consts", 0))
+
+    body_plan = analyze(
+        nested.jaxpr,
+        concrete_outputs=concrete_outputs,
+    )
+
+    # Prefer explicit length metadata if present.
+    length = eqn.params.get("length")
+
+    if length is None:
+        # Infer from first mapped outer operand.
+        mapped_inputs = eqn.invars[num_consts:]
+        if not mapped_inputs:
+            raise ValueError("map has no mapped inputs from which to infer length")
+
+        shape = _shape_of(mapped_inputs[0])
+        if not shape:
+            raise ValueError("map input must have a leading mapped axis")
+
+        length = shape[0]
+
+    return MapPlan(
+        body=body_plan,
+        consts=nested.consts,
+        num_consts=num_consts,
+        length=int(length),
+        reverse=False,
+        concrete_inputs=body_plan.concrete_inputs,
+    )
+
+
 def _analyze_nested(
     eqn: JaxprEqn,
     *,
@@ -379,17 +483,13 @@ def _analyze_nested(
     call_kind = _call_kind(eqn)
 
     if call_kind is not None:
-        return _analyze_call(
-            eqn,
-            kind=call_kind,
-            concrete_outputs=concrete_outputs,
-        )
+        return _analyze_call(eqn, kind=call_kind, concrete_outputs=concrete_outputs)
 
     if _is_scan(eqn):
-        return _analyze_scan(
-            eqn,
-            concrete_outputs=concrete_outputs,
-        )
+        return _analyze_scan(eqn, concrete_outputs=concrete_outputs)
+
+    if _is_map(eqn):
+        return _analyze_map(eqn, concrete_outputs=concrete_outputs)
 
     return None
 
