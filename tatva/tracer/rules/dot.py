@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import cache
 from typing import Any
 
 import numpy as np
@@ -93,6 +94,118 @@ def _grouped_dependency_union(
     return result
 
 
+@cache
+def _dot_general_map(
+    lhs_shape: tuple[int, ...],
+    rhs_shape: tuple[int, ...],
+    output_shape: tuple[int, ...],
+    dimension_numbers: tuple[
+        tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]
+    ],
+) -> DotGeneralMap:
+    (lhs_contract, rhs_contract, lhs_batch, rhs_batch) = dimension_numbers
+
+    lhs_excluded = set(lhs_contract) | set(lhs_batch)
+    rhs_excluded = set(rhs_contract) | set(rhs_batch)
+
+    lhs_free = tuple(axis for axis in range(len(lhs_shape)) if axis not in lhs_excluded)
+    rhs_free = tuple(axis for axis in range(len(rhs_shape)) if axis not in rhs_excluded)
+
+    # Validate paired dimensions.
+    for la, ra in zip(lhs_batch, rhs_batch):
+        if lhs_shape[la] != rhs_shape[ra]:
+            raise ValueError(
+                f"incompatible batch dimensions: "
+                f"lhs[{la}]={lhs_shape[la]} != "
+                f"rhs[{ra}]={rhs_shape[ra]}"
+            )
+
+    for la, ra in zip(lhs_contract, rhs_contract):
+        if lhs_shape[la] != rhs_shape[ra]:
+            raise ValueError(
+                f"incompatible contracting dimensions: "
+                f"lhs[{la}]={lhs_shape[la]} != "
+                f"rhs[{ra}]={rhs_shape[ra]}"
+            )
+
+    batch_shape = tuple(lhs_shape[a] for a in lhs_batch)
+    lhs_free_shape = tuple(lhs_shape[a] for a in lhs_free)
+    rhs_free_shape = tuple(rhs_shape[a] for a in rhs_free)
+    contract_shape = tuple(lhs_shape[a] for a in lhs_contract)
+
+    expected_output_shape = batch_shape + lhs_free_shape + rhs_free_shape
+
+    if output_shape != expected_output_shape:
+        raise ValueError(
+            f"unexpected dot_general output shape: "
+            f"expected {expected_output_shape}, got {output_shape}"
+        )
+
+    full_shape = output_shape + contract_shape
+
+    n_output = int(np.prod(output_shape, dtype=np.int64))
+    n_contract = int(np.prod(contract_shape, dtype=np.int64))
+
+    # --------------------------------------------------------------
+    # LHS
+    #
+    # Reorder:
+    #
+    #   original
+    #       ↓
+    #   batch, lhs_free, contract
+    #
+    # Then insert singleton rhs_free axes:
+    #
+    #   batch, lhs_free, 1..., contract
+    #
+    # and broadcast across rhs_free.
+    # --------------------------------------------------------------
+    lhs_ids = np.arange(
+        int(np.prod(lhs_shape, dtype=np.int64)), dtype=np.int64
+    ).reshape(lhs_shape)
+
+    lhs_perm = tuple(lhs_batch) + lhs_free + tuple(lhs_contract)
+    lhs_ordered = np.transpose(lhs_ids, lhs_perm)
+    lhs_view_shape = (
+        batch_shape + lhs_free_shape + (1,) * len(rhs_free_shape) + contract_shape
+    )
+    lhs_rows = np.broadcast_to(
+        lhs_ordered.reshape(lhs_view_shape),
+        full_shape,
+    ).reshape(n_output, n_contract)
+
+    # --------------------------------------------------------------
+    # RHS
+    #
+    # Reorder:
+    #
+    #   batch, rhs_free, contract
+    #
+    # Then insert singleton lhs_free axes.
+    # --------------------------------------------------------------
+    rhs_ids = np.arange(
+        int(np.prod(rhs_shape, dtype=np.int64)), dtype=np.int64
+    ).reshape(rhs_shape)
+
+    rhs_perm = tuple(rhs_batch) + rhs_free + tuple(rhs_contract)
+    rhs_ordered = np.transpose(rhs_ids, rhs_perm)
+    rhs_view_shape = (
+        batch_shape + (1,) * len(lhs_free_shape) + rhs_free_shape + contract_shape
+    )
+    rhs_rows = np.broadcast_to(
+        rhs_ordered.reshape(rhs_view_shape),
+        full_shape,
+    ).reshape(n_output, n_contract)
+
+    return DotGeneralMap(
+        lhs_rows=lhs_rows,
+        rhs_rows=rhs_rows,
+        output_shape=output_shape,
+    )
+
+
+# intentionally reference-quality code -> NOT optimized
 def prepare_dot_general(ctx: RuleContext) -> DotGeneralMap:
     eqn = ctx.eqn
 
@@ -102,124 +215,11 @@ def prepare_dot_general(ctx: RuleContext) -> DotGeneralMap:
             f"{len(ctx.input_deps)} inputs and {len(eqn.outvars)} outputs"
         )
 
-    lhs_shape = tuple(ctx.input_deps[0].shape)
-    rhs_shape = tuple(ctx.input_deps[1].shape)
-    output_shape = _shape_of(eqn.outvars[0])
-
-    (
-        lhs_contract,
-        rhs_contract,
-        lhs_batch,
-        rhs_batch,
-    ) = _dot_dimension_numbers(eqn.params["dimension_numbers"])
-
-    if len(lhs_contract) != len(rhs_contract):
-        raise ValueError("lhs/rhs contracting dimensions do not match")
-
-    if len(lhs_batch) != len(rhs_batch):
-        raise ValueError("lhs/rhs batch dimensions do not match")
-
-    # Validate paired contracting dimensions.
-    for lhs_axis, rhs_axis in zip(lhs_contract, rhs_contract):
-        if lhs_shape[lhs_axis] != rhs_shape[rhs_axis]:
-            raise ValueError(
-                "dot_general contracting dimensions have incompatible sizes: "
-                f"lhs axis {lhs_axis} has {lhs_shape[lhs_axis]}, "
-                f"rhs axis {rhs_axis} has {rhs_shape[rhs_axis]}"
-            )
-
-    # Validate paired batch dimensions.
-    for lhs_axis, rhs_axis in zip(lhs_batch, rhs_batch):
-        if lhs_shape[lhs_axis] != rhs_shape[rhs_axis]:
-            raise ValueError(
-                "dot_general batch dimensions have incompatible sizes: "
-                f"lhs axis {lhs_axis} has {lhs_shape[lhs_axis]}, "
-                f"rhs axis {rhs_axis} has {rhs_shape[rhs_axis]}"
-            )
-
-    lhs_excluded = set(lhs_contract) | set(lhs_batch)
-    rhs_excluded = set(rhs_contract) | set(rhs_batch)
-
-    lhs_free = tuple(axis for axis in range(len(lhs_shape)) if axis not in lhs_excluded)
-    rhs_free = tuple(axis for axis in range(len(rhs_shape)) if axis not in rhs_excluded)
-
-    batch_shape = tuple(lhs_shape[axis] for axis in lhs_batch)
-    lhs_free_shape = tuple(lhs_shape[axis] for axis in lhs_free)
-    rhs_free_shape = tuple(rhs_shape[axis] for axis in rhs_free)
-
-    expected_output_shape = batch_shape + lhs_free_shape + rhs_free_shape
-
-    if output_shape != expected_output_shape:
-        raise ValueError(
-            "unexpected dot_general output shape: "
-            f"expected {expected_output_shape}, got {output_shape}"
-        )
-
-    contract_shape = tuple(lhs_shape[axis] for axis in lhs_contract)
-
-    n_output = int(np.prod(output_shape, dtype=np.int64))
-    n_contract = int(np.prod(contract_shape, dtype=np.int64))
-
-    # Empty contraction dimension => every output is an empty sum.
-    if n_contract == 0:
-        return DotGeneralMap(
-            lhs_rows=np.empty((n_output, 0), dtype=np.int64),
-            rhs_rows=np.empty((n_output, 0), dtype=np.int64),
-            output_shape=output_shape,
-        )
-
-    # np.ndindex(()) correctly gives one scalar contraction coordinate.
-    contraction_coords = tuple(np.ndindex(contract_shape))
-
-    lhs_rows = np.empty((n_output, n_contract), dtype=np.int64)
-    rhs_rows = np.empty((n_output, n_contract), dtype=np.int64)
-
-    n_batch = len(batch_shape)
-    n_lhs_free = len(lhs_free_shape)
-
-    for output_row, output_coord in enumerate(np.ndindex(output_shape)):
-        batch_coord = output_coord[:n_batch]
-
-        lhs_free_coord = output_coord[n_batch : n_batch + n_lhs_free]
-
-        rhs_free_coord = output_coord[n_batch + n_lhs_free :]
-
-        for contraction_index, contract_coord in enumerate(contraction_coords):
-            lhs_coord = [0] * len(lhs_shape)
-            rhs_coord = [0] * len(rhs_shape)
-
-            # Batch coordinates.
-            for coord, lhs_axis, rhs_axis in zip(batch_coord, lhs_batch, rhs_batch):
-                lhs_coord[lhs_axis] = coord
-                rhs_coord[rhs_axis] = coord
-
-            # LHS free coordinates.
-            for coord, axis in zip(lhs_free_coord, lhs_free):
-                lhs_coord[axis] = coord
-
-            # RHS free coordinates.
-            for coord, axis in zip(rhs_free_coord, rhs_free):
-                rhs_coord[axis] = coord
-
-            # Matching contraction coordinates.
-            for coord, lhs_axis, rhs_axis in zip(
-                contract_coord, lhs_contract, rhs_contract
-            ):
-                lhs_coord[lhs_axis] = coord
-                rhs_coord[rhs_axis] = coord
-
-            lhs_rows[output_row, contraction_index] = np.ravel_multi_index(
-                tuple(lhs_coord), lhs_shape
-            )
-
-            rhs_rows[output_row, contraction_index] = np.ravel_multi_index(
-                tuple(rhs_coord), rhs_shape
-            )
-
-    return DotGeneralMap(
-        lhs_rows=lhs_rows,
-        rhs_rows=rhs_rows,
-        output_shape=output_shape,
+    return _dot_general_map(
+        tuple(ctx.input_deps[0].shape),
+        tuple(ctx.input_deps[1].shape),
+        _shape_of(eqn.outvars[0]),
+        _dot_dimension_numbers(eqn.params["dimension_numbers"]),
     )
 
 

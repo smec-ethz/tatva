@@ -1,7 +1,6 @@
-import math
-
 import numpy as np
 import scipy.sparse as sps
+from numpy.typing import NDArray
 
 from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.helpers import _shape_of
@@ -21,21 +20,36 @@ def select_n_dependencies(
     prepared: SelectNRoute,
 ) -> tuple[DependencySet, ...]:
     output_shape = _shape_of(ctx.eqn.outvars[0])
-    n_output = int(math.prod(output_shape))
+    n_output = int(np.prod(output_shape))
 
-    cases = [dep.broadcast_to(output_shape) for dep in ctx.input_deps[1:]]
-    if prepared.case_indices.shape != (n_output,):
-        raise ValueError(
-            f"select_n route has {prepared.case_indices.size} rows, expected {n_output}"
-        )
+    cases = tuple(dep.broadcast_to(output_shape) for dep in ctx.input_deps[1:])
 
-    n_dofs = cases[0].csr.shape[1]
-    output = sps.csr_matrix((n_output, n_dofs), dtype=bool)
+    selected_rows: list[NDArray[np.int64]] = []
+    selected_blocks: list[sps.csr_matrix] = []
 
     for case_index, dep in enumerate(cases):
-        rows = np.flatnonzero(prepared.case_indices == case_index)
-        if rows.size:
-            output[rows] = dep.csr[rows]
+        rows = np.flatnonzero(prepared.case_indices == case_index).astype(np.int64)
+
+        if rows.size == 0:
+            continue
+
+        selected_rows.append(rows)
+        selected_blocks.append(dep.csr[rows])
+
+    if not selected_blocks:
+        output = sps.csr_matrix(
+            (n_output, ctx.n_dofs),
+            dtype=bool,
+        )
+    else:
+        rows = np.concatenate(selected_rows)
+        stacked = sps.vstack(
+            selected_blocks,
+            format="csr",
+        )
+        # `rows[i]` says which output position stacked row i belongs to.
+        permutation = np.argsort(rows)
+        output = stacked[permutation]
 
     return (DependencySet(output, output_shape),)
 
