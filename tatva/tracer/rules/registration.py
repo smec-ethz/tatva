@@ -13,7 +13,7 @@ from tatva.tracer.rules.elementwise_unary import (
 from tatva.tracer.rules.structural import RESHAPE_LIKE
 from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian
 
-from . import elementwise_binary, gather_scatter, structural
+from . import elementwise_binary, gather_scatter, reductions, structural
 from .zero_dependency import IOTA, ZERO_DEPENDENCY
 
 if TYPE_CHECKING:
@@ -265,6 +265,29 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             )
         ),
     )
+    for primitive in (
+        lax.scatter_p,
+        lax.scatter_add_p,
+        lax.scatter_sub_p,
+        lax.scatter_min_p,
+        lax.scatter_max_p,
+    ):
+        reg.register(primitive, gather_scatter.SCATTER_BASIC)
+
+    reg.register(lax.scatter_mul_p, gather_scatter.SCATTER_MUL)
+
+
+def _register_reduction_rules(reg: PrimitiveRegistry) -> None:
+    for primitive in (
+        lax.reduce_sum_p,
+        lax.reduce_max_p,
+        lax.reduce_min_p,
+    ):
+        reg.register(primitive, reductions.REDUCE_BASIC)
+
+    reg.register(lax.reduce_prod_p, reductions.REDUCE_PROD)
+    reg.register(lax.reduce_and_p, reductions.ZERO_REDUCTION)
+    reg.register(lax.reduce_or_p, reductions.ZERO_REDUCTION)
 
 
 def _register_unstable_api_rules(reg: PrimitiveRegistry) -> None:
@@ -282,6 +305,7 @@ def register_builtin_rules(reg: PrimitiveRegistry) -> None:
     _register_elementwise_binary_rules(reg)
     _register_structural_rules(reg)
     _register_routing_rules(reg)
+    _register_reduction_rules(reg)
 
     # Register rules for unstable API primitives if enabled
     _register_unstable_api_rules(reg)
