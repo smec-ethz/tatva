@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from jax import lax
+
+from tatva.tracer.rules.elementwise_binary import ELEMENTWISE_BINARY_BASIC
+from tatva.tracer.rules.elementwise_unary import (
+    INTEGER_POW,
+    LINEAR_UNARY,
+    NONLINEAR_UNARY,
+)
+from tatva.tracer.rules.structural import RESHAPE_LIKE
+from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian
+
+from . import elementwise_binary, gather_scatter, structural
+from .zero_dependency import IOTA, ZERO_DEPENDENCY
+
+if TYPE_CHECKING:
+    from tatva.tracer.registry import PrimitiveRegistry
+
+
+def _register_zero_deps_rules(reg: PrimitiveRegistry) -> None:
+    reg.register(lax.iota_p, IOTA)
+    # these have no dependency propagation, but they will have demand and contribution rules defined later
+    for primitive in (
+        lax.lt_p,
+        lax.lt_to_p,
+        lax.le_p,
+        lax.le_to_p,
+        lax.gt_p,
+        lax.ge_p,
+        lax.eq_p,
+        lax.ne_p,
+        lax.and_p,
+        lax.or_p,
+        lax.not_p,
+        lax.xor_p,
+        lax.is_finite_p,
+        # lax.is_nan_p,  # doesn't exist, where is it defined?
+        lax.argmax_p,
+        lax.argmin_p,
+        lax.floor_p,
+        lax.ceil_p,
+        lax.round_p,
+        lax.sign_p,
+    ):
+        reg.register(primitive, ZERO_DEPENDENCY)
+
+    for primitive in (
+        lax.shift_left_p,
+        lax.shift_right_arithmetic_p,
+    ):
+        reg.register(primitive, ZERO_DEPENDENCY)
+
+
+def _register_elementwise_unary_rules(reg: PrimitiveRegistry) -> None:
+    for primitive in (
+        lax.neg_p,
+        lax.abs_p,
+        lax.copy_p,
+        lax.device_put_p,
+        lax.conj_p,
+        lax.real_p,
+        lax.imag_p,
+        lax.convert_element_type_p,
+        lax.stop_gradient_p,  # does it really need dep propagation?
+    ):
+        reg.register(primitive, LINEAR_UNARY)
+
+    # stop_gradient is wrong right now. It is registered under LINEAR_UNARY in
+    # rules/__init__.py:206–217, which propagates its input dependency. It must produce a zero
+    # DependencySet. Otherwise something like sin(stop_gradient(u)) incorrectly generates
+    # Hessian couplings. This also illustrates why value-provenance and derivative-dependence
+    # must be separate analyses.
+
+    for primitive in (
+        lax.sin_p,
+        lax.cos_p,
+        lax.tan_p,
+        lax.asin_p,
+        lax.acos_p,
+        lax.atan_p,
+        lax.exp_p,
+        lax.exp2_p,
+        lax.expm1_p,
+        lax.log_p,
+        lax.log1p_p,
+        # lax.log2_p,
+        lax.sqrt_p,
+        lax.rsqrt_p,
+        lax.cbrt_p,
+        lax.tanh_p,
+        lax.sinh_p,
+        lax.cosh_p,
+        lax.atanh_p,
+        lax.asinh_p,
+        lax.acosh_p,
+        lax.erf_p,
+        lax.erfc_p,
+        # lax.erfinv_p,
+        lax.lgamma_p,
+        lax.digamma_p,
+        lax.logistic_p,
+    ):
+        reg.register(primitive, NONLINEAR_UNARY)
+
+    reg.register(lax.integer_pow_p, INTEGER_POW)
+
+
+def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
+    for primitive in (
+        lax.add_p,
+        lax.sub_p,
+        lax.min_p,
+        lax.max_p,
+    ):
+        reg.register(primitive, ELEMENTWISE_BINARY_BASIC)
+
+    reg.register(
+        lax.mul_p,
+        PrimitiveRule(
+            DerivativeRule(
+                elementwise_binary.prepare_elementwise_binary,
+                elementwise_binary.union_dependencies,
+                elementwise_binary.elementwise_mul_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.div_p,
+        PrimitiveRule(
+            DerivativeRule(
+                elementwise_binary.prepare_elementwise_binary,
+                elementwise_binary.union_dependencies,
+                elementwise_binary.elementwise_div_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.pow_p,
+        PrimitiveRule(
+            DerivativeRule(
+                elementwise_binary.prepare_elementwise_binary,
+                elementwise_binary.union_dependencies,
+                elementwise_binary.elementwise_pow_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.atan2_p,
+        PrimitiveRule(
+            DerivativeRule(
+                elementwise_binary.prepare_elementwise_binary,
+                elementwise_binary.union_dependencies,
+                elementwise_binary.elementwise_atan2_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.rem_p,
+        PrimitiveRule(
+            DerivativeRule(
+                elementwise_binary.prepare_elementwise_binary,
+                elementwise_binary.union_dependencies,
+                no_hessian,
+            )
+        ),
+    )
+
+
+def _register_structural_rules(reg: PrimitiveRegistry) -> None:
+    reg.register(lax.reshape_p, RESHAPE_LIKE)
+    reg.register(lax.squeeze_p, RESHAPE_LIKE)
+    reg.register(
+        lax.broadcast_in_dim_p,
+        PrimitiveRule(
+            DerivativeRule(
+                prepare=structural.prepare_broadcast,
+                dependencies=structural.unary_routed_dependencies,
+                hessian=no_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.transpose_p,
+        PrimitiveRule(
+            DerivativeRule(
+                prepare=structural.prepare_transpose,
+                dependencies=structural.unary_routed_dependencies,
+                hessian=no_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.slice_p,
+        PrimitiveRule(
+            DerivativeRule(
+                prepare=structural.prepare_slice,
+                dependencies=structural.unary_routed_dependencies,
+                hessian=no_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.rev_p,
+        PrimitiveRule(
+            DerivativeRule(
+                prepare=structural.prepare_rev,
+                dependencies=structural.unary_routed_dependencies,
+                hessian=no_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.concatenate_p,
+        PrimitiveRule(
+            DerivativeRule(
+                prepare=structural.prepare_concatenate,
+                dependencies=structural.multi_input_routed_dependencies,
+                hessian=no_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.stack_p,
+        PrimitiveRule(
+            DerivativeRule(
+                prepare=structural.prepare_stack,
+                dependencies=structural.multi_input_routed_dependencies,
+                hessian=no_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.pad_p,
+        PrimitiveRule(
+            DerivativeRule(
+                prepare=structural.prepare_pad,
+                dependencies=structural.multi_input_routed_dependencies,
+                hessian=no_hessian,
+            )
+        ),
+    )
+    reg.register(
+        lax.split_p,
+        PrimitiveRule(
+            DerivativeRule(
+                structural.prepare_split,
+                structural.multi_output_unary_routed_dependencies,
+                no_hessian,
+            )
+        ),
+    )
+
+
+def _register_routing_rules(reg: PrimitiveRegistry) -> None:
+    reg.register(
+        lax.gather_p,
+        PrimitiveRule(
+            DerivativeRule(
+                prepare=gather_scatter.prepare_gather,
+                dependencies=gather_scatter.gather_dependencies,
+                hessian=no_hessian,
+            )
+        ),
+    )
+
+
+def _register_unstable_api_rules(reg: PrimitiveRegistry) -> None:
+    from jax._src.ad_util import add_any_p
+
+    reg.register(
+        add_any_p,
+        ELEMENTWISE_BINARY_BASIC,
+    )
+
+
+def register_builtin_rules(reg: PrimitiveRegistry) -> None:
+    _register_zero_deps_rules(reg)
+    _register_elementwise_unary_rules(reg)
+    _register_elementwise_binary_rules(reg)
+    _register_structural_rules(reg)
+    _register_routing_rules(reg)
+
+    # Register rules for unstable API primitives if enabled
+    _register_unstable_api_rules(reg)
