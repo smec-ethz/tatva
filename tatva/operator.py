@@ -140,6 +140,14 @@ class Operator(Generic[ElementT]):
         coords = self.mesh.coords
         elements = self.mesh.elements
 
+        # JAX rebuilds this pytree with placeholder leaves in a few places for tracing, e.g.
+        # `Traced.lower()`, which unflattens the input tree with `ArgInfo`
+        # objects to build `args_info`. Those carry no shape or dtype, so the checks
+        # below are meaningless there. The real leaves were already validated when the
+        # Operator was first constructed; skip rather than crash on a rebuild.
+        if not hasattr(coords, "ndim") or not hasattr(elements, "ndim"):
+            return
+
         if coords.ndim != 2:
             raise ValueError(
                 "Mesh coordinates must be a 2D array shaped (n_nodes, n_dim)."
@@ -353,7 +361,17 @@ class Operator(Generic[ElementT]):
             element (shape: (n_elements, n_values)).
         """
 
-        return jnp.einsum("eq...,eq->e...", quad_values, self.get_integration_weights())
+        # earlier einsum "eq...,eq->e..." although read like a plain reduction, but with n_quad_points > 1
+        # XLA sees a batched contraction (batch e, contract q) and emits a `dot`, one tiny
+        # GEMM per element. therefore, writing as broadcasted multiplication.
+        weights = self.get_integration_weights()
+
+        # broadcast weights to match the shape of quad_values for elementwise multiplication
+        weights = weights.reshape(
+            weights.shape + (1,) * (quad_values.ndim - weights.ndim)
+        )
+        # we sum over the quadrature points (axis=1) to get the integral per element
+        return jnp.sum(quad_values * weights, axis=1)
 
     def eval(self, nodal_values: jax.Array) -> jax.Array:
         """Evaluates the nodal values at the quadrature points.
