@@ -115,6 +115,37 @@ One exception is not a simplification but a correctness change: ``tk.tensordot``
 ``jnp.tensordot(A, B, axes=1)``, *not* ``jnp.matmul``. The two disagree once ``B``
 is rank 3 or more, silently and with no error.
 
+Say what you mean: ``tk.contract``
+---------------------------------
+The entry point is ``tk.contract(spec, A, B)``, and the spec is an einsum-style
+string naming the contraction::
+
+    J    = tk.contract("in,nj->ij",    dNdr,        nodal_coords)
+    dNdX = tk.contract("ij,jn->in",    tk.inv(J),   dNdr)
+    grad = tk.contract("in,n...->i...", dNdX,       nodal_values)
+    val  = tk.contract("n,n...->...",  N,           nodal_values)
+
+The spec is a *name*, not an instruction. It is never handed to ``jnp.einsum`` --
+every one of these sums over a shared index, so einsum would lower all four to a
+``dot``, which is the thing this module exists to avoid. It is resolved at trace
+time against ``_known_implementationss``, a four-line table holding how each contraction
+is spelled and why.
+
+Why a spec rather than differently-named functions: how a contraction should be
+spelled does not line up with anything visible at the call site. At rank 2,
+``"in,nj->ij"`` and ``"in,n...->i..."`` are the same kind of product and compute
+the same thing, yet they are spelled differently, for reasons that come out of
+measurement rather than shape. A name like ``matmul`` cannot carry that, and a
+reader cannot infer it. The spec says *what*; the table says *how*.
+
+Only one entry consults the backend, ``_MATMUL``: ``@`` on CPU, broadcast on GPU.
+It earns the dispatch because ``@`` wins 5-7x on CPU across every element type with
+no reversal. The node contraction is broadcast on both backends even though the CPU
+picture there is mixed -- ``@`` wins on Tri3/Quad4, loses 1.6x on Hex8 with a scalar
+field, ties on Quad4 with a vector field -- because a rule that reverses with the
+element type and the component count is not a rule. See `contract` for the numbers
+and what always-broadcast costs.
+
 When not to use these
 ---------------------
 These take one tensor, never a stack of tensors -- batching is ``jax.vmap``'s job,
@@ -129,6 +160,7 @@ dimension can grow large, use ``@`` and let XLA call the GEMM -- large matrices 
 the case that machinery was built for, and there it wins.
 """
 
+import jax
 import jax.numpy as jnp
 from jax import Array
 
@@ -185,6 +217,12 @@ def inv(J: Array) -> Array:
 def tensordot(A: Array, B: Array) -> Array:
     """``jnp.tensordot(A, B, axes=1)`` without the dot path.
 
+    The broadcast form on *both* backends, by design -- unlike `matmul`, this does not
+    dispatch on the platform. Call it for the contraction against nodal values over the
+    node axis, where `B` carries the field components; call `matmul` for the two rank-2
+    Jacobian products. See "Which one do I call" in the module docstring, which also
+    records what always-broadcast costs on CPU and why that cost is accepted.
+
     Contracts the last axis of `A` with the first axis of `B` and leaves every other
     axis free: (q,) or (p, q), against (q, ...). That single rule covers both shapes
     tatva needs -- the shape-function contraction ``N . nodal_values``, and the
@@ -222,3 +260,171 @@ def tensordot(A: Array, B: Array) -> Array:
     Ae = A.reshape(A.shape + (1,) * (B.ndim - 1))
     Be = B.reshape((1,) * (A.ndim - 1) + B.shape)
     return jnp.sum(Ae * Be, axis=A.ndim - 1)
+
+
+# --------------------------------------------------------------------------------
+# contract is a replacement for einsum with a fixed set of contractions
+# --------------------------------------------------------------------------------
+#
+
+
+def _dot(A: Array, B: Array) -> Array:
+    """The contraction as XLA's `dot`. Fast where XLA can fuse or fold it away."""
+    return A @ B
+
+
+def _broadcast(A: Array, B: Array) -> Array:
+    """The contraction as broadcast-multiply-reduce. Never lowers to a `dot`.
+    Hence never cross the boundary with cublas for GEMM on GPU.
+    """
+    return tensordot(A, B)
+
+
+def _dot_on_cpu_broadcast_elsewhere(A: Array, B: Array) -> Array:
+    """
+    The only spec-dependent dispatch, and the only place a backend is consulted.
+    On CPU, `dot` is fused away by XLA, so we use `@` to avoid the broadcast form.
+    But only for matrix-matrix products: `dot` is not fused for vector-vector or matrix-vector.
+    On GPU, we avoid `dot` altogether and use use _broadcast form instead.
+    """
+    return jax.lax.platform_dependent(A, B, cpu=_dot, default=_broadcast)
+
+
+# Currently in tatva we have four contractions: matmul, vecmat, row_contract, and vec_contract:
+_MATMUL = "ab,bc->ac"  # (p, q) x (q, r): the element Jacobian and the product after it
+_VECMAT = "a,ab->b"  # (q,) x (q, r): the Line2/Line3 tangent vector
+_ROW_CONTRACT = "ab,b...->a..."  # (p, q) x (q, ...): dNdX against nodal values
+_VEC_CONTRACT = "a,a...->..."  # (q,) x (q, ...): N against nodal values
+
+
+_known_implementations = {
+    _MATMUL: _dot_on_cpu_broadcast_elsewhere,  # matrix-matrix: dot on CPU, broadcast otherwise
+    _VECMAT: _dot,  # vector-matrix: dot everywhere
+    _ROW_CONTRACT: _broadcast,  # row-contract: broadcast everywhere
+    _VEC_CONTRACT: _broadcast,  # vec-contract: broadcast everywhere
+}
+
+# (A.ndim, B.ndim); None means "any rank >= 1", i.e. the spec has an ellipsis there.
+_known_ranks = {
+    _MATMUL: (2, 2),
+    _VECMAT: (1, 2),
+    _ROW_CONTRACT: (2, None),
+    _VEC_CONTRACT: (1, None),
+}
+
+
+def _tokenize(term: str) -> list[str]:
+    """Split a spec term into index letters, with ``...`` as a single token.
+    For example, ``"in,n...->i..."`` is split into ``["in", "...", "->", "i..."]``.
+
+    Args:
+        term: The spec term to tokenize.
+
+    Returns:
+        The list of tokens.
+    """
+    tokens, i = [], 0
+    while i < len(term):
+        if term.startswith("...", i):
+            tokens.append("...")
+            i += 3
+        else:
+            tokens.append(term[i])
+            i += 1
+    return tokens
+
+
+def _canonicalise(spec: str) -> str:
+    """Rename index letters in order of first appearance.
+
+    So a call site may use letters that mean something -- ``"in,nj->ij"`` for the
+    Jacobian, ``"in,n...->i..."`` for the node contraction -- while the lookup table
+    holds one entry per *contraction*, not one per spelling.
+    """
+    cleaned = spec.replace(" ", "")
+    if cleaned.count("->") != 1 or cleaned.count(",") != 1:
+        raise ValueError(
+            f"tk.contract could not parse the spec {spec!r}. Expected exactly one ',' "
+            "and one '->', as in 'in,nj->ij'."
+        )
+    lhs, out = cleaned.split("->")
+    a_term, b_term = lhs.split(",")
+
+    renaming: dict[str, str] = {}
+
+    def rename(term: str) -> str:
+        letters = []
+        for token in _tokenize(term):
+            if token == "...":
+                letters.append(token)
+                continue
+            if not token.isalpha():
+                raise ValueError(
+                    f"tk.contract could not parse the spec {spec!r}: {token!r} is not an "
+                    "index letter."
+                )
+            if token not in renaming:
+                renaming[token] = chr(ord("a") + len(renaming))
+            letters.append(renaming[token])
+        return "".join(letters)
+
+    return f"{rename(a_term)},{rename(b_term)}->{rename(out)}"
+
+
+def contract(spec: str, A: Array, B: Array) -> Array:
+    """Contract two element-sized tensors, named by an einsum-style spec.
+
+        J    = tk.contract("in,nj->ij", dNdr, nodal_coords)     # (d, n) x (n, d)
+        dNdX = tk.contract("ij,jn->in", tk.inv(J), dNdr)        # (d, d) x (d, n)
+        grad = tk.contract("in,n...->i...", dNdX, nodal_values)  # over the node axis
+        val  = tk.contract("n,n...->...", N, nodal_values)      # over the node axis
+
+    Index letters are free. They are canonicalised by order of first appearance, so
+    ``"in,nj->ij"`` and ``"pq,qr->pr"`` are the same entry, and a call site may use
+    letters that carry meaning. An unrecognised contraction is refused rather than
+    given a general fallback: a new spec needs a measured decision about how to spell
+    it, which is exactly what this function exists to record.
+
+    Args:
+        spec: einsum-style contraction, e.g. ``"in,nj->ij"``. Must name one of the four
+            supported contractions; letters are arbitrary.
+        A: first operand, a single tensor.
+        B: second operand, a single tensor.
+
+    Returns:
+        The contraction, with axes in the order the spec's output term gives.
+
+    Raises:
+        ValueError: if the spec is unparseable, names a contraction with no measured
+            implementation, or disagrees with the operand shapes.
+    """
+    canonical = _canonicalise(spec)
+    implementation = _known_implementations.get(canonical)
+    if implementation is None:
+        supported = ", ".join(repr(s) for s in _known_implementations)
+        raise ValueError(
+            f"tk.contract has no implementation for {spec!r} (canonically {canonical!r})."
+            f" Supported contractions are {supported}. This is deliberate rather than a "
+            "gap: each entry is a measured decision about how to spell the contraction "
+            "so it does not lower to a `dot`. Add an entry, with the measurement, rather "
+            "than reaching for jnp.einsum -- see the module docstring."
+        )
+
+    expected_a, expected_b = _known_ranks[canonical]
+    got = (A.ndim, B.ndim)
+    if A.ndim != expected_a or (expected_b is not None and B.ndim != expected_b):
+        wanted = f"({expected_a}, {expected_b if expected_b is not None else '>=1'})"
+        raise ValueError(
+            f"tk.contract({spec!r}, ...) wants operand ranks {wanted}, got {got} from "
+            f"shapes {A.shape} and {B.shape}. These take a single tensor each -- batch "
+            "with jax.vmap, which fuses the contraction into the surrounding work "
+            "instead of materialising it."
+        )
+    if A.shape[-1] != B.shape[0]:
+        raise ValueError(
+            f"tk.contract({spec!r}, ...) contracts A's last axis with B's first, but "
+            f"they are {A.shape[-1]} and {B.shape[0]} from shapes {A.shape} and "
+            f"{B.shape}."
+        )
+
+    return implementation(A, B)
