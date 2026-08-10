@@ -1,38 +1,96 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import Literal
 
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
+from tatva.tracer.nested import normalize_nested_jaxpr
 from tatva.tracer.registry import SEMANTICS
 
 
 @dataclass(frozen=True)
-class AnalysisPlan:
-    eqns: tuple[JaxprEqn, ...]
-    concrete_vars: frozenset[Var]
-    concrete_eqns: frozenset[JaxprEqn]
+class CallPlan:
+    kind: Literal["jit", "remat"]
+    body: JaxprPlan
+    consts: tuple[object, ...] = ()
+
+    @property
+    def concrete_inputs(self) -> frozenset[int]:
+        return self.body.concrete_inputs
 
 
-def analyze(jaxpr: Jaxpr) -> AnalysisPlan:
-    relevant_eqns = backward_output_slice(jaxpr)
-    concrete_vars, concrete_eqns = backward_concrete_slice(relevant_eqns)
+@dataclass(frozen=True)
+class ScanPlan:
+    body: JaxprPlan
+    consts: tuple[object, ...]
+    num_consts: int
+    num_carry: int
+    length: int
+    reverse: bool
+    # concrete requirements as seen from the outer scan eqn
+    concrete_inputs: frozenset[int]
 
-    return AnalysisPlan(relevant_eqns, concrete_vars, concrete_eqns)
+
+type NestedPlan = CallPlan | ScanPlan
 
 
-def backward_output_slice(jaxpr: Jaxpr) -> tuple[JaxprEqn, ...]:
-    """Keep exactly the equations that can influence a JAXPR output. Assumes ordinary SSA
-    JAXPR semantics: every Var is produced once."""
+@dataclass(frozen=True)
+class EqnPlan:
+    index: int
+    eqn: JaxprEqn
+    nested: NestedPlan | None
+    # which outputs of this eqn must be available concretely in this jaxpr frame
+    concrete_outputs: frozenset[int]
+
+
+@dataclass(frozen=True)
+class JaxprPlan:
+    jaxpr: Jaxpr
+    # output reachable eqns
+    eqns: tuple[EqnPlan, ...]
+    # inputs of this jaxpr which must be concretely available to materialize routing
+    # inside this frame
+    concrete_inputs: frozenset[int]
+    # outputs that the parent requires concretely
+    concrete_outputs: frozenset[int]
+
+
+def _call_kind(eqn: JaxprEqn) -> Literal["jit", "remat"] | None:
+    name = eqn.primitive.name
+    if name in {"jit", "pjit"}:
+        return "jit"
+
+    if name == "remat2":
+        return "remat"
+
+    return None
+
+
+def _is_scan(eqn: JaxprEqn) -> bool:
+    return eqn.primitive.name == "scan"
+
+
+def backward_output_slice(
+    jaxpr: Jaxpr,
+) -> tuple[tuple[int, JaxprEqn], ...]:
+    """Keep equations that can influence any Jaxpr output.
+
+    Returned indices refer to the original jaxpr.eqns tuple.
+    """
     required: set[Var] = {var for var in jaxpr.outvars if isinstance(var, Var)}
 
-    kept_reversed: list[JaxprEqn] = []
+    kept_reversed: list[tuple[int, JaxprEqn]] = []
 
-    for eqn in reversed(jaxpr.eqns):
+    for index in range(len(jaxpr.eqns) - 1, -1, -1):
+        eqn = jaxpr.eqns[index]
+
         if not any(
             isinstance(outvar, Var) and outvar in required for outvar in eqn.outvars
         ):
             continue
 
-        kept_reversed.append(eqn)
+        kept_reversed.append((index, eqn))
 
         for invar in eqn.invars:
             if isinstance(invar, Var):
@@ -42,83 +100,307 @@ def backward_output_slice(jaxpr: Jaxpr) -> tuple[JaxprEqn, ...]:
     return tuple(kept_reversed)
 
 
-def backward_concrete_slice(
-    eqns: tuple[JaxprEqn, ...],
-) -> tuple[frozenset[Var], frozenset[JaxprEqn]]:
-    """Find variables whose concrete values must be available to resolve structural
-    routing. A primitive seeds this requirement through PrimitiveRule.concrete_inputs. The
-    requirement is then propagated backwards through the producers."""
-    # firsst, seed variables directly requested by structural primitive rules
+def analyze(
+    jaxpr: Jaxpr,
+    *,
+    concrete_outputs: frozenset[int] = frozenset(),
+) -> JaxprPlan:
+    _validate_output_indices(
+        jaxpr,
+        concrete_outputs,
+    )
+
+    relevant = backward_output_slice(jaxpr)
+
+    # Variables whose values must be known concretely in this frame.
     required: set[Var] = set()
 
-    for eqn in eqns:
+    # Seed requirements requested by the parent.
+    for output_index in concrete_outputs:
+        atom = jaxpr.outvars[output_index]
+
+        if isinstance(atom, Var):
+            required.add(atom)
+
+    nested_plans: dict[int, NestedPlan] = {}
+    concrete_outputs_by_eqn: dict[int, frozenset[int]] = {}
+
+    # Walk backwards through this frame.
+    for index, eqn in reversed(relevant):
+        required_outputs = frozenset(
+            output_index
+            for output_index, outvar in enumerate(eqn.outvars)
+            if isinstance(outvar, Var) and outvar in required
+        )
+
+        if required_outputs:
+            concrete_outputs_by_eqn[index] = required_outputs
+
+        # Nested primitive.
+        nested = _analyze_nested(
+            eqn,
+            concrete_outputs=required_outputs,
+        )
+
+        if nested is not None:
+            nested_plans[index] = nested
+
+            # Any child input needed concretely becomes a concrete
+            # requirement on the corresponding outer equation input.
+            for input_index in nested.concrete_inputs:
+                if input_index >= len(eqn.invars):
+                    raise ValueError(
+                        f"nested plan for {eqn.primitive.name} requires "
+                        f"input {input_index}, but equation only has "
+                        f"{len(eqn.invars)} inputs"
+                    )
+
+                atom = eqn.invars[input_index]
+
+                if isinstance(atom, Var):
+                    required.add(atom)
+
+            continue
+
+        # Ordinary primitive.
         rule = SEMANTICS.get(eqn.primitive)
 
-        for index in rule.concrete_inputs(eqn):
-            atom = eqn.invars[index]
+        # A route-aware primitive can explicitly request particular
+        # inputs to be concretely available.
+        for input_index in rule.concrete_inputs(eqn):
+            if input_index < 0 or input_index >= len(eqn.invars):
+                raise ValueError(
+                    f"{eqn.primitive.name}.concrete_inputs returned "
+                    f"invalid input index {input_index}"
+                )
+
+            atom = eqn.invars[input_index]
+
             if isinstance(atom, Var):
                 required.add(atom)
 
-    concrete_eqns: set[JaxprEqn] = set()
+        # If one of this primitive's outputs itself must be concrete,
+        # then evaluating the primitive requires all non-literal inputs.
+        #
+        # This is deliberately distinct from rule.concrete_inputs():
+        #
+        #   rule.concrete_inputs
+        #       inputs needed to resolve this equation's routing
+        #
+        #   required_outputs
+        #       this equation must run in the concrete subgraph because
+        #       a downstream equation needs its value
+        #
+        if required_outputs:
+            for atom in eqn.invars:
+                if isinstance(atom, Var):
+                    required.add(atom)
 
-    # then propagate backwards through the producers
-    for eqn in reversed(eqns):
-        if not any(isinstance(v, Var) and v in required for v in eqn.outvars):
-            continue
+    concrete_inputs = frozenset(
+        input_index
+        for input_index, invar in enumerate(jaxpr.invars)
+        if invar in required
+    )
 
-        concrete_eqns.add(eqn)
+    eqn_plans = tuple(
+        EqnPlan(
+            index=index,
+            eqn=eqn,
+            nested=nested_plans.get(index),
+            concrete_outputs=concrete_outputs_by_eqn.get(index, frozenset()),
+        )
+        for index, eqn in relevant
+    )
 
-        for invar in eqn.invars:
-            if isinstance(invar, Var):
-                required.add(invar)
+    return JaxprPlan(
+        jaxpr=jaxpr,
+        eqns=eqn_plans,
+        concrete_inputs=concrete_inputs,
+        concrete_outputs=concrete_outputs,
+    )
 
-    return frozenset(required), frozenset(concrete_eqns)
 
+def _analyze_call(
+    eqn: JaxprEqn,
+    *,
+    kind: Literal["jit", "remat"],
+    concrete_outputs: frozenset[int],
+) -> CallPlan:
+    nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
 
-def dof_value_dependencies(jaxpr: Jaxpr) -> dict[Var, bool]:
-    """Conservative value provenance.
-
-    True means the concrete value may change when the DOF vector changes.
-    This is deliberately different from derivative dependence:
-    stop_gradient(u) is still value-dependent on u.
-    """
-    if not jaxpr.invars:
-        raise ValueError("Expected a DOF-vector input")
-
-    depends: dict[Var, bool] = {}
-
-    depends[jaxpr.invars[0]] = True
-
-    for var in jaxpr.invars[1:]:
-        depends[var] = False
-
-    for var in jaxpr.constvars:
-        depends[var] = False
-
-    for eqn in jaxpr.eqns:
-        output_depends = any(
-            depends[invar] for invar in eqn.invars if isinstance(invar, Var)
+    if len(nested.jaxpr.outvars) != len(eqn.outvars):
+        raise ValueError(
+            f"{eqn.primitive.name} has {len(eqn.outvars)} outer outputs "
+            f"but nested Jaxpr has {len(nested.jaxpr.outvars)} outputs"
         )
 
-        for outvar in eqn.outvars:
-            if isinstance(outvar, Var):
-                depends[outvar] = output_depends
+    if len(nested.jaxpr.invars) != len(eqn.invars):
+        raise ValueError(
+            f"{eqn.primitive.name} has {len(eqn.invars)} outer inputs "
+            f"but nested Jaxpr has {len(nested.jaxpr.invars)} inputs"
+        )
 
-    return depends
+    body = analyze(nested.jaxpr, concrete_outputs=concrete_outputs)
+
+    return CallPlan(kind=kind, body=body, consts=nested.consts)
 
 
-def validate_static_concrete_inputs(
-    plan: AnalysisPlan,
-    value_dependencies: dict[Var, bool],
+def _analyze_scan(
+    eqn: JaxprEqn,
+    *,
+    concrete_outputs: frozenset[int],
+) -> ScanPlan:
+    nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
+
+    num_consts = int(eqn.params.get("num_consts", 0))
+    num_carry = int(eqn.params["num_carry"])
+    length = int(eqn.params["length"])
+    reverse = bool(eqn.params["reverse"])
+
+    body = nested.jaxpr
+
+    if len(body.invars) != len(eqn.invars):
+        raise ValueError(
+            f"scan has {len(eqn.invars)} outer inputs "
+            f"but body has {len(body.invars)} inputs"
+        )
+
+    if len(body.outvars) != len(eqn.outvars):
+        raise ValueError(
+            f"scan has {len(eqn.outvars)} outer outputs "
+            f"but body has {len(body.outvars)} outputs"
+        )
+
+    if num_consts + num_carry > len(eqn.invars):
+        raise ValueError(
+            "invalid scan metadata: num_consts + num_carry exceeds input count"
+        )
+
+    if num_carry > len(eqn.outvars):
+        raise ValueError("invalid scan metadata: num_carry exceeds output count")
+
+    # ------------------------------------------------------------------
+    # Parent concrete-output requirements
+    #
+    # scan output:
+    #
+    #   carry_final[0:num_carry]
+    #   ys[...]
+    #
+    # body output:
+    #
+    #   carry_next[0:num_carry]
+    #   y_step[...]
+    # ------------------------------------------------------------------
+
+    required_carry_outputs = {
+        output_index for output_index in concrete_outputs if output_index < num_carry
+    }
+
+    required_y_outputs = {
+        output_index for output_index in concrete_outputs if output_index >= num_carry
+    }
+
+    # No iteration means final carry == initial carry.
+    if length == 0:
+        body_plan = analyze(body)
+
+        required_outer_inputs = {
+            num_consts + carry_index for carry_index in required_carry_outputs
+        }
+
+        return ScanPlan(
+            body=body_plan,
+            consts=nested.consts,
+            num_consts=num_consts,
+            num_carry=num_carry,
+            length=length,
+            reverse=reverse,
+            concrete_inputs=frozenset(required_outer_inputs),
+        )
+
+    # ------------------------------------------------------------------
+    # Carry fixed point.
+    #
+    # If routing inside the body requires carry[i] concretely, then the
+    # previous iteration must produce carry_out[i] concretely.
+    #
+    # That additional output requirement can itself require more body
+    # inputs, including other carry components.
+    # ------------------------------------------------------------------
+
+    required_carry = set(required_carry_outputs)
+
+    while True:
+        required_body_outputs = frozenset(required_carry | required_y_outputs)
+
+        body_plan = analyze(
+            body,
+            concrete_outputs=required_body_outputs,
+        )
+
+        required_carry_inputs = {
+            body_input_index - num_consts
+            for body_input_index in body_plan.concrete_inputs
+            if (num_consts <= body_input_index < num_consts + num_carry)
+        }
+
+        expanded = required_carry | required_carry_inputs
+
+        if expanded == required_carry:
+            break
+
+        required_carry = expanded
+
+    # Body inputs and outer scan inputs use the same ordering:
+    #
+    #   consts, carry, xs
+    #
+    # so the body's concrete input requirements directly tell us which
+    # outer scan operands must be concrete.
+    scan_concrete_inputs = body_plan.concrete_inputs
+
+    return ScanPlan(
+        body=body_plan,
+        consts=nested.consts,
+        num_consts=num_consts,
+        num_carry=num_carry,
+        length=length,
+        reverse=reverse,
+        concrete_inputs=scan_concrete_inputs,
+    )
+
+
+def _analyze_nested(
+    eqn: JaxprEqn,
+    *,
+    concrete_outputs: frozenset[int],
+) -> NestedPlan | None:
+    call_kind = _call_kind(eqn)
+
+    if call_kind is not None:
+        return _analyze_call(
+            eqn,
+            kind=call_kind,
+            concrete_outputs=concrete_outputs,
+        )
+
+    if _is_scan(eqn):
+        return _analyze_scan(
+            eqn,
+            concrete_outputs=concrete_outputs,
+        )
+
+    return None
+
+
+def _validate_output_indices(
+    jaxpr: Jaxpr,
+    outputs: frozenset[int],
 ) -> None:
-    for eqn in plan.eqns:
-        rule = SEMANTICS.get(eqn.primitive)
-
-        for input_index in rule.concrete_inputs(eqn):
-            atom = eqn.invars[input_index]
-
-            if isinstance(atom, Var) and value_dependencies[atom]:
-                raise ValueError(
-                    f"{eqn.primitive.name} requires a static routing value, "
-                    f"but input {input_index} depends on the DOF vector: {atom}"
-                )
+    for index in outputs:
+        if index < 0 or index >= len(jaxpr.outvars):
+            raise ValueError(
+                f"Jaxpr output index {index} is invalid for "
+                f"{len(jaxpr.outvars)} outputs"
+            )
