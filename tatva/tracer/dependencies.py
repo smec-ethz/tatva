@@ -6,13 +6,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import scipy.sparse as sps
-from jax.core import Atom
-from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 from numpy.typing import NDArray
 
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.model import RouteEnv, Shape
-from tatva.tracer.semantics import RuleContext
+from tatva.tracer.model import Shape
 
 
 @dataclass
@@ -183,86 +179,3 @@ class HessianAccumulator:
         pat.sum_duplicates()
         pat.data[:] = 1
         return pat
-
-
-@dataclass(frozen=True)
-class DerivativeTrace:
-    dependencies: dict[Var, DependencySet]
-    hessian: sps.csr_matrix
-
-
-def trace_derivatives(
-    jaxpr: Jaxpr,
-    eqns: tuple[JaxprEqn, ...],
-    routes: RouteEnv,
-    n_dofs: int,
-) -> DerivativeTrace:
-    from tatva.tracer.registry import SEMANTICS
-
-    dependencies = _seed_dependencies(jaxpr, n_dofs)
-    acc = HessianAccumulator(n_dofs)
-
-    def dependency_of(atom: Atom) -> DependencySet:
-        if isinstance(atom, Literal):
-            return DependencySet.empty(_shape_of(atom), n_dofs)
-        return dependencies[atom]
-
-    for eqn in eqns:
-        rule = SEMANTICS.get(eqn.primitive)
-
-        input_deps = tuple(dependency_of(atom) for atom in eqn.invars)
-
-        ctx = RuleContext(
-            eqn=eqn,
-            input_deps=input_deps,
-            route=routes.get(eqn),
-            n_dofs=n_dofs,
-        )
-
-        prepared = rule.derivatives.prepare(ctx)
-
-        # Primitive-local second derivative contribution.
-        rule.derivatives.hessian(ctx, prepared, acc)
-
-        # Structural Jacobian propagation.
-        output_deps = rule.derivatives.dependencies(ctx, prepared)
-
-        if len(output_deps) != len(eqn.outvars):
-            raise RuntimeError(
-                f"{eqn.primitive.name} returned {len(output_deps)} dependency "
-                f"sets for {len(eqn.outvars)} outputs"
-            )
-
-        for outvar, dep in zip(eqn.outvars, output_deps):
-            if isinstance(outvar, Var):
-                dependencies[outvar] = dep
-
-    return DerivativeTrace(dependencies=dependencies, hessian=acc.finalize())
-
-
-def _seed_dependencies(
-    jaxpr: Jaxpr,
-    n_dofs: int,
-) -> dict[Var, DependencySet]:
-    env: dict[Var, DependencySet] = {}
-
-    if not jaxpr.invars:
-        raise ValueError("Expected the first JAXPR input to be the DOF vector")
-
-    dof_var = jaxpr.invars[0]
-
-    if _shape_of(dof_var) != (n_dofs,):
-        raise ValueError(
-            f"DOF input must have shape ({n_dofs},), got {_shape_of(dof_var)}"
-        )
-
-    env[dof_var] = DependencySet.singletons(n_dofs)
-
-    # All other arguments are parameters/data, not differentiation variables.
-    for var in jaxpr.invars[1:]:
-        env[var] = DependencySet.empty(_shape_of(var), n_dofs)
-
-    for var in jaxpr.constvars:
-        env[var] = DependencySet.empty(_shape_of(var), n_dofs)
-
-    return env

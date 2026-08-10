@@ -9,17 +9,10 @@ import scipy.sparse as sps
 from jax import Array
 from jax.extend.core import ClosedJaxpr, Jaxpr
 
-from tatva.tracer.analysis import (
-    AnalysisPlan,
-    analyze,
-    dof_value_dependencies,
-    validate_static_concrete_inputs,
-)
-from tatva.tracer.concrete import evaluate_concrete
-from tatva.tracer.dependencies import DerivativeTrace, trace_derivatives
+from tatva.tracer.analysis import JaxprPlan, analyze
+from tatva.tracer.derivatives import DerivativeTrace, trace_derivatives
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.model import ConcreteEnv, RouteEnv
-from tatva.tracer.routing import resolve_routes
+from tatva.tracer.materialize import JaxprInstance, materialize_plan
 
 
 @dataclass(frozen=True)
@@ -63,11 +56,8 @@ class CapturedJaxpr:
 @dataclass(frozen=True)
 class TraceResult:
     captured: CapturedJaxpr
-    analysis: AnalysisPlan
-
-    concrete: ConcreteEnv
-    routes: RouteEnv
-
+    analysis: JaxprPlan
+    resolved: JaxprInstance
     derivatives: DerivativeTrace
 
     @property
@@ -89,37 +79,24 @@ def trace(captured: CapturedJaxpr) -> TraceResult:
     n_dofs = dof_shape[0]
 
     # 1. Static structural analysis
-    plan = analyze(jaxpr)
+    analysis = analyze(jaxpr)
 
-    # 2. Ensure anything baked into routing is independent of u
-    value_dependencies = dof_value_dependencies(jaxpr)
-    validate_static_concrete_inputs(plan, value_dependencies)
-
-    # 3. Evaluate exactly the concrete subgraph needed by routing
-    concrete = evaluate_concrete(
+    # 2. recursive concrete evaluation + route materialization
+    resolved = materialize_plan(
         captured.closed_jaxpr,
         captured.flat_args,
-        plan,
+        analysis,
     )
 
-    # 4. Resolve all global-coordinate structural routes
-    routes = resolve_routes(
-        plan.eqns,
-        concrete,
-    )
-
-    # 5. Forward derivative-structure propagation
+    # 3. recursive derivative propagation
     derivatives = trace_derivatives(
-        jaxpr=jaxpr,
-        eqns=plan.eqns,
-        routes=routes,
+        resolved,
         n_dofs=n_dofs,
     )
 
     return TraceResult(
         captured=captured,
-        analysis=plan,
-        concrete=concrete,
-        routes=routes,
+        analysis=analysis,
+        resolved=resolved,
         derivatives=derivatives,
     )
