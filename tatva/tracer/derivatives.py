@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import scipy.sparse as sps
 from jax.core import Atom
 from jax.extend.core import Literal, Var
 
+from tatva.tracer.analysis import MapPlan, ScanPlan
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.materialize import (
     CallInstance,
     JaxprInstance,
+    MapInstance,
     ResolvedEqn,
     ScanInstance,
 )
@@ -35,7 +38,20 @@ class ScanDerivativeTrace:
     iterations: tuple[ScanIterationDerivativeTrace, ...]
 
 
-type NestedDerivativeTrace = CallDerivativeTrace | ScanDerivativeTrace
+@dataclass(frozen=True)
+class MapIterationDerivativeTrace:
+    index: int
+    body: JaxprDerivativeTrace
+
+
+@dataclass(frozen=True)
+class MapDerivativeTrace:
+    iterations: tuple[MapIterationDerivativeTrace, ...]
+
+
+type NestedDerivativeTrace = (
+    CallDerivativeTrace | ScanDerivativeTrace | MapDerivativeTrace
+)
 
 
 @dataclass(frozen=True)
@@ -149,6 +165,7 @@ def _trace_jaxpr(
                 acc=acc,
                 n_dofs=n_dofs,
             )
+
         elif isinstance(resolved.nested, CallInstance):
             output_deps, nested_trace = _trace_call(
                 resolved=resolved,
@@ -156,8 +173,17 @@ def _trace_jaxpr(
                 acc=acc,
                 n_dofs=n_dofs,
             )
-
             nested_traces[resolved.plan.index] = nested_trace
+
+        elif isinstance(resolved.nested, MapInstance):
+            output_deps, nested_trace = _trace_map(
+                resolved=resolved,
+                input_deps=input_eqn_deps,
+                acc=acc,
+                n_dofs=n_dofs,
+            )
+            nested_traces[resolved.plan.index] = nested_trace
+
         elif isinstance(resolved.nested, ScanInstance):
             output_deps, nested_trace = _trace_scan(
                 resolved=resolved,
@@ -165,8 +191,8 @@ def _trace_jaxpr(
                 acc=acc,
                 n_dofs=n_dofs,
             )
-
             nested_traces[resolved.plan.index] = nested_trace
+
         else:
             raise TypeError(f"unsupported nested instance {type(resolved.nested)!r}")
 
@@ -246,7 +272,7 @@ def _trace_call(
     )
 
 
-def _scan_input_step(
+def _leading_axis_dependency(
     dep: DependencySet,
     index: int,
 ) -> DependencySet:
@@ -270,7 +296,7 @@ def _scan_input_step(
     )
 
 
-def _stack_scan_output_dependencies(
+def _stack_leading_axis_dependencies(
     steps: list[DependencySet],
 ) -> DependencySet:
     if not steps:
@@ -306,13 +332,11 @@ def _trace_scan(
     if not isinstance(nested, ScanInstance):
         raise TypeError("expected ScanInstance")
 
-    if scan_plan is None:
-        raise RuntimeError("ScanInstance has no corresponding ScanPlan")
-
-    from tatva.tracer.analysis import ScanPlan
-
     if not isinstance(scan_plan, ScanPlan):
         raise TypeError("expected ScanPlan")
+
+    if scan_plan.num_carry < 0:
+        raise RuntimeError("carry-free scan should have been lowered to MapPlan")
 
     num_consts = scan_plan.num_consts
     num_carry = scan_plan.num_carry
@@ -356,7 +380,7 @@ def _trace_scan(
         logical_index = iteration.index
 
         x_step_deps = tuple(
-            _scan_input_step(
+            _leading_axis_dependency(
                 dep,
                 logical_index,
             )
@@ -409,7 +433,7 @@ def _trace_scan(
             )
 
         stacked_y.append(
-            _stack_scan_output_dependencies([dep for dep in steps if dep is not None])
+            _stack_leading_axis_dependencies([dep for dep in steps if dep is not None])
         )
 
     return (
@@ -417,4 +441,81 @@ def _trace_scan(
         ScanDerivativeTrace(
             iterations=tuple(iteration_traces),
         ),
+    )
+
+
+def _trace_map(
+    *,
+    resolved: ResolvedEqn,
+    input_deps: tuple[DependencySet, ...],
+    acc: HessianAccumulator,
+    n_dofs: int,
+) -> tuple[
+    tuple[DependencySet, ...],
+    MapDerivativeTrace,
+]:
+    nested = resolved.nested
+    map_plan = resolved.plan.nested
+
+    if not isinstance(nested, MapInstance):
+        raise TypeError("expected MapInstance")
+
+    if not isinstance(map_plan, MapPlan):
+        raise TypeError("expected MapPlan")
+
+    num_consts = map_plan.num_consts
+
+    const_deps = input_deps[:num_consts]
+    mapped_deps = input_deps[num_consts:]
+
+    outputs_by_index: list[list[DependencySet | None]] = [
+        [None] * map_plan.length for _ in resolved.plan.eqn.outvars
+    ]
+
+    iteration_traces: list[MapIterationDerivativeTrace] = []
+
+    for iteration in nested.iterations:
+        logical_index = iteration.index
+        step_deps = tuple(
+            _leading_axis_dependency(dep, logical_index) for dep in mapped_deps
+        )
+        body_inputs = tuple(const_deps) + step_deps
+        body_trace = _trace_jaxpr(
+            instance=iteration.body, input_deps=body_inputs, acc=acc, n_dofs=n_dofs
+        )
+
+        if len(body_trace.output_deps) != len(outputs_by_index):
+            raise RuntimeError(
+                f"mapped body returned "
+                f"{len(body_trace.output_deps)} outputs; "
+                f"expected {len(outputs_by_index)}"
+            )
+
+        for output_index, dep in enumerate(body_trace.output_deps):
+            outputs_by_index[output_index][logical_index] = dep
+
+        iteration_traces.append(
+            MapIterationDerivativeTrace(index=logical_index, body=body_trace)
+        )
+
+    outputs: list[DependencySet] = []
+
+    for output_index, steps in enumerate(outputs_by_index):
+        if map_plan.length == 0:
+            shape = _shape_of(resolved.plan.eqn.outvars[output_index])
+            outputs.append(DependencySet.empty(shape, n_dofs))
+            continue
+
+        if any(dep is None for dep in steps):
+            raise RuntimeError(
+                f"mapped output {output_index} is missing dependency information"
+            )
+
+        outputs.append(
+            _stack_leading_axis_dependencies([dep for dep in steps if dep is not None])
+        )
+
+    return (
+        tuple(outputs),
+        MapDerivativeTrace(iterations=tuple(iteration_traces)),
     )
