@@ -16,7 +16,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax.extend.core import Literal, Var
+from numpy.typing import NDArray
 
+from tatva.tracer.contributions import ContributionTrace
 from tatva.tracer.demand import (
     _FullAxis,
     _IndexAxis,
@@ -42,6 +44,7 @@ from tatva.tracer.lowerings import (
     LoweringContext,
     lower_default,
 )
+from tatva.tracer.partition import OwnedContribution
 
 
 def extract_local_value(
@@ -785,13 +788,154 @@ def _validate_map_output_layout(
         )
 
 
+def _compile_contribution_terms(
+    plan: LocalJaxprPlan,
+    contributions: ContributionTrace,
+    owned: tuple[OwnedContribution, ...],
+) -> tuple[LocalContributionTerm, ...]:
+    roots_by_id = {}
+
+    for root in contributions.roots:
+        if root.id in roots_by_id:
+            raise ValueError(f"duplicate contribution root id {root.id}")
+
+        roots_by_id[root.id] = root
+
+    terms: list[LocalContributionTerm] = []
+
+    for ownership in owned:
+        try:
+            root = roots_by_id[ownership.root_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"ownership references unknown contribution root {ownership.root_id}"
+            ) from exc
+
+        # First executable milestone:
+        #
+        # Contribution detection may eventually place roots inside a
+        # transparent call/remat FramePath. Our current executable environment
+        # exposes root-frame variables only.
+        #
+        # Map/scan contribution roots are deliberately kept outside those
+        # frames by contribution detection.
+        if root.value.path:
+            raise NotImplementedError(
+                "local scalar reconstruction for contribution "
+                f"root {root.id} inside FramePath "
+                f"{root.value.path} is not implemented yet"
+            )
+
+        var = root.value.var
+
+        try:
+            stored_layout = plan.layouts[var]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"contribution root {root.id} variable {var} has no local layout"
+            ) from exc
+
+        owned_layout = TensorLayout.from_demand(ownership.demand)
+        if stored_layout.global_shape != owned_layout.global_shape:
+            raise RuntimeError(
+                f"contribution root {root.id} shape mismatch: "
+                f"stored {stored_layout.global_shape}, "
+                f"owned {owned_layout.global_shape}"
+            )
+
+        # Exact owned contribution rows in global coordinates.
+        owned_local_rows = np.arange(owned_layout.local_size, dtype=np.int64)
+        owned_global_rows = owned_layout.local_rows_to_global_rows(owned_local_rows)
+
+        # Rewrite them into rows of the actual stored local tensor.
+        #
+        # This also verifies that liveness included every owned
+        # contribution entry.
+        try:
+            source_rows = stored_layout.global_rows_to_local_rows(owned_global_rows)
+
+        except ValueError as exc:
+            raise RuntimeError(
+                f"owned contribution root {root.id} "
+                "is not contained in its finalized local layout"
+            ) from exc
+
+        terms.append(
+            LocalContributionTerm(
+                root_id=root.id,
+                part=ownership.part,
+                var=var,
+                coefficient=root.coefficient,
+                source_rows=source_rows,
+                owned_shape=owned_layout.local_shape,
+            )
+        )
+
+    return tuple(terms)
+
+
+def _reconstruct_local_scalar(
+    env: dict[Var, Any],
+    terms: tuple[LocalContributionTerm, ...],
+):
+    total = None
+
+    for term in terms:
+        try:
+            value = env[term.var]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"contribution root {term.root_id} variable {term.var} was not produced"
+            ) from exc
+
+        flat = jnp.ravel(value)
+        selected = flat[jnp.asarray(term.source_rows)]
+        contribution = jnp.asarray(term.coefficient) * jnp.sum(selected)
+        total = contribution if total is None else total + contribution
+
+    if total is None:
+        # A rank can legitimately own no contributions.
+        return jnp.asarray(0.0)
+
+    return total
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class LocalContributionTerm:
+    """One rank-owned contribution to the local scalar objective.
+
+    `source_rows` indexes the flattened tensor stored for `var`.
+
+    The rows correspond exactly to OwnedContribution.demand, so the stored
+    TensorLayout may be a larger structured hull without causing overcounting.
+    """
+
+    root_id: int
+    part: int
+
+    var: Var
+    coefficient: Any
+
+    source_rows: NDArray[np.int64]
+    owned_shape: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        rows = np.asarray(self.source_rows, dtype=np.int64).ravel()
+        if np.any(rows < 0):
+            raise ValueError("contribution source rows must be nonnegative")
+
+        rows = rows.copy()
+        rows.flags.writeable = False
+
+        object.__setattr__(self, "source_rows", rows)
+        object.__setattr__(self, "owned_shape", tuple(int(x) for x in self.owned_shape))
+
+
 @dataclass(frozen=True)
 class LocalExecutable:
     plan: LocalJaxprPlan
-
-    # Original root JAXPR input positions that survive.
     input_indices: tuple[int, ...]
-    output_vars: tuple[Var, ...]
+    contribution_terms: tuple[LocalContributionTerm, ...]
     function: Callable
 
     def pack_global_inputs(
@@ -809,7 +953,6 @@ class LocalExecutable:
         for index in self.input_indices:
             layout = self.plan.input_layouts[index]
             assert layout is not None
-
             result.append(extract_local_value(global_inputs[index], layout))
 
         return tuple(result)
@@ -824,7 +967,8 @@ class LocalExecutable:
 def build_local_executable(
     plan: LocalPlan | LocalJaxprPlan,
     *,
-    output_vars: tuple[Var, ...] | None = None,
+    contributions: ContributionTrace,
+    owned: tuple[OwnedContribution, ...],
     jit: bool = True,
 ) -> LocalExecutable:
     if isinstance(plan, LocalPlan):
@@ -832,40 +976,22 @@ def build_local_executable(
     else:
         root = plan
 
-    jaxpr = root.instance.plan.jaxpr
-
     input_indices = tuple(
         index for index, layout in enumerate(root.input_layouts) if layout is not None
     )
-
-    if output_vars is None:
-        output_vars = tuple(
-            atom
-            for atom, layout in zip(jaxpr.outvars, root.output_layouts)
-            if (layout is not None and isinstance(atom, Var))
-        )
-
-    if not output_vars:
-        raise ValueError(
-            "no root outputs are live; pass output_vars explicitly, "
-            "for example the rank-owned ContributionRoot variables"
-        )
-
-    for var in output_vars:
-        if var not in root.layouts:
-            raise ValueError(f"requested output {var} has no local layout")
+    contribution_terms = _compile_contribution_terms(root, contributions, owned)
 
     def function(
         *local_inputs,
     ):
         env = _execute_frame(root, tuple(local_inputs))
-        return tuple(env[var] for var in output_vars)
+        return _reconstruct_local_scalar(env, contribution_terms)
 
     lowered = jax.jit(function) if jit else function
 
     return LocalExecutable(
         plan=root,
         input_indices=input_indices,
-        output_vars=output_vars,
+        contribution_terms=contribution_terms,
         function=lowered,
     )
