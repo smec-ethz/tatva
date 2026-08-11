@@ -1,15 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import scipy.sparse as sps
+from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
+from tatva.tracer.demand import (
+    AxisSubset,
+    Demand,
+    TensorDemand,
+    _axis_from_indices,
+    _axis_from_range,
+    _FullAxis,
+    _RangeAxis,
+    axis_indices,
+    demand_axes,
+    demand_rows,
+)
 from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian, no_prepare
+from tatva.tracer.semantics import (
+    DemandContext,
+    DerivativeRule,
+    PrimitiveRule,
+    no_hessian,
+    no_prepare,
+)
 
 if TYPE_CHECKING:
     from tatva.tracer.semantics import RuleContext
@@ -202,21 +221,19 @@ def prepare_concatenate(ctx: RuleContext) -> MultiInputRowMap:
     )
 
 
-def prepare_stack(ctx: RuleContext) -> MultiInputRowMap:
-    eqn = ctx.eqn
-
+def _stack_row_map(
+    eqn: JaxprEqn,
+) -> MultiInputRowMap:
     axis = int(eqn.params["axis"])
+    source_shapes = [_shape_of(atom) for atom in eqn.invars]
     output_shape = _shape_of(eqn.outvars[0])
 
     operand_parts = []
     source_parts = []
 
-    for operand_index, dep in enumerate(ctx.input_deps):
-        shape = dep.shape
+    for operand_index, shape in enumerate(source_shapes):
         size = int(np.prod(shape))
-
         operand_parts.append(np.full(shape, operand_index, dtype=np.int64))
-
         source_parts.append(np.arange(size, dtype=np.int64).reshape(shape))
 
     return MultiInputRowMap(
@@ -226,28 +243,34 @@ def prepare_stack(ctx: RuleContext) -> MultiInputRowMap:
     )
 
 
-def prepare_pad(ctx: RuleContext) -> MultiInputRowMap:
-    eqn = ctx.eqn
+def prepare_stack(ctx: RuleContext) -> MultiInputRowMap:
+    if len(ctx.input_deps) == 0:
+        raise ValueError("stack expects at least one input")
 
-    if len(ctx.input_deps) != 2:
-        raise ValueError("pad expects source and padding-value inputs")
+    return _stack_row_map(ctx.eqn)
 
-    source_shape = ctx.input_deps[0].shape
-    output_shape = _shape_of(eqn.outvars[0])
 
+def demand_stack(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    return _multi_input_row_map_demand(ctx, _stack_row_map(ctx.eqn))
+
+
+def _pad_row_map(
+    eqn: JaxprEqn,
+) -> MultiInputRowMap:
     config = eqn.params["padding_config"]
+    source_shape = _shape_of(eqn.invars[0])
 
+    output_shape = _shape_of(eqn.outvars[0])
     n_output = int(np.prod(output_shape))
-
     output_rows = np.arange(n_output, dtype=np.int64)
-
     output_coords = np.stack(
         np.unravel_index(output_rows, output_shape),
         axis=1,
     )
 
     source_coords = np.zeros((n_output, len(source_shape)), dtype=np.int64)
-
     valid_source = np.ones(n_output, dtype=bool)
 
     for axis, (low, _high, interior) in enumerate(config):
@@ -283,18 +306,29 @@ def prepare_pad(ctx: RuleContext) -> MultiInputRowMap:
     )
 
 
-def prepare_split(ctx: RuleContext) -> MultiOutputUnaryMap:
-    if len(ctx.input_deps) != 1:
-        raise ValueError("split expects one input")
+def prepare_pad(ctx: RuleContext) -> MultiInputRowMap:
+    if len(ctx.input_deps) != 2:
+        raise ValueError("pad expects source and padding-value inputs")
 
     eqn = ctx.eqn
-    source = ctx.input_deps[0]
+    return _pad_row_map(eqn)
 
+
+def demand_pad(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    return _multi_input_row_map_demand(ctx, _pad_row_map(ctx.eqn))
+
+
+def _split_row_map(
+    eqn: JaxprEqn,
+) -> MultiOutputUnaryMap:
     axis = int(eqn.params["axis"])
     sizes = tuple(int(x) for x in eqn.params["sizes"])
+    source_shape = _shape_of(eqn.invars[0])
 
-    index_tensor = np.arange(int(np.prod(source.shape)), dtype=np.int64).reshape(
-        source.shape
+    index_tensor = np.arange(int(np.prod(source_shape)), dtype=np.int64).reshape(
+        source_shape
     )
 
     routes: list[NDArray[np.int64]] = []
@@ -315,6 +349,291 @@ def prepare_split(ctx: RuleContext) -> MultiOutputUnaryMap:
     return MultiOutputUnaryMap(source_rows=tuple(routes), output_shapes=tuple(shapes))
 
 
+def prepare_split(ctx: RuleContext) -> MultiOutputUnaryMap:
+    if len(ctx.input_deps) != 1:
+        raise ValueError("split expects one input")
+
+    return _split_row_map(ctx.eqn)
+
+
+def demand_split(ctx: DemandContext) -> tuple[Demand, ...]:
+    return _multi_output_unary_row_map_demand(ctx, _split_row_map(ctx.eqn))
+
+
+# --------------------------------
+# Demand rules
+# --------------------------------
+
+
+def demand_reshape_squeeze(ctx: DemandContext) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None,)
+    rows = demand_rows(output)
+    return (TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[0]), rows),)
+
+
+def demand_transpose(ctx: DemandContext) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None,)
+
+    permutation = tuple(int(axis) for axis in ctx.eqn.params["permutation"])
+    output_axes = demand_axes(output)
+    input_axes: list[AxisSubset | None] = [None] * len(permutation)
+
+    for output_axis, input_axis in enumerate(permutation):
+        input_axes[input_axis] = output_axes[output_axis]
+
+    if any(axis is None for axis in input_axes):
+        raise RuntimeError("invalid transpose permutation")
+
+    return (
+        TensorDemand.from_axes(
+            _shape_of(ctx.eqn.invars[0]),
+            tuple(axis for axis in input_axes if axis is not None),
+        ),
+    )
+
+
+def demand_broadcast_in_dim(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None,)
+
+    input_shape = _shape_of(ctx.eqn.invars[0])
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    dimensions = tuple(int(axis) for axis in ctx.eqn.params["broadcast_dimensions"])
+
+    if len(dimensions) != len(input_shape):
+        raise ValueError("broadcast_dimensions rank mismatch")
+
+    if not input_shape:
+        return (TensorDemand.full(()),)
+
+    output_axes = demand_axes(output)
+    input_axes = []
+
+    for input_axis, output_axis in enumerate(dimensions):
+        input_extent = input_shape[input_axis]
+        output_extent = output_shape[output_axis]
+
+        if input_extent == output_extent:
+            input_axes.append(output_axes[output_axis])
+        elif input_extent == 1:
+            input_axes.append(_FullAxis())
+        else:
+            raise ValueError("invalid broadcast_in_dim geometry")
+
+    return (
+        TensorDemand.from_axes(
+            input_shape,
+            tuple(input_axes),
+        ),
+    )
+
+
+def demand_slice(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None,)
+
+    input_shape = _shape_of(ctx.eqn.invars[0])
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    starts = tuple(int(x) for x in ctx.eqn.params["start_indices"])
+    strides = ctx.eqn.params.get("strides")
+
+    if strides is None:
+        strides = (1,) * len(input_shape)
+    else:
+        strides = tuple(int(x) for x in strides)
+
+    output_axes = demand_axes(output)
+    input_axes = []
+
+    for input_extent, output_extent, output_axis, start, stride in zip(
+        input_shape, output_shape, output_axes, starts, strides
+    ):
+        if stride == 1 and isinstance(output_axis, _FullAxis):
+            selected = _axis_from_range(input_extent, start, start + output_extent)
+
+        elif stride == 1 and isinstance(output_axis, _RangeAxis):
+            selected = _axis_from_range(
+                input_extent, start + output_axis.start, start + output_axis.stop
+            )
+
+        else:
+            rows = axis_indices(output_axis, extent=output_extent)
+            selected = _axis_from_indices(input_extent, start + rows * stride)
+
+        if selected is None:
+            return (None,)
+
+        input_axes.append(selected)
+
+    return (
+        TensorDemand.from_axes(
+            input_shape,
+            tuple(input_axes),
+        ),
+    )
+
+
+def demand_rev(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None,)
+
+    shape = _shape_of(ctx.eqn.invars[0])
+    reversed_axes = {int(axis) for axis in ctx.eqn.params["dimensions"]}
+    output_axes = demand_axes(output)
+    input_axes = []
+
+    for axis_index, (extent, selection) in enumerate(zip(shape, output_axes)):
+        if axis_index not in reversed_axes:
+            input_axes.append(selection)
+            continue
+
+        if isinstance(selection, _FullAxis):
+            input_axes.append(_FullAxis())
+
+        elif isinstance(selection, _RangeAxis):
+            input_axes.append(
+                _RangeAxis(
+                    start=extent - selection.stop,
+                    stop=extent - selection.start,
+                )
+            )
+
+        else:
+            indices = extent - 1 - selection.indices
+            input_axes.append(cast(AxisSubset, _axis_from_indices(extent, indices)))
+
+    return (
+        TensorDemand.from_axes(
+            shape,
+            tuple(input_axes),
+        ),
+    )
+
+
+def demand_concatenate(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    axis = int(ctx.eqn.params["dimension"])
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    output_axes = demand_axes(output)
+    output_axis = output_axes[axis]
+    result: list[Demand] = []
+    offset = 0
+
+    for atom in ctx.eqn.invars:
+        input_shape = _shape_of(atom)
+        extent = input_shape[axis]
+
+        if isinstance(output_axis, _FullAxis):
+            local_axis: AxisSubset = _FullAxis()
+
+        elif isinstance(output_axis, _RangeAxis):
+            start = max(output_axis.start, offset)
+            stop = min(output_axis.stop, offset + extent)
+
+            if start >= stop:
+                local_axis = None
+            else:
+                local_axis = _axis_from_range(extent, start - offset, stop - offset)
+
+        else:
+            indices = output_axis.indices
+            mask = (indices >= offset) & (indices < offset + extent)
+            local_axis = _axis_from_indices(
+                extent,
+                indices[mask] - offset,
+            )
+
+        if local_axis is None:
+            result.append(None)
+            offset += extent
+            continue
+
+        input_axes = list(output_axes)
+        input_axes[axis] = local_axis
+
+        result.append(
+            TensorDemand.from_axes(
+                input_shape,
+                tuple(input_axes),
+            )
+        )
+        offset += extent
+
+    if offset != output_shape[axis]:
+        raise RuntimeError("concatenate axis geometry mismatch")
+
+    return tuple(result)
+
+
+def _multi_input_row_map_demand(
+    ctx: DemandContext,
+    prepared: MultiInputRowMap,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    output_rows = demand_rows(output)
+    operand_indices = prepared.operand_indices[output_rows]
+    source_rows = prepared.source_rows[output_rows]
+    result: list[Demand] = []
+
+    for operand_index, atom in enumerate(ctx.eqn.invars):
+        mask = operand_indices == operand_index
+
+        rows = source_rows[mask]
+        rows = rows[rows >= 0]
+
+        result.append(TensorDemand.from_rows_hull(_shape_of(atom), rows))
+
+    return tuple(result)
+
+
+def _multi_output_unary_row_map_demand(
+    ctx: DemandContext,
+    prepared: MultiOutputUnaryMap,
+) -> tuple[Demand, ...]:
+    source_parts = []
+
+    for output_index, demand in enumerate(ctx.output_demands):
+        if demand is None:
+            continue
+
+        rows = demand_rows(demand)
+        source_parts.append(prepared.source_rows[output_index][rows])
+
+    if not source_parts:
+        return (None,)
+
+    source_rows = np.unique(np.concatenate(source_parts))
+    source_rows = source_rows[source_rows >= 0]
+
+    return (TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[0]), source_rows),)
+
+
 RESHAPE_LIKE = PrimitiveRule(
-    DerivativeRule(no_prepare, reshape_like_dependencies, no_hessian)
+    DerivativeRule(
+        no_prepare,
+        reshape_like_dependencies,
+        no_hessian,
+    ),
+    demand=demand_reshape_squeeze,
 )

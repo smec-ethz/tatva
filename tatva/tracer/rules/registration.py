@@ -198,7 +198,8 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 prepare=structural.prepare_broadcast,
                 dependencies=structural.unary_routed_dependencies,
                 hessian=no_hessian,
-            )
+            ),
+            demand=structural.demand_broadcast_in_dim,
         ),
     )
     reg.register(
@@ -208,7 +209,8 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 prepare=structural.prepare_transpose,
                 dependencies=structural.unary_routed_dependencies,
                 hessian=no_hessian,
-            )
+            ),
+            demand=structural.demand_transpose,
         ),
     )
     reg.register(
@@ -218,7 +220,8 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 prepare=structural.prepare_slice,
                 dependencies=structural.unary_routed_dependencies,
                 hessian=no_hessian,
-            )
+            ),
+            demand=structural.demand_slice,
         ),
     )
     reg.register(
@@ -228,7 +231,8 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 prepare=structural.prepare_rev,
                 dependencies=structural.unary_routed_dependencies,
                 hessian=no_hessian,
-            )
+            ),
+            demand=structural.demand_rev,
         ),
     )
     reg.register(
@@ -238,7 +242,8 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 prepare=structural.prepare_concatenate,
                 dependencies=structural.multi_input_routed_dependencies,
                 hessian=no_hessian,
-            )
+            ),
+            demand=structural.demand_concatenate,
         ),
     )
     reg.register(
@@ -248,7 +253,8 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 prepare=structural.prepare_stack,
                 dependencies=structural.multi_input_routed_dependencies,
                 hessian=no_hessian,
-            )
+            ),
+            demand=structural.demand_stack,
         ),
     )
     reg.register(
@@ -258,7 +264,8 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 prepare=structural.prepare_pad,
                 dependencies=structural.multi_input_routed_dependencies,
                 hessian=no_hessian,
-            )
+            ),
+            demand=structural.demand_pad,
         ),
     )
     reg.register(
@@ -268,7 +275,8 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 structural.prepare_split,
                 structural.multi_output_unary_routed_dependencies,
                 no_hessian,
-            )
+            ),
+            demand=structural.demand_split,
         ),
     )
 
