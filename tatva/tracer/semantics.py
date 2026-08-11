@@ -2,18 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from jax.extend.core import JaxprEqn
+from jax.extend.core import JaxprEqn, Literal
 
-from tatva.tracer.demand import TensorDemand
+from tatva.tracer.demand import Demand, TensorDemand
+from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import ConcreteEnv, Route
 
 if TYPE_CHECKING:
     from tatva.tracer.dependencies import DependencySet, HessianAccumulator
-
-
-type ContributionDemand = object  # placeholder until contribution analysis is added
 
 
 # --------------------------------
@@ -39,26 +37,18 @@ def no_route(eqn: JaxprEqn, env: ConcreteEnv) -> None:
     return None
 
 
-def stop_contributions(
-    eqn: JaxprEqn,
-    inputs: tuple[ContributionDemand | None, ...],
-    route: Route | None,
-) -> ContributionResult:
-    # conservative: do not attempt to push additive decomposition through unknown
-    # primitives
-    raise NotImplementedError(
-        f"contribution rule not implemented for {eqn.primitive.name}"
-    )
+def conservative_demand(ctx: DemandContext) -> tuple[Demand, ...]:
+    if not any(demand is not None for demand in ctx.output_demands):
+        return tuple(None for _ in ctx.eqn.invars)
 
+    result: list[Demand] = []
+    for atom in ctx.eqn.invars:
+        if isinstance(atom, Literal):
+            result.append(None)
+        else:
+            result.append(TensorDemand.full(_shape_of(atom)))
 
-def conservative_demand(
-    eqn: JaxprEqn,
-    inputs: tuple[TensorDemand, ...],
-    route: Route | None,
-) -> DemandResult:
-    # replace this with implementation that demands Full(shape) for every non-literal
-    # input whenever any output is live
-    raise NotImplementedError(f"demand rule not implemented for {eqn.primitive.name}")
+    return tuple(result)
 
 
 # --------------------------------
@@ -87,16 +77,9 @@ class HessianRule[T](Protocol):
 
 
 @dataclass(frozen=True)
-class ContributionResult:
-    inputs: tuple[ContributionDemand | None, ...]
-    # if decomposition stops at this eqn, these are the newly discovered roots
-    roots: tuple[Any, ...] = ()
-
-
-@dataclass(frozen=True)
 class DemandContext:
     eqn: JaxprEqn
-    output_demands: tuple[TensorDemand | None, ...]
+    output_demands: tuple[Demand, ...]
     route: Route | None
 
 
@@ -107,12 +90,7 @@ class DemandResult:
 
 type ConcreteInputRule = Callable[[JaxprEqn], tuple[int, ...]]
 type RouteRule = Callable[[JaxprEqn, ConcreteEnv], Route | None]
-type ContributionRule = Callable[
-    [JaxprEqn, tuple[ContributionDemand | None, ...], Route | None], ContributionResult
-]
-type DemandRule = Callable[
-    [JaxprEqn, tuple[TensorDemand, ...], Route | None], DemandResult
-]
+type DemandRule = Callable[[DemandContext], tuple[Demand, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,5 +108,5 @@ class PrimitiveRule[T]:
 
     concrete_inputs: ConcreteInputRule = no_concrete_inputs
     route: RouteRule = no_route
-    contributions: ContributionRule = stop_contributions
+
     demand: DemandRule = conservative_demand

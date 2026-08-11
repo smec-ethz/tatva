@@ -10,8 +10,8 @@ from tatva.tracer.routing import (
     resolve_gather_route,
     resolve_select_n_route,
 )
-from tatva.tracer.rules.elementwise_binary import ELEMENTWISE_BINARY_BASIC
-from tatva.tracer.rules.elementwise_unary import (
+from tatva.tracer.rules.elementwise import (
+    ELEMENTWISE_BINARY_BASIC,
     INTEGER_POW,
     LINEAR_UNARY,
     NONLINEAR_UNARY,
@@ -21,7 +21,7 @@ from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian
 
 from . import (
     dot,
-    elementwise_binary,
+    elementwise,
     gather_scatter,
     indexing,
     opaque,
@@ -135,50 +135,55 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
         lax.mul_p,
         PrimitiveRule(
             DerivativeRule(
-                elementwise_binary.prepare_elementwise_binary,
-                elementwise_binary.union_dependencies,
-                elementwise_binary.elementwise_mul_hessian,
-            )
+                elementwise.prepare_elementwise_binary,
+                elementwise.union_dependencies,
+                elementwise.elementwise_mul_hessian,
+            ),
+            demand=elementwise.elementwise_demand,
         ),
     )
     reg.register(
         lax.div_p,
         PrimitiveRule(
             DerivativeRule(
-                elementwise_binary.prepare_elementwise_binary,
-                elementwise_binary.union_dependencies,
-                elementwise_binary.elementwise_div_hessian,
-            )
+                elementwise.prepare_elementwise_binary,
+                elementwise.union_dependencies,
+                elementwise.elementwise_div_hessian,
+            ),
+            demand=elementwise.elementwise_demand,
         ),
     )
     reg.register(
         lax.pow_p,
         PrimitiveRule(
             DerivativeRule(
-                elementwise_binary.prepare_elementwise_binary,
-                elementwise_binary.union_dependencies,
-                elementwise_binary.elementwise_pow_hessian,
-            )
+                elementwise.prepare_elementwise_binary,
+                elementwise.union_dependencies,
+                elementwise.elementwise_pow_hessian,
+            ),
+            demand=elementwise.elementwise_demand,
         ),
     )
     reg.register(
         lax.atan2_p,
         PrimitiveRule(
             DerivativeRule(
-                elementwise_binary.prepare_elementwise_binary,
-                elementwise_binary.union_dependencies,
-                elementwise_binary.elementwise_atan2_hessian,
-            )
+                elementwise.prepare_elementwise_binary,
+                elementwise.union_dependencies,
+                elementwise.elementwise_atan2_hessian,
+            ),
+            demand=elementwise.elementwise_demand,
         ),
     )
     reg.register(
         lax.rem_p,
         PrimitiveRule(
             DerivativeRule(
-                elementwise_binary.prepare_elementwise_binary,
-                elementwise_binary.union_dependencies,
+                elementwise.prepare_elementwise_binary,
+                elementwise.union_dependencies,
                 no_hessian,
-            )
+            ),
+            demand=elementwise.elementwise_demand,
         ),
     )
 
