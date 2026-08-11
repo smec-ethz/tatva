@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -40,6 +41,8 @@ def no_route(eqn: JaxprEqn, env: ConcreteEnv) -> None:
 def conservative_demand(ctx: DemandContext) -> tuple[Demand, ...]:
     if not any(demand is not None for demand in ctx.output_demands):
         return tuple(None for _ in ctx.eqn.invars)
+
+    warnings.warn(f"Conservative demand rule used for {ctx.eqn.primitive.name}. ")
 
     result: list[Demand] = []
     for atom in ctx.eqn.invars:
