@@ -41,6 +41,7 @@ from tatva.tracer.contributions import (
     ContributionTrace,
     ValueRef,
 )
+from tatva.tracer.demand import TensorDemand
 from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.derivatives import (
     CallDerivativeTrace,
@@ -49,7 +50,6 @@ from tatva.tracer.derivatives import (
     MapDerivativeTrace,
     ScanDerivativeTrace,
 )
-from tatva.tracer.liveness import TensorDemand
 from tatva.tracer.model import Shape
 
 
@@ -132,19 +132,16 @@ def _owned_from_axis_owners(
     result: list[OwnedContribution] = []
 
     for part in range(n_parts):
-        indices = np.flatnonzero(owners == part).astype(np.int64, copy=False)
-        if indices.size == 0:
+        indices = np.flatnonzero(owners == part)
+        demand = TensorDemand.axis_selection(root.domain.shape, axis, indices)
+        if demand is None:
             continue
 
         result.append(
             OwnedContribution(
                 root_id=root.id,
                 part=part,
-                demand=TensorDemand.axis_selection(
-                    shape=root.domain.shape,
-                    axis=axis,
-                    indices=tuple(int(i) for i in indices),
-                ),
+                demand=demand,
             )
         )
 
@@ -161,13 +158,10 @@ def _partition_root_contiguous(
     if not root.domain.partition_axes:
         # Nothing structurally partitionable.
         # Assign the complete root to rank zero.
-        return [
-            OwnedContribution(
-                root_id=root.id,
-                part=0,
-                demand=TensorDemand.full(shape),
-            )
-        ]
+        demand = TensorDemand.full(shape)
+        if demand is None:
+            return []
+        return [OwnedContribution(root_id=root.id, part=0, demand=demand)]
 
     axis = root.domain.partition_axes[0]
     extent = shape[axis]
@@ -443,13 +437,10 @@ def _partition_root_by_dependency(
             counts = np.bincount(mapping[active_dofs], minlength=n_parts)
             owner = int(np.flatnonzero(counts == counts.max())[0])
 
-        return [
-            OwnedContribution(
-                root_id=root.id,
-                part=owner,
-                demand=TensorDemand.full(shape),
-            )
-        ]
+        demand = TensorDemand.full(shape)
+        if demand is None:
+            return []
+        return [OwnedContribution(root_id=root.id, part=owner, demand=demand)]
 
     # NOTE: for now, we intentionally use only the first declared axis.
     axis = root.domain.partition_axes[0]

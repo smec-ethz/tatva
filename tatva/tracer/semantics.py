@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from jax.extend.core import JaxprEqn
 
-from tatva.tracer.liveness import TensorDemand
+from tatva.tracer.demand import TensorDemand
 from tatva.tracer.model import ConcreteEnv, Route
 
 if TYPE_CHECKING:
