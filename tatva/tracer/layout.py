@@ -217,8 +217,7 @@ class TensorLayout:
         axis: int,
         indices: ArrayLike,
     ) -> NDArray[np.int64]:
-        """
-        Strict global -> local axis mapping.
+        """Strict global -> local axis mapping.
 
         Raises if any requested global coordinate is not stored locally.
         """
