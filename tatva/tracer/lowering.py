@@ -13,6 +13,8 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax import lax
 from jax.extend.core import Literal, Var
 
 from tatva.tracer.demand import (
@@ -28,6 +30,12 @@ from tatva.tracer.local_plan import (
     LocalMapPlan,
     LocalPlan,
     LocalScanPlan,
+)
+from tatva.tracer.localize import (
+    LocalDynamicSliceRoute,
+    LocalGatherRoute,
+    LocalScatterRoute,
+    LocalSelectNRoute,
 )
 from tatva.tracer.lowerings import (
     LOWERINGS,
@@ -77,6 +85,50 @@ def extract_local_value(
         )
 
     return result
+
+
+def _project_local_value(
+    value,
+    *,
+    source_layout: TensorLayout,
+    target_layout: TensorLayout,
+):
+    """Extract `target_layout` from a tensor currently stored using
+    `source_layout`.
+
+    Both layouts describe the same global tensor. target_layout must be a
+    subset of source_layout.
+
+    This handles the important case where a frame-level layout is a
+    structured hull larger than the exact subset consumed by one child.
+    """
+    if source_layout.global_shape != target_layout.global_shape:
+        raise ValueError(
+            "cannot project between different global tensors: "
+            f"{source_layout.global_shape} != "
+            f"{target_layout.global_shape}"
+        )
+
+    if source_layout.local_shape == target_layout.local_shape and all(
+        np.array_equal(
+            source_layout.global_axis_indices(axis),
+            target_layout.global_axis_indices(axis),
+        )
+        for axis in range(source_layout.ndim)
+    ):
+        return value
+
+    target_local_rows = np.arange(target_layout.local_size, dtype=np.int64)
+    target_global_rows = target_layout.local_rows_to_global_rows(target_local_rows)
+
+    try:
+        source_local_rows = source_layout.global_rows_to_local_rows(target_global_rows)
+
+    except ValueError as exc:
+        raise ValueError("target layout is not contained in source layout") from exc
+
+    result = jnp.ravel(value)[jnp.asarray(source_local_rows)]
+    return jnp.reshape(result, target_layout.local_shape)
 
 
 def _read_atom(
@@ -129,6 +181,26 @@ def _validate_outputs(
             )
 
 
+def _frame_outputs(
+    plan: LocalJaxprPlan,
+    env: dict[Var, Any],
+) -> tuple[Any | None, ...]:
+    result: list[Any | None] = []
+
+    for atom, layout in zip(plan.instance.plan.jaxpr.outvars, plan.output_layouts):
+        if layout is None:
+            result.append(None)
+            continue
+
+        if isinstance(atom, Literal):
+            result.append(atom.val)
+            continue
+
+        result.append(env[atom])
+
+    return tuple(result)
+
+
 def _lower_call(
     plan: LocalEqnPlan,
     inputs: tuple[Any | None, ...],
@@ -139,31 +211,205 @@ def _lower_call(
         raise TypeError("expected LocalCallPlan")
 
     body = nested.body
-
-    if len(inputs) != len(body.input_layouts):
-        raise RuntimeError("call/body input arity mismatch")
-
     child_inputs = tuple(
         value for value, layout in zip(inputs, body.input_layouts) if layout is not None
     )
 
     env = _execute_frame(body, child_inputs)
-    results: list[Any | None] = []
+    return _frame_outputs(body, env)
 
-    for atom, layout in zip(
-        body.instance.plan.jaxpr.outvars,
-        body.output_layouts,
+
+def _lower_map(
+    plan: LocalEqnPlan,
+    inputs: tuple[Any | None, ...],
+) -> tuple[Any | None, ...]:
+    nested = plan.nested
+
+    if not isinstance(nested, LocalMapPlan):
+        raise TypeError("expected LocalMapPlan")
+
+    template = _map_template(nested)
+
+    logical_indices = np.asarray(nested.indices, dtype=np.int64)
+    n_iterations = logical_indices.size
+
+    if n_iterations == 0:
+        raise RuntimeError("live local map has no surviving iterations")
+
+    if len(inputs) != len(template.input_layouts):
+        raise RuntimeError(
+            "map outer/body input arity mismatch: "
+            f"{len(inputs)} != "
+            f"{len(template.input_layouts)}"
+        )
+
+    if nested.num_consts > len(inputs):
+        raise RuntimeError("map num_consts exceeds input arity")
+
+    # Prepare body constants.
+    body_constants: dict[int, Any] = {}
+
+    for input_index in range(nested.num_consts):
+        body_layout = template.input_layouts[input_index]
+        if body_layout is None:
+            continue
+
+        value = inputs[input_index]
+        outer_layout = plan.input_layouts[input_index]
+
+        if value is None:
+            raise RuntimeError(
+                f"map constant {input_index} is live in body but dead in outer frame"
+            )
+
+        if outer_layout is None:
+            raise RuntimeError(f"map constant {input_index} has no outer layout")
+
+        body_constants[input_index] = _project_local_value(
+            value,
+            source_layout=outer_layout,
+            target_layout=body_layout,
+        )
+
+    # Prepare stacked mapped inputs.
+    mapped_input_indices: list[int] = []
+    mapped_values: list[Any] = []
+
+    for input_index in range(nested.num_consts, len(inputs)):
+        body_layout = template.input_layouts[input_index]
+
+        # This map input exists globally but is not required by
+        # the local body.
+        if body_layout is None:
+            continue
+
+        value = inputs[input_index]
+        outer_layout = plan.input_layouts[input_index]
+
+        if value is None:
+            raise RuntimeError(
+                f"mapped input {input_index} is live in body but unavailable"
+            )
+
+        if outer_layout is None:
+            raise RuntimeError(f"mapped input {input_index} has no outer layout")
+
+        stacked = _stack_map_input(
+            value,
+            outer_layout=outer_layout,
+            body_layout=body_layout,
+            logical_indices=logical_indices,
+        )
+
+        mapped_input_indices.append(input_index)
+        mapped_values.append(stacked)
+
+    mapped_slot = {
+        input_index: slot for slot, input_index in enumerate(mapped_input_indices)
+    }
+
+    # Determine live body outputs.
+    live_output_indices = tuple(
+        index
+        for index, layout in enumerate(template.output_layouts)
+        if layout is not None
+    )
+
+    if not live_output_indices:
+        raise RuntimeError("live map has no live body outputs")
+
+    # Every live outer output should correspond to a live body output.
+    for output_index, (outer_layout, body_layout) in enumerate(
+        zip(plan.output_layouts, template.output_layouts)
     ):
-        if layout is None:
-            results.append(None)
+        if outer_layout is None:
+            if body_layout is not None:
+                raise RuntimeError(
+                    f"map output {output_index} is dead outside "
+                    "but live in body template"
+                )
 
-        elif isinstance(atom, Literal):
-            results.append(atom.val)
+            continue
 
+        if body_layout is None:
+            raise RuntimeError(
+                f"map output {output_index} is live outside but dead in body template"
+            )
+
+        _validate_map_output_layout(
+            outer_layout=outer_layout,
+            body_layout=body_layout,
+            logical_indices=logical_indices,
+        )
+
+    # One compiled iteration body.
+    def body(
+        mapped_slices,
+    ):
+        # lax.map passes one slice from every leaf in the xs pytree.
+        if mapped_values:
+            slices = mapped_slices
         else:
-            results.append(env[atom])
+            slices = ()
 
-    return tuple(results)
+        local_inputs: list[Any] = []
+
+        for input_index, body_layout in enumerate(template.input_layouts):
+            if body_layout is None:
+                continue
+
+            if input_index < nested.num_consts:
+                local_inputs.append(body_constants[input_index])
+
+            else:
+                slot = mapped_slot[input_index]
+                local_inputs.append(slices[slot])
+
+        env = _execute_frame(template, tuple(local_inputs))
+        outputs = _frame_outputs(template, env)
+
+        return tuple(outputs[index] for index in live_output_indices)
+
+    # Execute the map.
+    if mapped_values:
+        xs = tuple(mapped_values)
+    else:
+        # lax.map needs a leading iteration axis. The values are ignored.
+        xs = jnp.arange(n_iterations, dtype=jnp.int32)
+
+    mapped_outputs = lax.map(body, xs)
+
+    # Body always returns a tuple, so mapped_outputs is a tuple too.
+    if not isinstance(mapped_outputs, tuple):
+        mapped_outputs = (mapped_outputs,)
+
+    if len(mapped_outputs) != len(live_output_indices):
+        raise RuntimeError("lax.map output arity mismatch")
+
+    by_output_index = {
+        output_index: value
+        for output_index, value in zip(live_output_indices, mapped_outputs)
+    }
+
+    result: list[Any | None] = []
+
+    for output_index, layout in enumerate(plan.output_layouts):
+        if layout is None:
+            result.append(None)
+            continue
+
+        value = by_output_index[output_index]
+
+        if tuple(value.shape) != layout.local_shape:
+            raise RuntimeError(
+                f"localized map output {output_index} "
+                f"has shape {value.shape}; "
+                f"expected {layout.local_shape}"
+            )
+
+        result.append(value)
+
+    return tuple(result)
 
 
 def _lower_nested(
@@ -174,7 +420,7 @@ def _lower_nested(
         return _lower_call(plan, inputs)
 
     if isinstance(plan.nested, LocalMapPlan):
-        raise NotImplementedError("local map lowering is the next nested milestone")
+        return _lower_map(plan, inputs)
 
     if isinstance(plan.nested, LocalScanPlan):
         raise NotImplementedError("local scan lowering is not implemented")
@@ -258,6 +504,285 @@ def _execute_frame(
                 env[outvar] = value
 
     return env
+
+
+def _stack_map_input(
+    value,
+    *,
+    outer_layout: TensorLayout,
+    body_layout: TensorLayout,
+    logical_indices: np.ndarray,
+):
+    """Extract body-local tensors for multiple logical map iterations.
+
+    outer tensor:
+        (global_map_length, *body_global_shape)
+
+    result:
+        (n_local_iterations, *body_layout.local_shape)
+
+    This uses exact global scalar coordinates, so it remains correct when the
+    outer TensorLayout is a structured hull larger than this map's exact
+    requirements.
+    """
+    if outer_layout.ndim < 1:
+        raise ValueError("mapped input must have a leading map axis")
+
+    if outer_layout.global_shape[1:] != body_layout.global_shape:
+        raise ValueError(
+            "mapped input/body global shape mismatch: "
+            f"{outer_layout.global_shape[1:]} != "
+            f"{body_layout.global_shape}"
+        )
+    logical_indices = np.asarray(logical_indices, dtype=np.int64).ravel()
+
+    n_iterations = logical_indices.size
+    body_rows = np.arange(body_layout.local_size, dtype=np.int64)
+    body_global_rows = body_layout.local_rows_to_global_rows(body_rows)
+
+    # Convert body scalar rows to body global coordinates.
+    if body_layout.ndim == 0:
+        # Outer tensor is simply shape (map_length,).
+        outer_global_rows = logical_indices.copy()
+
+    else:
+        body_coords = np.unravel_index(body_global_rows, body_layout.global_shape)
+        leading = np.repeat(logical_indices, body_layout.local_size)
+        trailing = tuple(np.tile(coords, n_iterations) for coords in body_coords)
+
+        outer_global_rows = np.ravel_multi_index(
+            (leading,) + trailing,
+            outer_layout.global_shape,
+        )
+
+    # Those global rows must be present in the enclosing local layout.
+    try:
+        outer_local_rows = outer_layout.global_rows_to_local_rows(outer_global_rows)
+
+    except ValueError as exc:
+        raise ValueError(
+            "mapped body requires values not present in the outer input layout"
+        ) from exc
+
+    selected = jnp.ravel(value)[jnp.asarray(outer_local_rows)]
+
+    return jnp.reshape(
+        selected,
+        (n_iterations, *body_layout.local_shape),
+    )
+
+
+def _same_layout(
+    lhs: TensorLayout | None,
+    rhs: TensorLayout | None,
+) -> bool:
+    if lhs is None or rhs is None:
+        return lhs is rhs
+
+    if lhs.global_shape != rhs.global_shape:
+        return False
+
+    if lhs.local_shape != rhs.local_shape:
+        return False
+
+    return all(
+        np.array_equal(
+            lhs.global_axis_indices(axis),
+            rhs.global_axis_indices(axis),
+        )
+        for axis in range(lhs.ndim)
+    )
+
+
+def _same_layouts(
+    lhs,
+    rhs,
+) -> bool:
+    return len(lhs) == len(rhs) and all(_same_layout(a, b) for a, b in zip(lhs, rhs))
+
+
+def _same_local_route(
+    lhs,
+    rhs,
+) -> bool:
+    if lhs is None or rhs is None:
+        return lhs is rhs
+
+    if type(lhs) is not type(rhs):
+        return False
+
+    if isinstance(lhs, LocalGatherRoute):
+        return lhs.output_shape == rhs.output_shape and np.array_equal(
+            lhs.source_rows, rhs.source_rows
+        )
+
+    if isinstance(lhs, LocalScatterRoute):
+        return (
+            lhs.operand_shape == rhs.operand_shape
+            and lhs.update_shape == rhs.update_shape
+            and lhs.output_shape == rhs.output_shape
+            and np.array_equal(lhs.operand_rows, rhs.operand_rows)
+            and np.array_equal(lhs.operand_output_rows, rhs.operand_output_rows)
+            and np.array_equal(lhs.update_rows, rhs.update_rows)
+            and np.array_equal(lhs.target_rows, rhs.target_rows)
+        )
+
+    if isinstance(lhs, LocalDynamicSliceRoute):
+        return lhs.output_shape == rhs.output_shape and np.array_equal(
+            lhs.source_rows, rhs.source_rows
+        )
+
+    if isinstance(lhs, LocalSelectNRoute):
+        if lhs.output_shape != rhs.output_shape or len(lhs.cases) != len(rhs.cases):
+            return False
+
+        return all(
+            np.array_equal(a.output_rows, b.output_rows)
+            and np.array_equal(a.source_rows, b.source_rows)
+            for a, b in zip(lhs.cases, rhs.cases)
+        )
+
+    # Unknown localized route => don't assume equivalence.
+    return False
+
+
+def _same_nested_local_plan(
+    lhs,
+    rhs,
+) -> bool:
+    if lhs is None or rhs is None:
+        return lhs is rhs
+
+    if type(lhs) is not type(rhs):
+        return False
+
+    if isinstance(lhs, LocalCallPlan):
+        return _same_local_jaxpr_plan(lhs.body, rhs.body)
+
+    if isinstance(lhs, LocalMapPlan):
+        if lhs.num_consts != rhs.num_consts:
+            return False
+
+        if lhs.indices != rhs.indices:
+            return False
+
+        if len(lhs.iterations) != len(rhs.iterations):
+            return False
+
+        return all(
+            _same_local_jaxpr_plan(a.body, b.body)
+            for a, b in zip(lhs.iterations, rhs.iterations)
+        )
+
+    if isinstance(lhs, LocalScanPlan):
+        if len(lhs.iterations) != len(rhs.iterations):
+            return False
+
+        return all(
+            (a.index == b.index and _same_local_jaxpr_plan(a.body, b.body))
+            for a, b in zip(lhs.iterations, rhs.iterations)
+        )
+
+    return False
+
+
+def _same_local_jaxpr_plan(
+    lhs: LocalJaxprPlan,
+    rhs: LocalJaxprPlan,
+) -> bool:
+    # All map iterations should originate from the same analyzed body.
+    if lhs.instance.plan.jaxpr is not rhs.instance.plan.jaxpr:
+        return False
+
+    if not _same_layouts(lhs.input_layouts, rhs.input_layouts):
+        return False
+
+    if not _same_layouts(lhs.output_layouts, rhs.output_layouts):
+        return False
+
+    if not _same_layouts(lhs.const_layouts, rhs.const_layouts):
+        return False
+
+    if len(lhs.eqns) != len(rhs.eqns):
+        return False
+
+    for left, right in zip(lhs.eqns, rhs.eqns):
+        if left.index != right.index:
+            return False
+
+        if left.eqn.primitive is not right.eqn.primitive:
+            return False
+
+        if not _same_layouts(left.input_layouts, right.input_layouts):
+            return False
+
+        if not _same_layouts(left.output_layouts, right.output_layouts):
+            return False
+
+        left_route = None if left.route is None else left.route.local
+        right_route = None if right.route is None else right.route.local
+
+        if not _same_local_route(left_route, right_route):
+            return False
+
+        if not _same_nested_local_plan(left.nested, right.nested):
+            return False
+
+    return True
+
+
+def _map_template(
+    plan: LocalMapPlan,
+) -> LocalJaxprPlan:
+    if not plan.iterations:
+        raise RuntimeError("cannot lower empty LocalMapPlan")
+
+    template = plan.iterations[0].body
+
+    for iteration in plan.iterations[1:]:
+        if not _same_local_jaxpr_plan(template, iteration.body):
+            raise NotImplementedError(
+                "local map iterations have different localized "
+                "program structures; template map lowering is "
+                "not valid for this map"
+            )
+
+    return template
+
+
+def _validate_map_output_layout(
+    *,
+    outer_layout: TensorLayout,
+    body_layout: TensorLayout,
+    logical_indices: np.ndarray,
+) -> None:
+    if outer_layout.ndim < 1:
+        raise RuntimeError("map output must have leading map axis")
+
+    if outer_layout.global_shape[1:] != body_layout.global_shape:
+        raise RuntimeError(
+            "map body/output global shape mismatch: "
+            f"{outer_layout.global_shape[1:]} != "
+            f"{body_layout.global_shape}"
+        )
+
+    stored_indices = outer_layout.global_axis_indices(0)
+    if not np.array_equal(stored_indices, logical_indices):
+        raise RuntimeError(
+            "map iteration set does not match outer output layout leading axis"
+        )
+
+    expected_local_shape = (
+        logical_indices.size,
+        *body_layout.local_shape,
+    )
+
+    if outer_layout.local_shape != expected_local_shape:
+        raise RuntimeError(
+            "map output local shape mismatch: "
+            f"{outer_layout.local_shape} != "
+            f"{expected_local_shape}"
+        )
 
 
 @dataclass(frozen=True)

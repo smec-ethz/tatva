@@ -12,9 +12,13 @@ from jax.extend.core import Primitive
 from jax.scipy.linalg import lu_solve
 
 from tatva.tracer.localize import (
+    LocalDynamicSliceRoute,
     LocalGatherRoute,
     LocalScatterRoute,
+    LocalSelectNRoute,
+    localize_unary_source_rows,
 )
+from tatva.tracer.rules.structural import slice_row_map
 
 if TYPE_CHECKING:
     from tatva.tracer.local_plan import LocalEqnPlan
@@ -72,10 +76,22 @@ def lower_default(
             f"dead inputs {dead}; add a specialized lowering"
         )
 
-    result = eqn.primitive.bind(
-        *ctx.inputs,
-        **eqn.params,
-    )
+    try:
+        result = eqn.primitive.bind(
+            *ctx.inputs,
+            **eqn.params,
+        )
+    except Exception as exc:
+        input_shapes = tuple(
+            None if value is None else tuple(value.shape) for value in ctx.inputs
+        )
+        raise RuntimeError(
+            f"default local lowering failed:\n"
+            f"  eqn={ctx.plan.index}\n"
+            f"  primitive={eqn.primitive.name}\n"
+            f"  input_shapes={input_shapes}\n"
+            f"  params={eqn.params}"
+        ) from exc
 
     if eqn.primitive.multiple_results:
         return tuple(result)
@@ -249,6 +265,87 @@ def lower_scatter_set(
     return (jnp.reshape(output, route.output_shape),)
 
 
+def lower_dynamic_slice(
+    ctx: LoweringContext,
+) -> tuple[Any, ...]:
+    operand = _input(ctx, 0)
+    route_plan = ctx.plan.route
+
+    if route_plan is None or not isinstance(route_plan.local, LocalDynamicSliceRoute):
+        raise RuntimeError("dynamic_slice requires LocalDynamicSliceRoute")
+
+    route = route_plan.local
+    flat_operand = jnp.ravel(operand)
+    result = flat_operand[jnp.asarray(route.source_rows)]
+
+    return (jnp.reshape(result, route.output_shape),)
+
+
+def lower_slice(
+    ctx: LoweringContext,
+) -> tuple[Any, ...]:
+    operand = _input(ctx, 0)
+    input_layout = ctx.plan.input_layouts[0]
+    output_layout = ctx.plan.output_layouts[0]
+
+    if input_layout is None:
+        raise RuntimeError("live slice has no operand layout")
+
+    if output_layout is None:
+        raise RuntimeError("live slice has no output layout")
+
+    global_map = slice_row_map(ctx.plan.eqn)
+    source_rows = localize_unary_source_rows(
+        global_map.source_rows,
+        operand_layout=input_layout,
+        output_layout=output_layout,
+        allow_invalid=False,
+    )
+
+    result = jnp.ravel(operand)[jnp.asarray(source_rows)]
+    return (jnp.reshape(result, output_layout.local_shape),)
+
+
+def lower_select_n(
+    ctx: LoweringContext,
+) -> tuple[Any, ...]:
+    route_plan = ctx.plan.route
+    if route_plan is None or not isinstance(route_plan.local, LocalSelectNRoute):
+        raise RuntimeError("select_n requires LocalSelectNRoute")
+
+    route = route_plan.local
+
+    # Selector ctx.inputs[0] is deliberately dead.
+    dtype = None
+
+    for case_index, case_route in enumerate(route.cases):
+        if case_route.output_rows.size == 0:
+            continue
+
+        value = ctx.inputs[case_index + 1]
+        if value is None:
+            raise RuntimeError(f"live select_n case {case_index} is unavailable")
+
+        dtype = value.dtype
+        break
+
+    if dtype is None:
+        raise RuntimeError("select_n has no live case")
+
+    output = jnp.empty((int(prod(route.output_shape)),), dtype=dtype)
+
+    for case_index, case_route in enumerate(route.cases):
+        if case_route.output_rows.size == 0:
+            continue
+
+        value = ctx.inputs[case_index + 1]
+        assert value is not None
+        source = jnp.ravel(value)[jnp.asarray(case_route.source_rows)]
+        output = output.at[jnp.asarray(case_route.output_rows)].set(source)
+
+    return (jnp.reshape(output, route.output_shape),)
+
+
 def lower_custom_linear_solve(
     ctx: LoweringContext,
 ) -> tuple[Any, ...]:
@@ -308,6 +405,9 @@ def register_default_lowerings() -> None:
 
     register(lax.gather_p, lower_gather)
     register(lax.scatter_p, lower_scatter_set)
+    register(lax.dynamic_slice_p, lower_dynamic_slice)
+    register(lax.slice_p, lower_slice)
+    register(lax.select_n_p, lower_select_n)
 
     register(lax.linear_solve_p, lower_custom_linear_solve)
 
