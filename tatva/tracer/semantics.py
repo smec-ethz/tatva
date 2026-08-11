@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from jax.extend.core import JaxprEqn
 
+from tatva.tracer.liveness import TensorDemand
 from tatva.tracer.model import ConcreteEnv, Route
 
 if TYPE_CHECKING:
@@ -13,7 +14,6 @@ if TYPE_CHECKING:
 
 
 type ContributionDemand = object  # placeholder until contribution analysis is added
-type TensorDemand = object  # placeholder until liveness analysis is added
 
 
 # --------------------------------
@@ -91,6 +91,13 @@ class ContributionResult:
     inputs: tuple[ContributionDemand | None, ...]
     # if decomposition stops at this eqn, these are the newly discovered roots
     roots: tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
+class DemandContext:
+    eqn: JaxprEqn
+    output_demands: tuple[TensorDemand | None, ...]
+    route: Route | None
 
 
 @dataclass(frozen=True)
