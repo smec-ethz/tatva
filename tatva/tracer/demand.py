@@ -29,7 +29,6 @@ from dataclasses import dataclass
 from typing import Self
 
 import numpy as np
-from jax.extend.core import Var
 from numpy.typing import ArrayLike, NDArray
 
 from tatva.tracer.model import Shape
@@ -484,21 +483,6 @@ def merge_demands(
         return lhs
 
     return lhs.merge(rhs)
-
-
-def _add_demand(
-    demands: dict[Var, TensorDemand],
-    var: Var,
-    demand: TensorDemand | None,
-) -> None:
-    if demand is None:
-        return
-
-    existing = demands.get(var)
-    merged = merge_demands(existing, demand)
-    assert merged is not None
-
-    demands[var] = merged
 
 
 def demand_axes(demand: TensorDemand) -> tuple[AxisSubset, ...]:

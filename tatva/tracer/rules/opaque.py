@@ -9,7 +9,7 @@ import scipy.sparse as sps
 
 from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian
+from tatva.tracer.semantics import DerivativeRule, no_hessian
 
 if TYPE_CHECKING:
     from tatva.tracer.dependencies import HessianAccumulator
@@ -84,18 +84,15 @@ def opaque_nonlinear_hessian(
     acc.add_self(prepared.total)
 
 
-OPAQUE_NONLINEAR = PrimitiveRule(
-    DerivativeRule(
-        prepare_opaque,
-        opaque_dependencies,
-        opaque_nonlinear_hessian,
-    )
+DERIVATIVES_OPAQUE_NONLINEAR = DerivativeRule(
+    prepare_opaque,
+    opaque_dependencies,
+    opaque_nonlinear_hessian,
 )
 
-OPAQUE_LINEAR = PrimitiveRule(
-    DerivativeRule(
-        prepare_opaque,
-        opaque_dependencies,
-        no_hessian,
-    )
+
+DERIVATIVES_OPAQUE_LINEAR = DerivativeRule(
+    prepare_opaque,
+    opaque_dependencies,
+    no_hessian,
 )

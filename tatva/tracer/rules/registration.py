@@ -24,6 +24,7 @@ from . import (
     elementwise,
     gather_scatter,
     indexing,
+    linalg,
     opaque,
     reductions,
     structural,
@@ -380,16 +381,34 @@ def _register_dot_general(reg: PrimitiveRegistry) -> None:
 def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
     # Register rules for opaque primitives if needed
     for primitive in (
-        lax.linalg.lu_p,
         lax.linalg.cholesky_p,
         lax.linalg.eig_p,
         lax.linalg.eigh_p,
         lax.linalg.triangular_solve_p,
-        lax.linear_solve_p,
         custom_derivatives.custom_jvp_call_p,
         custom_derivatives.custom_vjp_call_p,
     ):
-        reg.register(primitive, opaque.OPAQUE_NONLINEAR)
+        reg.register(
+            primitive,
+            PrimitiveRule(
+                derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
+            ),
+        )
+
+    reg.register(
+        lax.linear_solve_p,
+        PrimitiveRule(
+            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
+            demand=linalg.custom_linear_solve_demand,
+        ),
+    )
+    reg.register(
+        lax.linalg.lu_p,
+        PrimitiveRule(
+            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
+            demand=linalg.lu_demand,
+        ),
+    )
 
 
 def _register_unstable_api_rules(reg: PrimitiveRegistry) -> None:
