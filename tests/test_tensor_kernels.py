@@ -94,7 +94,7 @@ def test_tensordot_matches_jnp_tensordot(a_shape, b_shape):
     rng = np.random.default_rng(2)
     A = jnp.asarray(rng.random(a_shape))
     B = jnp.asarray(rng.random(b_shape))
-    assert jnp.allclose(tk.tensordot(A, B), jnp.tensordot(A, B, axes=1))
+    assert jnp.allclose(tk._tensordot(A, B), jnp.tensordot(A, B, axes=1))
 
 
 def test_tensordot_is_not_jnp_matmul_for_rank3_operands():
@@ -109,16 +109,16 @@ def test_tensordot_is_not_jnp_matmul_for_rank3_operands():
     A = jnp.asarray(rng.random((2, 3)))
     B = jnp.asarray(rng.random((3, 3, 4)))
 
-    assert tk.tensordot(A, B).shape == (2, 3, 4)
+    assert tk._tensordot(A, B).shape == (2, 3, 4)
     assert jnp.matmul(A, B).shape == (3, 2, 4)
-    assert jnp.allclose(tk.tensordot(A, B), jnp.tensordot(A, B, axes=1))
+    assert jnp.allclose(tk._tensordot(A, B), jnp.tensordot(A, B, axes=1))
 
 
 def test_tensordot_vmaps_over_a_batch():
     rng = np.random.default_rng(3)
     A = jnp.asarray(rng.random((16, 2, 3)))
     B = jnp.asarray(rng.random((16, 3, 4)))
-    assert jnp.allclose(jax.vmap(tk.tensordot)(A, B), jnp.einsum("epq,eqr->epr", A, B))
+    assert jnp.allclose(jax.vmap(tk._tensordot)(A, B), jnp.einsum("epq,eqr->epr", A, B))
 
 
 def test_tensordot_rejects_a_stack_of_matrices():
@@ -126,7 +126,7 @@ def test_tensordot_rejects_a_stack_of_matrices():
     (p, q, r) product, so a batch axis allocates it in full. Use jax.vmap.
     """
     with pytest.raises(ValueError, match="single vector or matrix"):
-        tk.tensordot(jnp.zeros((5, 2, 3)), jnp.zeros((3, 4)))
+        tk._tensordot(jnp.zeros((5, 2, 3)), jnp.zeros((3, 4)))
 
 
 # --------------------------------------------------------------------------------
@@ -164,9 +164,7 @@ def test_contract_is_indifferent_to_the_index_letters():
     rng = np.random.default_rng(10)
     A = jnp.asarray(rng.random((2, 4)))
     B = jnp.asarray(rng.random((4, 3)))
-    assert jnp.allclose(
-        tk.contract("in,nj->ij", A, B), tk.contract("pq,qr->pr", A, B)
-    )
+    assert jnp.allclose(tk.contract("in,nj->ij", A, B), tk.contract("pq,qr->pr", A, B))
     assert jnp.allclose(tk.contract("ab,bc->ac", A, B), A @ B)
 
 
@@ -256,7 +254,7 @@ def test_contract_matmul_branches_agree_where_it_dispatches():
     rng = np.random.default_rng(11)
     A = jnp.asarray(rng.random((2, 4)))
     B = jnp.asarray(rng.random((4, 3)))
-    assert jnp.allclose(A @ B, tk.tensordot(A, B))
+    assert jnp.allclose(A @ B, tk._tensordot(A, B))
 
 
 def test_every_contract_spec_in_the_library_is_in_the_table():
@@ -269,7 +267,9 @@ def test_every_contract_spec_in_the_library_is_in_the_table():
     literals = {
         match.group(1)
         for path in package.rglob("*.py")
-        for match in re.finditer(r"""tk\.contract\(\s*["']([^"']+)["']""", path.read_text())
+        for match in re.finditer(
+            r"""tk\.contract\(\s*["']([^"']+)["']""", path.read_text()
+        )
     }
     assert literals, "found no tk.contract call sites -- has the API been renamed?"
 
@@ -290,7 +290,9 @@ def test_every_contract_spec_in_the_library_is_in_the_table():
         ("n,nj->j", (4,), (4, 2), "n,nj->j"),
     ],
 )
-def test_contract_differentiates_like_the_einsum_it_names(spec, a_shape, b_shape, einsum):
+def test_contract_differentiates_like_the_einsum_it_names(
+    spec, a_shape, b_shape, einsum
+):
     """The whole library reaches these through jax.grad, so agreeing on the primal is
     only half the contract. `platform_dependent` in particular puts a branch between the
     caller and the arithmetic, and that has to be transparent to AD.
@@ -300,7 +302,9 @@ def test_contract_differentiates_like_the_einsum_it_names(spec, a_shape, b_shape
     B = jnp.asarray(rng.random(b_shape))
 
     mine = jax.grad(lambda a, b: tk.contract(spec, a, b).sum(), argnums=(0, 1))(A, B)
-    reference = jax.grad(lambda a, b: jnp.einsum(einsum, a, b).sum(), argnums=(0, 1))(A, B)
+    reference = jax.grad(lambda a, b: jnp.einsum(einsum, a, b).sum(), argnums=(0, 1))(
+        A, B
+    )
     for got, want in zip(mine, reference):
         assert jnp.allclose(got, want)
 
