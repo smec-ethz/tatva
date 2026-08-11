@@ -4,12 +4,14 @@ from typing import Any
 
 import numpy as np
 import scipy.sparse as sps
+from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
+from tatva.tracer.demand import Demand, TensorDemand, demand_rows
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import Shape
-from tatva.tracer.semantics import RuleContext
+from tatva.tracer.semantics import DemandContext, RuleContext
 
 
 @dataclass(frozen=True)
@@ -205,22 +207,25 @@ def _dot_general_map(
     )
 
 
-# intentionally reference-quality code -> NOT optimized
-def prepare_dot_general(ctx: RuleContext) -> DotGeneralMap:
-    eqn = ctx.eqn
-
-    if len(ctx.input_deps) != 2 or len(eqn.outvars) != 1:
-        raise ValueError(
-            f"dot_general expects two inputs and one output; got "
-            f"{len(ctx.input_deps)} inputs and {len(eqn.outvars)} outputs"
-        )
-
+def dot_general_map(
+    eqn: JaxprEqn,
+) -> DotGeneralMap:
     return _dot_general_map(
-        tuple(ctx.input_deps[0].shape),
-        tuple(ctx.input_deps[1].shape),
-        _shape_of(eqn.outvars[0]),
+        tuple(_shape_of(eqn.invars[0])),
+        tuple(_shape_of(eqn.invars[1])),
+        tuple(_shape_of(eqn.outvars[0])),
         _dot_dimension_numbers(eqn.params["dimension_numbers"]),
     )
+
+
+def prepare_dot_general(ctx: RuleContext) -> DotGeneralMap:
+    if len(ctx.input_deps) != 2 or len(ctx.eqn.outvars) != 1:
+        raise ValueError(
+            f"dot_general expects two inputs and one output; got "
+            f"{len(ctx.input_deps)} inputs and {len(ctx.eqn.outvars)} outputs"
+        )
+
+    return dot_general_map(ctx.eqn)
 
 
 def dot_general_dependencies(
@@ -246,3 +251,27 @@ def dot_general_hessian(
     lhs, rhs = ctx.input_deps
 
     acc.add_paired_cross(lhs, prepared.lhs_rows.ravel(), rhs, prepared.rhs_rows.ravel())
+
+
+def dot_general_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None, None)
+
+    prepared = dot_general_map(ctx.eqn)
+    rows = demand_rows(output)
+    lhs_rows = np.unique(prepared.lhs_rows[rows].ravel())
+    rhs_rows = np.unique(prepared.rhs_rows[rows].ravel())
+
+    return (
+        TensorDemand.from_rows_hull(
+            _shape_of(ctx.eqn.invars[0]),
+            lhs_rows,
+        ),
+        TensorDemand.from_rows_hull(
+            _shape_of(ctx.eqn.invars[1]),
+            rhs_rows,
+        ),
+    )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -8,11 +9,17 @@ import scipy.sparse as sps
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
+from tatva.tracer.demand import Demand, TensorDemand, demand_rows
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import GatherRoute, ScatterRoute, Shape
 from tatva.tracer.routing import resolve_scatter_route
-from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian
+from tatva.tracer.semantics import (
+    DemandContext,
+    DerivativeRule,
+    PrimitiveRule,
+    no_hessian,
+)
 
 if TYPE_CHECKING:
     from tatva.tracer.semantics import RuleContext
@@ -61,6 +68,34 @@ def gather_dependencies(
     output_csr = (selection @ source.csr).astype(bool).tocsr()
 
     return (DependencySet(output_csr, output_shape),)
+
+
+def gather_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    route = ctx.route
+
+    if not isinstance(route, GatherRoute):
+        raise TypeError("gather demand requires GatherRoute")
+
+    output_rows = demand_rows(output)
+    source_rows = route.source_rows[output_rows]
+    source_rows = source_rows[source_rows >= 0]
+
+    result: list[Demand] = [None] * len(ctx.eqn.invars)
+    result[0] = TensorDemand.from_rows_hull(
+        _shape_of(ctx.eqn.invars[0]),
+        source_rows,
+    )
+
+    # indices are compiled into the route
+    result[1] = None
+
+    return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -125,6 +160,72 @@ def scatter_mul_hessian(
     acc.add_cross(base_deps, update_deps)
 
 
+def _scatter_demand(
+    ctx: DemandContext,
+    *,
+    needs_operand_at_updates: bool,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    route = ctx.route
+
+    if not isinstance(route, ScatterRoute):
+        raise TypeError("scatter demand requires ScatterRoute")
+
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    n_output = int(math.prod(output_shape))
+    output_rows = demand_rows(output)
+
+    wanted = np.zeros(
+        n_output,
+        dtype=bool,
+    )
+    wanted[output_rows] = True
+
+    targets = route.target_rows
+    valid = (targets >= 0) & (targets < n_output)
+
+    update_rows = np.flatnonzero(
+        valid & wanted[np.clip(targets, 0, max(n_output - 1, 0))]
+    )
+
+    if needs_operand_at_updates:
+        operand_rows = output_rows
+    else:
+        overwritten = np.unique(targets[valid])
+        operand_rows = output_rows[~np.isin(output_rows, overwritten)]
+
+    result: list[Demand] = [None] * len(ctx.eqn.invars)
+    result[0] = TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[0]), operand_rows)
+    # indices are compiled into ScatterRoute
+    result[1] = None
+    result[2] = TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[2]), update_rows)
+
+    return tuple(result)
+
+
+def scatter_set_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    # Output targets replace operand entries.
+    return _scatter_demand(
+        ctx,
+        needs_operand_at_updates=False,
+    )
+
+
+def scatter_accumulate_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    # add/mul/min/max combine update with existing operand.
+    return _scatter_demand(
+        ctx,
+        needs_operand_at_updates=True,
+    )
+
+
 SCATTER_BASIC = PrimitiveRule(
     DerivativeRule(
         prepare=prepare_scatter,
@@ -133,6 +234,18 @@ SCATTER_BASIC = PrimitiveRule(
     ),
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
+    demand=scatter_set_demand,
+)
+
+SCATTER_ACCUMULATE = PrimitiveRule(
+    DerivativeRule(
+        prepare=prepare_scatter,
+        dependencies=scatter_accumulate_dependencies,
+        hessian=no_hessian,
+    ),
+    concrete_inputs=scatter_concrete_inputs,
+    route=resolve_scatter_route,
+    demand=scatter_accumulate_demand,
 )
 SCATTER_MUL = PrimitiveRule(
     DerivativeRule(
@@ -142,4 +255,5 @@ SCATTER_MUL = PrimitiveRule(
     ),
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
+    demand=scatter_accumulate_demand,
 )

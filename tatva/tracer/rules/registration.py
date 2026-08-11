@@ -292,17 +292,18 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             ),
             concrete_inputs=lambda _eqn: (1,),
             route=resolve_gather_route,
+            demand=gather_scatter.gather_demand,
         ),
     )
     for primitive in (
-        lax.scatter_p,
         lax.scatter_add_p,
         lax.scatter_sub_p,
         lax.scatter_min_p,
         lax.scatter_max_p,
     ):
-        reg.register(primitive, gather_scatter.SCATTER_BASIC)
+        reg.register(primitive, gather_scatter.SCATTER_ACCUMULATE)
 
+    reg.register(lax.scatter_p, gather_scatter.SCATTER_BASIC)
     reg.register(lax.scatter_mul_p, gather_scatter.SCATTER_MUL)
 
     # select_n
@@ -316,6 +317,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             ),
             concrete_inputs=lambda _eqn: (0,),
             route=resolve_select_n_route,
+            demand=indexing.select_n_demand,
         ),
     )
 
@@ -330,6 +332,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             ),
             concrete_inputs=lambda eqn: tuple(range(1, len(eqn.invars))),
             route=resolve_dynamic_slice_route,
+            demand=indexing.dynamic_slice_demand,
         ),
     )
     reg.register(
@@ -342,6 +345,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             ),
             concrete_inputs=lambda eqn: tuple(range(2, len(eqn.invars))),
             route=resolve_dynamic_update_slice_route,
+            demand=indexing.dynamic_update_slice_demand,
         ),
     )
 
@@ -367,7 +371,8 @@ def _register_dot_general(reg: PrimitiveRegistry) -> None:
                 dot.prepare_dot_general,
                 dot.dot_general_dependencies,
                 dot.dot_general_hessian,
-            )
+            ),
+            demand=dot.dot_general_demand,
         ),
     )
 

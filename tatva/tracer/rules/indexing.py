@@ -1,11 +1,15 @@
+import math
+
 import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
+from tatva.tracer.demand import Demand, TensorDemand, demand_rows
 from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import DynamicSliceRoute, DynamicUpdateSliceRoute, SelectNRoute
-from tatva.tracer.semantics import RuleContext
+from tatva.tracer.rules.elementwise import inverse_elementwise_broadcast
+from tatva.tracer.semantics import DemandContext, RuleContext
 
 
 def prepare_select_n(ctx: RuleContext) -> SelectNRoute:
@@ -100,3 +104,102 @@ def dynamic_update_slice_dependencies(
     output[prepared.target_rows] = update.csr
 
     return (DependencySet(output.tocsr(), output_shape),)
+
+
+def select_n_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    route = ctx.route
+
+    if not isinstance(route, SelectNRoute):
+        raise TypeError("select_n demand requires SelectNRoute")
+
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    demanded_rows = demand_rows(output)
+    result: list[Demand] = [None] * len(ctx.eqn.invars)
+
+    # selector is compiled into route.case_indices.
+    result[0] = None
+    selected_cases = route.case_indices[demanded_rows]
+
+    for case_index, atom in enumerate(ctx.eqn.invars[1:]):
+        mask = selected_cases == case_index
+        rows = demanded_rows[mask]
+        if rows.size == 0:
+            continue
+
+        case_output_demand = TensorDemand.from_rows_hull(output_shape, rows)
+
+        result[case_index + 1] = inverse_elementwise_broadcast(
+            case_output_demand,
+            input_shape=_shape_of(atom),
+            output_shape=output_shape,
+        )
+
+    return tuple(result)
+
+
+def dynamic_slice_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    route = ctx.route
+
+    if not isinstance(route, DynamicSliceRoute):
+        raise TypeError("dynamic_slice demand requires DynamicSliceRoute")
+
+    rows = demand_rows(output)
+    source_rows = route.source_rows[rows]
+    result: list[Demand] = [None] * len(ctx.eqn.invars)
+    result[0] = TensorDemand.from_rows_hull(
+        _shape_of(ctx.eqn.invars[0]),
+        source_rows,
+    )
+
+    # start indices compiled into route.
+    return tuple(result)
+
+
+def dynamic_update_slice_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    route = ctx.route
+
+    if not isinstance(route, DynamicUpdateSliceRoute):
+        raise TypeError("dynamic_update_slice demand requires DynamicUpdateSliceRoute")
+
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    output_rows = demand_rows(output)
+    n_output = int(math.prod(output_shape))
+
+    wanted = np.zeros(
+        n_output,
+        dtype=bool,
+    )
+    wanted[output_rows] = True
+
+    target_rows = route.target_rows
+    valid_update = (target_rows >= 0) & (target_rows < n_output)
+    update_rows = np.flatnonzero(
+        valid_update & wanted[np.clip(target_rows, 0, max(n_output - 1, 0))]
+    )
+
+    overwritten = np.unique(target_rows[valid_update])
+    operand_rows = output_rows[~np.isin(output_rows, overwritten, assume_unique=False)]
+
+    result: list[Demand] = [None] * len(ctx.eqn.invars)
+    result[0] = TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[0]), operand_rows)
+    result[1] = TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[1]), update_rows)
+
+    return tuple(result)
