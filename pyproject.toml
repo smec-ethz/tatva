@@ -12,7 +12,7 @@ license-files = [
     "COPYING.LESSER",
 ]
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
@@ -20,6 +20,7 @@ classifiers = [
 dependencies = [
     "jax>=0.4.1",
     "numpy",
+    "scipy",
     "jax-autovmap>=0.3.0",
     "tatva-coloring>=0.0.2"
 ]
