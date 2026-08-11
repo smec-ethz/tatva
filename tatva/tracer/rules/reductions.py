@@ -4,10 +4,12 @@ import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
+from tatva.tracer.demand import AxisSubset, Demand, TensorDemand, _FullAxis, demand_axes
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import Shape
 from tatva.tracer.semantics import (
+    DemandContext,
     DerivativeRule,
     PrimitiveRule,
     RuleContext,
@@ -143,12 +145,40 @@ def reduce_prod_hessian(
         start = stop
 
 
+def reduce_sum_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None,)
+
+    input_shape = _shape_of(ctx.eqn.invars[0])
+    reduced_axes = {int(axis) for axis in ctx.eqn.params["axes"]}
+    output_axes = iter(demand_axes(output))
+    input_axes: list[AxisSubset] = []
+
+    for axis in range(len(input_shape)):
+        if axis in reduced_axes:
+            # Every entry of a reduced dimension contributes.
+            input_axes.append(_FullAxis())
+        else:
+            input_axes.append(next(output_axes))
+
+    return (
+        TensorDemand.from_axes(
+            input_shape,
+            tuple(input_axes),
+        ),
+    )
+
+
 REDUCE_BASIC = PrimitiveRule(
     DerivativeRule(
         prepare=prepare_reduction,
         dependencies=reduction_dependencies,
         hessian=no_hessian,
-    )
+    ),
+    demand=reduce_sum_demand,
 )
 REDUCE_PROD = PrimitiveRule(
     DerivativeRule(
