@@ -30,7 +30,6 @@ from types import MappingProxyType
 
 from jax.extend.core import JaxprEqn, Literal, Var
 
-from tatva.tracer.demand import TensorDemand
 from tatva.tracer.layout import TensorLayout
 from tatva.tracer.liveness import (
     CallDemandTrace,

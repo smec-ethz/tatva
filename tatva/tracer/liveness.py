@@ -173,23 +173,23 @@ def _backprop_ordinary(
         )
     )
 
-    max_output_fraction = max(
-        (_demand_fraction(demand) for demand in output_demands), default=0.0
-    )
-    for input_index, demand in enumerate(result):
-        if demand is None:
-            continue
-
-        fraction = _demand_fraction(demand)
-        if fraction == 1.0 and max_output_fraction < 1.0:
-            print(
-                "DEMAND WIDENING:",
-                eqn.primitive.name,
-                f"input={input_index}",
-                f"input_shape={demand.shape}",
-                f"fraction={fraction:.3f}",
-                f"max_output_fraction={max_output_fraction:.3f}",
-            )
+    # max_output_fraction = max(
+    #     (_demand_fraction(demand) for demand in output_demands), default=0.0
+    # )
+    # for input_index, demand in enumerate(result):
+    #     if demand is None:
+    #         continue
+    #
+    #     fraction = _demand_fraction(demand)
+    #     if fraction == 1.0 and max_output_fraction < 1.0:
+    #         print(
+    #             "DEMAND WIDENING:",
+    #             eqn.primitive.name,
+    #             f"input={input_index}",
+    #             f"input_shape={demand.shape}",
+    #             f"fraction={fraction:.3f}",
+    #             f"max_output_fraction={max_output_fraction:.3f}",
+    #         )
 
     if len(result) != len(eqn.invars):
         raise RuntimeError(
