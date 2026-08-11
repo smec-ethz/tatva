@@ -155,10 +155,10 @@ def prepare_transpose(ctx: RuleContext) -> UnaryRowMap:
     )
 
 
-def prepare_slice(ctx: RuleContext) -> UnaryRowMap:
-    eqn = ctx.eqn
-
-    input_shape = ctx.input_deps[0].shape
+def slice_row_map(
+    eqn: JaxprEqn,
+) -> UnaryRowMap:
+    input_shape = _shape_of(eqn.invars[0])
     output_shape = _shape_of(eqn.outvars[0])
 
     starts = eqn.params["start_indices"]
@@ -179,6 +179,11 @@ def prepare_slice(ctx: RuleContext) -> UnaryRowMap:
         source_rows=rows[slices].ravel(),
         output_shape=output_shape,
     )
+
+
+def prepare_slice(ctx: RuleContext) -> UnaryRowMap:
+    eqn = ctx.eqn
+    return slice_row_map(eqn)
 
 
 def prepare_rev(ctx: RuleContext) -> UnaryRowMap:

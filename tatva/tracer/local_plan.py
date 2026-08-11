@@ -30,6 +30,7 @@ from types import MappingProxyType
 
 from jax.extend.core import JaxprEqn, Literal, Var
 
+from tatva.tracer.analysis import MapPlan
 from tatva.tracer.layout import TensorLayout
 from tatva.tracer.liveness import (
     CallDemandTrace,
@@ -40,8 +41,10 @@ from tatva.tracer.liveness import (
 )
 from tatva.tracer.localize import (
     LocalRoute,
+    localize_dynamic_slice_route,
     localize_gather_route,
     localize_scatter_route,
+    localize_select_n_route,
 )
 from tatva.tracer.materialize import (
     CallInstance,
@@ -50,7 +53,7 @@ from tatva.tracer.materialize import (
     ResolvedEqn,
     ScanInstance,
 )
-from tatva.tracer.model import ScatterRoute
+from tatva.tracer.model import DynamicSliceRoute, ScatterRoute, SelectNRoute
 from tatva.tracer.routing import (
     GatherRoute,
     Route,
@@ -86,7 +89,12 @@ class LocalMapIterationPlan:
 
 @dataclass(frozen=True)
 class LocalMapPlan:
+    num_consts: int
     iterations: tuple[LocalMapIterationPlan, ...]
+
+    @property
+    def indices(self) -> tuple[int, ...]:
+        return tuple(iteration.index for iteration in self.iterations)
 
 
 @dataclass(frozen=True)
@@ -201,6 +209,7 @@ def _build_route_plan(
             local=local,
         )
 
+    # Scatter
     if isinstance(route, ScatterRoute):
         if len(input_layouts) < 3:
             raise RuntimeError("scatter expected operand, indices and updates")
@@ -222,6 +231,57 @@ def _build_route_plan(
             route,
             operand_layout=operand_layout,
             update_layout=update_layout,
+            output_layout=output_layout,
+        )
+
+        return RoutePlan(
+            global_route=route,
+            local=local,
+        )
+
+    # Dynamic slice
+    if isinstance(route, DynamicSliceRoute):
+        if not input_layouts:
+            raise RuntimeError("dynamic_slice has no operand")
+
+        operand_layout = input_layouts[0]
+        if operand_layout is None:
+            raise RuntimeError("live dynamic_slice output has no live operand")
+
+        if len(output_layouts) != 1:
+            raise RuntimeError("dynamic_slice expected one output")
+
+        output_layout = output_layouts[0]
+
+        if output_layout is None:
+            raise RuntimeError("attempted to localize dead dynamic_slice")
+
+        local = localize_dynamic_slice_route(
+            route,
+            operand_layout=operand_layout,
+            output_layout=output_layout,
+        )
+
+        return RoutePlan(
+            global_route=route,
+            local=local,
+        )
+
+    if isinstance(route, SelectNRoute):
+        if len(output_layouts) != 1:
+            raise RuntimeError("select_n expected one output")
+
+        output_layout = output_layouts[0]
+        if output_layout is None:
+            raise RuntimeError("attempted to localize dead select_n")
+
+        # input 0 is the selector. Its concrete values are already
+        # compiled into SelectNRoute.case_indices.
+        case_layouts = tuple(input_layouts[1:])
+
+        local = localize_select_n_route(
+            route,
+            case_layouts=case_layouts,
             output_layout=output_layout,
         )
 
@@ -252,32 +312,41 @@ def _plan_call(
 def _plan_map(
     instance: MapInstance,
     trace: MapDemandTrace,
+    analysis_plan: MapPlan,
 ) -> LocalMapPlan:
     traces_by_index = {
         iteration.index: iteration.body for iteration in trace.iterations
     }
-    iterations: list[LocalMapIterationPlan] = []
 
-    for materialized in instance.iterations:
-        body_trace = traces_by_index.get(materialized.index)
+    instances_by_index = {
+        iteration.index: iteration.body for iteration in instance.iterations
+    }
 
-        if body_trace is None:
-            # Entire logical map iteration is dead locally.
-            continue
-
-        iterations.append(
-            LocalMapIterationPlan(
-                index=materialized.index,
-                body=_build_local_jaxpr_plan(materialized.body, body_trace),
-            )
-        )
-
-    if len(iterations) != len(trace.iterations):
+    if set(traces_by_index) - set(instances_by_index):
         raise RuntimeError(
-            "map demand trace contains an iteration not present in materialization"
+            "map demand trace contains iterations not present in materialization"
         )
 
-    return LocalMapPlan(iterations=tuple(iterations))
+    # Independent map iterations are stored in logical index order.
+    # This also matches TensorLayout axis storage order, since RangeAxis
+    # and IndexAxis coordinates are canonical/increasing.
+    indices = sorted(traces_by_index)
+
+    iterations = tuple(
+        LocalMapIterationPlan(
+            index=index,
+            body=_build_local_jaxpr_plan(
+                instances_by_index[index],
+                traces_by_index[index],
+            ),
+        )
+        for index in indices
+    )
+
+    return LocalMapPlan(
+        num_consts=analysis_plan.num_consts,
+        iterations=iterations,
+    )
 
 
 def _plan_scan(
@@ -338,7 +407,10 @@ def _build_nested_plan(
         if not isinstance(nested_trace, MapDemandTrace):
             raise TypeError("MapInstance/demand trace mismatch")
 
-        return _plan_map(nested_instance, nested_trace)
+        analysis_nested = resolved.plan.nested
+        if not isinstance(analysis_nested, MapPlan):
+            raise TypeError("MapInstance/analysis plan mismatch")
+        return _plan_map(nested_instance, nested_trace, analysis_nested)
 
     if isinstance(nested_instance, ScanInstance):
         if not isinstance(nested_trace, ScanDemandTrace):
@@ -476,11 +548,26 @@ def build_local_plan(
 def pending_routes(
     plan: LocalJaxprPlan,
 ) -> tuple[LocalEqnPlan, ...]:
-    return tuple(
-        eqn
-        for eqn in plan.eqns
-        if (eqn.route is not None and not eqn.route.is_localized)
-    )
+    result: list[LocalEqnPlan] = []
+
+    def visit(
+        frame: LocalJaxprPlan,
+    ) -> None:
+        for eqn in frame.eqns:
+            if eqn.route is not None and not eqn.route.is_localized:
+                result.append(eqn)
+            nested = eqn.nested
+
+            if isinstance(nested, LocalCallPlan):
+                visit(nested.body)
+
+            elif isinstance(nested, (LocalMapPlan, LocalScanPlan)):
+                for iteration in nested.iterations:
+                    visit(iteration.body)
+
+    visit(plan)
+
+    return tuple(result)
 
 
 def summarize_local_plan(

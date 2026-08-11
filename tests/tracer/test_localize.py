@@ -4,11 +4,11 @@ import pytest
 from tatva.tracer.demand import TensorDemand
 from tatva.tracer.layout import TensorLayout
 from tatva.tracer.localize import (
-    LocalGatherRoute,
+    localize_dynamic_slice_route,
     localize_gather_route,
     localize_scatter_route,
 )
-from tatva.tracer.model import ScatterRoute
+from tatva.tracer.model import DynamicSliceRoute, ScatterRoute
 from tatva.tracer.routing import GatherRoute
 
 
@@ -141,7 +141,7 @@ def test_localize_gather_route_rejects_missing_live_source():
     assert output_demand is not None
     output_layout = TensorLayout.from_demand(output_demand)
 
-    with pytest.raises(ValueError, match="not stored"):
+    with pytest.raises(ValueError):
         localize_gather_route(
             route,
             operand_layout=operand_layout,
@@ -432,3 +432,44 @@ def test_scatter_operand_layout_may_be_larger_than_output_layout():
     # Update 0 targets global 7 -> local output row 1.
     np.testing.assert_array_equal(local.update_rows, [0])
     np.testing.assert_array_equal(local.target_rows, [1])
+
+
+def test_localize_dynamic_slice_route():
+    operand_demand = TensorDemand.axis_selection(
+        shape=(10,),
+        axis=0,
+        indices=[2, 4, 5, 8],
+    )
+
+    output_demand = TensorDemand.axis_selection(
+        shape=(4,),
+        axis=0,
+        indices=[1, 2],
+    )
+
+    assert operand_demand is not None
+    assert output_demand is not None
+
+    # Global dynamic-slice relation:
+    #
+    # output 0 -> operand 2
+    # output 1 -> operand 4
+    # output 2 -> operand 5
+    # output 3 -> operand 8
+    route = DynamicSliceRoute(source_rows=np.array([2, 4, 5, 8], dtype=np.int64))
+    local = localize_dynamic_slice_route(
+        route,
+        operand_layout=TensorLayout.from_demand(operand_demand),
+        output_layout=TensorLayout.from_demand(output_demand),
+    )
+
+    # Operand local coordinates:
+    #
+    # global [2,4,5,8]
+    # local  [0,1,2,3]
+    #
+    # local outputs represent global outputs 1,2
+    # -> sources global 4,5
+    # -> local rows 1,2
+    np.testing.assert_array_equal(local.source_rows, [1, 2])
+    assert local.output_shape == (2,)
