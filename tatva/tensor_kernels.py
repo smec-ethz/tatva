@@ -16,26 +16,22 @@
 # along with tatva.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""Small dense tensor operations, written to avoid XLA's ``dot`` path.
+"""Small dense tensor operations, written to avoid XLA's ``dot`` path on GPU.
 
-Everything in a tatva happens on tiny arrays: a 2x2 Jacobian, a
-(2, 4) matrix of shape function derivatives. But those tiny operations are
-vmapped over millions of elements at once. That combination of very small
-matrices but very large batch is the one case where the obvious way to write the
-code is dramatically slower than it should be.
+In a tatva at element level, operations happen on tiny arrays: a 2x2 Jacobian, a
+(2, 4) matrix of shape function derivatives. But the obvious way of writing tiny operations
+as vmapped over millions of elements at once makes the code is dramatically slower
+than it should be.
 
 When we write ``A @ B`` or any einsum that sums over a shared index, XLA emits a
 ``dot_general`` and hands the work to the machinery built for matrix products: on
-GPU, a batched GEMM kernel. "Matrix product" is the machinery's idea, not ours --
-``"n,n...->..."`` gets the same treatment, see "How to spot it" below.
-
-That machinery is great for large matrices as it tiles them, stages tiles into fast
-on-chip memory, and keeps the arithmetic units saturated. All of that setup has a
-fixed cost per matrix.
+GPU, a batched GEMM kernel. That machinery is great for large matrices as it tiles them,
+stages tiles into fast on-chip memory, and keeps the arithmetic units saturated.
+All of that setup has a fixed cost per matrix.
 
 Our matrices are 2x2. We pay the setup cost millions of times to do almost no
-arithmetic. Worse, a GEMM is a hard boundary for the compiler which means it cannot merge
-that step into the cheap operations on either side, so every intermediate result
+arithmetic. Worse, a GEMM is a hard boundary for the compiler which means it cannot
+merge/fuse that step into the cheap operations on either side, so every intermediate result
 is written out to main memory and read straight back in. The data movement, not
 the arithmetic, becomes the whole cost.
 
@@ -70,26 +66,10 @@ So all of ``"ij,jk->ik"``, ``"n,n...->..."``, ``"i,i->"`` and ``"eq...,eq->e..."
 are dots, however little they look like matrix products; while ``"eq,q->eq"`` and
 ``"ij,kl->ijkl"`` are not, because nothing is summed. Several specs in tatva were
 assumed safe on the grounds that they "read like reductions" and every one of them
-cost 2-5x.
-
-Note the last row. ``"eq...,eq->e..."`` is the *same* contraction as
+cost 2-5x. Note the last row. ``"eq...,eq->e..."`` is the *same* contraction as
 ``"q,q...->..."`` with a batch index bolted on -- it is what `jax.vmap` would build
 for you. Writing that by hand is how `_integrate_quad_array` ended up emitting a
 dot over the whole mesh.
-
-Two things this rule does NOT tell you, both of which cost real time here:
-
-A dot is not always a batched tiny GEMM. XLA may hoist a constant operand out of the
-vmap and emit one large matrix product instead -- assumed to be "fine, that is what
-GEMM is for", but a skinny k=4 GEMM is memory-bound and still lost 2.5-3.7x to a
-fused broadcast.
-
-And the converse: ``Line2/Line3.get_jacobian`` writes ``dNdr @ coords`` and XLA emits
-no ``dot`` at all, fusing it perfectly; rewriting *that* by hand was 7x slower.
-
-The rule that survived every measurement: rewrite a site if, and only if, its
-compiled HLO contains a ``dot``. `tests/test_tensor_kernels.py` asserts this for the
-element kernels and the `Operator` entry points.
 
 What it cost us
 ---------------
@@ -172,10 +152,20 @@ def inv(J: Array) -> Array:
     That is right for one large matrix and ruinous when vmapped over millions of
     tiny element Jacobians. The branch is on a static shape, so it is resolved at
     trace time -- there is no runtime dispatch.
+
+    For 1x1, 2x2 and 3x3 matrices, the inverse is computed in closed form. For larger
+    matrices, it falls back to `jnp.linalg.inv`.
+
+    Args:
+        J: a single matrix, shape (d, d) with d in {1, 2, 3}.
+
+    Returns:
+        The inverse of J, shape (d, d).
+
     """
     if J.ndim != 2:
         raise ValueError(
-            f"tk.inv takes a single matrix, got shape {J.shape}. Batch with jax.vmap "
+            f"tensor_kernels.inv takes a single matrix, got shape {J.shape}. Batch with jax.vmap "
             "rather than passing a stack"
         )
 
@@ -214,45 +204,34 @@ def inv(J: Array) -> Array:
     return jnp.linalg.inv(J)
 
 
-def tensordot(A: Array, B: Array) -> Array:
-    """``jnp.tensordot(A, B, axes=1)`` without the dot path.
-
-    The broadcast form on *both* backends, by design -- unlike `matmul`, this does not
-    dispatch on the platform. Call it for the contraction against nodal values over the
-    node axis, where `B` carries the field components; call `matmul` for the two rank-2
-    Jacobian products. See "Which one do I call" in the module docstring, which also
-    records what always-broadcast costs on CPU and why that cost is accepted.
-
+def _tensordot(A: Array, B: Array) -> Array:
+    """
     Contracts the last axis of `A` with the first axis of `B` and leaves every other
     axis free: (q,) or (p, q), against (q, ...). That single rule covers both shapes
-    tatva needs -- the shape-function contraction ``N . nodal_values``, and the
-    matrix products inside `Element.gradient` -- so they are one function, not two.
+    tatva needs, the shape-function contraction ``N . nodal_values``, and the
+    matrix products inside `Element.gradient`.
 
     Both operands are padded with singleton axes so broadcasting lines the contracted
     axis up: `A` gains one trailing axis per free axis of `B`, `B` one leading axis
     per free axis of `A`. Both counts are derived from the operand ranks.
 
-    We cannot `jnp.tensordot` as it lowers to a `dot`, which is the entire
-    problem. Vmapped over millions of elements at quad shapes, `jnp.tensordot` and
-    `jnp.matmul` both compile to ``dot=1``, this to ``dot=0``. Measured as a
-    replacement for the equivalent einsums, per `Operator` call at 90k-400k elements:
-
-        Element.interpolate  Tri3 3.7x   Quad4 2.5x   Line2 1.7x   Line3 2.7x
-        Line gradients       Line2 4.9x  Line3 4.2x
-
-    A rank-3+ `A` is refused. That is legal `tensordot`, but it means someone is
+    We cannot use `jnp.tensordot` as it lowers to a `dot`, which is the entire
+    problem. A rank-3+ `A` is refused. That is legal `tensordot`, but it means someone is
     hand-batching: this materialises the (p, q, r) product before reducing it, which
     is free at the sizes one element produces and ruinous once a dimension is large.
     Batch with `jax.vmap`, which fuses the reduction into the surrounding work.
 
-    Finally, this is not a blanket replacement for ``@``. `Line2/Line3.get_jacobian`
-    keeps plain ``@`` because XLA emits no `dot` there at all, and routing it through
-    this function measured 7x *slower*. Rewrite a site only when its compiled HLO
-    actually contains a `dot` -- see the module docstring.
+    Args:
+        A: a single vector or matrix, shape (q,) or (p, q).
+        B: a single tensor, shape (q, ...).
+
+    Returns:
+        The contraction, shape (p, ...) or (...), with axes in the order they appear in `B`
+        after the contracted axis.
     """
     if A.ndim > 2:
         raise ValueError(
-            f"tk.tensordot takes a single vector or matrix as A, got shape {A.shape}. "
+            f"tensor_kernels.tensordot takes a single vector or matrix as A, got shape {A.shape}. "
             "Batch with jax.vmap rather than passing a stack: this builds the full "
             "outer product before reducing, so a batch axis materialises it in full."
         )
@@ -263,21 +242,38 @@ def tensordot(A: Array, B: Array) -> Array:
 
 
 # --------------------------------------------------------------------------------
-# contract is a replacement for einsum with a fixed set of contractions
+# contract is a drop-in replacement for einsum with a fixed set of contractions
 # --------------------------------------------------------------------------------
 #
 
 
 def _dot(A: Array, B: Array) -> Array:
-    """The contraction as XLA's `dot`. Fast where XLA can fuse or fold it away."""
+    """The contraction as XLA's `dot`. Fast where XLA can fuse or fold it away.
+
+    Args:
+        A: a single vector or matrix, shape (q,) or (p, q).
+        B: a single tensor, shape (q, ...) or (q, r).
+
+    Returns:
+        The contraction, shape (p, ...) or (...), with axes in the order they appear in `B`
+        after the contracted axis.
+    """
+
     return A @ B
 
 
 def _broadcast(A: Array, B: Array) -> Array:
     """The contraction as broadcast-multiply-reduce. Never lowers to a `dot`.
     Hence never cross the boundary with cublas for GEMM on GPU.
+
+    Args:
+        A: a single vector or matrix, shape (q,) or (p, q).
+        B: a single tensor, shape (q, ...) or (q, r).
+
+    Returns:
+        The contraction, shape (p, ...) or (...), with axes in the order they appear in `B` after the contracted axis.
     """
-    return tensordot(A, B)
+    return _tensordot(A, B)
 
 
 def _dot_on_cpu_broadcast_elsewhere(A: Array, B: Array) -> Array:
@@ -337,7 +333,7 @@ def _tokenize(term: str) -> list[str]:
 def _canonicalise(spec: str) -> str:
     """Rename index letters in order of first appearance.
 
-    So a call site may use letters that mean something -- ``"in,nj->ij"`` for the
+    So a call may use letters that mean something -- ``"in,nj->ij"`` for the
     Jacobian, ``"in,n...->i..."`` for the node contraction -- while the lookup table
     holds one entry per *contraction*, not one per spelling.
     """

@@ -364,9 +364,10 @@ class Operator(Generic[ElementT]):
         # earlier einsum "eq...,eq->e..." although read like a plain reduction, but with n_quad_points > 1
         # XLA sees a batched contraction (batch e, contract q) and emits a `dot`, one tiny
         # GEMM per element. therefore, writing as broadcasted multiplication.
-        weights = self.get_integration_weights()
+        weights = self.get_integration_weights()  # shape: (n_elements, n_quad_points)
 
-        # broadcast weights to match the shape of quad_values for elementwise multiplication
+        # broadcast weights to (n_elements, n_quad_points, 1, ..., 1)  match the shape of quad_values
+        # for elementwise multiplication
         weights = weights.reshape(
             weights.shape + (1,) * (quad_values.ndim - weights.ndim)
         )
