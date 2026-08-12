@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import cast
 
 import numpy as np
 from jax.core import Atom
@@ -37,13 +38,11 @@ from jax.extend.core import Literal, Var
 
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.materialize import (
-    CallInstance,
-    FramePath,
-    FrameStep,
     JaxprInstance,
     ResolvedEqn,
 )
 from tatva.tracer.model import Shape
+from tatva.tracer.nested import CallInvocation, FramePath
 
 
 @dataclass(frozen=True)
@@ -209,22 +208,6 @@ def _validated_partition_axes(
     return axes
 
 
-def _make_domain(
-    value: ValueRef,
-    *,
-    partition_axes: PartitionAxesPolicy,
-) -> ContributionDomain:
-    shape = _shape_of(value.var)
-    return ContributionDomain(
-        shape=shape,
-        partition_axes=_validated_partition_axes(
-            value,
-            shape,
-            partition_axes=partition_axes,
-        ),
-    )
-
-
 def _root_candidate(
     path: FramePath,
     var: Var,
@@ -233,9 +216,18 @@ def _root_candidate(
     partition_axes: PartitionAxesPolicy,
 ) -> _RootCandidate:
     value = ValueRef(path=path, var=var)
+    shape = _shape_of(var)
+
     return _RootCandidate(
         value=value,
-        domain=_make_domain(value, partition_axes=partition_axes),
+        domain=ContributionDomain(
+            shape=shape,
+            partition_axes=_validated_partition_axes(
+                value,
+                shape,
+                partition_axes=partition_axes,
+            ),
+        ),
         coefficient=coefficient,
     )
 
@@ -473,13 +465,13 @@ def _trace_call(
 ) -> tuple[list[_RootCandidate], list[_Seed]]:
     """Trace transparently through a call/remat child frame."""
     nested = resolved.nested
-    if not isinstance(nested, CallInstance):
+    if not isinstance(nested, CallInvocation):
         raise InvalidMaterializedJaxprError(
             "_trace_call received a non-call nested instance"
         )
 
     eqn = resolved.plan.eqn
-    child = nested.body
+    child = cast(JaxprInstance, nested.body)
     child_jaxpr = child.plan.jaxpr
 
     if output_index >= len(child_jaxpr.outvars):
@@ -487,7 +479,7 @@ def _trace_call(
             f"{eqn.primitive.name} output mapping is inconsistent"
         )
 
-    child_path = path + (FrameStep(eqn_index=resolved.plan.index, kind="call"),)
+    child_path = path + (nested.children()[0].frame_step,)
     child_result = _walk_frame(
         child,
         child_path,
@@ -604,7 +596,7 @@ def _walk_frame(
 
         resolved, output_index = producer
 
-        if isinstance(resolved.nested, CallInstance):
+        if isinstance(resolved.nested, CallInvocation):
             child_roots, forwarded = _trace_call(
                 resolved,
                 output_index,

@@ -46,7 +46,6 @@ Key invariants:
 
 from __future__ import annotations
 
-import typing
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,13 +54,23 @@ from jax.core import Atom
 from jax.extend.core import ClosedJaxpr, JaxprEqn, Literal, Var
 
 from tatva.tracer.analysis import (
-    CallPlan,
     EqnPlan,
     JaxprPlan,
-    MapPlan,
-    ScanPlan,
+    NestedPlan,
 )
 from tatva.tracer.concrete import CONCRETE_EVALS
+from tatva.tracer.nested import (
+    AnyNestedInvocation,
+    CallInvocation,
+    CallSpec,
+    FramePath,
+    IndexedChild,
+    MapSpec,
+    RepeatedInvocation,
+    ScanSpec,
+    collect_logical_output,
+    dispatch_nested_spec,
+)
 from tatva.tracer.registry import SEMANTICS
 from tatva.tracer.routing import Route
 
@@ -74,42 +83,10 @@ class DynamicRoutingError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class CallInstance:
-    body: JaxprInstance
-
-
-@dataclass(frozen=True)
-class ScanIteration:
-    # Logical index in the scanned leading axis.
-    index: int
-
-    body: JaxprInstance
-
-
-@dataclass(frozen=True)
-class ScanInstance:
-    iterations: tuple[ScanIteration, ...]
-
-
-@dataclass(frozen=True)
-class MapIteration:
-    index: int
-    body: JaxprInstance
-
-
-@dataclass(frozen=True)
-class MapInstance:
-    iterations: tuple[MapIteration, ...]
-
-
-type NestedInstance = CallInstance | ScanInstance | MapInstance
-
-
-@dataclass(frozen=True)
 class ResolvedEqn:
     plan: EqnPlan
     route: Route | None
-    nested: NestedInstance | None
+    nested: AnyNestedInvocation[JaxprInstance] | None
 
 
 @dataclass(frozen=True)
@@ -125,23 +102,6 @@ class JaxprInstance:
     # Concrete values of this frame's outputs.
     # None means "not materialized / unavailable", not numerical None.
     output_values: tuple[ConcreteValue | None, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class FrameStep:
-    """One step from a parent JaxprInstance into a nested invocation.
-
-    iteration is None for call-like wrappers and is the logical iteration index for
-    map/scan bodies.
-    """
-
-    eqn_index: int
-    kind: FrameKind
-    iteration: int | None = None
-
-
-type FrameKind = typing.Literal["call", "scan", "map"]
-type FramePath = tuple[FrameStep, ...]
 
 
 def _read(
@@ -297,7 +257,8 @@ def _materialize_ordinary(
 
 def _materialize_call(
     eqn_plan: EqnPlan,
-    nested_plan: CallPlan,
+    nested_plan: NestedPlan,
+    spec: CallSpec,
     parent_env: ConcreteEnv,
 ) -> ResolvedEqn:
     eqn = eqn_plan.eqn
@@ -317,7 +278,7 @@ def _materialize_call(
 
         if value is None:
             raise DynamicRoutingError(
-                f"{nested_plan.kind} output {output_index} is required "
+                f"{spec.call_kind.name.lower()} output {output_index} is required "
                 "concretely but the nested computation did not "
                 "materialize it"
             )
@@ -331,7 +292,7 @@ def _materialize_call(
     return ResolvedEqn(
         plan=eqn_plan,
         route=None,
-        nested=CallInstance(body=child),
+        nested=CallInvocation(eqn_index=eqn_plan.index, body=child),
     )
 
 
@@ -351,14 +312,15 @@ def _leading_axis_value(
 
 def _materialize_scan(
     eqn_plan: EqnPlan,
-    scan_plan: ScanPlan,
+    scan_plan: NestedPlan,
+    spec: ScanSpec,
     parent_env: ConcreteEnv,
 ) -> ResolvedEqn:
     eqn = eqn_plan.eqn
 
-    num_consts = scan_plan.num_consts
-    num_carry = scan_plan.num_carry
-    length = scan_plan.length
+    num_consts = spec.num_consts
+    num_carry = spec.num_carry
+    length = spec.length
 
     if num_carry <= 0:
         raise RuntimeError("carry-free scan should have been lowered to MapPlan")
@@ -381,21 +343,9 @@ def _materialize_scan(
                 "for routing inside the scan body, but is unavailable"
             )
 
-    execution_indices = (
-        range(length - 1, -1, -1) if scan_plan.reverse else range(length)
-    )
+    iterations: list[IndexedChild[JaxprInstance]] = []
 
-    iterations: list[ScanIteration] = []
-
-    # Store concrete y values by logical scan index.
-    # ys_by_output[j][i]
-    n_y_outputs = len(eqn.outvars) - num_carry
-
-    ys_by_output: list[list[ConcreteValue | None]] = [
-        [None] * length for _ in range(n_y_outputs)
-    ]
-
-    for logical_index in execution_indices:
+    for logical_index in spec.execution_indices():
         x_step_values = tuple(
             _leading_axis_value(value, logical_index) for value in xs_values
         )
@@ -408,19 +358,12 @@ def _materialize_scan(
             const_values=scan_plan.consts,
         )
 
-        iterations.append(ScanIteration(index=logical_index, body=body))
+        iterations.append(IndexedChild(index=logical_index, body=body))
 
         body_outputs = body.output_values
 
         # Carry for the next execution step.
         carry_values = list(body_outputs[:num_carry])
-
-        # Per-step scan outputs.
-        y_outputs = body_outputs[num_carry:]
-
-        for y_index, value in enumerate(y_outputs):
-            if value is not None:
-                ys_by_output[y_index][logical_index] = value
 
     # Expose required outer scan outputs to the parent frame.
     for output_index in eqn_plan.concrete_outputs:
@@ -436,37 +379,36 @@ def _materialize_scan(
 
         else:
             # Stacked y output.
-            y_index = output_index - num_carry
-            values = ys_by_output[y_index]
-
-            if any(value is None for value in values):
-                raise DynamicRoutingError(
-                    f"scan output {output_index} is required concretely "
-                    "but one or more iterations did not materialize it"
+            try:
+                values = collect_logical_output(
+                    ((item.index, item.body.output_values) for item in iterations),
+                    output_index=output_index,
+                    length=length,
+                    label="scan",
                 )
-
-            value = np.stack(
-                [np.asarray(item) for item in values if item is not None], axis=0
-            )
+            except RuntimeError as exc:
+                raise DynamicRoutingError(str(exc)) from exc
+            value = np.stack([np.asarray(item) for item in values], axis=0)
 
         _write(parent_env, eqn.outvars[output_index], value)
 
     return ResolvedEqn(
         plan=eqn_plan,
         route=None,
-        nested=ScanInstance(iterations=tuple(iterations)),
+        nested=RepeatedInvocation.from_spec(eqn_plan.index, spec, tuple(iterations)),
     )
 
 
 def _materialize_map(
     eqn_plan: EqnPlan,
-    map_plan: MapPlan,
+    map_plan: NestedPlan,
+    spec: MapSpec,
     parent_env: ConcreteEnv,
 ) -> ResolvedEqn:
     eqn = eqn_plan.eqn
 
     values = tuple(_read(parent_env, atom) for atom in eqn.invars)
-    num_consts = map_plan.num_consts
+    num_consts = spec.num_consts
     const_values = values[:num_consts]
     mapped_values = values[num_consts:]
 
@@ -477,17 +419,9 @@ def _materialize_map(
                 "for routing inside the map body, but is unavailable"
             )
 
-    execution_indices = (
-        range(map_plan.length - 1, -1, -1)
-        if map_plan.reverse
-        else range(map_plan.length)
-    )
-    iterations: list[MapIteration] = []
-    outputs_by_index: list[list[ConcreteValue | None]] = [
-        [None] * map_plan.length for _ in eqn.outvars
-    ]
+    iterations: list[IndexedChild[JaxprInstance]] = []
 
-    for logical_index in execution_indices:
+    for logical_index in spec.execution_indices():
         step_values = tuple(
             _leading_axis_value(value, logical_index) for value in mapped_values
         )
@@ -495,27 +429,26 @@ def _materialize_map(
         body = _materialize_jaxpr(
             map_plan.body, input_values=body_inputs, const_values=map_plan.consts
         )
-        iterations.append(MapIteration(index=logical_index, body=body))
-
-        for output_index, value in enumerate(body.output_values):
-            if value is not None:
-                outputs_by_index[output_index][logical_index] = value
+        iterations.append(IndexedChild(index=logical_index, body=body))
 
     # only expose concrete outputs actually requested by parent
     for output_index in eqn_plan.concrete_outputs:
-        values_for_output = outputs_by_index[output_index]
-        if any(value is None for value in values_for_output):
-            raise DynamicRoutingError(
-                f"map output {output_index} is required concretely "
-                "but one or more iterations did not materialize it"
+        try:
+            values_for_output = collect_logical_output(
+                ((item.index, item.body.output_values) for item in iterations),
+                output_index=output_index,
+                length=spec.length,
+                label="map",
             )
-        value = np.stack(
-            [np.asarray(item) for item in values_for_output if item is not None], axis=0
-        )
+        except RuntimeError as exc:
+            raise DynamicRoutingError(str(exc)) from exc
+        value = np.stack([np.asarray(item) for item in values_for_output], axis=0)
         _write(parent_env, eqn.outvars[output_index], value)
 
     return ResolvedEqn(
-        eqn_plan, route=None, nested=MapInstance(iterations=tuple(iterations))
+        eqn_plan,
+        route=None,
+        nested=RepeatedInvocation.from_spec(eqn_plan.index, spec, tuple(iterations)),
     )
 
 
@@ -525,16 +458,28 @@ def _materialize_eqn(
 ) -> ResolvedEqn:
     nested = eqn_plan.nested
 
-    if isinstance(nested, CallPlan):
-        return _materialize_call(eqn_plan, nested, env)
+    if nested is None:
+        return _materialize_ordinary(eqn_plan, env)
 
-    if isinstance(nested, ScanPlan):
-        return _materialize_scan(eqn_plan, nested, env)
+    return dispatch_nested_spec(
+        nested.spec, _MaterializeNestedHandler(eqn_plan, nested, env)
+    )
 
-    if isinstance(nested, MapPlan):
-        return _materialize_map(eqn_plan, nested, env)
 
-    return _materialize_ordinary(eqn_plan, env)
+@dataclass(frozen=True)
+class _MaterializeNestedHandler:
+    eqn_plan: EqnPlan
+    nested_plan: NestedPlan
+    env: ConcreteEnv
+
+    def call(self, spec: CallSpec) -> ResolvedEqn:
+        return _materialize_call(self.eqn_plan, self.nested_plan, spec, self.env)
+
+    def map(self, spec: MapSpec) -> ResolvedEqn:
+        return _materialize_map(self.eqn_plan, self.nested_plan, spec, self.env)
+
+    def scan(self, spec: ScanSpec) -> ResolvedEqn:
+        return _materialize_scan(self.eqn_plan, self.nested_plan, spec, self.env)
 
 
 def _materialize_jaxpr(
@@ -616,54 +561,11 @@ def resolve_frame(
         resolved = resolved_eqn(current, step.eqn_index)
         nested = resolved.nested
 
-        if step.kind == "call":
-            if not isinstance(nested, CallInstance):
-                raise ValueError(
-                    f"frame step expects call at equation {step.eqn_index}"
-                )
-
-            if step.iteration is not None:
-                raise ValueError("call frame step must not specify an iteration")
-
-            current = nested.body
-            continue
-
-        if step.kind == "map":
-            if not isinstance(nested, MapInstance):
-                raise ValueError(f"frame step expects map at equation {step.eqn_index}")
-
-            if step.iteration is None:
-                raise ValueError("map frame step requires an iteration")
-
-            iteration = next(
-                (item for item in nested.iterations if item.index == step.iteration),
-                None,
+        if nested is None:
+            raise ValueError(
+                f"frame step expects {step.kind.name.lower()} at equation "
+                f"{step.eqn_index}"
             )
-            if iteration is None:
-                raise KeyError(f"map has no iteration {step.iteration}")
-
-            current = iteration.body
-            continue
-
-        if step.kind == "scan":
-            if not isinstance(nested, ScanInstance):
-                raise ValueError(
-                    f"frame step expects scan at equation {step.eqn_index}"
-                )
-
-            if step.iteration is None:
-                raise ValueError("scan frame step requires an iteration")
-
-            iteration = next(
-                (item for item in nested.iterations if item.index == step.iteration),
-                None,
-            )
-            if iteration is None:
-                raise KeyError(f"scan has no iteration {step.iteration}")
-
-            current = iteration.body
-            continue
-
-        raise ValueError(f"unknown frame kind {step.kind!r}")
+        current = nested.child_at(step)
 
     return current

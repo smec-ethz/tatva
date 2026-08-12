@@ -17,8 +17,6 @@ from tatva.tracer.demand import (
     _FullAxis,
     _RangeAxis,
     axis_indices,
-    demand_axes,
-    demand_rows,
 )
 from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.helpers import _shape_of
@@ -374,7 +372,7 @@ def demand_reshape_squeeze(ctx: DemandContext) -> tuple[Demand, ...]:
     output = ctx.output_demands[0]
     if output is None:
         return (None,)
-    rows = demand_rows(output)
+    rows = output.rows()
     return (TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[0]), rows),)
 
 
@@ -384,11 +382,10 @@ def demand_transpose(ctx: DemandContext) -> tuple[Demand, ...]:
         return (None,)
 
     permutation = tuple(int(axis) for axis in ctx.eqn.params["permutation"])
-    output_axes = demand_axes(output)
     input_axes: list[AxisSubset | None] = [None] * len(permutation)
 
     for output_axis, input_axis in enumerate(permutation):
-        input_axes[input_axis] = output_axes[output_axis]
+        input_axes[input_axis] = output.axes[output_axis]
 
     if any(axis is None for axis in input_axes):
         raise RuntimeError("invalid transpose permutation")
@@ -418,7 +415,6 @@ def demand_broadcast_in_dim(
     if not input_shape:
         return (TensorDemand.full(()),)
 
-    output_axes = demand_axes(output)
     input_axes = []
 
     for input_axis, output_axis in enumerate(dimensions):
@@ -426,7 +422,7 @@ def demand_broadcast_in_dim(
         output_extent = output_shape[output_axis]
 
         if input_extent == output_extent:
-            input_axes.append(output_axes[output_axis])
+            input_axes.append(output.axes[output_axis])
         elif input_extent == 1:
             input_axes.append(_FullAxis())
         else:
@@ -457,11 +453,10 @@ def demand_slice(
     else:
         strides = tuple(int(x) for x in strides)
 
-    output_axes = demand_axes(output)
     input_axes = []
 
     for input_extent, output_extent, output_axis, start, stride in zip(
-        input_shape, output_shape, output_axes, starts, strides
+        input_shape, output_shape, output.axes, starts, strides
     ):
         if stride == 1 and isinstance(output_axis, _FullAxis):
             selected = _axis_from_range(input_extent, start, start + output_extent)
@@ -497,10 +492,9 @@ def demand_rev(
 
     shape = _shape_of(ctx.eqn.invars[0])
     reversed_axes = {int(axis) for axis in ctx.eqn.params["dimensions"]}
-    output_axes = demand_axes(output)
     input_axes = []
 
-    for axis_index, (extent, selection) in enumerate(zip(shape, output_axes)):
+    for axis_index, (extent, selection) in enumerate(zip(shape, output.axes)):
         if axis_index not in reversed_axes:
             input_axes.append(selection)
             continue
@@ -537,8 +531,7 @@ def demand_concatenate(
 
     axis = int(ctx.eqn.params["dimension"])
     output_shape = _shape_of(ctx.eqn.outvars[0])
-    output_axes = demand_axes(output)
-    output_axis = output_axes[axis]
+    output_axis = output.axes[axis]
     result: list[Demand] = []
     offset = 0
 
@@ -571,7 +564,7 @@ def demand_concatenate(
             offset += extent
             continue
 
-        input_axes = list(output_axes)
+        input_axes = list(output.axes)
         input_axes[axis] = local_axis
 
         result.append(
@@ -596,7 +589,7 @@ def _multi_input_row_map_demand(
     if output is None:
         return tuple(None for _ in ctx.eqn.invars)
 
-    output_rows = demand_rows(output)
+    output_rows = output.rows()
     operand_indices = prepared.operand_indices[output_rows]
     source_rows = prepared.source_rows[output_rows]
     result: list[Demand] = []
@@ -622,7 +615,7 @@ def _multi_output_unary_row_map_demand(
         if demand is None:
             continue
 
-        rows = demand_rows(demand)
+        rows = demand.rows()
         source_parts.append(prepared.source_rows[output_index][rows])
 
     if not source_parts:

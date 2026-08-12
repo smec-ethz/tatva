@@ -192,6 +192,29 @@ class TensorDemand:
             size *= extent if isinstance(axis, _FullAxis) else axis.size
         return size
 
+    @property
+    def axes(self) -> tuple[AxisSubset, ...]:
+        return self.subset.axes
+
+    def rows(self: TensorDemand) -> NDArray[np.int64]:
+        """Exact C-order scalar rows represented by a structured demand.
+
+        This is an ephemeral representation for applying scalar-entry routes.
+        """
+        if not self.shape:
+            return np.array([0], dtype=np.int64)
+
+        indices = tuple(
+            axis_indices(axis, extent=extent)
+            for extent, axis in zip(self.shape, self.subset.axes)
+        )
+
+        grids = np.meshgrid(*indices, indexing="ij")
+
+        return np.ravel_multi_index(
+            tuple(grid.ravel() for grid in grids), self.shape
+        ).astype(np.int64, copy=False)
+
     @classmethod
     def full(cls, shape: tuple[int, ...]) -> Self | None:
         _validate_shape(shape)
@@ -340,12 +363,6 @@ class TensorDemand:
         return axis_indices(subset, extent=self.shape[axis])
 
 
-def _is_contiguous_indices(indices: NDArray[np.int64]) -> bool:
-    if indices.size <= 1:
-        return True
-    return bool(np.all(indices[1:] == indices[:-1] + 1))
-
-
 def _merge_axis_subsets(
     lhs: AxisSubset,
     rhs: AxisSubset,
@@ -358,10 +375,7 @@ def _merge_axis_subsets(
     if isinstance(rhs, _FullAxis):
         return rhs
 
-    # --------------------------------------------------------------
     # Range ∪ Range can often remain a Range without allocating.
-    # --------------------------------------------------------------
-
     if isinstance(lhs, _RangeAxis) and isinstance(rhs, _RangeAxis):
         # Overlap or adjacency:
         #
@@ -387,10 +401,7 @@ def _merge_axis_subsets(
         assert result is not None
         return result
 
-    # --------------------------------------------------------------
     # At least one irregular selection.
-    # --------------------------------------------------------------
-
     lhs_indices = axis_indices(lhs, extent=extent)
     rhs_indices = axis_indices(rhs, extent=extent)
 
@@ -421,6 +432,12 @@ def axis_contains(axis: AxisSubset, index: int, *, extent: int) -> bool:
 
     pos = np.searchsorted(axis.indices, index)
     return bool(pos < axis.indices.size and axis.indices[pos] == index)
+
+
+def _is_contiguous_indices(indices: NDArray[np.int64]) -> bool:
+    if indices.size <= 1:
+        return True
+    return bool(np.all(indices[1:] == indices[:-1] + 1))
 
 
 def _axis_from_indices(
@@ -485,32 +502,6 @@ def merge_demands(
     return lhs.merge(rhs)
 
 
-def demand_axes(demand: TensorDemand) -> tuple[AxisSubset, ...]:
-    return demand.subset.axes
-
-
-def demand_rows(
-    demand: TensorDemand,
-) -> NDArray[np.int64]:
-    """Exact C-order scalar rows represented by a structured demand.
-
-    This is an ephemeral representation for applying scalar-entry routes.
-    """
-    if not demand.shape:
-        return np.array([0], dtype=np.int64)
-
-    indices = tuple(
-        axis_indices(axis, extent=extent)
-        for extent, axis in zip(demand.shape, demand.subset.axes)
-    )
-
-    grids = np.meshgrid(*indices, indexing="ij")
-
-    return np.ravel_multi_index(
-        tuple(grid.ravel() for grid in grids), demand.shape
-    ).astype(np.int64, copy=False)
-
-
 def take_leading_axis_demand(
     demand: Demand,
     index: int,
@@ -555,7 +546,7 @@ def lift_leading_axis_demand(
 
     leading = _axis_from_range(outer_shape[0], index, index + 1)
     assert leading is not None
-    inner = demand_axes(demand)
+    inner = demand.axes
 
     return TensorDemand.from_axes(
         outer_shape,

@@ -4,7 +4,7 @@ import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
-from tatva.tracer.demand import AxisSubset, Demand, TensorDemand, _FullAxis, demand_axes
+from tatva.tracer.demand import AxisSubset, Demand, TensorDemand, _FullAxis
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import Shape
@@ -154,7 +154,7 @@ def reduce_sum_demand(
 
     input_shape = _shape_of(ctx.eqn.invars[0])
     reduced_axes = {int(axis) for axis in ctx.eqn.params["axes"]}
-    output_axes = iter(demand_axes(output))
+    output_axes = iter(output.axes)
     input_axes: list[AxisSubset] = []
 
     for axis in range(len(input_shape)):

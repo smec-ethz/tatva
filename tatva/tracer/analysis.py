@@ -9,10 +9,10 @@ primitives should be interpreted.
 The analysis distinguishes ordinary primitives from higher-order/nested
 constructs such as calls, maps, and scans:
 
-- `CallPlan` represents transparent call-like wrappers such as `jit` and remat.
-- `MapPlan` represents independent repeated applications of a body JAXPR,
+- `CallSpec` represents transparent call-like wrappers such as `jit` and remat.
+- `MapSpec` represents independent repeated applications of a body JAXPR,
   including carry-free scans.
-- `ScanPlan` represents recurrent scans whose carry creates dependencies between
+- `ScanSpec` represents recurrent scans whose carry creates dependencies between
   iterations.
 
 Concrete requirements are propagated backwards. Primitive rules can request
@@ -29,57 +29,36 @@ Key invariants:
 - Plans are hierarchical and follow the nesting structure of the source JAXPR.
 - Equation indices refer to positions in the original `jaxpr.eqns`.
 - Concrete requirements are expressed at JAXPR input/output boundaries.
-- Carry-free scans are represented as `MapPlan`; only scans with carry become
-  `ScanPlan`.
+- Carry-free scans use a `MapSpec`; only scans with carry use a `ScanSpec`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.nested import NestedJaxpr, normalize_nested_jaxpr
+from tatva.tracer.nested import (
+    CallKind,
+    CallSpec,
+    MapSpec,
+    NestedJaxpr,
+    NestedSpec,
+    ScanSpec,
+    normalize_nested_jaxpr,
+)
 from tatva.tracer.registry import SEMANTICS
 
 
 @dataclass(frozen=True)
-class CallPlan:
-    kind: Literal["jit", "remat"]
-    body: JaxprPlan
-    consts: tuple[object, ...] = ()
+class NestedPlan:
+    """A phase-independent nested body plus its control-flow specification."""
 
-    @property
-    def concrete_inputs(self) -> frozenset[int]:
-        return self.body.concrete_inputs
-
-
-@dataclass(frozen=True)
-class ScanPlan:
+    spec: NestedSpec
     body: JaxprPlan
     consts: tuple[object, ...]
-    num_consts: int
-    num_carry: int
-    length: int
-    reverse: bool
-    # concrete requirements as seen from the outer scan eqn
     concrete_inputs: frozenset[int]
-
-
-@dataclass(frozen=True)
-class MapPlan:
-    body: JaxprPlan
-    consts: tuple[object, ...]
-    num_consts: int
-    length: int
-    reverse: bool
-    # concrete requirements as seen from the outer map eqn
-    concrete_inputs: frozenset[int]
-
-
-type NestedPlan = CallPlan | ScanPlan | MapPlan
 
 
 @dataclass(frozen=True)
@@ -101,25 +80,6 @@ class JaxprPlan:
     concrete_inputs: frozenset[int]
     # outputs that the parent requires concretely
     concrete_outputs: frozenset[int]
-
-
-def _call_kind(eqn: JaxprEqn) -> Literal["jit", "remat"] | None:
-    name = eqn.primitive.name
-    if name in {"jit", "pjit"}:
-        return "jit"
-
-    if name == "remat2":
-        return "remat"
-
-    return None
-
-
-def _is_scan(eqn: JaxprEqn) -> bool:
-    return eqn.primitive.name == "scan"
-
-
-def _is_map(eqn: JaxprEqn) -> bool:
-    return eqn.primitive.name == "map"
 
 
 def backward_output_slice(
@@ -156,10 +116,13 @@ def analyze(
     *,
     concrete_outputs: frozenset[int] = frozenset(),
 ) -> JaxprPlan:
-    _validate_output_indices(
-        jaxpr,
-        concrete_outputs,
-    )
+    # validate output indices before doing any work
+    for index in concrete_outputs:
+        if index < 0 or index >= len(jaxpr.outvars):
+            raise ValueError(
+                f"Jaxpr output index {index} is invalid for "
+                f"{len(jaxpr.outvars)} outputs"
+            )
 
     relevant = backward_output_slice(jaxpr)
 
@@ -188,10 +151,7 @@ def analyze(
             concrete_outputs_by_eqn[index] = required_outputs
 
         # Nested primitive.
-        nested = _analyze_nested(
-            eqn,
-            concrete_outputs=required_outputs,
-        )
+        nested = _analyze_nested(eqn, concrete_outputs=required_outputs)
 
         if nested is not None:
             nested_plans[index] = nested
@@ -271,12 +231,34 @@ def analyze(
     )
 
 
+def _analyze_nested(
+    eqn: JaxprEqn,
+    *,
+    concrete_outputs: frozenset[int],
+) -> NestedPlan | None:
+    match eqn.primitive.name:
+        case "jit" | "pjit":
+            return _analyze_call(
+                eqn, kind=CallKind.JIT, concrete_outputs=concrete_outputs
+            )
+        case "remat2":
+            return _analyze_call(
+                eqn, kind=CallKind.REMAT, concrete_outputs=concrete_outputs
+            )
+        case "scan":
+            return _analyze_scan(eqn, concrete_outputs=concrete_outputs)
+        case "map":
+            return _analyze_map(eqn, concrete_outputs=concrete_outputs)
+        case _:
+            return None
+
+
 def _analyze_call(
     eqn: JaxprEqn,
     *,
-    kind: Literal["jit", "remat"],
+    kind: CallKind,
     concrete_outputs: frozenset[int],
-) -> CallPlan:
+) -> NestedPlan:
     nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
 
     if len(nested.jaxpr.outvars) != len(eqn.outvars):
@@ -293,14 +275,19 @@ def _analyze_call(
 
     body = analyze(nested.jaxpr, concrete_outputs=concrete_outputs)
 
-    return CallPlan(kind=kind, body=body, consts=nested.consts)
+    return NestedPlan(
+        spec=CallSpec(call_kind=kind),
+        body=body,
+        consts=nested.consts,
+        concrete_inputs=body.concrete_inputs,
+    )
 
 
 def _analyze_scan(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
-) -> ScanPlan | MapPlan:
+) -> NestedPlan:
     nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
 
     num_consts = int(eqn.params.get("num_consts", 0))
@@ -365,13 +352,15 @@ def _analyze_scan(
             num_consts + carry_index for carry_index in required_carry_outputs
         }
 
-        return ScanPlan(
+        return NestedPlan(
+            spec=ScanSpec(
+                num_consts=num_consts,
+                num_carry=num_carry,
+                length=length,
+                reverse=reverse,
+            ),
             body=body_plan,
             consts=nested.consts,
-            num_consts=num_consts,
-            num_carry=num_carry,
-            length=length,
-            reverse=reverse,
             concrete_inputs=frozenset(required_outer_inputs),
         )
 
@@ -416,13 +405,15 @@ def _analyze_scan(
     # outer scan operands must be concrete.
     scan_concrete_inputs = body_plan.concrete_inputs
 
-    return ScanPlan(
+    return NestedPlan(
+        spec=ScanSpec(
+            num_consts=num_consts,
+            num_carry=num_carry,
+            length=length,
+            reverse=reverse,
+        ),
         body=body_plan,
         consts=nested.consts,
-        num_consts=num_consts,
-        num_carry=num_carry,
-        length=length,
-        reverse=reverse,
         concrete_inputs=scan_concrete_inputs,
     )
 
@@ -434,7 +425,7 @@ def _analyze_carry_free_scan(
     num_consts: int,
     length: int,
     reverse: bool,
-) -> MapPlan:
+) -> NestedPlan:
     body = nested.jaxpr
 
     # With no carry:
@@ -458,12 +449,10 @@ def _analyze_carry_free_scan(
     # every input after num_consts is sliced along leading axis.
     concrete_inputs = body_plan.concrete_inputs
 
-    return MapPlan(
+    return NestedPlan(
+        spec=MapSpec(num_consts=num_consts, length=length, reverse=reverse),
         body=body_plan,
         consts=nested.consts,
-        num_consts=num_consts,
-        length=length,
-        reverse=reverse,
         concrete_inputs=concrete_inputs,
     )
 
@@ -472,7 +461,7 @@ def _analyze_map(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
-) -> MapPlan:
+) -> NestedPlan:
     nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
 
     # Your historical map representation apparently used the same
@@ -500,42 +489,9 @@ def _analyze_map(
 
         length = shape[0]
 
-    return MapPlan(
+    return NestedPlan(
+        spec=MapSpec(num_consts=num_consts, length=int(length), reverse=False),
         body=body_plan,
         consts=nested.consts,
-        num_consts=num_consts,
-        length=int(length),
-        reverse=False,
         concrete_inputs=body_plan.concrete_inputs,
     )
-
-
-def _analyze_nested(
-    eqn: JaxprEqn,
-    *,
-    concrete_outputs: frozenset[int],
-) -> NestedPlan | None:
-    call_kind = _call_kind(eqn)
-
-    if call_kind is not None:
-        return _analyze_call(eqn, kind=call_kind, concrete_outputs=concrete_outputs)
-
-    if _is_scan(eqn):
-        return _analyze_scan(eqn, concrete_outputs=concrete_outputs)
-
-    if _is_map(eqn):
-        return _analyze_map(eqn, concrete_outputs=concrete_outputs)
-
-    return None
-
-
-def _validate_output_indices(
-    jaxpr: Jaxpr,
-    outputs: frozenset[int],
-) -> None:
-    for index in outputs:
-        if index < 0 or index >= len(jaxpr.outvars):
-            raise ValueError(
-                f"Jaxpr output index {index} is invalid for "
-                f"{len(jaxpr.outvars)} outputs"
-            )

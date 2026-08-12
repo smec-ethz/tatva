@@ -7,7 +7,7 @@ import scipy.sparse as sps
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
-from tatva.tracer.demand import Demand, TensorDemand, demand_rows
+from tatva.tracer.demand import Demand, TensorDemand
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import Shape
@@ -261,7 +261,7 @@ def dot_general_demand(
         return (None, None)
 
     prepared = dot_general_map(ctx.eqn)
-    rows = demand_rows(output)
+    rows = output.rows()
     lhs_rows = np.unique(prepared.lhs_rows[rows].ravel())
     rhs_rows = np.unique(prepared.rhs_rows[rows].ravel())
 
