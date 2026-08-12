@@ -20,6 +20,7 @@ from numpy.typing import NDArray
 
 from tatva.tracer.contributions import ContributionTrace
 from tatva.tracer.demand import (
+    TensorDemand,
     _FullAxis,
     _IndexAxis,
     _RangeAxis,
@@ -46,6 +47,8 @@ from tatva.tracer.nested import (
     MapContext,
     RepeatedInvocation,
     ScanContext,
+    ScanSpec,
+    TraversalOrder,
     dispatch_nested,
 )
 from tatva.tracer.partition import OwnedContribution
@@ -226,7 +229,12 @@ def _lower_map(
     context: MapContext[LocalJaxprPlan],
     inputs: tuple[Any | None, ...],
 ) -> tuple[Any | None, ...]:
-    template = _map_template(context.invocation)
+    template = _common_repeated_template(context.invocation)
+    if template is None:
+        raise NotImplementedError(
+            "localized map iterations have different body layouts/routes; "
+            "a single lax.map template cannot represent them"
+        )
 
     logical_indices = np.asarray(
         [
@@ -251,63 +259,22 @@ def _lower_map(
     if context.spec.num_consts > len(inputs):
         raise RuntimeError("map num_consts exceeds input arity")
 
-    # Prepare body constants.
-    body_constants: dict[int, Any] = {}
+    body_constants = _project_repeated_constants(
+        plan,
+        template,
+        inputs,
+        num_consts=context.spec.num_consts,
+        label="map",
+    )
 
-    for input_index in range(context.spec.num_consts):
-        body_layout = template.input_layouts[input_index]
-        if body_layout is None:
-            continue
-
-        value = inputs[input_index]
-        outer_layout = plan.input_layouts[input_index]
-
-        if value is None:
-            raise RuntimeError(
-                f"map constant {input_index} is live in body but dead in outer frame"
-            )
-
-        if outer_layout is None:
-            raise RuntimeError(f"map constant {input_index} has no outer layout")
-
-        body_constants[input_index] = _project_local_value(
-            value,
-            source_layout=outer_layout,
-            target_layout=body_layout,
-        )
-
-    # Prepare stacked mapped inputs.
-    mapped_input_indices: list[int] = []
-    mapped_values: list[Any] = []
-
-    for input_index in range(context.spec.num_consts, len(inputs)):
-        body_layout = template.input_layouts[input_index]
-
-        # This map input exists globally but is not required by
-        # the local body.
-        if body_layout is None:
-            continue
-
-        value = inputs[input_index]
-        outer_layout = plan.input_layouts[input_index]
-
-        if value is None:
-            raise RuntimeError(
-                f"mapped input {input_index} is live in body but unavailable"
-            )
-
-        if outer_layout is None:
-            raise RuntimeError(f"mapped input {input_index} has no outer layout")
-
-        stacked = _stack_map_input(
-            value,
-            outer_layout=outer_layout,
-            body_layout=body_layout,
-            logical_indices=logical_indices,
-        )
-
-        mapped_input_indices.append(input_index)
-        mapped_values.append(stacked)
+    mapped_input_indices, mapped_values = _stack_repeated_inputs(
+        plan,
+        template,
+        inputs,
+        start=context.spec.num_consts,
+        logical_indices=logical_indices,
+        label="map",
+    )
 
     mapped_slot = {
         input_index: slot for slot, input_index in enumerate(mapped_input_indices)
@@ -341,10 +308,11 @@ def _lower_map(
                 f"map output {output_index} is live outside but dead in body template"
             )
 
-        _validate_map_output_layout(
+        _validate_repeated_output_layout(
             outer_layout=outer_layout,
             body_layout=body_layout,
             logical_indices=logical_indices,
+            label="map",
         )
 
     # One compiled iteration body.
@@ -417,6 +385,346 @@ def _lower_map(
     return tuple(result)
 
 
+def _lower_scan(
+    plan: LocalEqnPlan,
+    context: ScanContext[LocalJaxprPlan],
+    inputs: tuple[Any | None, ...],
+) -> tuple[Any | None, ...]:
+    invocation = context.invocation
+    spec = context.spec
+    template = _common_repeated_template(invocation)
+    if template is None:
+        return _lower_scan_unrolled(plan, context, inputs)
+    _validate_scan_iteration_subset(context, template)
+
+    logical_indices = np.asarray(
+        tuple(
+            child.logical_index
+            for child in invocation.children(TraversalOrder.LOGICAL)
+            if child.logical_index is not None
+        ),
+        dtype=np.int64,
+    )
+    n_iterations = logical_indices.size
+
+    num_consts = spec.num_consts
+    num_carry = spec.num_carry
+
+    if len(inputs) != len(template.input_layouts):
+        raise RuntimeError("scan parent/body input arity mismatch")
+
+    # Constants
+    body_constants = _project_repeated_constants(
+        plan,
+        template,
+        inputs,
+        num_consts=num_consts,
+        label="scan",
+    )
+
+    # Carry
+    live_carry_indices = _scan_live_carry_indices(spec, template)
+    carry_slots = {
+        carry_index: slot for slot, carry_index in enumerate(live_carry_indices)
+    }
+    initial_carry = []
+
+    for carry_index in live_carry_indices:
+        parent_input_index = num_consts + carry_index
+        value = inputs[parent_input_index]
+        outer_layout = plan.input_layouts[parent_input_index]
+        body_layout = template.input_layouts[parent_input_index]
+
+        if value is None or body_layout is None:
+            raise RuntimeError(f"live scan carry {carry_index} is unavailable")
+
+        initial_carry.append(
+            _project_repeated_value(
+                plan,
+                parent_input_index,
+                value,
+                outer_layout=outer_layout,
+                body_layout=body_layout,
+                label="scan carry",
+            )
+        )
+
+    initial_carry = tuple(initial_carry)
+
+    # Scanned inputs xs
+    xs_start = num_consts + num_carry
+    mapped_input_indices, stacked_xs = _stack_repeated_inputs(
+        plan,
+        template,
+        inputs,
+        start=xs_start,
+        logical_indices=logical_indices,
+        label="scan xs",
+    )
+
+    x_slots = {
+        input_index: slot for slot, input_index in enumerate(mapped_input_indices)
+    }
+
+    # Live stacked y outputs
+    body_y_start = num_carry
+    live_y_indices = []
+
+    for parent_output_index in range(num_carry, len(plan.output_layouts)):
+        y_index = parent_output_index - num_carry
+        body_output_index = body_y_start + y_index
+        outer_layout = plan.output_layouts[parent_output_index]
+        body_layout = template.output_layouts[body_output_index]
+
+        if outer_layout is None and body_layout is None:
+            continue
+
+        if outer_layout is None or body_layout is None:
+            raise RuntimeError(
+                f"scan y output {y_index} has inconsistent parent/body liveness"
+            )
+
+        _validate_repeated_output_layout(
+            outer_layout=outer_layout,
+            body_layout=body_layout,
+            logical_indices=logical_indices,
+            label="scan",
+        )
+        live_y_indices.append(y_index)
+
+    live_y_indices = tuple(live_y_indices)
+
+    # Compiled scan body
+    def body(packed_carry, packed_xs):
+        body_inputs: list[Any] = []
+
+        for input_index, body_layout in enumerate(template.input_layouts):
+            if body_layout is None:
+                continue
+
+            # Constants
+            if input_index < num_consts:
+                body_inputs.append(body_constants[input_index])
+                continue
+
+            # Carries
+            if input_index < (num_consts + num_carry):
+                carry_index = input_index - num_consts
+                slot = carry_slots[carry_index]
+                body_inputs.append(packed_carry[slot])
+                continue
+
+            # xs
+            slot = x_slots[input_index]
+            body_inputs.append(packed_xs[slot])
+
+        env = _execute_frame(template, tuple(body_inputs))
+        outputs = _frame_outputs(template, env)
+        next_carry = tuple(outputs[carry_index] for carry_index in live_carry_indices)
+        ys = tuple(outputs[num_carry + y_index] for y_index in live_y_indices)
+
+        return (next_carry, ys)
+
+    # Run scan
+    xs = tuple(stacked_xs) if stacked_xs else None
+
+    final_carry, stacked_ys = jax.lax.scan(
+        body,
+        initial_carry,
+        xs,
+        length=n_iterations,
+        reverse=spec.reverse,
+    )
+
+    # Reconstruct parent outputs
+    carry_by_index = {
+        carry_index: value
+        for carry_index, value in zip(live_carry_indices, final_carry)
+    }
+    y_by_index = {y_index: value for y_index, value in zip(live_y_indices, stacked_ys)}
+
+    result: list[Any | None] = []
+
+    for output_index, outer_layout in enumerate(plan.output_layouts):
+        if outer_layout is None:
+            result.append(None)
+            continue
+
+        # Final carry
+        if output_index < num_carry:
+            carry_index = output_index
+            value = carry_by_index[carry_index]
+            body_layout = template.output_layouts[carry_index]
+            assert body_layout is not None
+
+            # Usually identical, but projecting makes the boundary robust
+            # against a larger body hull.
+            value = _project_local_value(
+                value,
+                source_layout=body_layout,
+                target_layout=outer_layout,
+            )
+
+            result.append(value)
+            continue
+
+        # Stacked ys
+        y_index = output_index - num_carry
+        result.append(y_by_index[y_index])
+
+    return tuple(result)
+
+
+def _lower_scan_unrolled(
+    plan: LocalEqnPlan,
+    context: ScanContext[LocalJaxprPlan],
+    inputs: tuple[Any | None, ...],
+) -> tuple[Any | None, ...]:
+    """Lower a scan whose localized iterations do not share one signature.
+
+    The Python loop runs while JAX traces the local function, so this still emits
+    an ordinary JAX program; it does not interpret the scan at runtime.
+    """
+    spec = context.spec
+    _validate_scan_iteration_subset(context, context.invocation.iterations[0].body)
+    carry: dict[int, tuple[Any, TensorLayout | None]] = {}
+    ys: dict[tuple[int, int], tuple[Any, TensorLayout]] = {}
+
+    for carry_index in range(spec.num_carry):
+        input_index = spec.num_consts + carry_index
+        value = inputs[input_index]
+        layout = plan.input_layouts[input_index]
+        if value is not None:
+            carry[carry_index] = (value, layout)
+
+    for child in context.invocation.children(TraversalOrder.EXECUTION):
+        logical_index = child.logical_index
+        assert logical_index is not None
+        body_plan = child.payload
+        body_inputs: list[Any] = []
+
+        for input_index, body_layout in enumerate(body_plan.input_layouts):
+            if body_layout is None:
+                continue
+            if input_index < spec.num_consts:
+                value = inputs[input_index]
+                if value is None:
+                    raise RuntimeError(
+                        f"live scan constant {input_index} is unavailable"
+                    )
+                body_inputs.append(
+                    _project_repeated_value(
+                        plan,
+                        input_index,
+                        value,
+                        outer_layout=plan.input_layouts[input_index],
+                        body_layout=body_layout,
+                        label="scan constant",
+                    )
+                )
+                continue
+
+            if input_index < spec.num_consts + spec.num_carry:
+                carry_index = input_index - spec.num_consts
+                try:
+                    value, source_layout = carry[carry_index]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"scan carry {carry_index} is unavailable at iteration "
+                        f"{logical_index}"
+                    ) from exc
+                if source_layout is None:
+                    body_inputs.append(
+                        _project_repeated_value(
+                            plan,
+                            spec.num_consts + carry_index,
+                            value,
+                            outer_layout=None,
+                            body_layout=body_layout,
+                            label="scan carry",
+                        )
+                    )
+                else:
+                    body_inputs.append(
+                        _project_local_value(
+                            value,
+                            source_layout=source_layout,
+                            target_layout=body_layout,
+                        )
+                    )
+                continue
+
+            value = inputs[input_index]
+            outer_layout = plan.input_layouts[input_index]
+            if value is None or outer_layout is None:
+                raise RuntimeError(f"live scan xs input {input_index} is unavailable")
+            body_inputs.append(
+                _stack_repeated_input(
+                    value,
+                    outer_layout=outer_layout,
+                    body_layout=body_layout,
+                    logical_indices=np.asarray([logical_index], dtype=np.int64),
+                )[0]
+            )
+
+        outputs = _frame_outputs(
+            body_plan, _execute_frame(body_plan, tuple(body_inputs))
+        )
+        for carry_index in range(spec.num_carry):
+            value = outputs[carry_index]
+            layout = body_plan.output_layouts[carry_index]
+            if value is not None and layout is not None:
+                carry[carry_index] = (value, layout)
+
+        for y_index in range(len(outputs) - spec.num_carry):
+            output_index = spec.num_carry + y_index
+            value = outputs[output_index]
+            layout = body_plan.output_layouts[output_index]
+            if value is not None and layout is not None:
+                ys[logical_index, y_index] = value, layout
+
+    result: list[Any | None] = []
+    for output_index, outer_layout in enumerate(plan.output_layouts):
+        if outer_layout is None:
+            result.append(None)
+            continue
+        if output_index < spec.num_carry:
+            value, source_layout = carry[output_index]
+            if source_layout is None:
+                raise RuntimeError(
+                    f"scan final carry {output_index} has no localized layout"
+                )
+            result.append(
+                _project_local_value(
+                    value,
+                    source_layout=source_layout,
+                    target_layout=outer_layout,
+                )
+            )
+            continue
+
+        y_index = output_index - spec.num_carry
+        values = []
+        for logical_index in outer_layout.global_axis_indices(0):
+            try:
+                value, body_layout = ys[int(logical_index), y_index]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"scan y output {y_index} is unavailable at iteration "
+                    f"{logical_index}"
+                ) from exc
+            _validate_repeated_output_layout(
+                outer_layout=outer_layout,
+                body_layout=body_layout,
+                logical_indices=outer_layout.global_axis_indices(0),
+                label="scan",
+            )
+            values.append(value)
+        result.append(jnp.stack(values, axis=0))
+
+    return tuple(result)
+
+
 def _lower_nested(
     plan: LocalEqnPlan,
     inputs: tuple[Any | None, ...],
@@ -442,8 +750,7 @@ class _LowerNestedHandler:
         return _lower_map(self.plan, context, self.inputs)
 
     def scan(self, context: ScanContext[LocalJaxprPlan]):
-        del context
-        raise NotImplementedError("local scan lowering is not implemented")
+        return _lower_scan(self.plan, context, self.inputs)
 
 
 def _lower_eqn(
@@ -524,17 +831,17 @@ def _execute_frame(
     return env
 
 
-def _stack_map_input(
+def _stack_repeated_input(
     value,
     *,
     outer_layout: TensorLayout,
     body_layout: TensorLayout,
     logical_indices: np.ndarray,
 ):
-    """Extract body-local tensors for multiple logical map iterations.
+    """Extract body-local tensors for multiple logical repeated iterations.
 
     outer tensor:
-        (global_map_length, *body_global_shape)
+        (global_iteration_count, *body_global_shape)
 
     result:
         (n_local_iterations, *body_layout.local_shape)
@@ -544,14 +851,15 @@ def _stack_map_input(
     requirements.
     """
     if outer_layout.ndim < 1:
-        raise ValueError("mapped input must have a leading map axis")
+        raise ValueError("repeated input must have a leading iteration axis")
 
     if outer_layout.global_shape[1:] != body_layout.global_shape:
         raise ValueError(
-            "mapped input/body global shape mismatch: "
+            "repeated input/body global shape mismatch: "
             f"{outer_layout.global_shape[1:]} != "
             f"{body_layout.global_shape}"
         )
+
     logical_indices = np.asarray(logical_indices, dtype=np.int64).ravel()
 
     n_iterations = logical_indices.size
@@ -579,7 +887,7 @@ def _stack_map_input(
 
     except ValueError as exc:
         raise ValueError(
-            "mapped body requires values not present in the outer input layout"
+            "repeated body requires values not present in the outer input layout"
         ) from exc
 
     selected = jnp.ravel(value)[jnp.asarray(outer_local_rows)]
@@ -588,6 +896,104 @@ def _stack_map_input(
         selected,
         (n_iterations, *body_layout.local_shape),
     )
+
+
+def _project_repeated_constants(
+    plan: LocalEqnPlan,
+    template: LocalJaxprPlan,
+    inputs: tuple[Any | None, ...],
+    *,
+    num_consts: int,
+    label: str,
+) -> dict[int, Any]:
+    constants: dict[int, Any] = {}
+
+    for input_index in range(num_consts):
+        body_layout = template.input_layouts[input_index]
+        if body_layout is None:
+            continue
+
+        value = inputs[input_index]
+        outer_layout = plan.input_layouts[input_index]
+        if value is None:
+            raise RuntimeError(f"live {label} constant {input_index} is unavailable")
+
+        constants[input_index] = _project_repeated_value(
+            plan,
+            input_index,
+            value,
+            outer_layout=outer_layout,
+            body_layout=body_layout,
+            label=f"{label} constant",
+        )
+
+    return constants
+
+
+def _stack_repeated_inputs(
+    plan: LocalEqnPlan,
+    template: LocalJaxprPlan,
+    inputs: tuple[Any | None, ...],
+    *,
+    start: int,
+    logical_indices: np.ndarray,
+    label: str,
+) -> tuple[tuple[int, ...], tuple[Any, ...]]:
+    indices: list[int] = []
+    values: list[Any] = []
+
+    for input_index in range(start, len(inputs)):
+        body_layout = template.input_layouts[input_index]
+        if body_layout is None:
+            continue
+
+        value = inputs[input_index]
+        outer_layout = plan.input_layouts[input_index]
+        if value is None:
+            raise RuntimeError(f"live {label} input {input_index} is unavailable")
+
+        if outer_layout is None:
+            atom = plan.eqn.invars[input_index]
+            if not isinstance(atom, Literal):
+                raise RuntimeError(f"live {label} input {input_index} has no layout")
+
+            demand = TensorDemand.full(tuple(value.shape))
+            assert demand is not None
+            outer_layout = TensorLayout.from_demand(demand)
+
+        indices.append(input_index)
+        values.append(
+            _stack_repeated_input(
+                value,
+                outer_layout=outer_layout,
+                body_layout=body_layout,
+                logical_indices=logical_indices,
+            )
+        )
+
+    return tuple(indices), tuple(values)
+
+
+def _project_repeated_value(
+    plan: LocalEqnPlan,
+    input_index: int,
+    value,
+    *,
+    outer_layout: TensorLayout | None,
+    body_layout: TensorLayout,
+    label: str,
+):
+    if outer_layout is not None:
+        return _project_local_value(
+            value,
+            source_layout=outer_layout,
+            target_layout=body_layout,
+        )
+
+    if not isinstance(plan.eqn.invars[input_index], Literal):
+        raise TypeError(f"live {label} {input_index} has no outer layout")
+
+    return extract_local_value(value, body_layout)
 
 
 def _same_layout(
@@ -735,45 +1141,53 @@ def _same_local_jaxpr_plan(
     return True
 
 
-def _map_template(
+def _common_repeated_template(
     invocation: RepeatedInvocation[LocalJaxprPlan],
-) -> LocalJaxprPlan:
+) -> LocalJaxprPlan | None:
+    # This check iterates over all iterations, to check if the body is the same for all of them.
+    # Potentially slow, maybe skip if we know this from somewhere already.
     if not invocation.iterations:
-        raise RuntimeError("cannot lower empty LocalMapPlan")
+        return None
 
     template = invocation.iterations[0].body
 
     for iteration in invocation.iterations[1:]:
         if not _same_local_jaxpr_plan(template, iteration.body):
-            raise NotImplementedError(
-                "local map iterations have different localized "
-                "program structures; template map lowering is "
-                "not valid for this map"
-            )
+            return None
 
     return template
 
 
-def _validate_map_output_layout(
+def _validate_repeated_output_layout(
     *,
     outer_layout: TensorLayout,
     body_layout: TensorLayout,
     logical_indices: np.ndarray,
+    label: str,
 ) -> None:
     if outer_layout.ndim < 1:
-        raise RuntimeError("map output must have leading map axis")
+        raise RuntimeError(f"{label} output must have a leading iteration axis")
 
     if outer_layout.global_shape[1:] != body_layout.global_shape:
         raise RuntimeError(
-            "map body/output global shape mismatch: "
+            f"{label} body/output global shape mismatch: "
             f"{outer_layout.global_shape[1:]} != "
             f"{body_layout.global_shape}"
         )
 
+    for axis in range(body_layout.ndim):
+        if not np.array_equal(
+            outer_layout.global_axis_indices(axis + 1),
+            body_layout.global_axis_indices(axis),
+        ):
+            raise RuntimeError(
+                f"{label} body/output selection differs along body axis {axis}"
+            )
+
     stored_indices = outer_layout.global_axis_indices(0)
     if not np.array_equal(stored_indices, logical_indices):
         raise RuntimeError(
-            "map iteration set does not match outer output layout leading axis"
+            f"{label} iterations do not match the output layout leading axis"
         )
 
     expected_local_shape = (
@@ -783,10 +1197,83 @@ def _validate_map_output_layout(
 
     if outer_layout.local_shape != expected_local_shape:
         raise RuntimeError(
-            "map output local shape mismatch: "
+            f"{label} output local shape mismatch: "
             f"{outer_layout.local_shape} != "
             f"{expected_local_shape}"
         )
+
+
+def _validate_scan_iteration_subset(
+    context: ScanContext[LocalJaxprPlan],
+    template: LocalJaxprPlan,
+) -> None:
+    """If any carry component is runtime-live, surviving iterations must form
+    a prefix of the original execution order.
+
+    Otherwise dropping an intermediate iteration would incorrectly skip a
+    carry transition.
+
+    If all carry components are dead, arbitrary selected iterations are safe:
+    the scan has effectively become map-like for local runtime purposes.
+    """
+    spec = context.spec
+    selected = tuple(child.logical_index for child in context.invocation.children())
+    if not selected:
+        raise RuntimeError("live scan has no surviving iterations")
+
+    carry_live = False
+
+    for carry_index in range(spec.num_carry):
+        body_input_index = spec.num_consts + carry_index
+
+        if (
+            template.input_layouts[body_input_index] is not None
+            or template.output_layouts[carry_index] is not None
+        ):
+            carry_live = True
+            break
+
+    if not carry_live:
+        return
+
+    expected = spec.execution_indices()[: len(selected)]
+
+    if selected != expected:
+        raise NotImplementedError(
+            "localized recurrent scan iterations do not form "
+            "a prefix of execution order; skipping an intermediate "
+            "carry transition would change semantics"
+        )
+
+
+def _scan_live_carry_indices(
+    spec: ScanSpec,
+    template: LocalJaxprPlan,
+) -> tuple[int, ...]:
+    result = []
+
+    for carry_index in range(spec.num_carry):
+        input_index = spec.num_consts + carry_index
+        input_layout = template.input_layouts[input_index]
+        output_layout = template.output_layouts[carry_index]
+
+        if input_layout is None and output_layout is None:
+            continue
+
+        if input_layout is None or output_layout is None:
+            raise NotImplementedError(
+                f"scan carry {carry_index} is live on only "
+                "one side of the body boundary"
+            )
+
+        if not _same_layout(input_layout, output_layout):
+            raise NotImplementedError(
+                f"localized scan carry {carry_index} changes layout between iterations"
+            )
+
+        result.append(carry_index)
+
+    return tuple(result)
 
 
 def _compile_contribution_terms(
