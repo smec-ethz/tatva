@@ -18,11 +18,11 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "jax>=0.4.1",
+    "jax>=0.11",
     "numpy",
     "scipy",
     "jax-autovmap>=0.3.0",
-    "tatva-coloring>=0.0.2"
+    "tatva-coloring>=0.0.2",
 ]
 
 [project.optional-dependencies]
