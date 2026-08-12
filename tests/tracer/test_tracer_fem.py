@@ -6,11 +6,11 @@ import numpy as np
 from jax import Array
 from jax_autovmap import autovmap
 
-from tatva import Mesh, Operator, sparse
+from tatva import Mesh, Operator
 from tatva.compound import Compound, field
 from tatva.element.base import Tri3
 from tatva.lifter import Fixed, Lifter, Periodic
-from tatva.tracer.api import CapturedJaxpr, analyze, trace, trace_derivatives
+from tatva.tracer.api import CapturedJaxpr, trace
 
 jax.config.update("jax_enable_x64", True)
 

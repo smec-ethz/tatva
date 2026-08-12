@@ -26,12 +26,9 @@ from tatva.tracer.demand import (
 )
 from tatva.tracer.layout import TensorLayout
 from tatva.tracer.local_plan import (
-    LocalCallPlan,
     LocalEqnPlan,
     LocalJaxprPlan,
-    LocalMapPlan,
-    LocalPlan,
-    LocalScanPlan,
+    LocalNestedPlan,
 )
 from tatva.tracer.localize import (
     LocalDynamicSliceRoute,
@@ -43,6 +40,13 @@ from tatva.tracer.lowerings import (
     LOWERINGS,
     LoweringContext,
     lower_default,
+)
+from tatva.tracer.nested import (
+    CallContext,
+    MapContext,
+    RepeatedInvocation,
+    ScanContext,
+    dispatch_nested,
 )
 from tatva.tracer.partition import OwnedContribution
 
@@ -205,15 +209,10 @@ def _frame_outputs(
 
 
 def _lower_call(
-    plan: LocalEqnPlan,
+    context: CallContext[LocalJaxprPlan],
     inputs: tuple[Any | None, ...],
 ) -> tuple[Any | None, ...]:
-    nested = plan.nested
-
-    if not isinstance(nested, LocalCallPlan):
-        raise TypeError("expected LocalCallPlan")
-
-    body = nested.body
+    body = context.invocation.body
     child_inputs = tuple(
         value for value, layout in zip(inputs, body.input_layouts) if layout is not None
     )
@@ -224,16 +223,19 @@ def _lower_call(
 
 def _lower_map(
     plan: LocalEqnPlan,
+    context: MapContext[LocalJaxprPlan],
     inputs: tuple[Any | None, ...],
 ) -> tuple[Any | None, ...]:
-    nested = plan.nested
+    template = _map_template(context.invocation)
 
-    if not isinstance(nested, LocalMapPlan):
-        raise TypeError("expected LocalMapPlan")
-
-    template = _map_template(nested)
-
-    logical_indices = np.asarray(nested.indices, dtype=np.int64)
+    logical_indices = np.asarray(
+        [
+            child.logical_index
+            for child in context.invocation.children()
+            if child.logical_index is not None
+        ],
+        dtype=np.int64,
+    )
     n_iterations = logical_indices.size
 
     if n_iterations == 0:
@@ -246,13 +248,13 @@ def _lower_map(
             f"{len(template.input_layouts)}"
         )
 
-    if nested.num_consts > len(inputs):
+    if context.spec.num_consts > len(inputs):
         raise RuntimeError("map num_consts exceeds input arity")
 
     # Prepare body constants.
     body_constants: dict[int, Any] = {}
 
-    for input_index in range(nested.num_consts):
+    for input_index in range(context.spec.num_consts):
         body_layout = template.input_layouts[input_index]
         if body_layout is None:
             continue
@@ -278,7 +280,7 @@ def _lower_map(
     mapped_input_indices: list[int] = []
     mapped_values: list[Any] = []
 
-    for input_index in range(nested.num_consts, len(inputs)):
+    for input_index in range(context.spec.num_consts, len(inputs)):
         body_layout = template.input_layouts[input_index]
 
         # This map input exists globally but is not required by
@@ -361,7 +363,7 @@ def _lower_map(
             if body_layout is None:
                 continue
 
-            if input_index < nested.num_consts:
+            if input_index < context.spec.num_consts:
                 local_inputs.append(body_constants[input_index])
 
             else:
@@ -419,16 +421,29 @@ def _lower_nested(
     plan: LocalEqnPlan,
     inputs: tuple[Any | None, ...],
 ) -> tuple[Any | None, ...]:
-    if isinstance(plan.nested, LocalCallPlan):
-        return _lower_call(plan, inputs)
+    if plan.nested is None:
+        raise TypeError("expected a nested local plan")
+    return dispatch_nested(
+        plan.nested.spec,
+        plan.nested.invocation,
+        _LowerNestedHandler(plan, inputs),
+    )
 
-    if isinstance(plan.nested, LocalMapPlan):
-        return _lower_map(plan, inputs)
 
-    if isinstance(plan.nested, LocalScanPlan):
+@dataclass(frozen=True)
+class _LowerNestedHandler:
+    plan: LocalEqnPlan
+    inputs: tuple[Any | None, ...]
+
+    def call(self, context: CallContext[LocalJaxprPlan]):
+        return _lower_call(context, self.inputs)
+
+    def map(self, context: MapContext[LocalJaxprPlan]):
+        return _lower_map(self.plan, context, self.inputs)
+
+    def scan(self, context: ScanContext[LocalJaxprPlan]):
+        del context
         raise NotImplementedError("local scan lowering is not implemented")
-
-    raise TypeError(f"unsupported nested plan {type(plan.nested)!r}")
 
 
 def _lower_eqn(
@@ -650,43 +665,29 @@ def _same_local_route(
 
 
 def _same_nested_local_plan(
-    lhs,
-    rhs,
+    lhs: LocalNestedPlan | None,
+    rhs: LocalNestedPlan | None,
 ) -> bool:
     if lhs is None or rhs is None:
         return lhs is rhs
 
-    if type(lhs) is not type(rhs):
+    if not isinstance(lhs, LocalNestedPlan) or not isinstance(rhs, LocalNestedPlan):
         return False
-
-    if isinstance(lhs, LocalCallPlan):
-        return _same_local_jaxpr_plan(lhs.body, rhs.body)
-
-    if isinstance(lhs, LocalMapPlan):
-        if lhs.num_consts != rhs.num_consts:
-            return False
-
-        if lhs.indices != rhs.indices:
-            return False
-
-        if len(lhs.iterations) != len(rhs.iterations):
-            return False
-
-        return all(
-            _same_local_jaxpr_plan(a.body, b.body)
-            for a, b in zip(lhs.iterations, rhs.iterations)
-        )
-
-    if isinstance(lhs, LocalScanPlan):
-        if len(lhs.iterations) != len(rhs.iterations):
-            return False
-
-        return all(
-            (a.index == b.index and _same_local_jaxpr_plan(a.body, b.body))
-            for a, b in zip(lhs.iterations, rhs.iterations)
-        )
-
-    return False
+    if lhs.spec != rhs.spec:
+        return False
+    left = lhs.invocation
+    right = rhs.invocation
+    if left.kind is not right.kind or left.eqn_index != right.eqn_index:
+        return False
+    left_children = left.children()
+    right_children = right.children()
+    if len(left_children) != len(right_children):
+        return False
+    return all(
+        a.logical_index == b.logical_index
+        and _same_local_jaxpr_plan(a.payload, b.payload)
+        for a, b in zip(left_children, right_children)
+    )
 
 
 def _same_local_jaxpr_plan(
@@ -735,14 +736,14 @@ def _same_local_jaxpr_plan(
 
 
 def _map_template(
-    plan: LocalMapPlan,
+    invocation: RepeatedInvocation[LocalJaxprPlan],
 ) -> LocalJaxprPlan:
-    if not plan.iterations:
+    if not invocation.iterations:
         raise RuntimeError("cannot lower empty LocalMapPlan")
 
-    template = plan.iterations[0].body
+    template = invocation.iterations[0].body
 
-    for iteration in plan.iterations[1:]:
+    for iteration in invocation.iterations[1:]:
         if not _same_local_jaxpr_plan(template, iteration.body):
             raise NotImplementedError(
                 "local map iterations have different localized "
@@ -965,32 +966,27 @@ class LocalExecutable:
 
 
 def build_local_executable(
-    plan: LocalPlan | LocalJaxprPlan,
+    plan: LocalJaxprPlan,
     *,
     contributions: ContributionTrace,
     owned: tuple[OwnedContribution, ...],
     jit: bool = True,
 ) -> LocalExecutable:
-    if isinstance(plan, LocalPlan):
-        root = plan.root
-    else:
-        root = plan
-
     input_indices = tuple(
-        index for index, layout in enumerate(root.input_layouts) if layout is not None
+        index for index, layout in enumerate(plan.input_layouts) if layout is not None
     )
-    contribution_terms = _compile_contribution_terms(root, contributions, owned)
+    contribution_terms = _compile_contribution_terms(plan, contributions, owned)
 
     def function(
         *local_inputs,
     ):
-        env = _execute_frame(root, tuple(local_inputs))
+        env = _execute_frame(plan, tuple(local_inputs))
         return _reconstruct_local_scalar(env, contribution_terms)
 
     lowered = jax.jit(function) if jit else function
 
     return LocalExecutable(
-        plan=root,
+        plan=plan,
         input_indices=input_indices,
         contribution_terms=contribution_terms,
         function=lowered,

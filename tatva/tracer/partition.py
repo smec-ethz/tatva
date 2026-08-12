@@ -44,11 +44,8 @@ from tatva.tracer.contributions import (
 from tatva.tracer.demand import TensorDemand
 from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.derivatives import (
-    CallDerivativeTrace,
     DerivativeTrace,
     JaxprDerivativeTrace,
-    MapDerivativeTrace,
-    ScanDerivativeTrace,
 )
 from tatva.tracer.model import Shape
 
@@ -189,61 +186,21 @@ def _resolve_derivative_frame(
                 f"no nested derivative trace for equation {step.eqn_index}"
             ) from exc
 
-        if step.kind == "call":
-            if not isinstance(nested, CallDerivativeTrace):
-                raise TypeError(
-                    f"expected call derivative trace at equation {step.eqn_index}"
-                )
-
-            current = nested.body
-            continue
-
-        if step.kind == "map":
-            if not isinstance(nested, MapDerivativeTrace):
-                raise TypeError(
-                    f"expected map derivative trace at equation {step.eqn_index}"
-                )
-
-            if step.iteration is None:
-                raise ValueError("map ValueRef path requires an iteration")
-
-            iteration = next(
-                (item for item in nested.iterations if item.index == step.iteration),
-                None,
+        if nested.invocation.kind is not step.kind:
+            raise TypeError(
+                f"expected {step.kind.name.lower()} derivative trace at equation "
+                f"{step.eqn_index}"
             )
 
-            if iteration is None:
+        try:
+            current = nested.invocation.child_at(step)
+        except KeyError as exc:
+            if nested.template is not None:
                 raise RuntimeError(
                     "cannot resolve an iteration-qualified ValueRef "
                     "through a template-optimized MapDerivativeTrace"
-                )
-
-            current = iteration.body
-            continue
-
-        if step.kind == "scan":
-            if not isinstance(nested, ScanDerivativeTrace):
-                raise TypeError(
-                    f"expected scan derivative trace at equation {step.eqn_index}"
-                )
-
-            if step.iteration is None:
-                raise ValueError("scan ValueRef path requires an iteration")
-
-            iteration = next(
-                (item for item in nested.iterations if item.index == step.iteration),
-                None,
-            )
-
-            if iteration is None:
-                raise KeyError(
-                    f"scan derivative trace has no iteration {step.iteration}"
-                )
-
-            current = iteration.body
-            continue
-
-        raise ValueError(f"unknown frame kind {step.kind!r}")
+                ) from exc
+            raise
 
     return current
 

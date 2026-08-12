@@ -11,7 +11,6 @@ from tatva.tracer.demand import (
     Demand,
     TensorDemand,
     _FullAxis,
-    demand_axes,
     merge_demands,
 )
 from tatva.tracer.helpers import _shape_of
@@ -365,7 +364,7 @@ def _project_batch_demand(
 
     return TensorDemand.from_axes(
         batch_shape,
-        demand_axes(demand)[:batch_rank],
+        demand.axes[:batch_rank],
     )
 
 
@@ -385,8 +384,7 @@ def _expand_batch_demand(
 
     return TensorDemand.from_axes(
         shape,
-        demand_axes(batch_demand)
-        + tuple(_FullAxis() for _ in range(len(shape) - batch_rank)),
+        batch_demand.axes + tuple(_FullAxis() for _ in range(len(shape) - batch_rank)),
     )
 
 
@@ -473,7 +471,7 @@ def lu_demand(
         else:
             projected = TensorDemand.from_axes(
                 batch_shape,
-                demand_axes(output_demand)[:batch_rank],
+                output_demand.axes[:batch_rank],
             )
 
         batch_demand = merge_demands(batch_demand, projected)

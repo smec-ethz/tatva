@@ -27,18 +27,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import cast
 
 from jax.extend.core import JaxprEqn, Literal, Var
 
-from tatva.tracer.analysis import MapPlan
 from tatva.tracer.layout import TensorLayout
-from tatva.tracer.liveness import (
-    CallDemandTrace,
-    DemandTrace,
-    JaxprDemandTrace,
-    MapDemandTrace,
-    ScanDemandTrace,
-)
+from tatva.tracer.liveness import JaxprDemandTrace
 from tatva.tracer.localize import (
     LocalRoute,
     localize_dynamic_slice_route,
@@ -46,14 +40,23 @@ from tatva.tracer.localize import (
     localize_scatter_route,
     localize_select_n_route,
 )
-from tatva.tracer.materialize import (
-    CallInstance,
-    JaxprInstance,
-    MapInstance,
-    ResolvedEqn,
-    ScanInstance,
-)
+from tatva.tracer.materialize import JaxprInstance, ResolvedEqn
 from tatva.tracer.model import DynamicSliceRoute, ScatterRoute, SelectNRoute
+from tatva.tracer.nested import (
+    AnyNestedInvocation,
+    CallContext,
+    CallInvocation,
+    CallSpec,
+    IndexedChild,
+    MapContext,
+    MapSpec,
+    NestedSpec,
+    RepeatedInvocation,
+    ScanContext,
+    ScanSpec,
+    TraversalOrder,
+    dispatch_nested,
+)
 from tatva.tracer.routing import (
     GatherRoute,
     Route,
@@ -77,38 +80,17 @@ class RoutePlan:
 
 
 @dataclass(frozen=True)
-class LocalCallPlan:
-    body: LocalJaxprPlan
-
-
-@dataclass(frozen=True)
-class LocalMapIterationPlan:
-    index: int
-    body: LocalJaxprPlan
-
-
-@dataclass(frozen=True)
-class LocalMapPlan:
-    num_consts: int
-    iterations: tuple[LocalMapIterationPlan, ...]
+class LocalNestedPlan:
+    spec: NestedSpec
+    invocation: AnyNestedInvocation[LocalJaxprPlan]
 
     @property
     def indices(self) -> tuple[int, ...]:
-        return tuple(iteration.index for iteration in self.iterations)
-
-
-@dataclass(frozen=True)
-class LocalScanIterationPlan:
-    index: int
-    body: LocalJaxprPlan
-
-
-@dataclass(frozen=True)
-class LocalScanPlan:
-    iterations: tuple[LocalScanIterationPlan, ...]
-
-
-type NestedLocalPlan = LocalCallPlan | LocalMapPlan | LocalScanPlan
+        return tuple(
+            child.logical_index
+            for child in self.invocation.children(TraversalOrder.LOGICAL)
+            if child.logical_index is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -118,7 +100,7 @@ class LocalEqnPlan:
     input_layouts: tuple[TensorLayout | None, ...]
     output_layouts: tuple[TensorLayout | None, ...]
     route: RoutePlan | None
-    nested: NestedLocalPlan | None
+    nested: LocalNestedPlan | None
 
     @property
     def primitive_name(self) -> str:
@@ -143,11 +125,6 @@ class LocalJaxprPlan:
     @property
     def local_eqn_count(self) -> int:
         return len(self.eqns)
-
-
-@dataclass(frozen=True)
-class LocalPlan:
-    root: LocalJaxprPlan
 
 
 def _finalize_layouts(
@@ -298,28 +275,35 @@ def _build_route_plan(
 
 
 def _plan_call(
-    instance: CallInstance,
-    trace: CallDemandTrace,
-) -> LocalCallPlan:
-    return LocalCallPlan(
-        body=_build_local_jaxpr_plan(
-            instance.body,
-            trace.body,
-        )
+    instance: CallInvocation[JaxprInstance],
+    trace: CallInvocation[JaxprDemandTrace],
+    spec: CallSpec,
+) -> LocalNestedPlan:
+    return LocalNestedPlan(
+        spec=spec,
+        invocation=CallInvocation(
+            instance.eqn_index,
+            _build_local_jaxpr_plan(
+                instance.body,
+                trace.body,
+            ),
+        ),
     )
 
 
 def _plan_map(
-    instance: MapInstance,
-    trace: MapDemandTrace,
-    analysis_plan: MapPlan,
-) -> LocalMapPlan:
+    instance: RepeatedInvocation[JaxprInstance],
+    trace: RepeatedInvocation[JaxprDemandTrace],
+    spec: MapSpec,
+) -> LocalNestedPlan:
     traces_by_index = {
-        iteration.index: iteration.body for iteration in trace.iterations
+        cast(int, child.logical_index): child.payload
+        for child in trace.children(TraversalOrder.LOGICAL)
     }
 
     instances_by_index = {
-        iteration.index: iteration.body for iteration in instance.iterations
+        cast(int, child.logical_index): child.payload
+        for child in instance.children(TraversalOrder.LOGICAL)
     }
 
     if set(traces_by_index) - set(instances_by_index):
@@ -333,7 +317,7 @@ def _plan_map(
     indices = sorted(traces_by_index)
 
     iterations = tuple(
-        LocalMapIterationPlan(
+        IndexedChild(
             index=index,
             body=_build_local_jaxpr_plan(
                 instances_by_index[index],
@@ -343,46 +327,76 @@ def _plan_map(
         for index in indices
     )
 
-    return LocalMapPlan(
-        num_consts=analysis_plan.num_consts,
-        iterations=iterations,
+    return LocalNestedPlan(
+        spec=spec,
+        invocation=instance.with_children(iterations),
     )
 
 
 def _plan_scan(
-    instance: ScanInstance,
-    trace: ScanDemandTrace,
-) -> LocalScanPlan:
+    instance: RepeatedInvocation[JaxprInstance],
+    trace: RepeatedInvocation[JaxprDemandTrace],
+    spec: ScanSpec,
+) -> LocalNestedPlan:
     traces_by_index = {
-        iteration.index: iteration.body for iteration in trace.iterations
+        cast(int, child.logical_index): child.payload for child in trace.children()
     }
 
-    iterations: list[LocalScanIterationPlan] = []
+    iterations: list[IndexedChild[LocalJaxprPlan]] = []
 
-    for materialized in instance.iterations:
-        body_trace = traces_by_index.get(materialized.index)
+    for materialized in instance.children(TraversalOrder.EXECUTION):
+        body_trace = traces_by_index.get(materialized.logical_index)
         if body_trace is None:
             continue
 
         iterations.append(
-            LocalScanIterationPlan(
-                index=materialized.index,
-                body=_build_local_jaxpr_plan(materialized.body, body_trace),
+            IndexedChild(
+                index=cast(int, materialized.logical_index),
+                body=_build_local_jaxpr_plan(materialized.payload, body_trace),
             )
         )
 
-    if len(iterations) != len(trace.iterations):
+    if len(iterations) != len(trace.children()):
         raise RuntimeError(
             "scan demand trace contains an iteration not present in materialization"
         )
 
-    return LocalScanPlan(iterations=tuple(iterations))
+    return LocalNestedPlan(
+        spec=spec,
+        invocation=instance.with_children(tuple(iterations)),
+    )
+
+
+@dataclass(frozen=True)
+class _LocalPlanNestedHandler:
+    trace: AnyNestedInvocation[JaxprDemandTrace]
+
+    def call(self, context: CallContext[JaxprInstance]) -> LocalNestedPlan:
+        return _plan_call(
+            context.invocation,
+            cast(CallInvocation[JaxprDemandTrace], self.trace),
+            context.spec,
+        )
+
+    def map(self, context: MapContext[JaxprInstance]) -> LocalNestedPlan:
+        return _plan_map(
+            context.invocation,
+            cast(RepeatedInvocation[JaxprDemandTrace], self.trace),
+            context.spec,
+        )
+
+    def scan(self, context: ScanContext[JaxprInstance]) -> LocalNestedPlan:
+        return _plan_scan(
+            context.invocation,
+            cast(RepeatedInvocation[JaxprDemandTrace], self.trace),
+            context.spec,
+        )
 
 
 def _build_nested_plan(
     resolved: ResolvedEqn,
     trace: JaxprDemandTrace,
-) -> NestedLocalPlan | None:
+) -> LocalNestedPlan | None:
     nested_instance = resolved.nested
     if nested_instance is None:
         return None
@@ -397,28 +411,16 @@ def _build_nested_plan(
             "has no nested demand trace"
         )
 
-    if isinstance(nested_instance, CallInstance):
-        if not isinstance(nested_trace, CallDemandTrace):
-            raise TypeError("CallInstance/demand trace mismatch")
-
-        return _plan_call(nested_instance, nested_trace)
-
-    if isinstance(nested_instance, MapInstance):
-        if not isinstance(nested_trace, MapDemandTrace):
-            raise TypeError("MapInstance/demand trace mismatch")
-
-        analysis_nested = resolved.plan.nested
-        if not isinstance(analysis_nested, MapPlan):
-            raise TypeError("MapInstance/analysis plan mismatch")
-        return _plan_map(nested_instance, nested_trace, analysis_nested)
-
-    if isinstance(nested_instance, ScanInstance):
-        if not isinstance(nested_trace, ScanDemandTrace):
-            raise TypeError("ScanInstance/demand trace mismatch")
-
-        return _plan_scan(nested_instance, nested_trace)
-
-    raise TypeError(f"unsupported nested instance {type(nested_instance)!r}")
+    if nested_instance.kind is not nested_trace.kind:
+        raise TypeError("nested instance/demand trace mismatch")
+    analysis_plan = resolved.plan.nested
+    if analysis_plan is None:
+        raise TypeError("nested instance has no analysis plan")
+    return dispatch_nested(
+        analysis_plan.spec,
+        nested_instance,
+        _LocalPlanNestedHandler(nested_trace),
+    )
 
 
 def _build_local_jaxpr_plan(
@@ -535,14 +537,9 @@ def _validate_local_jaxpr_plan(
 
 def build_local_plan(
     root: JaxprInstance,
-    demand: DemandTrace,
-) -> LocalPlan:
-    return LocalPlan(
-        root=_build_local_jaxpr_plan(
-            root,
-            demand.root,
-        )
-    )
+    demand: JaxprDemandTrace,
+) -> LocalJaxprPlan:
+    return _build_local_jaxpr_plan(root, demand)
 
 
 def pending_routes(
@@ -558,12 +555,9 @@ def pending_routes(
                 result.append(eqn)
             nested = eqn.nested
 
-            if isinstance(nested, LocalCallPlan):
-                visit(nested.body)
-
-            elif isinstance(nested, (LocalMapPlan, LocalScanPlan)):
-                for iteration in nested.iterations:
-                    visit(iteration.body)
+            if nested is not None:
+                for child in nested.invocation.children():
+                    visit(child.payload)
 
     visit(plan)
 

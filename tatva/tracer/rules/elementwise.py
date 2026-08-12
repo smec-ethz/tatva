@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from jax.extend.core import Literal
 
-from tatva.tracer.demand import Demand, TensorDemand, _FullAxis, demand_axes
+from tatva.tracer.demand import Demand, TensorDemand, _FullAxis
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.semantics import (
@@ -195,7 +195,7 @@ def inverse_elementwise_broadcast(
     if not input_shape:
         return TensorDemand.full(())
 
-    output_axes = demand_axes(demand)
+    output_axes = demand.axes
     offset = len(output_shape) - len(input_shape)
     input_axes = []
 

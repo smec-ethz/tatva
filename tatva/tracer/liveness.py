@@ -15,7 +15,6 @@ primitive demand rules.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -23,11 +22,6 @@ import numpy as np
 from jax.extend.core import Literal, Var
 from numpy.typing import NDArray
 
-from tatva.tracer.analysis import (
-    CallPlan,
-    MapPlan,
-    ScanPlan,
-)
 from tatva.tracer.contributions import ValueRef
 from tatva.tracer.demand import (
     Demand,
@@ -39,12 +33,20 @@ from tatva.tracer.demand import (
 )
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.materialize import (
-    CallInstance,
-    FrameStep,
     JaxprInstance,
-    MapInstance,
     ResolvedEqn,
-    ScanInstance,
+)
+from tatva.tracer.nested import (
+    AnyNestedInvocation,
+    CallContext,
+    CallInvocation,
+    FrameStep,
+    IndexedChild,
+    MapContext,
+    RepeatedInvocation,
+    ScanContext,
+    TraversalOrder,
+    dispatch_nested,
 )
 from tatva.tracer.registry import SEMANTICS
 from tatva.tracer.semantics import (
@@ -58,34 +60,7 @@ class DemandSeed:
     demand: TensorDemand
 
 
-@dataclass(frozen=True)
-class CallDemandTrace:
-    body: JaxprDemandTrace
-
-
-@dataclass(frozen=True)
-class MapIterationDemandTrace:
-    index: int
-    body: JaxprDemandTrace
-
-
-@dataclass(frozen=True)
-class MapDemandTrace:
-    iterations: tuple[MapIterationDemandTrace, ...]
-
-
-@dataclass(frozen=True)
-class ScanIterationDemandTrace:
-    index: int
-    body: JaxprDemandTrace
-
-
-@dataclass(frozen=True)
-class ScanDemandTrace:
-    iterations: tuple[ScanIterationDemandTrace, ...]
-
-
-type NestedDemandTrace = CallDemandTrace | MapDemandTrace | ScanDemandTrace
+type NestedDemandTrace = AnyNestedInvocation[JaxprDemandTrace]
 
 
 @dataclass(frozen=True)
@@ -93,11 +68,6 @@ class JaxprDemandTrace:
     demands: dict[Var, TensorDemand]
     input_demands: tuple[Demand, ...]
     nested: dict[int, NestedDemandTrace]
-
-
-@dataclass(frozen=True)
-class DemandTrace:
-    root: JaxprDemandTrace
 
 
 @dataclass
@@ -147,17 +117,6 @@ def _add_demand(
     demands[atom] = merged
 
 
-def _demand_fraction(demand: Demand) -> float:
-    if demand is None:
-        return 0.0
-
-    total = int(math.prod(demand.shape))
-    if total == 0:
-        return 0.0
-
-    return demand.size / total
-
-
 def _backprop_ordinary(
     resolved: ResolvedEqn,
     output_demands: tuple[Demand, ...],
@@ -173,24 +132,6 @@ def _backprop_ordinary(
         )
     )
 
-    # max_output_fraction = max(
-    #     (_demand_fraction(demand) for demand in output_demands), default=0.0
-    # )
-    # for input_index, demand in enumerate(result):
-    #     if demand is None:
-    #         continue
-    #
-    #     fraction = _demand_fraction(demand)
-    #     if fraction == 1.0 and max_output_fraction < 1.0:
-    #         print(
-    #             "DEMAND WIDENING:",
-    #             eqn.primitive.name,
-    #             f"input={input_index}",
-    #             f"input_shape={demand.shape}",
-    #             f"fraction={fraction:.3f}",
-    #             f"max_output_fraction={max_output_fraction:.3f}",
-    #         )
-
     if len(result) != len(eqn.invars):
         raise RuntimeError(
             f"demand rule for {eqn.primitive.name!r} "
@@ -203,20 +144,14 @@ def _backprop_ordinary(
 
 def _backprop_call(
     resolved: ResolvedEqn,
+    context: CallContext[JaxprInstance],
     output_demands: tuple[Demand, ...],
     child_seed: _SeedNode | None,
 ) -> tuple[
     tuple[Demand, ...],
-    CallDemandTrace,
+    CallInvocation[JaxprDemandTrace],
 ]:
-    nested = resolved.nested
-    plan = resolved.plan.nested
-
-    if not isinstance(nested, CallInstance):
-        raise TypeError("expected CallInstance")
-
-    if not isinstance(plan, CallPlan):
-        raise TypeError("expected CallPlan")
+    nested = context.invocation
 
     child = _backprop_jaxpr(
         nested.body,
@@ -226,34 +161,18 @@ def _backprop_call(
 
     return (
         child.input_demands,
-        CallDemandTrace(body=child),
+        CallInvocation(eqn_index=nested.eqn_index, body=child),
     )
 
 
-def _map_iteration(
-    nested: MapInstance,
-    plan: MapPlan,
-    logical_index: int,
-):
-    if logical_index < 0 or logical_index >= plan.length:
-        raise IndexError(logical_index)
-
-    position = plan.length - 1 - logical_index if plan.reverse else logical_index
-    iteration = nested.iterations[position]
-
-    if iteration.index != logical_index:
-        raise RuntimeError("MapInstance iteration ordering invariant violated")
-
-    return iteration
-
-
 def _map_demanded_indices(
-    plan: MapPlan,
+    context: MapContext[JaxprInstance],
     output_demands: tuple[Demand, ...],
     seed_node: _SeedNode,
     *,
     eqn_index: int,
 ) -> NDArray[np.int64]:
+    spec = context.spec
     parts = []
 
     for demand in output_demands:
@@ -261,16 +180,13 @@ def _map_demanded_indices(
             continue
 
         first = demand.axis_subset(0)
-        parts.append(axis_indices(first, extent=plan.length))
+        parts.append(axis_indices(first, extent=spec.length))
 
+    child_steps = {child.frame_step for child in context.invocation.children()}
     explicit = [
         step.iteration
         for step in seed_node.children
-        if (
-            step.eqn_index == eqn_index
-            and step.kind == "map"
-            and step.iteration is not None
-        )
+        if step in child_steps and step.iteration is not None
     ]
 
     if explicit:
@@ -284,26 +200,22 @@ def _map_demanded_indices(
 
 def _backprop_map(
     resolved: ResolvedEqn,
+    context: MapContext[JaxprInstance],
     output_demands: tuple[Demand, ...],
     seed_node: _SeedNode,
 ) -> tuple[
     tuple[Demand, ...],
-    MapDemandTrace,
+    RepeatedInvocation[JaxprDemandTrace],
 ]:
-    nested = resolved.nested
-    plan = resolved.plan.nested
+    nested = context.invocation
     eqn = resolved.plan.eqn
 
-    if not isinstance(nested, MapInstance):
-        raise TypeError("expected MapInstance")
-
-    if not isinstance(plan, MapPlan):
-        raise TypeError("expected MapPlan")
+    spec = context.spec
 
     input_demands: list[Demand] = [None] * len(eqn.invars)
-    traces: list[MapIterationDemandTrace] = []
+    traces: list[IndexedChild[JaxprDemandTrace]] = []
     indices = _map_demanded_indices(
-        plan,
+        context,
         output_demands,
         seed_node,
         eqn_index=resolved.plan.index,
@@ -311,12 +223,8 @@ def _backprop_map(
 
     for logical_index in indices:
         logical_index = int(logical_index)
-        iteration = _map_iteration(nested, plan, logical_index)
-        child_step = FrameStep(
-            eqn_index=resolved.plan.index,
-            kind="map",
-            iteration=logical_index,
-        )
+        iteration = nested.child_at_index(logical_index)
+        child_step = nested.frame_step(logical_index)
 
         child_seed = seed_node.children.get(child_step, _SeedNode())
 
@@ -324,10 +232,10 @@ def _backprop_map(
             take_leading_axis_demand(demand, logical_index) for demand in output_demands
         )
 
-        child = _backprop_jaxpr(iteration.body, child_seed, output_demands=body_outputs)
+        child = _backprop_jaxpr(iteration, child_seed, output_demands=body_outputs)
 
         traces.append(
-            MapIterationDemandTrace(
+            IndexedChild(
                 index=logical_index,
                 body=child,
             )
@@ -337,7 +245,7 @@ def _backprop_map(
             if demand is None:
                 continue
 
-            if input_index < plan.num_consts:
+            if input_index < spec.num_consts:
                 lifted = demand
 
             else:
@@ -354,51 +262,43 @@ def _backprop_map(
 
     return (
         tuple(input_demands),
-        MapDemandTrace(iterations=tuple(traces)),
+        nested.with_children(tuple(traces)),
     )
 
 
 def _backprop_scan(
     resolved: ResolvedEqn,
+    context: ScanContext[JaxprInstance],
     output_demands: tuple[Demand, ...],
     seed_node: _SeedNode,
 ) -> tuple[
     tuple[Demand, ...],
-    ScanDemandTrace,
+    RepeatedInvocation[JaxprDemandTrace],
 ]:
-    nested = resolved.nested
-    plan = resolved.plan.nested
+    nested = context.invocation
     eqn = resolved.plan.eqn
 
-    if not isinstance(nested, ScanInstance):
-        raise TypeError("expected ScanInstance")
+    spec = context.spec
 
-    if not isinstance(plan, ScanPlan):
-        raise TypeError("expected ScanPlan")
-
-    if plan.num_carry <= 0:
+    if spec.num_carry <= 0:
         raise RuntimeError("carry-free scan should be MapPlan")
 
-    num_consts = plan.num_consts
-    num_carry = plan.num_carry
+    num_consts = spec.num_consts
+    num_carry = spec.num_carry
 
     num_xs = len(eqn.invars) - num_consts - num_carry
     carry_demands = list(output_demands[:num_carry])
     y_demands = output_demands[num_carry:]
     const_demands: list[Demand] = [None] * num_consts
     xs_demands: list[Demand] = [None] * num_xs
-    traces: list[ScanIterationDemandTrace] = []
+    traces: list[IndexedChild[JaxprDemandTrace]] = []
 
     # nested.iterations is execution order.
     # Backward liveness runs opposite execution order.
-    for iteration in reversed(nested.iterations):
-        logical_index = iteration.index
-
-        child_step = FrameStep(
-            eqn_index=resolved.plan.index,
-            kind="scan",
-            iteration=logical_index,
-        )
+    for nested_child in nested.children(TraversalOrder.REVERSE_EXECUTION):
+        logical_index = nested_child.logical_index
+        assert logical_index is not None
+        child_step = nested_child.frame_step
         child_seed = seed_node.children.get(child_step)
         y_step_demands = tuple(
             take_leading_axis_demand(demand, logical_index) for demand in y_demands
@@ -410,12 +310,12 @@ def _backprop_scan(
             continue
 
         child = _backprop_jaxpr(
-            iteration.body,
+            nested_child.payload,
             child_seed or _SeedNode(),
             output_demands=body_outputs,
         )
 
-        traces.append(ScanIterationDemandTrace(index=logical_index, body=child))
+        traces.append(IndexedChild(index=logical_index, body=child))
         inputs = child.input_demands
 
         # Shared constants.
@@ -447,10 +347,40 @@ def _backprop_scan(
 
     return (
         result,
-        ScanDemandTrace(
-            iterations=tuple(traces),
-        ),
+        nested.with_children(tuple(traces)),
     )
+
+
+@dataclass(frozen=True)
+class _DemandNestedHandler:
+    resolved: ResolvedEqn
+    output_demands: tuple[Demand, ...]
+    seed_node: _SeedNode
+
+    def call(
+        self, context: CallContext[JaxprInstance]
+    ) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
+        child_step = context.invocation.children()[0].frame_step
+        return _backprop_call(
+            self.resolved,
+            context,
+            self.output_demands,
+            self.seed_node.children.get(child_step),
+        )
+
+    def map(
+        self, context: MapContext[JaxprInstance]
+    ) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
+        return _backprop_map(
+            self.resolved, context, self.output_demands, self.seed_node
+        )
+
+    def scan(
+        self, context: ScanContext[JaxprInstance]
+    ) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
+        return _backprop_scan(
+            self.resolved, context, self.output_demands, self.seed_node
+        )
 
 
 def _backprop_jaxpr(
@@ -478,96 +408,43 @@ def _backprop_jaxpr(
         for atom, demand in zip(jaxpr.outvars, output_demands):
             _add_demand(demands, atom, demand)
 
-    # --------------------------------------------------------------
     # Reverse topological traversal.
-    # --------------------------------------------------------------
-
     for resolved in reversed(instance.eqns):
         eqn = resolved.plan.eqn
         eqn_output_demands = tuple(demands.get(outvar) for outvar in eqn.outvars)
         eqn_index = resolved.plan.index
 
-        # ----------------------------------------------------------
         # Ordinary primitive
-        # ----------------------------------------------------------
-
         if resolved.nested is None:
             if all(demand is None for demand in eqn_output_demands):
                 continue
 
             input_demands = _backprop_ordinary(resolved, eqn_output_demands)
 
-        # ----------------------------------------------------------
-        # call / remat
-        # ----------------------------------------------------------
-
-        elif isinstance(resolved.nested, CallInstance):
-            child_step = FrameStep(
-                eqn_index=eqn_index,
-                kind="call",
-            )
-            child_seed = seed_node.children.get(child_step)
-
-            if (
-                all(demand is None for demand in eqn_output_demands)
-                and child_seed is None
-            ):
-                continue
-
-            (input_demands, nested_trace) = _backprop_call(
-                resolved, eqn_output_demands, child_seed
-            )
-            nested_traces[eqn_index] = nested_trace
-
-        # ----------------------------------------------------------
-        # independent map
-        # ----------------------------------------------------------
-
-        elif isinstance(resolved.nested, MapInstance):
-            has_child_seed = any(
-                step.eqn_index == eqn_index and step.kind == "map"
-                for step in seed_node.children
-            )
-
-            if (
-                all(demand is None for demand in eqn_output_demands)
-                and not has_child_seed
-            ):
-                continue
-
-            (input_demands, nested_trace) = _backprop_map(
-                resolved, eqn_output_demands, seed_node
-            )
-            nested_traces[eqn_index] = nested_trace
-
-        # ----------------------------------------------------------
-        # recurrent scan
-        # ----------------------------------------------------------
-
-        elif isinstance(resolved.nested, ScanInstance):
-            has_child_seed = any(
-                step.eqn_index == eqn_index and step.kind == "scan"
-                for step in seed_node.children
-            )
-
-            if (
-                all(demand is None for demand in eqn_output_demands)
-                and not has_child_seed
-            ):
-                continue
-
-            (input_demands, nested_trace) = _backprop_scan(
-                resolved, eqn_output_demands, seed_node
-            )
-            nested_traces[eqn_index] = nested_trace
-
         else:
-            raise TypeError(f"unsupported nested instance {type(resolved.nested)!r}")
+            nested_plan = resolved.plan.nested
+            if nested_plan is None:
+                raise TypeError("nested invocation has no analysis plan")
 
-        # ----------------------------------------------------------
+            has_child_seed = any(
+                child.frame_step in seed_node.children
+                for child in resolved.nested.children()
+            )
+
+            if (
+                all(demand is None for demand in eqn_output_demands)
+                and not has_child_seed
+            ):
+                continue
+
+            input_demands, nested_trace = dispatch_nested(
+                nested_plan.spec,
+                resolved.nested,
+                _DemandNestedHandler(resolved, eqn_output_demands, seed_node),
+            )
+            nested_traces[eqn_index] = nested_trace
+
         # Merge producer requirements.
-        # ----------------------------------------------------------
-
         if len(input_demands) != len(eqn.invars):
             raise RuntimeError(
                 f"{eqn.primitive.name!r} demand propagation "
@@ -589,12 +466,7 @@ def _backprop_jaxpr(
 def backpropagate_demand(
     root: JaxprInstance,
     seeds: Iterable[DemandSeed],
-) -> DemandTrace:
+) -> JaxprDemandTrace:
     seed_tree = _build_seed_tree(seeds)
 
-    return DemandTrace(
-        root=_backprop_jaxpr(
-            root,
-            seed_tree,
-        )
-    )
+    return _backprop_jaxpr(root, seed_tree)

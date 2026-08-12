@@ -4,7 +4,7 @@ import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
-from tatva.tracer.demand import Demand, TensorDemand, demand_rows
+from tatva.tracer.demand import Demand, TensorDemand
 from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import DynamicSliceRoute, DynamicUpdateSliceRoute, SelectNRoute
@@ -119,7 +119,7 @@ def select_n_demand(
         raise TypeError("select_n demand requires SelectNRoute")
 
     output_shape = _shape_of(ctx.eqn.outvars[0])
-    demanded_rows = demand_rows(output)
+    demanded_rows = output.rows()
     result: list[Demand] = [None] * len(ctx.eqn.invars)
 
     # selector is compiled into route.case_indices.
@@ -155,7 +155,7 @@ def dynamic_slice_demand(
     if not isinstance(route, DynamicSliceRoute):
         raise TypeError("dynamic_slice demand requires DynamicSliceRoute")
 
-    rows = demand_rows(output)
+    rows = output.rows()
     source_rows = route.source_rows[rows]
     result: list[Demand] = [None] * len(ctx.eqn.invars)
     result[0] = TensorDemand.from_rows_hull(
@@ -180,7 +180,7 @@ def dynamic_update_slice_demand(
         raise TypeError("dynamic_update_slice demand requires DynamicUpdateSliceRoute")
 
     output_shape = _shape_of(ctx.eqn.outvars[0])
-    output_rows = demand_rows(output)
+    output_rows = output.rows()
     n_output = int(math.prod(output_shape))
 
     wanted = np.zeros(

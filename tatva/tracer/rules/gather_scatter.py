@@ -9,7 +9,7 @@ import scipy.sparse as sps
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
-from tatva.tracer.demand import Demand, TensorDemand, demand_rows
+from tatva.tracer.demand import Demand, TensorDemand
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import GatherRoute, ScatterRoute, Shape
@@ -82,7 +82,7 @@ def gather_demand(
     if not isinstance(route, GatherRoute):
         raise TypeError("gather demand requires GatherRoute")
 
-    output_rows = demand_rows(output)
+    output_rows = output.rows()
     source_rows = route.source_rows[output_rows]
     source_rows = source_rows[source_rows >= 0]
 
@@ -176,7 +176,7 @@ def _scatter_demand(
 
     output_shape = _shape_of(ctx.eqn.outvars[0])
     n_output = int(math.prod(output_shape))
-    output_rows = demand_rows(output)
+    output_rows = output.rows()
 
     wanted = np.zeros(
         n_output,
