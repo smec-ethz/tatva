@@ -413,9 +413,11 @@ def _build_nested_plan(
 
     if nested_instance.kind is not nested_trace.kind:
         raise TypeError("nested instance/demand trace mismatch")
+
     analysis_plan = resolved.plan.nested
     if analysis_plan is None:
         raise TypeError("nested instance has no analysis plan")
+
     return dispatch_nested(
         analysis_plan.spec,
         nested_instance,
