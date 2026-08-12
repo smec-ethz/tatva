@@ -290,10 +290,17 @@ def _analyze_scan(
 ) -> NestedPlan:
     nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
 
-    num_consts = int(eqn.params.get("num_consts", 0))
-    num_carry = int(eqn.params["num_carry"])
+    consts_group, carry_group, xs_group = eqn.params["ft_in"].unpack()
+    num_consts = len(consts_group)
+    num_carry = len(carry_group)
+    num_xs = len(xs_group)
     length = int(eqn.params["length"])
     reverse = bool(eqn.params["reverse"])
+
+    if num_consts + num_carry + num_xs != len(eqn.invars):
+        raise ValueError(
+            "invalid scan metadata: ft_in does not partition all scan inputs"
+        )
 
     if num_carry == 0:
         return _analyze_carry_free_scan(
@@ -312,11 +319,6 @@ def _analyze_scan(
         raise ValueError(
             f"scan has {len(eqn.outvars)} outer outputs "
             f"but body has {len(body.outvars)} outputs"
-        )
-
-    if num_consts + num_carry > len(eqn.invars):
-        raise ValueError(
-            "invalid scan metadata: num_consts + num_carry exceeds input count"
         )
 
     if num_carry > len(eqn.outvars):
