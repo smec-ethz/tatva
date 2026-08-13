@@ -91,19 +91,19 @@ is that the code becomes far slower, silently. That is what
 it compiles the element kernels and asserts the HLO holds no ``dot``, no cuBLAS
 call and no LU, so the regression fails loudly instead.
 
-One exception is not a simplification but a correctness change: ``tk.tensordot`` is
+One exception is not a simplification but a correctness change: ``linalg.tensordot`` is
 ``jnp.tensordot(A, B, axes=1)``, *not* ``jnp.matmul``. The two disagree once ``B``
 is rank 3 or more, silently and with no error.
 
-Say what you mean: ``tk.contract``
+Main entry point: ``linalg.contract``
 ---------------------------------
-The entry point is ``tk.contract(spec, A, B)``, and the spec is an einsum-style
+The entry point is ``linalg.contract(spec, A, B)``, and the spec is an einsum-style
 string naming the contraction::
 
-    J    = tk.contract("in,nj->ij",    dNdr,        nodal_coords)
-    dNdX = tk.contract("ij,jn->in",    tk.inv(J),   dNdr)
-    grad = tk.contract("in,n...->i...", dNdX,       nodal_values)
-    val  = tk.contract("n,n...->...",  N,           nodal_values)
+    J    = linalg.contract("in,nj->ij",    dNdr,        nodal_coords)
+    dNdX = linalg.contract("ij,jn->in",    linalg.inv(J),   dNdr)
+    grad = linalg.contract("in,n...->i...", dNdX,       nodal_values)
+    val  = linalg.contract("n,n...->...",  N,           nodal_values)
 
 The spec is a *name*, not an instruction. It is never handed to ``jnp.einsum`` --
 every one of these sums over a shared index, so einsum would lower all four to a
@@ -311,7 +311,7 @@ _known_ranks = {
 
 def _tokenize(term: str) -> list[str]:
     """Split a spec term into index letters, with ``...`` as a single token.
-    For example, ``"in,n...->i..."`` is split into ``["in", "...", "->", "i..."]``.
+    For example, ``"in,n...->i..."`` is split into  ["i", "n", "n", "...", "->", "i", "..."].
 
     Args:
         term: The spec term to tokenize.
@@ -331,7 +331,8 @@ def _tokenize(term: str) -> list[str]:
 
 
 def _canonicalise(spec: str) -> str:
-    """Rename index letters in order of first appearance.
+    """Rename index letters in order of first appearance i.e. the first letter encountered
+    is renamed to 'a', the second to 'b', etc.
 
     So a call may use letters that mean something -- ``"in,nj->ij"`` for the
     Jacobian, ``"in,n...->i..."`` for the node contraction -- while the lookup table
@@ -340,7 +341,7 @@ def _canonicalise(spec: str) -> str:
     cleaned = spec.replace(" ", "")
     if cleaned.count("->") != 1 or cleaned.count(",") != 1:
         raise ValueError(
-            f"tk.contract could not parse the spec {spec!r}. Expected exactly one ',' "
+            f"linalg.contract could not parse the spec {spec!r}. Expected exactly one ',' "
             "and one '->', as in 'in,nj->ij'."
         )
     lhs, out = cleaned.split("->")
@@ -356,11 +357,11 @@ def _canonicalise(spec: str) -> str:
                 continue
             if not token.isalpha():
                 raise ValueError(
-                    f"tk.contract could not parse the spec {spec!r}: {token!r} is not an "
+                    f"linalg.contract could not parse the spec {spec!r}: {token!r} is not an "
                     "index letter."
                 )
             if token not in renaming:
-                renaming[token] = chr(ord("a") + len(renaming))
+                renaming[token] = chr(ord("a") + len(renaming))  # assign a new letter
             letters.append(renaming[token])
         return "".join(letters)
 
@@ -370,10 +371,10 @@ def _canonicalise(spec: str) -> str:
 def contract(spec: str, A: Array, B: Array) -> Array:
     """Contract two element-sized tensors, named by an einsum-style spec.
 
-        J    = tk.contract("in,nj->ij", dNdr, nodal_coords)     # (d, n) x (n, d)
-        dNdX = tk.contract("ij,jn->in", tk.inv(J), dNdr)        # (d, d) x (d, n)
-        grad = tk.contract("in,n...->i...", dNdX, nodal_values)  # over the node axis
-        val  = tk.contract("n,n...->...", N, nodal_values)      # over the node axis
+        J    = linalg.contract("in,nj->ij", dNdr, nodal_coords)     # (d, n) x (n, d)
+        dNdX = linalg.contract("ij,jn->in", linalg.inv(J), dNdr)        # (d, d) x (d, n)
+        grad = linalg.contract("in,n...->i...", dNdX, nodal_values)  # over the node axis
+        val  = linalg.contract("n,n...->...", N, nodal_values)      # over the node axis
 
     Index letters are free. They are canonicalised by order of first appearance, so
     ``"in,nj->ij"`` and ``"pq,qr->pr"`` are the same entry, and a call site may use
@@ -394,31 +395,35 @@ def contract(spec: str, A: Array, B: Array) -> Array:
         ValueError: if the spec is unparseable, names a contraction with no measured
             implementation, or disagrees with the operand shapes.
     """
+    # convert the spec to canonical form, to match keys in the known implementations
     canonical = _canonicalise(spec)
+    # look up the implementation for the canonical spec
     implementation = _known_implementations.get(canonical)
+
     if implementation is None:
         supported = ", ".join(repr(s) for s in _known_implementations)
         raise ValueError(
-            f"tk.contract has no implementation for {spec!r} (canonically {canonical!r})."
+            f"linalg.contract has no implementation for {spec!r} (canonically {canonical!r})."
             f" Supported contractions are {supported}. This is deliberate rather than a "
             "gap: each entry is a measured decision about how to spell the contraction "
             "so it does not lower to a `dot`. Add an entry, with the measurement, rather "
             "than reaching for jnp.einsum -- see the module docstring."
         )
 
+    # check that the operand shapes match the expected ranks for this spec
     expected_a, expected_b = _known_ranks[canonical]
     got = (A.ndim, B.ndim)
     if A.ndim != expected_a or (expected_b is not None and B.ndim != expected_b):
         wanted = f"({expected_a}, {expected_b if expected_b is not None else '>=1'})"
         raise ValueError(
-            f"tk.contract({spec!r}, ...) wants operand ranks {wanted}, got {got} from "
+            f"linalg.contract({spec!r}, ...) wants operand ranks {wanted}, got {got} from "
             f"shapes {A.shape} and {B.shape}. These take a single tensor each -- batch "
             "with jax.vmap, which fuses the contraction into the surrounding work "
             "instead of materialising it."
         )
     if A.shape[-1] != B.shape[0]:
         raise ValueError(
-            f"tk.contract({spec!r}, ...) contracts A's last axis with B's first, but "
+            f"linalg.contract({spec!r}, ...) contracts A's last axis with B's first, but "
             f"they are {A.shape[-1]} and {B.shape[0]} from shapes {A.shape} and "
             f"{B.shape}."
         )

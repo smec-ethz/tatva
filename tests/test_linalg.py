@@ -24,8 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import tatva.tensor_kernels as tk
-from tatva import Mesh, Operator
+from tatva import Mesh, Operator, linalg
 from tatva.element.base import Hexahedron8, Line2, Line3, Quad4, Tetrahedron4, Tri3
 
 jax.config.update("jax_enable_x64", True)
@@ -45,13 +44,13 @@ def _well_conditioned(d: int, seed: int = 0) -> jnp.ndarray:
 @pytest.mark.parametrize("d", [1, 2, 3])
 def test_inv_matches_jnp_linalg_inv(d):
     J = _well_conditioned(d)
-    assert jnp.allclose(tk.inv(J), jnp.linalg.inv(J))
+    assert jnp.allclose(linalg.inv(J), jnp.linalg.inv(J))
 
 
 @pytest.mark.parametrize("d", [1, 2, 3])
 def test_inv_round_trips(d):
     J = _well_conditioned(d)
-    assert jnp.allclose(tk.inv(J) @ J, jnp.eye(d), atol=1e-12)
+    assert jnp.allclose(linalg.inv(J) @ J, jnp.eye(d), atol=1e-12)
 
 
 @pytest.mark.parametrize("d", [2, 3])
@@ -59,13 +58,13 @@ def test_inv_vmaps_over_a_batch(d):
     """Batching is vmap's job -- the kernel itself stays unbatched."""
     rng = np.random.default_rng(1)
     stack = jnp.eye(d) + 0.1 * jnp.asarray(rng.standard_normal((16, d, d)))
-    assert jnp.allclose(jax.vmap(tk.inv)(stack), jnp.linalg.inv(stack))
+    assert jnp.allclose(jax.vmap(linalg.inv)(stack), jnp.linalg.inv(stack))
 
 
 @pytest.mark.parametrize("shape", [(4, 2, 2), (3, 3, 3), (2,)])
 def test_inv_rejects_anything_that_is_not_a_single_matrix(shape):
     with pytest.raises(ValueError, match="single matrix"):
-        tk.inv(jnp.zeros(shape))
+        linalg.inv(jnp.zeros(shape))
 
 
 # --------------------------------------------------------------------------------
@@ -94,7 +93,7 @@ def test_tensordot_matches_jnp_tensordot(a_shape, b_shape):
     rng = np.random.default_rng(2)
     A = jnp.asarray(rng.random(a_shape))
     B = jnp.asarray(rng.random(b_shape))
-    assert jnp.allclose(tk._tensordot(A, B), jnp.tensordot(A, B, axes=1))
+    assert jnp.allclose(linalg._tensordot(A, B), jnp.tensordot(A, B, axes=1))
 
 
 def test_tensordot_is_not_jnp_matmul_for_rank3_operands():
@@ -109,16 +108,18 @@ def test_tensordot_is_not_jnp_matmul_for_rank3_operands():
     A = jnp.asarray(rng.random((2, 3)))
     B = jnp.asarray(rng.random((3, 3, 4)))
 
-    assert tk._tensordot(A, B).shape == (2, 3, 4)
+    assert linalg._tensordot(A, B).shape == (2, 3, 4)
     assert jnp.matmul(A, B).shape == (3, 2, 4)
-    assert jnp.allclose(tk._tensordot(A, B), jnp.tensordot(A, B, axes=1))
+    assert jnp.allclose(linalg._tensordot(A, B), jnp.tensordot(A, B, axes=1))
 
 
 def test_tensordot_vmaps_over_a_batch():
     rng = np.random.default_rng(3)
     A = jnp.asarray(rng.random((16, 2, 3)))
     B = jnp.asarray(rng.random((16, 3, 4)))
-    assert jnp.allclose(jax.vmap(tk._tensordot)(A, B), jnp.einsum("epq,eqr->epr", A, B))
+    assert jnp.allclose(
+        jax.vmap(linalg._tensordot)(A, B), jnp.einsum("epq,eqr->epr", A, B)
+    )
 
 
 def test_tensordot_rejects_a_stack_of_matrices():
@@ -126,7 +127,7 @@ def test_tensordot_rejects_a_stack_of_matrices():
     (p, q, r) product, so a batch axis allocates it in full. Use jax.vmap.
     """
     with pytest.raises(ValueError, match="single vector or matrix"):
-        tk._tensordot(jnp.zeros((5, 2, 3)), jnp.zeros((3, 4)))
+        linalg._tensordot(jnp.zeros((5, 2, 3)), jnp.zeros((3, 4)))
 
 
 # --------------------------------------------------------------------------------
@@ -154,7 +155,7 @@ def test_contract_computes_what_the_spec_says(spec, a_shape, b_shape, einsum):
     rng = np.random.default_rng(9)
     A = jnp.asarray(rng.random(a_shape))
     B = jnp.asarray(rng.random(b_shape))
-    assert jnp.allclose(tk.contract(spec, A, B), jnp.einsum(einsum, A, B))
+    assert jnp.allclose(linalg.contract(spec, A, B), jnp.einsum(einsum, A, B))
 
 
 def test_contract_is_indifferent_to_the_index_letters():
@@ -164,8 +165,10 @@ def test_contract_is_indifferent_to_the_index_letters():
     rng = np.random.default_rng(10)
     A = jnp.asarray(rng.random((2, 4)))
     B = jnp.asarray(rng.random((4, 3)))
-    assert jnp.allclose(tk.contract("in,nj->ij", A, B), tk.contract("pq,qr->pr", A, B))
-    assert jnp.allclose(tk.contract("ab,bc->ac", A, B), A @ B)
+    assert jnp.allclose(
+        linalg.contract("in,nj->ij", A, B), linalg.contract("pq,qr->pr", A, B)
+    )
+    assert jnp.allclose(linalg.contract("ab,bc->ac", A, B), A @ B)
 
 
 def test_contract_refuses_an_unmeasured_contraction():
@@ -176,9 +179,9 @@ def test_contract_refuses_an_unmeasured_contraction():
     A = jnp.zeros((2, 3))
     B = jnp.zeros((3, 4))
     with pytest.raises(ValueError, match="no implementation"):
-        tk.contract("ij,jk->ijk", A, B)  # no contraction at all
+        linalg.contract("ij,jk->ijk", A, B)  # no contraction at all
     with pytest.raises(ValueError, match="no implementation"):
-        tk.contract("ij,jk->ki", A, B)  # transposed output
+        linalg.contract("ij,jk->ki", A, B)  # transposed output
 
 
 @pytest.mark.parametrize("spec", ["in,nj->ij", "n,n...->...", "in,n...->i..."])
@@ -187,12 +190,12 @@ def test_contract_rejects_a_batch_axis(spec):
     intermediate, so a hand-rolled batch axis allocates it in full -- use jax.vmap.
     """
     with pytest.raises(ValueError, match="ranks"):
-        tk.contract(spec, jnp.zeros((5, 2, 3)), jnp.zeros((3, 4)))
+        linalg.contract(spec, jnp.zeros((5, 2, 3)), jnp.zeros((3, 4)))
 
 
 def test_contract_rejects_a_mismatched_contraction_axis():
     with pytest.raises(ValueError, match="contracts A's last axis"):
-        tk.contract("in,nj->ij", jnp.zeros((2, 3)), jnp.zeros((4, 2)))
+        linalg.contract("in,nj->ij", jnp.zeros((2, 3)), jnp.zeros((4, 2)))
 
 
 def test_contract_rejects_an_unparseable_spec():
@@ -200,22 +203,16 @@ def test_contract_rejects_an_unparseable_spec():
     B = jnp.zeros((3, 4))
     for spec in ["ij->i", "ij,jk", "ij,jk->ik->ik", "i1,1k->ik"]:
         with pytest.raises(ValueError, match="could not parse|no implementation"):
-            tk.contract(spec, A, B)
+            linalg.contract(spec, A, B)
 
 
 def test_contract_dispatches_the_matmul_spec_on_the_lowering_platform():
     """The one spec that consults the backend, and the reason it is
-    `jax.lax.platform_dependent` rather than `jax.default_backend()`.
-
-    `default_backend()` reports the highest-priority backend *available* in the process,
-    so on any machine with a GPU it answers "gpu" even for a computation placed on the
-    CPU -- the wrong branch, precisely on the mixed setups where the distinction matters.
-    Lowering the same function for two platforms shows the dispatch following the target,
-    and shows the branch not taken being pruned rather than kept behind a `conditional`.
+    `jax.lax.platform_dependent`.
     """
     A = jnp.ones((64, 2, 4))
     B = jnp.ones((64, 4, 2))
-    fn = jax.jit(jax.vmap(lambda a, b: tk.contract("in,nj->ij", a, b)))
+    fn = jax.jit(jax.vmap(lambda a, b: linalg.contract("in,nj->ij", a, b)))
     traced = fn.trace(A, B)
 
     cpu = traced.lower(lowering_platforms=("cpu",)).as_text()
@@ -238,7 +235,7 @@ def test_contract_does_not_dispatch_the_node_contractions(spec):
     """
     A = jnp.ones((64, 2, 4)) if spec.startswith("in") else jnp.ones((64, 4))
     B = jnp.ones((64, 4, 3))
-    traced = jax.jit(jax.vmap(lambda a, b: tk.contract(spec, a, b))).trace(A, B)
+    traced = jax.jit(jax.vmap(lambda a, b: linalg.contract(spec, a, b))).trace(A, B)
 
     for platform in ("cpu", "cuda"):
         text = traced.lower(lowering_platforms=(platform,)).as_text()
@@ -254,28 +251,28 @@ def test_contract_matmul_branches_agree_where_it_dispatches():
     rng = np.random.default_rng(11)
     A = jnp.asarray(rng.random((2, 4)))
     B = jnp.asarray(rng.random((4, 3)))
-    assert jnp.allclose(A @ B, tk._tensordot(A, B))
+    assert jnp.allclose(A @ B, linalg._tensordot(A, B))
 
 
 def test_every_contract_spec_in_the_library_is_in_the_table():
     """A spec is a string, so a typo in one is a runtime error on a path that may only
-    run for one element type in one dimension. This reads every ``tk.contract`` literal
+    run for one element type in one dimension. This reads every ``linalg.contract`` literal
     in the package and resolves it, so a bad spec fails here rather than the first time
     someone meshes with a Line3.
     """
-    package = pathlib.Path(tk.__file__).parent
+    package = pathlib.Path(linalg.__file__).parent
     literals = {
         match.group(1)
         for path in package.rglob("*.py")
         for match in re.finditer(
-            r"""tk\.contract\(\s*["']([^"']+)["']""", path.read_text()
+            r"""linalg\.contract\(\s*["']([^"']+)["']""", path.read_text()
         )
     }
-    assert literals, "found no tk.contract call sites -- has the API been renamed?"
+    assert literals, "found no linalg.contract call sites -- has the API been renamed?"
 
     for spec in sorted(literals):
-        canonical = tk._canonicalise(spec)
-        assert canonical in tk._known_implementations, (
+        canonical = linalg._canonicalise(spec)
+        assert canonical in linalg._known_implementations, (
             f"{spec!r} is used in the package but canonicalises to {canonical!r}, which "
             "has no entry in _known_implementations"
         )
@@ -301,7 +298,9 @@ def test_contract_differentiates_like_the_einsum_it_names(
     A = jnp.asarray(rng.random(a_shape))
     B = jnp.asarray(rng.random(b_shape))
 
-    mine = jax.grad(lambda a, b: tk.contract(spec, a, b).sum(), argnums=(0, 1))(A, B)
+    mine = jax.grad(lambda a, b: linalg.contract(spec, a, b).sum(), argnums=(0, 1))(
+        A, B
+    )
     reference = jax.grad(lambda a, b: jnp.einsum(einsum, a, b).sum(), argnums=(0, 1))(
         A, B
     )
@@ -325,7 +324,7 @@ def test_contract_vmaps_over_elements(spec, a_shape, b_shape, einsum):
     rng = np.random.default_rng(13)
     A = jnp.asarray(rng.random((16, *a_shape)))
     B = jnp.asarray(rng.random((16, *b_shape)))
-    batched = jax.vmap(lambda a, b: tk.contract(spec, a, b))(A, B)
+    batched = jax.vmap(lambda a, b: linalg.contract(spec, a, b))(A, B)
     assert jnp.allclose(batched, jnp.einsum(einsum, A, B))
 
 
@@ -354,7 +353,7 @@ def _gemm_ops(hlo: str) -> dict[str, int]:
 def test_element_kernels_avoid_lapack_and_cublas(element, dim):
     """`Element.gradient` and `get_jacobian` must never reach LAPACK or cuBLAS.
 
-    If this fails, someone has put `jnp.linalg.inv` back in place of `tk.inv` -- an LU
+    If this fails, someone has put `jnp.linalg.inv` back in place of `linalg.inv` -- an LU
     factorisation plus a triangular solve, per element, measured 77x slower than the
     closed form. The numbers stay correct, only the speed changes.
 
