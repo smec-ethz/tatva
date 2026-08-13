@@ -9,6 +9,13 @@ from tatva.tracer.lowering import build_local_executable
 from tatva.tracer.partition import partition_contributions
 
 
+def _bind_reverse(energy, reverse):
+    def fn(values):
+        return energy(values, reverse=reverse)
+
+    return fn
+
+
 def _lower_part(fn, u, *, n_parts=1, part=0):
     traced = trace(CapturedJaxpr.from_fn(fn, u))
     partition = partition_contributions(traced.contributions, n_parts=n_parts)
@@ -42,7 +49,7 @@ def test_scan_lowering_matches_forward_and_reverse_scans():
         return jnp.sum(ys)
 
     for reverse in (False, True):
-        fn = lambda values, reverse=reverse: energy(values, reverse=reverse)
+        fn = _bind_reverse(energy, reverse)
         np.testing.assert_allclose(_lower_part(fn, u), fn(u))
 
 
@@ -58,8 +65,6 @@ def test_scan_lowering_handles_partitioned_heterogeneous_iterations():
         return jnp.sum(ys)
 
     for reverse in (False, True):
-        fn = lambda values, reverse=reverse: energy(values, reverse=reverse)
-        parts = tuple(
-            _lower_part(fn, u, n_parts=2, part=part) for part in range(2)
-        )
+        fn = _bind_reverse(energy, reverse)
+        parts = tuple(_lower_part(fn, u, n_parts=2, part=part) for part in range(2))
         np.testing.assert_allclose(sum(parts), fn(u))
