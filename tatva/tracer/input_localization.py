@@ -5,7 +5,7 @@ from typing import Any, Protocol
 
 import jax.numpy as jnp
 import numpy as np
-from jax.extend.core import Var
+from jax.extend.core import Jaxpr, Var
 
 from tatva.tracer.capture import CapturedJaxpr
 from tatva.tracer.contributions import ValueRef
@@ -23,7 +23,7 @@ def _resolve_batched_root_index_demand(
     *,
     local_plan: LocalJaxprPlan,
     seeds: tuple[DemandSeed, ...],
-) -> tuple[int, TensorDemand]:
+) -> tuple[tuple[int, TensorDemand], ...]:
     if not seeds:
         raise ValueError("at least one gather index seed is required")
 
@@ -38,20 +38,35 @@ def _resolve_batched_root_index_demand(
         if demand is not None
     ]
 
-    if not roots:
-        raise NotImplementedError(
-            "gather indices do not originate from a captured input"
+    return tuple(roots)
+
+
+def _root_input_sources(
+    jaxpr: Jaxpr,
+) -> dict[Var, frozenset[int]]:
+    """Conservative root-input ancestry for variables in one JAXPR frame.
+
+    This tracks identity only, not demanded rows. The existing demand pass
+    remains responsible for computing the exact structured subset of each
+    root input. Literals and internally generated values contribute no root.
+    """
+    sources: dict[Var, frozenset[int]] = {
+        var: frozenset((index,)) for index, var in enumerate(jaxpr.invars)
+    }
+
+    for eqn in jaxpr.eqns:
+        input_sources = frozenset(
+            source
+            for atom in eqn.invars
+            if isinstance(atom, Var)
+            for source in sources.get(atom, ())
         )
 
-    if len(roots) != 1:
-        indices = [flat_index for flat_index, _ in roots]
-        raise NotImplementedError(
-            "batched gather indices resolve to multiple captured inputs: "
-            f"{indices}; tagged localization demands are required to preserve "
-            "the gather-to-input association"
-        )
+        for outvar in eqn.outvars:
+            if isinstance(outvar, Var):
+                sources[outvar] = input_sources
 
-    return roots[0]
+    return sources
 
 
 class InputAction(Protocol):
@@ -117,6 +132,12 @@ class _IndexRequest:
     operand_axis: int
 
 
+@dataclass(frozen=True, slots=True)
+class _OperandMap:
+    operand_layout: TensorLayout
+    operand_axis: int
+
+
 def _merge_index_request(
     requests: dict[int, _IndexRequest],
     *,
@@ -148,7 +169,7 @@ def _merge_index_request(
 
 
 def _same_operand_axis_map(
-    left: _IndexRequest,
+    left: _OperandMap,
     *,
     operand_layout: TensorLayout,
     operand_axis: int,
@@ -172,7 +193,8 @@ def build_input_localization_plan(
 
     requests: dict[int, _IndexRequest] = {}
     index_seeds: list[DemandSeed] = []
-    batched_request: _IndexRequest | None = None
+    operand_maps_by_root: dict[int, _OperandMap] = {}
+    root_sources = _root_input_sources(captured.jaxpr)
 
     for eqn_plan in local_plan.eqns:
         route_plan = eqn_plan.route
@@ -212,22 +234,33 @@ def build_input_localization_plan(
         if index_demand is None:
             continue
 
-        candidate = _IndexRequest(
-            demand=index_demand,
+        roots = root_sources.get(index_var, frozenset())
+        if not roots:
+            # The indices are generated inside the JAXPR, so there is no
+            # captured input object to slice or reconstruct.
+            continue
+        if len(roots) != 1:
+            raise NotImplementedError(
+                f"gather indices depend on multiple captured inputs: {sorted(roots)}"
+            )
+
+        root_index = next(iter(roots))
+        candidate = _OperandMap(
             operand_layout=operand_layout,
             operand_axis=operand_axis,
         )
 
-        if batched_request is None:
-            batched_request = candidate
+        previous = operand_maps_by_root.get(root_index)
+        if previous is None:
+            operand_maps_by_root[root_index] = candidate
         elif not _same_operand_axis_map(
-            batched_request,
+            previous,
             operand_layout=operand_layout,
             operand_axis=operand_axis,
         ):
             raise NotImplementedError(
-                "gathers in one batched localization pass use incompatible "
-                "operand axis maps; tagged localization demands are required"
+                f"gathers sourced from captured input {root_index} use "
+                "incompatible operand axis maps"
             )
 
         index_seeds.append(
@@ -241,19 +274,26 @@ def build_input_localization_plan(
     # These demands build input reconstruction actions only; they never enter
     # the runtime layouts or executable liveness trace.
     if index_seeds:
-        assert batched_request is not None
-        index_flat, root_demand = _resolve_batched_root_index_demand(
+        root_demands = _resolve_batched_root_index_demand(
             local_plan=local_plan,
             seeds=tuple(index_seeds),
         )
 
-        _merge_index_request(
-            requests,
-            flat_index=index_flat,
-            demand=root_demand,
-            operand_layout=batched_request.operand_layout,
-            operand_axis=batched_request.operand_axis,
-        )
+        for index_flat, root_demand in root_demands:
+            operand_map = operand_maps_by_root.get(index_flat)
+            if operand_map is None:
+                raise RuntimeError(
+                    "localization demand reached captured input "
+                    f"{index_flat} without a gather operand map"
+                )
+
+            _merge_index_request(
+                requests,
+                flat_index=index_flat,
+                demand=root_demand,
+                operand_layout=operand_map.operand_layout,
+                operand_axis=operand_map.operand_axis,
+            )
 
     actions: list[InputAction] = []
     for index, layout in enumerate(local_plan.input_layouts):

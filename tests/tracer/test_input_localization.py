@@ -64,3 +64,55 @@ def test_input_localization_batches_gather_demand_per_rank(monkeypatch):
     np.testing.assert_allclose(
         sum(local_values), energy(u, coords, connectivity), rtol=1e-6
     )
+
+
+def test_distinct_index_inputs_may_use_distinct_operand_maps():
+    u = jnp.arange(8.0)
+    auxiliary = jnp.arange(10.0)
+    u_indices = jnp.array(
+        [[0, 1], [1, 2], [4, 5], [6, 7]],
+        dtype=jnp.int32,
+    )
+    auxiliary_indices = jnp.array(
+        [[8, 9], [7, 8], [2, 3], [1, 2]],
+        dtype=jnp.int32,
+    )
+
+    def energy(u, auxiliary, u_indices, auxiliary_indices):
+        u_terms = jnp.sum(u[u_indices] ** 2, axis=1)
+        auxiliary_terms = jnp.sum(auxiliary[auxiliary_indices], axis=1)
+        return jnp.sum(u_terms + 0.01 * auxiliary_terms)
+
+    captured = CapturedJaxpr.from_fn(
+        energy,
+        u,
+        auxiliary,
+        u_indices,
+        auxiliary_indices,
+    )
+    distributed = trace(captured).partition(n_parts=2)
+
+    local_values = []
+    for rank in range(2):
+        local_args, local_kwargs = distributed.localize_inputs(
+            rank,
+            u,
+            auxiliary,
+            u_indices,
+            auxiliary_indices,
+        )
+        local_u, local_auxiliary, local_u_indices, local_auxiliary_indices = local_args
+
+        assert not local_kwargs
+        assert int(local_u_indices.max()) < local_u.shape[0]
+        assert int(local_auxiliary_indices.max()) < local_auxiliary.shape[0]
+
+        local_values.append(
+            distributed.local_function(rank)(*local_args, **local_kwargs)
+        )
+
+    np.testing.assert_allclose(
+        sum(local_values),
+        energy(u, auxiliary, u_indices, auxiliary_indices),
+        rtol=1e-6,
+    )
