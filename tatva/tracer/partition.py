@@ -34,6 +34,7 @@ from enum import Enum, auto
 
 import numpy as np
 import scipy.sparse as sps
+from jax.extend.core import Var
 from numpy.typing import ArrayLike, NDArray
 
 from tatva.tracer.contributions import (
@@ -47,6 +48,7 @@ from tatva.tracer.derivatives import (
     DerivativeTrace,
     JaxprDerivativeTrace,
 )
+from tatva.tracer.layout import TensorLayout
 from tatva.tracer.model import Shape
 
 
@@ -100,14 +102,8 @@ def _contiguous_owners(
     if n_parts <= 0:
         raise ValueError("n_parts must be positive")
 
-    owners = np.empty(
-        n_items,
-        dtype=np.int64,
-    )
-    quotient, remainder = divmod(
-        n_items,
-        n_parts,
-    )
+    owners = np.empty(n_items, dtype=np.int64)
+    quotient, remainder = divmod(n_items, n_parts)
     start = 0
 
     for part in range(n_parts):
@@ -289,6 +285,47 @@ def _validate_dof_partition(
         raise ValueError(f"dof_to_part contains part IDs >= n_parts={n_parts}")
 
     return mapping
+
+
+def dof_owner_from_contributions(
+    *,
+    owned: tuple[OwnedContribution, ...],
+    roots: tuple[ContributionRoot, ...],
+    dependencies: dict[Var, DependencySet],
+    n_dofs: int,
+    n_parts: int,
+) -> NDArray[np.int64]:
+    """Derive a unique DOF owner from contribution ownership.
+
+    A DOF is assigned to the lowest-numbered partition containing an owned
+    contribution that depends on that DOF.
+
+    DOFs unused by every contribution are assigned to partition 0.
+    """
+    roots_by_id = {root.id: root for root in roots}
+    owner = np.full(n_dofs, -1, dtype=np.int64)
+
+    for item in sorted(owned, key=lambda x: x.part):
+        root = roots_by_id[item.root_id]
+        dep = dependencies[root.value.var]
+
+        # Restrict to this partition's owned contribution entries.
+        owned_layout = TensorLayout.from_demand(item.demand)
+
+        local_rows = np.arange(owned_layout.local_size, dtype=np.int64)
+        global_rows = owned_layout.local_rows_to_global_rows(local_rows)
+
+        # Union of all DOFs influencing these contribution entries.
+        dofs = np.unique(dep.csr[global_rows].indices)
+        unowned = owner[dofs] < 0
+        owner[dofs[unowned]] = item.part
+
+    # DOFs that never affect the functional can be assigned arbitrarily.
+    owner[owner < 0] = 0
+    if np.any((owner < 0) | (owner >= n_parts)):
+        raise RuntimeError("invalid derived DOF ownership")
+
+    return owner
 
 
 def dependency_partition_owners(

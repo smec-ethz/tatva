@@ -16,9 +16,15 @@ type ConcreteEnv = Mapping[Var, ConcreteValue]
 
 @dataclass(frozen=True, slots=True)
 class GatherRoute:
-    """For each flattened output row, the flattened source row it reads."""
+    """Resolved gather geometry in global scalar rows.
+
+    `source_rows[o]` is the operand row read for output row `o`.
+    `index_rows[o, c]` is the flattened gather-index row supplying index
+    component `c` for output row `o`.
+    """
 
     source_rows: NDArray[np.int64]
+    index_rows: NDArray[np.int64] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,7 +14,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import lax
+from jax import Array, lax
 from jax.extend.core import Literal, Var
 from numpy.typing import NDArray
 
@@ -57,7 +57,7 @@ from tatva.tracer.partition import OwnedContribution
 def extract_local_value(
     value,
     layout: TensorLayout,
-):
+) -> Array:
     """Convenience helper for testing/local input construction.
 
     Production distributed execution can supply already-local tensors
@@ -1457,7 +1457,6 @@ def build_local_executable(
     *,
     contributions: ContributionTrace,
     owned: tuple[OwnedContribution, ...],
-    jit: bool = True,
 ) -> LocalExecutable:
     input_indices = tuple(
         index for index, layout in enumerate(plan.input_layouts) if layout is not None
@@ -1470,11 +1469,9 @@ def build_local_executable(
         env = _execute_frame(plan, tuple(local_inputs))
         return _reconstruct_local_scalar(env, contribution_terms)
 
-    lowered = jax.jit(function) if jit else function
-
     return LocalExecutable(
         plan=plan,
         input_indices=input_indices,
         contribution_terms=contribution_terms,
-        function=lowered,
+        function=function,
     )
