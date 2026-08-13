@@ -104,7 +104,7 @@ class DerivativeRule[T]:
 
 
 @dataclass(frozen=True, slots=True)
-class PrimitiveRule[T]:
+class OperationSemantics[T]:
     """Global structural semantics of one JAX primitive."""
 
     derivatives: DerivativeRule[T]

@@ -11,7 +11,7 @@ from tatva.tracer.helpers import _shape_of
 from tatva.tracer.semantics import (
     DemandContext,
     DerivativeRule,
-    PrimitiveRule,
+    OperationSemantics,
     no_hessian,
     no_prepare,
 )
@@ -246,7 +246,7 @@ def elementwise_demand(
     return tuple(result)
 
 
-LINEAR_UNARY = PrimitiveRule(
+LINEAR_UNARY = OperationSemantics(
     DerivativeRule(
         prepare_elementwise_unary,
         unary_passthrough_dependencies,
@@ -254,7 +254,7 @@ LINEAR_UNARY = PrimitiveRule(
     ),
     demand=elementwise_demand,
 )
-NONLINEAR_UNARY = PrimitiveRule(
+NONLINEAR_UNARY = OperationSemantics(
     DerivativeRule(
         prepare_elementwise_unary,
         unary_passthrough_dependencies,
@@ -262,7 +262,7 @@ NONLINEAR_UNARY = PrimitiveRule(
     ),
     demand=elementwise_demand,
 )
-INTEGER_POW = PrimitiveRule(
+INTEGER_POW = OperationSemantics(
     DerivativeRule(
         no_prepare,
         integer_pow_dependencies,
@@ -270,7 +270,7 @@ INTEGER_POW = PrimitiveRule(
     ),
     demand=elementwise_demand,
 )
-ELEMENTWISE_BINARY_BASIC = PrimitiveRule(
+ELEMENTWISE_BINARY_BASIC = OperationSemantics(
     DerivativeRule(
         prepare=prepare_elementwise_binary,
         dependencies=union_dependencies,
