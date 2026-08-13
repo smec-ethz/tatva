@@ -3,6 +3,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Protocol
 
 from jax.extend.core import JaxprEqn, Literal
@@ -14,6 +15,55 @@ from tatva.tracer.model import ConcreteEnv, Route
 if TYPE_CHECKING:
     from tatva.tracer.dependencies import DependencySet, HessianAccumulator
     from tatva.tracer.lowerings import LoweringRule
+    from tatva.tracer.materialize import JaxprInstance, ResolvedEqn
+
+type ContributionCoefficient = int | float | complex
+
+
+class ContributionMode(Enum):
+    SCALAR = auto()
+    DOMAIN = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class ContributionInput:
+    input_index: int
+    coefficient: ContributionCoefficient
+    mode: ContributionMode
+
+
+@dataclass(frozen=True, slots=True)
+class ContributionDecision:
+    inputs: tuple[ContributionInput, ...] = ()
+    root: bool = False
+
+    unsupported_reason: str | None = None
+    invalid_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ContributionContext:
+    instance: JaxprInstance
+    resolved: ResolvedEqn
+    output_index: int
+    coefficient: ContributionCoefficient
+    mode: ContributionMode
+
+
+type ContributionRule = Callable[[ContributionContext], ContributionDecision]
+
+
+def contribution_barrier(ctx: ContributionContext) -> ContributionDecision:
+    if ctx.mode is ContributionMode.DOMAIN:
+        return ContributionDecision(root=True)
+
+    return ContributionDecision(
+        unsupported_reason=(
+            "cannot decompose scalar objective through primitive "
+            f"{ctx.resolved.plan.eqn.primitive.name!r}; expected an additive "
+            "scalar tail ending, e.g. in reduce_sum"
+        )
+    )
 
 
 # --------------------------------
@@ -113,5 +163,7 @@ class OperationSemantics[T]:
     concrete_inputs: ConcreteInputRule = no_concrete_inputs
     route: RouteRule = no_route
     demand: DemandRule = conservative_demand
+
+    contribution: ContributionRule = contribution_barrier
 
     lowering: LoweringRule | None = None
