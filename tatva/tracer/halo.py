@@ -15,13 +15,28 @@ Communication itself is deliberately separated from tracing.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from tatva.tracer.layout import TensorLayout
+
+
+class HaloCommunicator(Protocol):
+    """Minimal collective interface for rank-local halo planning.
+
+    `mpi4py.MPI.Comm` satisfies this protocol. MPI remains an optional Tatva
+    dependency because the tracer imports only this structural interface.
+    """
+
+    def Get_rank(self) -> int: ...
+
+    def Get_size(self) -> int: ...
+
+    def alltoall(self, sendobj: list[Any]) -> list[Any]: ...
 
 
 def _freeze_i64(
@@ -206,6 +221,167 @@ class HaloPlan:
         return self.storage.ghost_global
 
 
+def _validate_owner(
+    dof_owner: ArrayLike,
+    *,
+    n_ranks: int,
+) -> NDArray[np.int64]:
+    if n_ranks <= 0:
+        raise ValueError("number of ranks must be positive")
+
+    owner = np.asarray(dof_owner, dtype=np.int64).ravel()
+    if np.any((owner < 0) | (owner >= n_ranks)):
+        raise ValueError("dof_owner contains invalid rank indices")
+    return owner
+
+
+def _compute_global(
+    layout: TensorLayout,
+    *,
+    rank: int,
+    n_dofs: int,
+) -> NDArray[np.int64]:
+    if layout.global_shape != (n_dofs,):
+        raise ValueError(
+            f"rank {rank} DOF layout has global shape "
+            f"{layout.global_shape}; expected {(n_dofs,)}"
+        )
+    return np.asarray(layout.global_axis_indices(0), dtype=np.int64)
+
+
+def _build_storage(
+    *,
+    rank: int,
+    compute_global: NDArray[np.int64],
+    owner: NDArray[np.int64],
+) -> DofStorageLayout:
+    owned_global = np.flatnonzero(owner == rank).astype(np.int64)
+    ghost_global = compute_global[owner[compute_global] != rank]
+    ghost_global = np.unique(ghost_global).astype(np.int64, copy=False)
+    return DofStorageLayout(
+        rank=rank,
+        owned_global=owned_global,
+        ghost_global=ghost_global,
+    )
+
+
+def _requests_by_owner(
+    storage: DofStorageLayout,
+    owner: NDArray[np.int64],
+) -> dict[int, NDArray[np.int64]]:
+    result: dict[int, NDArray[np.int64]] = {}
+    ghosts = storage.ghost_global
+    if not ghosts.size:
+        return result
+
+    ghost_owners = owner[ghosts]
+    for peer_value in np.unique(ghost_owners):
+        peer = int(peer_value)
+        result[peer] = np.ascontiguousarray(
+            ghosts[ghost_owners == peer], dtype=np.int64
+        )
+    return result
+
+
+def _build_rank_halo_plan(
+    *,
+    rank: int,
+    compute_global: NDArray[np.int64],
+    storage: DofStorageLayout,
+    recv_global: Mapping[int, ArrayLike],
+    send_global: Mapping[int, ArrayLike],
+) -> HaloPlan:
+    def exchanges(
+        relations: Mapping[int, ArrayLike],
+    ) -> tuple[NeighborExchange, ...]:
+        return tuple(
+            NeighborExchange(
+                peer=peer,
+                global_dofs=values,
+                local_rows=storage.global_to_local(values),
+            )
+            for peer, raw_values in sorted(relations.items())
+            if (values := np.asarray(raw_values, dtype=np.int64).ravel()).size
+        )
+
+    return HaloPlan(
+        rank=rank,
+        compute_global=compute_global,
+        storage=storage,
+        compute_rows=storage.global_to_local(compute_global),
+        recv=exchanges(recv_global),
+        send=exchanges(send_global),
+    )
+
+
+def build_local_halo_plan(
+    compute_layout: TensorLayout,
+    dof_owner: ArrayLike,
+    *,
+    comm: HaloCommunicator,
+) -> HaloPlan:
+    """Collectively build only this communicator rank's halo plan.
+
+    Every rank supplies its own liveness-derived root-DOF layout. Receives are
+    known locally from that layout and the replicated owner array. One object
+    `alltoall` exchanges ghost requests with their owners, providing exactly
+    the information needed to derive the send schedule.
+
+    All ranks in `comm` must call this function in the same collective order.
+    This host-side planning collective is not part of JIT execution.
+    """
+    rank = int(comm.Get_rank())
+    n_ranks = int(comm.Get_size())
+    if rank < 0 or rank >= n_ranks:
+        raise ValueError(f"communicator rank {rank} is outside [0, {n_ranks})")
+
+    owner = _validate_owner(dof_owner, n_ranks=n_ranks)
+    n_dofs = owner.size
+    compute_global = _compute_global(
+        compute_layout,
+        rank=rank,
+        n_dofs=n_dofs,
+    )
+    storage = _build_storage(
+        rank=rank,
+        compute_global=compute_global,
+        owner=owner,
+    )
+    recv_global = _requests_by_owner(storage, owner)
+
+    requests_to_owner = [np.empty(0, dtype=np.int64) for _ in range(n_ranks)]
+    for peer, values in recv_global.items():
+        requests_to_owner[peer] = values
+
+    requests_from_rank = comm.alltoall(requests_to_owner)
+    if len(requests_from_rank) != n_ranks:
+        raise RuntimeError(
+            "communicator alltoall returned "
+            f"{len(requests_from_rank)} entries; expected {n_ranks}"
+        )
+
+    send_global: dict[int, NDArray[np.int64]] = {}
+    for peer, values in enumerate(requests_from_rank):
+        if peer == rank:
+            continue
+        global_dofs = np.asarray(values, dtype=np.int64).ravel()
+        if not global_dofs.size:
+            continue
+        if np.any((global_dofs < 0) | (global_dofs >= n_dofs)):
+            raise RuntimeError(f"rank {peer} requested out-of-range global DOFs")
+        if np.any(owner[global_dofs] != rank):
+            raise RuntimeError(f"rank {peer} requested DOFs not owned by rank {rank}")
+        send_global[peer] = global_dofs
+
+    return _build_rank_halo_plan(
+        rank=rank,
+        compute_global=compute_global,
+        storage=storage,
+        recv_global=recv_global,
+        send_global=send_global,
+    )
+
+
 def build_halo_plans(
     compute_layouts: Sequence[TensorLayout],
     dof_owner: ArrayLike,
@@ -224,24 +400,14 @@ def build_halo_plans(
     if n_ranks == 0:
         return ()
 
-    owner = np.asarray(dof_owner, dtype=np.int64).ravel()
+    owner = _validate_owner(dof_owner, n_ranks=n_ranks)
     n_dofs = owner.size
 
-    if np.any((owner < 0) | (owner >= n_ranks)):
-        raise ValueError("dof_owner contains invalid rank indices")
-
     # Exact compute requirements from liveness.
-    required: list[NDArray[np.int64]] = []
-
-    for rank, layout in enumerate(compute_layouts):
-        if layout.global_shape != (n_dofs,):
-            raise ValueError(
-                f"rank {rank} DOF layout has global shape "
-                f"{layout.global_shape}; expected {(n_dofs,)}"
-            )
-
-        global_dofs = np.asarray(layout.global_axis_indices(0), dtype=np.int64)
-        required.append(global_dofs)
+    required = [
+        _compute_global(layout, rank=rank, n_dofs=n_dofs)
+        for rank, layout in enumerate(compute_layouts)
+    ]
 
     # Storage layouts.
     #
@@ -250,39 +416,19 @@ def build_halo_plans(
     #     every DOF it owns
     #     +
     #     only ghosts required by its local computation
-    storage: list[DofStorageLayout] = []
-
-    for rank in range(n_ranks):
-        owned = np.flatnonzero(owner == rank).astype(np.int64)
-        rank_required = required[rank]
-        ghost = rank_required[owner[rank_required] != rank]
-        ghost = np.unique(ghost).astype(np.int64, copy=False)
-
-        storage.append(
-            DofStorageLayout(
-                rank=rank,
-                owned_global=owned,
-                ghost_global=ghost,
-            )
+    storage = [
+        _build_storage(
+            rank=rank,
+            compute_global=required[rank],
+            owner=owner,
         )
+        for rank in range(n_ranks)
+    ]
 
     # Receive relation.
     #
     # recv[receiver][owner] = ghost DOFs requested from owner.
-    recv_global: list[dict[int, NDArray[np.int64]]] = [{} for _ in range(n_ranks)]
-
-    for receiver in range(n_ranks):
-        ghosts = storage[receiver].ghost_global
-
-        if not ghosts.size:
-            continue
-
-        ghost_owners = owner[ghosts]
-
-        for sender in np.unique(ghost_owners):
-            sender_int = int(sender)
-            values = ghosts[ghost_owners == sender_int]
-            recv_global[receiver][sender_int] = np.asarray(values, dtype=np.int64)
+    recv_global = [_requests_by_owner(rank_storage, owner) for rank_storage in storage]
 
     # Send relation is exactly the transpose.
     send_global: list[dict[int, NDArray[np.int64]]] = [{} for _ in range(n_ranks)]
@@ -291,46 +437,19 @@ def build_halo_plans(
         for sender, values in recv_global[receiver].items():
             send_global[sender][receiver] = values
 
-    # Compile global coordinates into local storage rows.
-    plans: list[HaloPlan] = []
-
-    for rank in range(n_ranks):
-        rank_storage = storage[rank]
-        compute_global = required[rank]
-        compute_rows = rank_storage.global_to_local(compute_global)
-
-        recv = tuple(
-            NeighborExchange(
-                peer=peer,
-                global_dofs=values,
-                local_rows=(rank_storage.global_to_local(values)),
-            )
-            for peer, values in sorted(recv_global[rank].items())
+    plans = tuple(
+        _build_rank_halo_plan(
+            rank=rank,
+            compute_global=required[rank],
+            storage=storage[rank],
+            recv_global=recv_global[rank],
+            send_global=send_global[rank],
         )
+        for rank in range(n_ranks)
+    )
 
-        send = tuple(
-            NeighborExchange(
-                peer=peer,
-                global_dofs=values,
-                local_rows=(rank_storage.global_to_local(values)),
-            )
-            for peer, values in sorted(send_global[rank].items())
-        )
-
-        plans.append(
-            HaloPlan(
-                rank=rank,
-                compute_global=compute_global,
-                storage=rank_storage,
-                compute_rows=compute_rows,
-                recv=recv,
-                send=send,
-            )
-        )
-
-    _validate_halo_plans(tuple(plans))
-
-    return tuple(plans)
+    _validate_halo_plans(plans)
+    return plans
 
 
 def _validate_halo_plans(
