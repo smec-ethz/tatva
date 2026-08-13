@@ -17,7 +17,7 @@ from tatva.tracer.rules.elementwise import (
     NONLINEAR_UNARY,
 )
 from tatva.tracer.rules.structural import RESHAPE_LIKE
-from tatva.tracer.semantics import DerivativeRule, PrimitiveRule, no_hessian
+from tatva.tracer.semantics import DerivativeRule, OperationSemantics, no_hessian
 
 from . import (
     dot,
@@ -134,7 +134,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
 
     reg.register(
         lax.mul_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 elementwise.prepare_elementwise_binary,
                 elementwise.union_dependencies,
@@ -145,7 +145,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.div_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 elementwise.prepare_elementwise_binary,
                 elementwise.union_dependencies,
@@ -156,7 +156,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.pow_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 elementwise.prepare_elementwise_binary,
                 elementwise.union_dependencies,
@@ -167,7 +167,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.atan2_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 elementwise.prepare_elementwise_binary,
                 elementwise.union_dependencies,
@@ -178,7 +178,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.rem_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 elementwise.prepare_elementwise_binary,
                 elementwise.union_dependencies,
@@ -194,7 +194,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
     reg.register(lax.squeeze_p, RESHAPE_LIKE)
     reg.register(
         lax.broadcast_in_dim_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 prepare=structural.prepare_broadcast,
                 dependencies=structural.unary_routed_dependencies,
@@ -205,7 +205,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.transpose_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 prepare=structural.prepare_transpose,
                 dependencies=structural.unary_routed_dependencies,
@@ -216,7 +216,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.slice_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 prepare=structural.prepare_slice,
                 dependencies=structural.unary_routed_dependencies,
@@ -227,7 +227,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.rev_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 prepare=structural.prepare_rev,
                 dependencies=structural.unary_routed_dependencies,
@@ -238,7 +238,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.concatenate_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 prepare=structural.prepare_concatenate,
                 dependencies=structural.multi_input_routed_dependencies,
@@ -249,7 +249,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.stack_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 prepare=structural.prepare_stack,
                 dependencies=structural.multi_input_routed_dependencies,
@@ -260,7 +260,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.pad_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 prepare=structural.prepare_pad,
                 dependencies=structural.multi_input_routed_dependencies,
@@ -271,7 +271,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.split_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 structural.prepare_split,
                 structural.multi_output_unary_routed_dependencies,
@@ -285,7 +285,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
 def _register_routing_rules(reg: PrimitiveRegistry) -> None:
     reg.register(
         lax.gather_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 prepare=gather_scatter.prepare_gather,
                 dependencies=gather_scatter.gather_dependencies,
@@ -310,7 +310,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
     # select_n
     reg.register(
         lax.select_n_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 indexing.prepare_select_n,
                 indexing.select_n_dependencies,
@@ -325,7 +325,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
     # slicing dynamic
     reg.register(
         lax.dynamic_slice_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 prepare=indexing.prepare_dynamic_slice,
                 dependencies=indexing.dynamic_slice_dependencies,
@@ -338,7 +338,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
     )
     reg.register(
         lax.dynamic_update_slice_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 indexing.prepare_dynamic_update_slice,
                 indexing.dynamic_update_slice_dependencies,
@@ -367,7 +367,7 @@ def _register_reduction_rules(reg: PrimitiveRegistry) -> None:
 def _register_dot_general(reg: PrimitiveRegistry) -> None:
     reg.register(
         lax.dot_general_p,
-        PrimitiveRule(
+        OperationSemantics(
             DerivativeRule(
                 dot.prepare_dot_general,
                 dot.dot_general_dependencies,
@@ -390,21 +390,21 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
     ):
         reg.register(
             primitive,
-            PrimitiveRule(
+            OperationSemantics(
                 derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
             ),
         )
 
     reg.register(
         lax.linear_solve_p,
-        PrimitiveRule(
+        OperationSemantics(
             derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
             demand=linalg.custom_linear_solve_demand,
         ),
     )
     reg.register(
         lax.linalg.lu_p,
-        PrimitiveRule(
+        OperationSemantics(
             derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
             demand=linalg.lu_demand,
         ),

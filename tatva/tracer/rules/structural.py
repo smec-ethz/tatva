@@ -23,7 +23,7 @@ from tatva.tracer.helpers import _shape_of
 from tatva.tracer.semantics import (
     DemandContext,
     DerivativeRule,
-    PrimitiveRule,
+    OperationSemantics,
     no_hessian,
     no_prepare,
 )
@@ -627,7 +627,7 @@ def _multi_output_unary_row_map_demand(
     return (TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[0]), source_rows),)
 
 
-RESHAPE_LIKE = PrimitiveRule(
+RESHAPE_LIKE = OperationSemantics(
     DerivativeRule(
         no_prepare,
         reshape_like_dependencies,

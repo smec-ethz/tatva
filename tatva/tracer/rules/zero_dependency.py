@@ -9,7 +9,7 @@ from tatva.tracer.rules.elementwise import elementwise_demand
 from tatva.tracer.semantics import (
     DemandContext,
     DerivativeRule,
-    PrimitiveRule,
+    OperationSemantics,
     no_hessian,
     no_prepare,
 )
@@ -40,7 +40,7 @@ def no_input_demand(ctx: DemandContext) -> tuple[Demand, ...]:
     return ()
 
 
-IOTA = PrimitiveRule(
+IOTA = OperationSemantics(
     DerivativeRule(
         no_prepare,
         zero_output_dependencies,
@@ -49,7 +49,7 @@ IOTA = PrimitiveRule(
     demand=no_input_demand,
 )
 
-ZERO_DEPENDENCY = PrimitiveRule(
+ZERO_DEPENDENCY = OperationSemantics(
     DerivativeRule(
         no_prepare,
         zero_output_dependencies,

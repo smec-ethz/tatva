@@ -17,7 +17,7 @@ from tatva.tracer.routing import resolve_scatter_route
 from tatva.tracer.semantics import (
     DemandContext,
     DerivativeRule,
-    PrimitiveRule,
+    OperationSemantics,
     no_hessian,
 )
 
@@ -226,7 +226,7 @@ def scatter_accumulate_demand(
     )
 
 
-SCATTER_BASIC = PrimitiveRule(
+SCATTER_BASIC = OperationSemantics(
     DerivativeRule(
         prepare=prepare_scatter,
         dependencies=scatter_accumulate_dependencies,
@@ -237,7 +237,7 @@ SCATTER_BASIC = PrimitiveRule(
     demand=scatter_set_demand,
 )
 
-SCATTER_ACCUMULATE = PrimitiveRule(
+SCATTER_ACCUMULATE = OperationSemantics(
     DerivativeRule(
         prepare=prepare_scatter,
         dependencies=scatter_accumulate_dependencies,
@@ -247,7 +247,7 @@ SCATTER_ACCUMULATE = PrimitiveRule(
     route=resolve_scatter_route,
     demand=scatter_accumulate_demand,
 )
-SCATTER_MUL = PrimitiveRule(
+SCATTER_MUL = OperationSemantics(
     DerivativeRule(
         prepare=prepare_scatter,
         dependencies=scatter_accumulate_dependencies,

@@ -11,7 +11,7 @@ from tatva.tracer.model import Shape
 from tatva.tracer.semantics import (
     DemandContext,
     DerivativeRule,
-    PrimitiveRule,
+    OperationSemantics,
     RuleContext,
     no_hessian,
 )
@@ -140,6 +140,7 @@ def reduce_prod_hessian(
                 rhs = deps[rhs_row : rhs_row + 1]
 
                 if rhs.nnz:
+                    # TODO: this fails, because add_cross expects two depsets, not sparse matrices. Fix this.
                     acc.add_cross(lhs, rhs)
 
         start = stop
@@ -172,7 +173,7 @@ def reduce_sum_demand(
     )
 
 
-REDUCE_BASIC = PrimitiveRule(
+REDUCE_BASIC = OperationSemantics(
     DerivativeRule(
         prepare=prepare_reduction,
         dependencies=reduction_dependencies,
@@ -180,13 +181,13 @@ REDUCE_BASIC = PrimitiveRule(
     ),
     demand=reduce_sum_demand,
 )
-REDUCE_PROD = PrimitiveRule(
+REDUCE_PROD = OperationSemantics(
     DerivativeRule(
         prepare=prepare_reduction,
         dependencies=reduction_dependencies,
         hessian=reduce_prod_hessian,
     )
 )
-ZERO_REDUCTION = PrimitiveRule(
+ZERO_REDUCTION = OperationSemantics(
     DerivativeRule(prepare_reduction, zero_reduction_dependencies, no_hessian)
 )
