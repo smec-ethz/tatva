@@ -11,9 +11,8 @@ import scipy.sparse as sps
 from numpy.typing import NDArray
 
 from tatva.sparse._coloring import csr_to_adjacency
-from tatva.tracer import make_captured_jaxpr
 from tatva.tracer.analysis import JaxprPlan, analyze
-from tatva.tracer.capture import CapturedJaxpr
+from tatva.tracer.capture import CapturedJaxpr, make_captured_jaxpr
 from tatva.tracer.contributions import ContributionTrace, detect_contributions
 from tatva.tracer.derivatives import DerivativeTrace, trace_derivatives
 from tatva.tracer.halo import (

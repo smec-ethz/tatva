@@ -790,7 +790,7 @@ def _execute_frame(
         if layout is None:
             continue
 
-        value = next(iterator)
+        value = jnp.asarray(next(iterator))
         if tuple(value.shape) != layout.local_shape:
             raise ValueError(
                 f"input {var} has shape {value.shape}; expected {layout.local_shape}"
