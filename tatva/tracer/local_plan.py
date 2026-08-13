@@ -35,13 +35,8 @@ from tatva.tracer.layout import TensorLayout
 from tatva.tracer.liveness import JaxprDemandTrace
 from tatva.tracer.localize import (
     LocalRoute,
-    localize_dynamic_slice_route,
-    localize_gather_route,
-    localize_scatter_route,
-    localize_select_n_route,
 )
 from tatva.tracer.materialize import JaxprInstance, ResolvedEqn
-from tatva.tracer.model import DynamicSliceRoute, ScatterRoute, SelectNRoute
 from tatva.tracer.nested import (
     AnyNestedInvocation,
     CallContext,
@@ -57,10 +52,11 @@ from tatva.tracer.nested import (
     TraversalOrder,
     dispatch_nested,
 )
+from tatva.tracer.registry import SEMANTICS
 from tatva.tracer.routing import (
-    GatherRoute,
     Route,
 )
+from tatva.tracer.semantics import RouteLocalizationContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,118 +155,26 @@ def _build_route_plan(
     if route is None:
         return None
 
-    # Gather
-    if isinstance(route, GatherRoute):
-        if not input_layouts:
-            raise RuntimeError("gather has no operand")
+    eqn = resolved.plan.eqn
+    semantics = SEMANTICS.get(eqn.primitive)
+    localizer = semantics.localization.localize_route
 
-        operand_layout = input_layouts[0]
-        if operand_layout is None:
-            raise RuntimeError("live gather output has no live operand layout")
-
-        if len(output_layouts) != 1:
-            raise RuntimeError("gather expected one output")
-
-        output_layout = output_layouts[0]
-        if output_layout is None:
-            raise RuntimeError("attempted to localize dead gather")
-
-        local = localize_gather_route(
-            route,
-            operand_layout=operand_layout,
-            output_layout=output_layout,
+    local = (
+        None
+        if localizer is None
+        else localizer(
+            RouteLocalizationContext(
+                eqn=eqn,
+                route=route,
+                input_layouts=input_layouts,
+                output_layouts=output_layouts,
+            )
         )
+    )
 
-        return RoutePlan(
-            global_route=route,
-            local=local,
-        )
-
-    # Scatter
-    if isinstance(route, ScatterRoute):
-        if len(input_layouts) < 3:
-            raise RuntimeError("scatter expected operand, indices and updates")
-
-        operand_layout = input_layouts[0]
-
-        # input 1 is the index tensor. It is deliberately allowed to be
-        # dead because its information has already been compiled into
-        # ScatterRoute.
-        update_layout = input_layouts[2]
-        if len(output_layouts) != 1:
-            raise RuntimeError("scatter expected one output")
-
-        output_layout = output_layouts[0]
-        if output_layout is None:
-            raise RuntimeError("attempted to localize dead scatter")
-
-        local = localize_scatter_route(
-            route,
-            operand_layout=operand_layout,
-            update_layout=update_layout,
-            output_layout=output_layout,
-        )
-
-        return RoutePlan(
-            global_route=route,
-            local=local,
-        )
-
-    # Dynamic slice
-    if isinstance(route, DynamicSliceRoute):
-        if not input_layouts:
-            raise RuntimeError("dynamic_slice has no operand")
-
-        operand_layout = input_layouts[0]
-        if operand_layout is None:
-            raise RuntimeError("live dynamic_slice output has no live operand")
-
-        if len(output_layouts) != 1:
-            raise RuntimeError("dynamic_slice expected one output")
-
-        output_layout = output_layouts[0]
-
-        if output_layout is None:
-            raise RuntimeError("attempted to localize dead dynamic_slice")
-
-        local = localize_dynamic_slice_route(
-            route,
-            operand_layout=operand_layout,
-            output_layout=output_layout,
-        )
-
-        return RoutePlan(
-            global_route=route,
-            local=local,
-        )
-
-    if isinstance(route, SelectNRoute):
-        if len(output_layouts) != 1:
-            raise RuntimeError("select_n expected one output")
-
-        output_layout = output_layouts[0]
-        if output_layout is None:
-            raise RuntimeError("attempted to localize dead select_n")
-
-        # input 0 is the selector. Its concrete values are already
-        # compiled into SelectNRoute.case_indices.
-        case_layouts = tuple(input_layouts[1:])
-
-        local = localize_select_n_route(
-            route,
-            case_layouts=case_layouts,
-            output_layout=output_layout,
-        )
-
-        return RoutePlan(
-            global_route=route,
-            local=local,
-        )
-
-    # Other route types are intentionally still pending.
     return RoutePlan(
         global_route=route,
-        local=None,
+        local=local,
     )
 
 

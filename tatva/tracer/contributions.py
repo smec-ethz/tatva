@@ -42,7 +42,11 @@ from tatva.tracer.materialize import (
 from tatva.tracer.model import Shape
 from tatva.tracer.nested import CallInvocation, FramePath
 from tatva.tracer.registry import SEMANTICS
-from tatva.tracer.semantics import ContributionContext, ContributionMode
+from tatva.tracer.semantics import (
+    ContributionCoefficient,
+    ContributionContext,
+    ContributionMode,
+)
 
 
 @dataclass(frozen=True)
@@ -59,9 +63,6 @@ class ContributionDomain:
 
     shape: Shape
     partition_axes: tuple[int, ...]
-
-
-type ContributionCoefficient = int | float | complex
 
 
 @dataclass(frozen=True)

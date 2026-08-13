@@ -12,12 +12,20 @@ from numpy.typing import NDArray
 from tatva.tracer.demand import Demand, TensorDemand
 from tatva.tracer.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.helpers import _shape_of
+from tatva.tracer.localize import (
+    LocalGatherRoute,
+    LocalScatterRoute,
+    localize_gather_route,
+    localize_scatter_route,
+)
 from tatva.tracer.model import GatherRoute, ScatterRoute, Shape
 from tatva.tracer.routing import resolve_scatter_route
 from tatva.tracer.semantics import (
     DemandContext,
     DerivativeRule,
+    LocalizationSemantics,
     OperationSemantics,
+    RouteLocalizationContext,
     no_hessian,
 )
 
@@ -226,6 +234,73 @@ def scatter_accumulate_demand(
     )
 
 
+def localize_gather(
+    ctx: RouteLocalizationContext,
+) -> LocalGatherRoute:
+    route = ctx.route
+
+    if not isinstance(route, GatherRoute):
+        raise TypeError(
+            f"{ctx.eqn.primitive.name} route localization requires GatherRoute"
+        )
+
+    if not ctx.input_layouts:
+        raise RuntimeError("gather has no operand")
+
+    operand_layout = ctx.input_layouts[0]
+
+    if operand_layout is None:
+        raise RuntimeError("live gather output has no live operand layout")
+
+    if len(ctx.output_layouts) != 1:
+        raise RuntimeError("gather expected one output")
+
+    output_layout = ctx.output_layouts[0]
+    if output_layout is None:
+        raise RuntimeError("attempted to localize dead gather")
+
+    return localize_gather_route(
+        route,
+        operand_layout=operand_layout,
+        output_layout=output_layout,
+    )
+
+
+def localize_scatter(
+    ctx: RouteLocalizationContext,
+) -> LocalScatterRoute:
+    route = ctx.route
+
+    if not isinstance(route, ScatterRoute):
+        raise TypeError(
+            f"{ctx.eqn.primitive.name} route localization requires ScatterRoute"
+        )
+
+    if len(ctx.input_layouts) < 3:
+        raise RuntimeError("scatter expected operand, indices and updates")
+
+    if len(ctx.output_layouts) != 1:
+        raise RuntimeError("scatter expected one output")
+
+    output_layout = ctx.output_layouts[0]
+    if output_layout is None:
+        raise RuntimeError("attempted to localize dead scatter")
+
+    # input 1 is the index tensor. Its values have already been
+    # compiled into ScatterRoute.
+    return localize_scatter_route(
+        route,
+        operand_layout=ctx.input_layouts[0],
+        update_layout=ctx.input_layouts[2],
+        output_layout=output_layout,
+    )
+
+
+SCATTER_LOCALIZATION = LocalizationSemantics(
+    localize_route=localize_scatter,
+)
+
+
 SCATTER_BASIC = OperationSemantics(
     DerivativeRule(
         prepare=prepare_scatter,
@@ -235,6 +310,7 @@ SCATTER_BASIC = OperationSemantics(
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
     demand=scatter_set_demand,
+    localization=SCATTER_LOCALIZATION,
 )
 
 SCATTER_ACCUMULATE = OperationSemantics(
@@ -246,6 +322,7 @@ SCATTER_ACCUMULATE = OperationSemantics(
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
     demand=scatter_accumulate_demand,
+    localization=SCATTER_LOCALIZATION,
 )
 SCATTER_MUL = OperationSemantics(
     DerivativeRule(
@@ -256,4 +333,5 @@ SCATTER_MUL = OperationSemantics(
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
     demand=scatter_accumulate_demand,
+    localization=SCATTER_LOCALIZATION,
 )
