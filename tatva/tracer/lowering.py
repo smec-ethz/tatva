@@ -37,11 +37,7 @@ from tatva.tracer.localize import (
     LocalScatterRoute,
     LocalSelectNRoute,
 )
-from tatva.tracer.lowerings import (
-    LOWERINGS,
-    LoweringContext,
-    lower_default,
-)
+from tatva.tracer.lowerings import LoweringContext, lower_bind
 from tatva.tracer.nested import (
     CallContext,
     MapContext,
@@ -52,6 +48,7 @@ from tatva.tracer.nested import (
     dispatch_nested,
 )
 from tatva.tracer.partition import OwnedContribution
+from tatva.tracer.registry import SEMANTICS
 
 
 def extract_local_value(
@@ -761,7 +758,9 @@ def _lower_eqn(
         result = _lower_nested(plan, inputs)
 
     else:
-        rule = LOWERINGS.get(plan.eqn.primitive, lower_default)
+        semantics = SEMANTICS.get(plan.eqn.primitive)
+        rule = semantics.lowering or lower_bind
+
         result = rule(LoweringContext(plan=plan, inputs=inputs))
 
     _validate_outputs(plan, result)

@@ -13,6 +13,7 @@ from tatva.tracer.model import ConcreteEnv, Route
 
 if TYPE_CHECKING:
     from tatva.tracer.dependencies import DependencySet, HessianAccumulator
+    from tatva.tracer.lowerings import LoweringRule
 
 
 # --------------------------------
@@ -111,5 +112,6 @@ class OperationSemantics[T]:
 
     concrete_inputs: ConcreteInputRule = no_concrete_inputs
     route: RouteRule = no_route
-
     demand: DemandRule = conservative_demand
+
+    lowering: LoweringRule | None = None
