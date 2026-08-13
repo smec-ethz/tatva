@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from jax import custom_derivatives, lax
 
+from tatva.tracer import lowerings
 from tatva.tracer.routing import (
     resolve_dynamic_slice_route,
     resolve_dynamic_update_slice_route,
@@ -36,7 +38,13 @@ if TYPE_CHECKING:
 
 
 def _register_zero_deps_rules(reg: PrimitiveRegistry) -> None:
-    reg.register(lax.iota_p, IOTA)
+    reg.register(
+        lax.iota_p,
+        replace(
+            IOTA,
+            lowering=lowerings.lower_iota,
+        ),
+    )
     # these have no dependency propagation, but they will have demand and contribution rules defined later
     for primitive in (
         lax.lt_p,
@@ -190,7 +198,13 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
 
 
 def _register_structural_rules(reg: PrimitiveRegistry) -> None:
-    reg.register(lax.reshape_p, RESHAPE_LIKE)
+    reg.register(
+        lax.reshape_p,
+        replace(
+            RESHAPE_LIKE,
+            lowering=lowerings.lower_reshape,
+        ),
+    )
     reg.register(lax.squeeze_p, RESHAPE_LIKE)
     reg.register(
         lax.broadcast_in_dim_p,
@@ -201,6 +215,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_broadcast_in_dim,
+            lowering=lowerings.lower_broadcast_in_dim,
         ),
     )
     reg.register(
@@ -223,6 +238,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_slice,
+            lowering=lowerings.lower_slice,
         ),
     )
     reg.register(
@@ -245,6 +261,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_concatenate,
+            lowering=lowerings.lower_concatenate,
         ),
     )
     reg.register(
@@ -294,6 +311,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda _eqn: (1,),
             route=resolve_gather_route,
             demand=gather_scatter.gather_demand,
+            lowering=lowerings.lower_gather,
         ),
     )
     for primitive in (
@@ -304,7 +322,13 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
     ):
         reg.register(primitive, gather_scatter.SCATTER_ACCUMULATE)
 
-    reg.register(lax.scatter_p, gather_scatter.SCATTER_BASIC)
+    reg.register(
+        lax.scatter_p,
+        replace(
+            gather_scatter.SCATTER_BASIC,
+            lowering=lowerings.lower_scatter_set,
+        ),
+    )
     reg.register(lax.scatter_mul_p, gather_scatter.SCATTER_MUL)
 
     # select_n
@@ -319,6 +343,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda _eqn: (0,),
             route=resolve_select_n_route,
             demand=indexing.select_n_demand,
+            lowering=lowerings.lower_select_n,
         ),
     )
 
@@ -334,6 +359,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda eqn: tuple(range(1, len(eqn.invars))),
             route=resolve_dynamic_slice_route,
             demand=indexing.dynamic_slice_demand,
+            lowering=lowerings.lower_dynamic_slice,
         ),
     )
     reg.register(
@@ -400,6 +426,7 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
         OperationSemantics(
             derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
             demand=linalg.custom_linear_solve_demand,
+            lowering=lowerings.lower_custom_linear_solve,
         ),
     )
     reg.register(

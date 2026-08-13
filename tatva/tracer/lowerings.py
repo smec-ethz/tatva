@@ -62,7 +62,7 @@ def _single_output_layout(
     return layout
 
 
-def lower_default(
+def lower_bind(
     ctx: LoweringContext,
 ) -> tuple[Any | None, ...]:
     eqn = ctx.plan.eqn
@@ -376,41 +376,3 @@ def lower_custom_linear_solve(
     result = lu_solve((lu, pivots), rhs)
 
     return (result,)
-
-
-LOWERINGS: dict[
-    Primitive,
-    LoweringRule,
-] = {}
-
-
-def register(
-    primitive: Primitive,
-    rule: LoweringRule,
-) -> None:
-    existing = LOWERINGS.get(primitive)
-
-    if existing is not None and existing is not rule:
-        raise ValueError(f"lowering already registered for {primitive.name!r}")
-
-    LOWERINGS[primitive] = rule
-
-
-def register_default_lowerings() -> None:
-    # Lowering rules
-    register(lax.broadcast_in_dim_p, lower_broadcast_in_dim)
-    register(lax.reshape_p, lower_reshape)
-    register(lax.iota_p, lower_iota)
-    register(lax.concatenate_p, lower_concatenate)
-
-    register(lax.gather_p, lower_gather)
-    register(lax.scatter_p, lower_scatter_set)
-    register(lax.dynamic_slice_p, lower_dynamic_slice)
-    register(lax.slice_p, lower_slice)
-    register(lax.select_n_p, lower_select_n)
-
-    register(lax.linear_solve_p, lower_custom_linear_solve)
-
-
-# Register default lowerings at module import time
-register_default_lowerings()
