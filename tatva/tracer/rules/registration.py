@@ -22,6 +22,9 @@ from tatva.tracer.rules.structural import RESHAPE_LIKE
 from tatva.tracer.semantics import DerivativeRule, OperationSemantics, no_hessian
 
 from . import (
+    contributions as contribution_rules,
+)
+from . import (
     dot,
     elementwise,
     gather_scatter,
@@ -78,18 +81,34 @@ def _register_zero_deps_rules(reg: PrimitiveRegistry) -> None:
 
 
 def _register_elementwise_unary_rules(reg: PrimitiveRegistry) -> None:
-    for primitive in (
+    reg.register(
         lax.neg_p,
+        replace(
+            LINEAR_UNARY,
+            contribution=contribution_rules.negative_unary,
+        ),
+    )
+    for primitive in (
         lax.abs_p,
-        lax.copy_p,
         lax.device_put_p,
         lax.conj_p,
         lax.real_p,
         lax.imag_p,
-        lax.convert_element_type_p,
-        lax.stop_gradient_p,  # does it really need dep propagation?
     ):
         reg.register(primitive, LINEAR_UNARY)
+
+    for primitive in (
+        lax.copy_p,
+        lax.convert_element_type_p,
+        lax.stop_gradient_p,
+    ):
+        reg.register(
+            primitive,
+            replace(
+                LINEAR_UNARY,
+                contribution=contribution_rules.transparent_unary,
+            ),
+        )
 
     # stop_gradient is wrong right now. It is registered under LINEAR_UNARY in
     # rules/__init__.py:206–217, which propagates its input dependency. It must produce a zero
@@ -132,9 +151,21 @@ def _register_elementwise_unary_rules(reg: PrimitiveRegistry) -> None:
 
 
 def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
-    for primitive in (
+    reg.register(
         lax.add_p,
+        replace(
+            ELEMENTWISE_BINARY_BASIC,
+            contribution=contribution_rules.additive_add,
+        ),
+    )
+    reg.register(
         lax.sub_p,
+        replace(
+            ELEMENTWISE_BINARY_BASIC,
+            contribution=contribution_rules.additive_sub,
+        ),
+    )
+    for primitive in (
         lax.min_p,
         lax.max_p,
     ):
@@ -149,6 +180,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
                 elementwise.elementwise_mul_hessian,
             ),
             demand=elementwise.elementwise_demand,
+            contribution=contribution_rules.scalar_multiply,
         ),
     )
     reg.register(
@@ -160,6 +192,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
                 elementwise.elementwise_div_hessian,
             ),
             demand=elementwise.elementwise_demand,
+            contribution=contribution_rules.scalar_divide,
         ),
     )
     reg.register(
@@ -202,10 +235,17 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
         lax.reshape_p,
         replace(
             RESHAPE_LIKE,
+            contribution=contribution_rules.transparent_unary,
             lowering=lowerings.lower_reshape,
         ),
     )
-    reg.register(lax.squeeze_p, RESHAPE_LIKE)
+    reg.register(
+        lax.squeeze_p,
+        replace(
+            RESHAPE_LIKE,
+            contribution=contribution_rules.transparent_unary,
+        ),
+    )
     reg.register(
         lax.broadcast_in_dim_p,
         OperationSemantics(
@@ -227,6 +267,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_transpose,
+            contribution=contribution_rules.transparent_unary,
         ),
     )
     reg.register(
@@ -250,6 +291,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_rev,
+            contribution=contribution_rules.transparent_unary,
         ),
     )
     reg.register(
@@ -378,8 +420,15 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
 
 
 def _register_reduction_rules(reg: PrimitiveRegistry) -> None:
-    for primitive in (
+    reg.register(
         lax.reduce_sum_p,
+        replace(
+            reductions.REDUCE_BASIC,
+            contribution=contribution_rules.reduce_sum,
+        ),
+    )
+
+    for primitive in (
         lax.reduce_max_p,
         lax.reduce_min_p,
     ):

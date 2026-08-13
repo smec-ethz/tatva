@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.extend.core import Primitive
 from jax.scipy.linalg import lu_solve
 
 from tatva.tracer.localize import (

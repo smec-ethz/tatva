@@ -27,12 +27,10 @@ backward liveness propagation, layout construction, or localization.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import cast
 
-import numpy as np
 from jax.core import Atom
 from jax.extend.core import Literal, Var
 
@@ -43,6 +41,8 @@ from tatva.tracer.materialize import (
 )
 from tatva.tracer.model import Shape
 from tatva.tracer.nested import CallInvocation, FramePath
+from tatva.tracer.registry import SEMANTICS
+from tatva.tracer.semantics import ContributionContext, ContributionMode
 
 
 @dataclass(frozen=True)
@@ -124,23 +124,18 @@ class InvalidMaterializedJaxprError(ContributionDetectionError):
     """The materialized JAXPR violates an invariant required by the detector."""
 
 
-class _Mode(Enum):
-    SCALAR = auto()
-    DOMAIN = auto()
-
-
 @dataclass(frozen=True)
 class _Seed:
     atom: Atom
     coefficient: ContributionCoefficient
-    mode: _Mode
+    mode: ContributionMode
 
 
 @dataclass(frozen=True)
 class _InputRequest:
     input_index: int
     coefficient: ContributionCoefficient
-    mode: _Mode
+    mode: ContributionMode
 
 
 @dataclass(frozen=True)
@@ -156,36 +151,8 @@ class _FrameResult:
     inputs: list[_InputRequest]
 
 
-@dataclass(frozen=True)
-class _TraceStep:
-    """Result of tracing one primitive inside the current frame."""
-
-    seeds: tuple[_Seed, ...] = ()
-    root: _RootCandidate | None = None
-
-
-_ADDITIVE_BINARY_FACTORS: dict[str, tuple[int, int]] = {
-    "add": (1, 1),
-    "sub": (1, -1),
-}
-
-_ADDITIVE_UNARY_FACTORS: dict[str, int] = {
-    "neg": -1,
-}
-
-_TRANSPARENT_UNARY = {
-    "reshape",
-    "squeeze",
-    "transpose",
-    "rev",
-    "copy",
-    "stop_gradient",
-    "convert_element_type",
-}
-
-
 # -----------------------------------------------------------------------------
-# Domain construction and validation
+# Domain construction and materialized JAXPR helpers
 # -----------------------------------------------------------------------------
 
 
@@ -232,11 +199,6 @@ def _root_candidate(
     )
 
 
-# -----------------------------------------------------------------------------
-# Materialized JAXPR helpers
-# -----------------------------------------------------------------------------
-
-
 def _producer_map(
     instance: JaxprInstance,
 ) -> dict[Var, tuple[ResolvedEqn, int]]:
@@ -250,205 +212,6 @@ def _producer_map(
     return producers
 
 
-def _require_arity(
-    primitive_name: str,
-    inputs: Sequence[Atom],
-    expected: int,
-) -> None:
-    actual = len(inputs)
-    if actual != expected:
-        raise InvalidMaterializedJaxprError(
-            f"{primitive_name} expected {expected} inputs, got {actual}"
-        )
-
-
-def _concrete_scalar(
-    instance: JaxprInstance,
-    atom: Atom,
-) -> ContributionCoefficient | None:
-    if isinstance(atom, Literal):
-        value = atom.val
-    elif isinstance(atom, Var):
-        value = instance.concrete.get(atom)
-        if value is None:
-            return None
-    else:
-        return None
-
-    array = np.asarray(value)
-    if array.shape != ():
-        return None
-
-    return array.item()
-
-
-# -----------------------------------------------------------------------------
-# Primitive semantics
-# -----------------------------------------------------------------------------
-
-
-def _trace_common_primitive(
-    resolved: ResolvedEqn,
-    coefficient: ContributionCoefficient,
-    mode: _Mode,
-) -> tuple[_Seed, ...] | None:
-    """Trace primitives with identical semantics in scalar and domain modes."""
-    eqn = resolved.plan.eqn
-    name = eqn.primitive.name
-
-    binary_factors = _ADDITIVE_BINARY_FACTORS.get(name)
-    if binary_factors is not None:
-        _require_arity(name, eqn.invars, 2)
-        lhs_factor, rhs_factor = binary_factors
-        return (
-            _Seed(eqn.invars[0], coefficient * lhs_factor, mode),
-            _Seed(eqn.invars[1], coefficient * rhs_factor, mode),
-        )
-
-    unary_factor = _ADDITIVE_UNARY_FACTORS.get(name)
-    if unary_factor is not None:
-        _require_arity(name, eqn.invars, 1)
-        return (_Seed(eqn.invars[0], coefficient * unary_factor, mode),)
-
-    if name in _TRANSPARENT_UNARY:
-        _require_arity(name, eqn.invars, 1)
-        return (_Seed(eqn.invars[0], coefficient, mode),)
-
-    return None
-
-
-def _trace_scalar_primitive(
-    instance: JaxprInstance,
-    resolved: ResolvedEqn,
-    coefficient: ContributionCoefficient,
-) -> _TraceStep:
-    """Trace one primitive while searching for the first additive reduction."""
-    common = _trace_common_primitive(resolved, coefficient, _Mode.SCALAR)
-    if common is not None:
-        return _TraceStep(seeds=common)
-
-    eqn = resolved.plan.eqn
-    name = eqn.primitive.name
-
-    if name == "reduce_sum":
-        _require_arity(name, eqn.invars, 1)
-        return _TraceStep(
-            seeds=(
-                _Seed(
-                    atom=eqn.invars[0],
-                    coefficient=coefficient,
-                    mode=_Mode.DOMAIN,
-                ),
-            )
-        )
-
-    if name == "mul":
-        return _trace_scalar_multiply(instance, resolved, coefficient)
-
-    if name == "div":
-        return _trace_scalar_divide(instance, resolved, coefficient)
-
-    raise UnsupportedContributionError(
-        f"cannot decompose scalar objective through primitive {name!r}; "
-        "expected an additive scalar tail ending in reduce_sum"
-    )
-
-
-def _trace_scalar_multiply(
-    instance: JaxprInstance,
-    resolved: ResolvedEqn,
-    coefficient: ContributionCoefficient,
-) -> _TraceStep:
-    eqn = resolved.plan.eqn
-    name = eqn.primitive.name
-    _require_arity(name, eqn.invars, 2)
-
-    lhs, rhs = eqn.invars
-    lhs_scalar = _concrete_scalar(instance, lhs)
-    rhs_scalar = _concrete_scalar(instance, rhs)
-
-    if lhs_scalar is not None and rhs_scalar is None:
-        return _TraceStep(
-            seeds=(
-                _Seed(
-                    atom=rhs,
-                    coefficient=coefficient * lhs_scalar,
-                    mode=_Mode.SCALAR,
-                ),
-            )
-        )
-
-    if rhs_scalar is not None and lhs_scalar is None:
-        return _TraceStep(
-            seeds=(
-                _Seed(
-                    atom=lhs,
-                    coefficient=coefficient * rhs_scalar,
-                    mode=_Mode.SCALAR,
-                ),
-            )
-        )
-
-    if lhs_scalar is not None and rhs_scalar is not None:
-        # Purely concrete term: it contributes no partitionable tensor domain.
-        return _TraceStep()
-
-    raise UnsupportedContributionError(
-        "contribution scalar multiplication requires exactly one concrete operand"
-    )
-
-
-def _trace_scalar_divide(
-    instance: JaxprInstance,
-    resolved: ResolvedEqn,
-    coefficient: ContributionCoefficient,
-) -> _TraceStep:
-    eqn = resolved.plan.eqn
-    name = eqn.primitive.name
-    _require_arity(name, eqn.invars, 2)
-
-    numerator, denominator = eqn.invars
-    denominator_scalar = _concrete_scalar(instance, denominator)
-
-    if denominator_scalar is None:
-        raise UnsupportedContributionError(
-            "contribution scalar division requires a concrete denominator"
-        )
-    if denominator_scalar == 0:
-        raise UnsupportedContributionError(
-            "contribution scalar division requires a nonzero denominator"
-        )
-
-    return _TraceStep(
-        seeds=(
-            _Seed(
-                atom=numerator,
-                coefficient=coefficient / denominator_scalar,
-                mode=_Mode.SCALAR,
-            ),
-        )
-    )
-
-
-def _trace_domain_primitive(
-    path: FramePath,
-    atom: Var,
-    resolved: ResolvedEqn,
-    coefficient: ContributionCoefficient,
-    *,
-    partition_axes: PartitionAxesPolicy,
-) -> _TraceStep:
-    """Trace one primitive while preserving entry-wise additive structure."""
-    common = _trace_common_primitive(resolved, coefficient, _Mode.DOMAIN)
-    if common is not None:
-        return _TraceStep(seeds=common)
-
-    # Any other primitive breaks the one-to-one contribution structure.
-    return _TraceStep(
-        root=_root_candidate(path, atom, coefficient, partition_axes=partition_axes)
-    )
-
-
 # -----------------------------------------------------------------------------
 # Nested-frame handling
 # -----------------------------------------------------------------------------
@@ -459,7 +222,7 @@ def _trace_call(
     output_index: int,
     path: FramePath,
     coefficient: ContributionCoefficient,
-    mode: _Mode,
+    mode: ContributionMode,
     *,
     partition_axes: PartitionAxesPolicy,
 ) -> tuple[list[_RootCandidate], list[_Seed]]:
@@ -516,12 +279,12 @@ def _trace_opaque_nested(
     path: FramePath,
     atom: Var,
     coefficient: ContributionCoefficient,
-    mode: _Mode,
+    mode: ContributionMode,
     *,
     partition_axes: PartitionAxesPolicy,
 ) -> _RootCandidate:
     """Handle any non-call nested construct as an opaque structured boundary."""
-    if mode is _Mode.DOMAIN:
+    if mode is ContributionMode.DOMAIN:
         return _root_candidate(path, atom, coefficient, partition_axes=partition_axes)
 
     name = resolved.plan.eqn.primitive.name
@@ -578,7 +341,7 @@ def _walk_frame(
             continue
 
         if atom in constvars:
-            if seed.mode is _Mode.DOMAIN:
+            if seed.mode is ContributionMode.DOMAIN:
                 roots.append(
                     _root_candidate(
                         path,
@@ -622,24 +385,45 @@ def _walk_frame(
             )
             continue
 
-        if seed.mode is _Mode.SCALAR:
-            step = _trace_scalar_primitive(
-                instance,
-                resolved,
-                seed.coefficient,
+        semantics = SEMANTICS.get(resolved.plan.eqn.primitive)
+        decision = semantics.contribution(
+            ContributionContext(
+                instance=instance,
+                resolved=resolved,
+                output_index=output_index,
+                coefficient=seed.coefficient,
+                mode=seed.mode,
             )
-        else:
-            step = _trace_domain_primitive(
-                path,
-                atom,
-                resolved,
-                seed.coefficient,
-                partition_axes=partition_axes,
+        )
+
+        if decision.invalid_reason is not None:
+            raise InvalidMaterializedJaxprError(decision.invalid_reason)
+
+        if decision.unsupported_reason is not None:
+            raise UnsupportedContributionError(decision.unsupported_reason)
+
+        if decision.root:
+            roots.append(
+                _root_candidate(
+                    path, atom, seed.coefficient, partition_axes=partition_axes
+                )
             )
 
-        if step.root is not None:
-            roots.append(step.root)
-        stack.extend(step.seeds)
+        eqn = resolved.plan.eqn
+        for request in decision.inputs:
+            if request.input_index < 0 or request.input_index >= len(eqn.invars):
+                raise InvalidMaterializedJaxprError(
+                    f"{eqn.primitive.name} contribution rule requested invalid "
+                    f"input {request.input_index}"
+                )
+
+            stack.append(
+                _Seed(
+                    atom=eqn.invars[request.input_index],
+                    coefficient=request.coefficient,
+                    mode=request.mode,
+                )
+            )
 
     return _FrameResult(
         roots=roots,
@@ -721,7 +505,7 @@ def detect_contributions(
             _Seed(
                 atom=output,
                 coefficient=1,
-                mode=_Mode.SCALAR,
+                mode=ContributionMode.SCALAR,
             )
         ],
         partition_axes=partition_axes,
@@ -735,7 +519,7 @@ def detect_contributions(
     for request in result.inputs:
         var = jaxpr.invars[request.input_index]
 
-        if request.mode is _Mode.SCALAR:
+        if request.mode is ContributionMode.SCALAR:
             raise UnsupportedContributionError(
                 "scalar objective reaches root input "
                 f"{request.input_index} without an additive reduction"
