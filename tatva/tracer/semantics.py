@@ -14,6 +14,8 @@ from tatva.tracer.model import ConcreteEnv, Route
 
 if TYPE_CHECKING:
     from tatva.tracer.dependencies import DependencySet, HessianAccumulator
+    from tatva.tracer.layout import TensorLayout
+    from tatva.tracer.localize import LocalRoute
     from tatva.tracer.lowerings import LoweringRule
     from tatva.tracer.materialize import JaxprInstance, ResolvedEqn
 
@@ -148,6 +150,29 @@ type DemandRule = Callable[[DemandContext], tuple[Demand, ...]]
 
 
 @dataclass(frozen=True, slots=True)
+class RouteLocalizationContext:
+    """Inputs available when converting a global route to rank-local rows."""
+
+    eqn: JaxprEqn
+    route: Route
+    input_layouts: tuple[TensorLayout | None, ...]
+    output_layouts: tuple[TensorLayout | None, ...]
+
+
+type RouteLocalizationRule = Callable[[RouteLocalizationContext], LocalRoute]
+
+
+@dataclass(frozen=True, slots=True)
+class LocalizationSemantics:
+    """Primitive-local capabilities used while constructing a local plan."""
+
+    localize_route: RouteLocalizationRule | None = None
+
+
+NO_LOCALIZATION = LocalizationSemantics()
+
+
+@dataclass(frozen=True, slots=True)
 class DerivativeRule[T]:
     prepare: PrepareRule[T]
     dependencies: DependencyRule[T]
@@ -163,7 +188,6 @@ class OperationSemantics[T]:
     concrete_inputs: ConcreteInputRule = no_concrete_inputs
     route: RouteRule = no_route
     demand: DemandRule = conservative_demand
-
     contribution: ContributionRule = contribution_barrier
-
+    localization: LocalizationSemantics = NO_LOCALIZATION
     lowering: LoweringRule | None = None

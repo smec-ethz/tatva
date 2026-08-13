@@ -7,9 +7,15 @@ from numpy.typing import NDArray
 from tatva.tracer.demand import Demand, TensorDemand
 from tatva.tracer.dependencies import DependencySet
 from tatva.tracer.helpers import _shape_of
+from tatva.tracer.localize import (
+    LocalDynamicSliceRoute,
+    LocalSelectNRoute,
+    localize_dynamic_slice_route,
+    localize_select_n_route,
+)
 from tatva.tracer.model import DynamicSliceRoute, DynamicUpdateSliceRoute, SelectNRoute
 from tatva.tracer.rules.elementwise import inverse_elementwise_broadcast
-from tatva.tracer.semantics import DemandContext, RuleContext
+from tatva.tracer.semantics import DemandContext, RouteLocalizationContext, RuleContext
 
 
 def prepare_select_n(ctx: RuleContext) -> SelectNRoute:
@@ -203,3 +209,61 @@ def dynamic_update_slice_demand(
     result[1] = TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[1]), update_rows)
 
     return tuple(result)
+
+
+def localize_select_n(
+    ctx: RouteLocalizationContext,
+) -> LocalSelectNRoute:
+    route = ctx.route
+
+    if not isinstance(route, SelectNRoute):
+        raise TypeError(
+            f"{ctx.eqn.primitive.name} route localization requires SelectNRoute"
+        )
+
+    if len(ctx.output_layouts) != 1:
+        raise RuntimeError("select_n expected one output")
+
+    output_layout = ctx.output_layouts[0]
+    if output_layout is None:
+        raise RuntimeError("attempted to localize dead select_n")
+
+    # input 0 is the selector. Its concrete values have already
+    # been compiled into SelectNRoute.case_indices.
+    return localize_select_n_route(
+        route,
+        case_layouts=tuple(ctx.input_layouts[1:]),
+        output_layout=output_layout,
+    )
+
+
+def localize_dynamic_slice(
+    ctx: RouteLocalizationContext,
+) -> LocalDynamicSliceRoute:
+    route = ctx.route
+
+    if not isinstance(route, DynamicSliceRoute):
+        raise TypeError(
+            f"{ctx.eqn.primitive.name} route localization requires DynamicSliceRoute"
+        )
+
+    if not ctx.input_layouts:
+        raise RuntimeError("dynamic_slice has no operand")
+
+    operand_layout = ctx.input_layouts[0]
+
+    if operand_layout is None:
+        raise RuntimeError("live dynamic_slice output has no live operand")
+
+    if len(ctx.output_layouts) != 1:
+        raise RuntimeError("dynamic_slice expected one output")
+
+    output_layout = ctx.output_layouts[0]
+    if output_layout is None:
+        raise RuntimeError("attempted to localize dead dynamic_slice")
+
+    return localize_dynamic_slice_route(
+        route,
+        operand_layout=operand_layout,
+        output_layout=output_layout,
+    )

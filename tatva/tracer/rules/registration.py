@@ -19,7 +19,12 @@ from tatva.tracer.rules.elementwise import (
     NONLINEAR_UNARY,
 )
 from tatva.tracer.rules.structural import RESHAPE_LIKE
-from tatva.tracer.semantics import DerivativeRule, OperationSemantics, no_hessian
+from tatva.tracer.semantics import (
+    DerivativeRule,
+    LocalizationSemantics,
+    OperationSemantics,
+    no_hessian,
+)
 
 from . import (
     contributions as contribution_rules,
@@ -353,6 +358,9 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda _eqn: (1,),
             route=resolve_gather_route,
             demand=gather_scatter.gather_demand,
+            localization=LocalizationSemantics(
+                gather_scatter.localize_gather,
+            ),
             lowering=lowerings.lower_gather,
         ),
     )
@@ -385,6 +393,9 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda _eqn: (0,),
             route=resolve_select_n_route,
             demand=indexing.select_n_demand,
+            localization=LocalizationSemantics(
+                localize_route=indexing.localize_select_n,
+            ),
             lowering=lowerings.lower_select_n,
         ),
     )
@@ -401,6 +412,9 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda eqn: tuple(range(1, len(eqn.invars))),
             route=resolve_dynamic_slice_route,
             demand=indexing.dynamic_slice_demand,
+            localization=LocalizationSemantics(
+                localize_route=indexing.localize_dynamic_slice,
+            ),
             lowering=lowerings.lower_dynamic_slice,
         ),
     )
