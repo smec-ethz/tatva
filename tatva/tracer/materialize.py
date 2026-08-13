@@ -515,7 +515,7 @@ def _materialize_jaxpr(
 
 def materialize_plan(
     closed_jaxpr: ClosedJaxpr,
-    flat_args: list[Any],
+    flat_args: tuple[Any, ...],
     plan: JaxprPlan,
 ) -> JaxprInstance:
     if closed_jaxpr.jaxpr is not plan.jaxpr:

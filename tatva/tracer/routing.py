@@ -246,6 +246,23 @@ def _compute_gather_route(
     else:
         index_vectors = np.empty((n_output, 0), dtype=np.int64)
 
+    if index_vector_size == 0:
+        index_rows = np.empty((n_output, 0), dtype=np.int64)
+    elif indices.ndim == 1:
+        index_rows = np.broadcast_to(
+            np.arange(index_vector_size, dtype=np.int64), (n_output, index_vector_size)
+        ).copy()
+    else:
+        components = np.tile(np.arange(index_vector_size, dtype=np.int64), n_output)
+        flattened_coords = [
+            np.repeat(batch_coords[:, axis], index_vector_size)
+            for axis in range(indices.ndim - 1)
+        ]
+        flattened_coords.append(components)
+        index_rows = np.ravel_multi_index(
+            tuple(flattened_coords), indices.shape
+        ).reshape(n_output, index_vector_size)
+
     # Start coordinate in operand space
     starts = np.zeros(
         (n_output, operand_rank),
@@ -323,6 +340,7 @@ def _compute_gather_route(
 
     return GatherRoute(
         source_rows=source_rows,
+        index_rows=index_rows,
     )
 
 
