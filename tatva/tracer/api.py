@@ -10,7 +10,6 @@ import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
-from tatva.mesh import Mesh
 from tatva.sparse._coloring import csr_to_adjacency
 from tatva.tracer.analysis import JaxprPlan, analyze
 from tatva.tracer.capture import CapturedJaxpr
@@ -25,8 +24,7 @@ from tatva.tracer.input_localization import (
 from tatva.tracer.layout import TensorLayout
 from tatva.tracer.liveness import DemandSeed, backpropagate_demand
 from tatva.tracer.local_plan import LocalJaxprPlan, build_local_plan
-from tatva.tracer.localize import LocalGatherRoute
-from tatva.tracer.lowering import build_local_executable, extract_local_value
+from tatva.tracer.lowering import build_local_executable
 from tatva.tracer.materialize import JaxprInstance, materialize_plan
 from tatva.tracer.partition import (
     ContributionPartition,
