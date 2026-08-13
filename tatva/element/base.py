@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-import tatva.tensor_kernels as tk
+from tatva import linalg
 
 
 class Element(ABC):
@@ -91,12 +91,14 @@ class Element(ABC):
 
     def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
         dNdr = self.shape_function_derivative(xi)
-        J = tk.contract("in,nj->ij", dNdr, nodal_coords)  # (d, n) x (n, d) -> (d, d)
+        J = linalg.contract(
+            "in,nj->ij", dNdr, nodal_coords
+        )  # (d, n) x (n, d) -> (d, d)
         return J, jnp.linalg.det(J)
 
     def interpolate(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         N = self.shape_function(xi)
-        return tk.contract("n,n...->...", N, nodal_values)
+        return linalg.contract("n,n...->...", N, nodal_values)
 
     def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         """Returns the gradient of the nodal values at the local coordinates xi.
@@ -112,11 +114,15 @@ class Element(ABC):
         # 'd': spatial dimension, 'n': number of nodes,
         #
         dNdr = self.shape_function_derivative(xi)  # (d, n)
-        J = tk.contract("in,nj->ij", dNdr, nodal_coords)  # (d, n) x (n, d) -> (d, d)
-        dNdX = tk.contract("ij,jn->in", tk.inv(J), dNdr)  # (d, d) x (d, n) -> (d, n)
+        J = linalg.contract(
+            "in,nj->ij", dNdr, nodal_coords
+        )  # (d, n) x (n, d) -> (d, d)
+        dNdX = linalg.contract(
+            "ij,jn->in", linalg.inv(J), dNdr
+        )  # (d, d) x (d, n) -> (d, n)
         # the contraction leaves the node axis summed and d leading; move d to the end
         return jnp.moveaxis(
-            tk.contract("in,n...->i...", dNdX, nodal_values), 0, -1
+            linalg.contract("in,n...->i...", dNdX, nodal_values), 0, -1
         )  # (..., d)
 
     def get_local_values(
@@ -138,11 +144,11 @@ class Element(ABC):
         N = self.shape_function(xi)
         dNdr = self.shape_function_derivative(xi)
         J, detJ = self.get_jacobian(xi, nodal_coords)
-        dNdX = tk.contract("ij,jn->in", tk.inv(J), dNdr)
+        dNdX = linalg.contract("ij,jn->in", linalg.inv(J), dNdr)
         return (
-            tk.contract("n,n...->...", N, nodal_values),
+            linalg.contract("n,n...->...", N, nodal_values),
             # the contraction leaves the node axis summed and d leading; move d to the end
-            jnp.moveaxis(tk.contract("in,n...->i...", dNdX, nodal_values), 0, -1),
+            jnp.moveaxis(linalg.contract("in,n...->i...", dNdX, nodal_values), 0, -1),
             detJ,
         )
 
@@ -169,7 +175,7 @@ class Line2(Element):
 
     def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
         dNdr = self.shape_function_derivative(xi)
-        Jvec = tk.contract("n,nj->j", dNdr, nodal_coords)
+        Jvec = linalg.contract("n,nj->j", dNdr, nodal_coords)
         J = jnp.sqrt(jnp.sum(Jvec * Jvec))
         return J, J
 
@@ -177,7 +183,7 @@ class Line2(Element):
         _N, dNdr = self.shape_function(xi), self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
-        return tk.contract("n,n...->...", dNdX, nodal_values)
+        return linalg.contract("n,n...->...", dNdX, nodal_values)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -186,8 +192,8 @@ class Line2(Element):
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdX = dNdr / J
         return (
-            tk.contract("n,n...->...", N, nodal_values),
-            tk.contract("n,n...->...", dNdX, nodal_values),
+            linalg.contract("n,n...->...", N, nodal_values),
+            linalg.contract("n,n...->...", dNdX, nodal_values),
             detJ,
         )
 
@@ -221,7 +227,7 @@ class Line3(Element):
 
     def get_jacobian(self, xi: Array, nodal_coords: Array) -> tuple[Array, Array]:
         dNdr = self.shape_function_derivative(xi)
-        Jvec = tk.contract("n,nj->j", dNdr, nodal_coords)
+        Jvec = linalg.contract("n,nj->j", dNdr, nodal_coords)
         # dot(Jvec, Jvec / |Jvec|) is |Jvec| with an extra divide.
         J = jnp.sqrt(jnp.sum(Jvec * Jvec))
         return J, J
@@ -230,7 +236,7 @@ class Line3(Element):
         dNdr = self.shape_function_derivative(xi)
         J, _ = self.get_jacobian(xi, nodal_coords)
         dNdS = dNdr / J
-        return tk.contract("n,n...->...", dNdS, nodal_values)
+        return linalg.contract("n,n...->...", dNdS, nodal_values)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
@@ -241,8 +247,8 @@ class Line3(Element):
         J, detJ = self.get_jacobian(xi, nodal_coords)
         dNdS = dNdr / J
         return (
-            tk.contract("n,n...->...", N, nodal_values),
-            tk.contract("n,n...->...", dNdS, nodal_values),
+            linalg.contract("n,n...->...", N, nodal_values),
+            linalg.contract("n,n...->...", dNdS, nodal_values),
             detJ,
         )
 
