@@ -386,7 +386,7 @@ def _walk_frame(
             )
             continue
 
-        semantics = SEMANTICS.get(resolved.plan.eqn.primitive)
+        semantics = SEMANTICS.get_ordinary(resolved.plan.eqn.primitive)
         decision = semantics.contribution(
             ContributionContext(
                 instance=instance,

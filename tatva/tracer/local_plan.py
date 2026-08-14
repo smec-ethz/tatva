@@ -156,7 +156,7 @@ def _build_route_plan(
         return None
 
     eqn = resolved.plan.eqn
-    semantics = SEMANTICS.get(eqn.primitive)
+    semantics = SEMANTICS.get_ordinary(eqn.primitive)
     localizer = semantics.localization.localize_route
 
     local = (

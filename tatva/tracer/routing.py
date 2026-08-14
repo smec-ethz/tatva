@@ -28,7 +28,7 @@ def resolve_routes(
     routes: dict[JaxprEqn, Route] = {}
 
     for eqn in eqns:
-        rule = SEMANTICS.get(eqn.primitive)
+        rule = SEMANTICS.get_ordinary(eqn.primitive)
 
         route = rule.route(eqn, concrete)
 

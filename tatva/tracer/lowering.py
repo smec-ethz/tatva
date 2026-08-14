@@ -758,7 +758,7 @@ def _lower_eqn(
         result = _lower_nested(plan, inputs)
 
     else:
-        semantics = SEMANTICS.get(plan.eqn.primitive)
+        semantics = SEMANTICS.get_ordinary(plan.eqn.primitive)
         rule = semantics.lowering or lower_bind
 
         result = rule(LoweringContext(plan=plan, inputs=inputs))

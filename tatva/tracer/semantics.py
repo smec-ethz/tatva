@@ -11,6 +11,7 @@ from jax.extend.core import JaxprEqn, Literal
 from tatva.tracer.demand import Demand, TensorDemand
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.model import ConcreteEnv, Route
+from tatva.tracer.nested import CallKind
 
 if TYPE_CHECKING:
     from tatva.tracer.dependencies import DependencySet, HessianAccumulator
@@ -191,3 +192,27 @@ class OperationSemantics[T]:
     contribution: ContributionRule = contribution_barrier
     localization: LocalizationSemantics = NO_LOCALIZATION
     lowering: LoweringRule | None = None
+
+
+# Nested-operation semantics
+@dataclass(frozen=True, slots=True)
+class CallAnalysisSemantics:
+    call_kind: CallKind
+
+
+@dataclass(frozen=True, slots=True)
+class ScanAnalysisSemantics:
+    pass
+
+
+type NestedAnalysisSemantics = CallAnalysisSemantics | ScanAnalysisSemantics
+
+
+@dataclass(frozen=True, slots=True)
+class NestedOperationSemantics:
+    """Semantics for a primitive containing a nested JAXPR."""
+
+    analysis: NestedAnalysisSemantics
+
+
+type RegisteredOperationSemantics = OperationSemantics | NestedOperationSemantics
