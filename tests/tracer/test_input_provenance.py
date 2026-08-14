@@ -2,12 +2,12 @@ import jax.numpy as jnp
 import numpy as np
 from jax.extend.core import Var
 
-from tatva.tracer.analysis import analyze
 from tatva.tracer.capture import CapturedJaxpr
-from tatva.tracer.contributions import ValueRef
-from tatva.tracer.demand import TensorDemand
-from tatva.tracer.liveness import DemandSeed, backpropagate_demand
-from tatva.tracer.materialize import materialize_plan
+from tatva.tracer.local.demand import TensorDemand
+from tatva.tracer.local.liveness import DemandSeed, backpropagate_demand
+from tatva.tracer.program.analysis import analyze
+from tatva.tracer.program.contributions import ValueRef
+from tatva.tracer.program.materialize import materialize_plan
 
 
 def test_targeted_gather_index_demand_reaches_root_input():

@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 import scipy.sparse as sps
 
-from tatva.tracer.dependencies import DependencySet
+from tatva.tracer.core.semantics import DerivativeRule, no_hessian
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.semantics import DerivativeRule, no_hessian
+from tatva.tracer.program.dependencies import DependencySet
 
 if TYPE_CHECKING:
-    from tatva.tracer.dependencies import HessianAccumulator
-    from tatva.tracer.semantics import RuleContext
+    from tatva.tracer.core.semantics import RuleContext
+    from tatva.tracer.program.dependencies import HessianAccumulator
 
 
 @dataclass(frozen=True)

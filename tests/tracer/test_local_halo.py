@@ -1,8 +1,8 @@
 import numpy as np
 
-from tatva.tracer.demand import TensorDemand
-from tatva.tracer.halo import build_halo_plans, build_local_halo_plan
-from tatva.tracer.layout import TensorLayout
+from tatva.tracer.distribution.halo import build_halo_plans, build_local_halo_plan
+from tatva.tracer.local.demand import TensorDemand
+from tatva.tracer.local.layout import TensorLayout
 
 
 class _ReferenceComm:

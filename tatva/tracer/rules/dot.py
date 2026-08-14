@@ -7,11 +7,11 @@ import scipy.sparse as sps
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
-from tatva.tracer.demand import Demand, TensorDemand
-from tatva.tracer.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.core.routes import Shape
+from tatva.tracer.core.semantics import DemandContext, RuleContext
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.model import Shape
-from tatva.tracer.semantics import DemandContext, RuleContext
+from tatva.tracer.local.demand import Demand, TensorDemand
+from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
 
 
 @dataclass(frozen=True)

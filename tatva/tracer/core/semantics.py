@@ -8,17 +8,17 @@ from typing import TYPE_CHECKING, Protocol
 
 from jax.extend.core import JaxprEqn, Literal
 
-from tatva.tracer.demand import Demand, TensorDemand
+from tatva.tracer.core.nested import CallKind
+from tatva.tracer.core.routes import ConcreteEnv, Route
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.model import ConcreteEnv, Route
-from tatva.tracer.nested import CallKind
+from tatva.tracer.local.demand import Demand, TensorDemand
 
 if TYPE_CHECKING:
-    from tatva.tracer.dependencies import DependencySet, HessianAccumulator
-    from tatva.tracer.layout import TensorLayout
-    from tatva.tracer.localize import LocalRoute
-    from tatva.tracer.lowerings import LoweringRule
-    from tatva.tracer.materialize import JaxprInstance, ResolvedEqn
+    from tatva.tracer.local.layout import TensorLayout
+    from tatva.tracer.local.localize import LocalRoute
+    from tatva.tracer.lowering.rules import LoweringRule
+    from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+    from tatva.tracer.program.materialize import JaxprInstance, ResolvedEqn
 
 type ContributionCoefficient = int | float | complex
 

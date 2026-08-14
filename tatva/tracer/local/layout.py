@@ -24,7 +24,7 @@ from math import prod
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from tatva.tracer.demand import (
+from tatva.tracer.local.demand import (
     AxisProduct,
     AxisSubset,
     Shape,

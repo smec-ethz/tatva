@@ -1,6 +1,6 @@
 import numpy as np
 
-from tatva.tracer.demand import (
+from tatva.tracer.local.demand import (
     AxisProduct,
     TensorDemand,
     _FullAxis,

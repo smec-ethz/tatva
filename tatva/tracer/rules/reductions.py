@@ -4,17 +4,17 @@ import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
-from tatva.tracer.demand import AxisSubset, Demand, TensorDemand, _FullAxis
-from tatva.tracer.dependencies import DependencySet, HessianAccumulator
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.model import Shape
-from tatva.tracer.semantics import (
+from tatva.tracer.core.routes import Shape
+from tatva.tracer.core.semantics import (
     DemandContext,
     DerivativeRule,
     OperationSemantics,
     RuleContext,
     no_hessian,
 )
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import AxisSubset, Demand, TensorDemand, _FullAxis
+from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
 
 
 @dataclass(frozen=True, slots=True)

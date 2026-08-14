@@ -9,18 +9,13 @@ import scipy.sparse as sps
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
-from tatva.tracer.demand import Demand, TensorDemand
-from tatva.tracer.dependencies import DependencySet, HessianAccumulator
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.localize import (
-    LocalGatherRoute,
-    LocalScatterRoute,
-    localize_gather_route,
-    localize_scatter_route,
+from tatva.tracer.core.routes import (
+    GatherRoute,
+    ScatterRoute,
+    Shape,
+    resolve_scatter_route,
 )
-from tatva.tracer.model import GatherRoute, ScatterRoute, Shape
-from tatva.tracer.routing import resolve_scatter_route
-from tatva.tracer.semantics import (
+from tatva.tracer.core.semantics import (
     DemandContext,
     DerivativeRule,
     LocalizationSemantics,
@@ -28,9 +23,18 @@ from tatva.tracer.semantics import (
     RouteLocalizationContext,
     no_hessian,
 )
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import Demand, TensorDemand
+from tatva.tracer.local.localize import (
+    LocalGatherRoute,
+    LocalScatterRoute,
+    localize_gather_route,
+    localize_scatter_route,
+)
+from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
 
 if TYPE_CHECKING:
-    from tatva.tracer.semantics import RuleContext
+    from tatva.tracer.core.semantics import RuleContext
 
 
 def prepare_gather(ctx: RuleContext) -> GatherRoute:

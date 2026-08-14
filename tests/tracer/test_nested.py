@@ -1,6 +1,6 @@
 import pytest
 
-from tatva.tracer.nested import (
+from tatva.tracer.core.nested import (
     CallInvocation,
     FrameStep,
     IndexedChild,
@@ -37,12 +37,13 @@ def test_repeated_invocation_centralizes_execution_and_logical_order():
 
     assert [child.payload for child in invocation.children()] == ["two", "one", "zero"]
     assert [
-        child.payload
-        for child in invocation.children(TraversalOrder.REVERSE_EXECUTION)
+        child.payload for child in invocation.children(TraversalOrder.REVERSE_EXECUTION)
     ] == ["zero", "one", "two"]
-    assert [
-        child.payload for child in invocation.children(TraversalOrder.LOGICAL)
-    ] == ["zero", "one", "two"]
+    assert [child.payload for child in invocation.children(TraversalOrder.LOGICAL)] == [
+        "zero",
+        "one",
+        "two",
+    ]
 
 
 def test_repeated_invocation_resolves_logical_frame_and_maps_topology():
@@ -115,11 +116,10 @@ def test_dispatch_validates_spec_and_invocation_before_handler():
 
 def test_collect_logical_output_validates_and_reorders_entries():
     entries = ((1, ("b",)), (0, ("a",)))
-    assert collect_logical_output(
-        entries, output_index=0, length=2, label="map"
-    ) == ("a", "b")
+    assert collect_logical_output(entries, output_index=0, length=2, label="map") == (
+        "a",
+        "b",
+    )
 
     with pytest.raises(RuntimeError, match="missing one or more iterations"):
-        collect_logical_output(
-            ((0, ("a",)),), output_index=0, length=2, label="map"
-        )
+        collect_logical_output(((0, ("a",)),), output_index=0, length=2, label="map")

@@ -7,17 +7,17 @@ from typing import Any
 import numpy as np
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
 
-from tatva.tracer.demand import (
+from tatva.tracer.core.routes import Shape
+from tatva.tracer.core.semantics import (
+    DemandContext,
+    conservative_demand,
+)
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import (
     Demand,
     TensorDemand,
     _FullAxis,
     merge_demands,
-)
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.model import Shape
-from tatva.tracer.semantics import (
-    DemandContext,
-    conservative_demand,
 )
 
 

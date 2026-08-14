@@ -16,9 +16,13 @@ from math import prod
 import numpy as np
 from numpy.typing import NDArray
 
-from tatva.tracer.layout import TensorLayout
-from tatva.tracer.model import DynamicSliceRoute, ScatterRoute, SelectNRoute
-from tatva.tracer.routing import GatherRoute
+from tatva.tracer.core.routes import (
+    DynamicSliceRoute,
+    GatherRoute,
+    ScatterRoute,
+    SelectNRoute,
+)
+from tatva.tracer.local.layout import TensorLayout
 
 
 @dataclass(frozen=True, slots=True, eq=False)

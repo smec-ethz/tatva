@@ -53,13 +53,8 @@ import numpy as np
 from jax.core import Atom
 from jax.extend.core import ClosedJaxpr, JaxprEqn, Literal, Var
 
-from tatva.tracer.analysis import (
-    EqnPlan,
-    JaxprPlan,
-    NestedPlan,
-)
 from tatva.tracer.concrete import CONCRETE_EVALS
-from tatva.tracer.nested import (
+from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallInvocation,
     CallSpec,
@@ -71,8 +66,13 @@ from tatva.tracer.nested import (
     collect_logical_output,
     dispatch_nested_spec,
 )
-from tatva.tracer.registry import SEMANTICS
-from tatva.tracer.routing import Route
+from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.routes import Route
+from tatva.tracer.program.analysis import (
+    EqnPlan,
+    JaxprPlan,
+    NestedPlan,
+)
 
 type ConcreteValue = Any
 type ConcreteEnv = dict[Var, ConcreteValue]

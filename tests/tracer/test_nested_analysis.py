@@ -4,14 +4,14 @@ import pytest
 from jax import lax
 from jax.extend.core import primitives as jax_primitives
 
-from tatva.tracer.analysis import analyze
-from tatva.tracer.nested import CallKind, CallSpec, MapSpec, ScanSpec
-from tatva.tracer.registry import SEMANTICS
-from tatva.tracer.semantics import (
+from tatva.tracer.core.nested import CallKind, CallSpec, MapSpec, ScanSpec
+from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     NestedOperationSemantics,
     ScanAnalysisSemantics,
 )
+from tatva.tracer.program.analysis import analyze
 
 
 def test_nested_primitive_cannot_be_requested_as_ordinary():

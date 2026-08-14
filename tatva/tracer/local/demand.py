@@ -31,7 +31,7 @@ from typing import Self
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from tatva.tracer.model import Shape
+from tatva.tracer.core.routes import Shape
 
 type Demand = TensorDemand | None
 

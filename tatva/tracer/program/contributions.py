@@ -34,18 +34,18 @@ from typing import cast
 from jax.core import Atom
 from jax.extend.core import Literal, Var
 
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.materialize import (
-    JaxprInstance,
-    ResolvedEqn,
-)
-from tatva.tracer.model import Shape
-from tatva.tracer.nested import CallInvocation, FramePath
-from tatva.tracer.registry import SEMANTICS
-from tatva.tracer.semantics import (
+from tatva.tracer.core.nested import CallInvocation, FramePath
+from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.routes import Shape
+from tatva.tracer.core.semantics import (
     ContributionCoefficient,
     ContributionContext,
     ContributionMode,
+)
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.program.materialize import (
+    JaxprInstance,
+    ResolvedEqn,
 )
 
 

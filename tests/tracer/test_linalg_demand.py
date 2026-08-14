@@ -4,7 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from tatva.tracer.demand import (
+from tatva.tracer.core.semantics import DemandContext
+from tatva.tracer.local.demand import (
     TensorDemand,
     _FullAxis,
     _IndexAxis,
@@ -14,7 +15,6 @@ from tatva.tracer.rules.linalg import (
     _recognize_batched_lu_solve,
     custom_linear_solve_demand,
 )
-from tatva.tracer.semantics import DemandContext
 
 
 def _find_eqn(jaxpr, primitive_name: str):

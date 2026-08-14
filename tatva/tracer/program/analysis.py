@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
-from tatva.tracer.nested import (
+from tatva.tracer.core.nested import (
     CallKind,
     CallSpec,
     MapSpec,
@@ -47,8 +47,8 @@ from tatva.tracer.nested import (
     ScanSpec,
     normalize_nested_jaxpr,
 )
-from tatva.tracer.registry import SEMANTICS
-from tatva.tracer.semantics import (
+from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     NestedAnalysisSemantics,
     NestedOperationSemantics,

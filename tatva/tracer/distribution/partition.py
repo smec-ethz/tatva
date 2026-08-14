@@ -22,8 +22,7 @@ the smallest part ID. Dependency-free slices also use their default contiguous
 owner.
 
 This module assigns ownership only. It does not propagate backward tensor
-demand or construct local layouts. `OwnedContribution.flat_rows()` provides the
-exact contribution rows that seed the subsequent demand pass.
+demand or construct local layouts.
 """
 
 from __future__ import annotations
@@ -37,19 +36,19 @@ import scipy.sparse as sps
 from jax.extend.core import Var
 from numpy.typing import ArrayLike, NDArray
 
-from tatva.tracer.contributions import (
+from tatva.tracer.core.routes import Shape
+from tatva.tracer.local.demand import TensorDemand
+from tatva.tracer.local.layout import TensorLayout
+from tatva.tracer.program.contributions import (
     ContributionRoot,
     ContributionTrace,
     ValueRef,
 )
-from tatva.tracer.demand import TensorDemand
-from tatva.tracer.dependencies import DependencySet
-from tatva.tracer.derivatives import (
+from tatva.tracer.program.dependencies import DependencySet
+from tatva.tracer.program.derivatives import (
     DerivativeTrace,
     JaxprDerivativeTrace,
 )
-from tatva.tracer.layout import TensorLayout
-from tatva.tracer.model import Shape
 
 
 class PartitionStrategy(Enum):
