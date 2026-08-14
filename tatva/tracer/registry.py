@@ -2,9 +2,14 @@ from jax.extend.core import Primitive
 
 from tatva.tracer.rules.registration import register_builtin_rules
 from tatva.tracer.semantics import (
+    CallAnalysisSemantics,
     NestedOperationSemantics,
     OperationSemantics,
     RegisteredOperationSemantics,
+    ScanAnalysisSemantics,
+    conservative_demand,
+    contribution_barrier,
+    no_route,
 )
 
 
@@ -19,6 +24,12 @@ class PrimitiveRegistry:
             raise ValueError(f"Primitive {primitive.name} is already registered.")
 
         self._rules[primitive] = rule
+
+    def try_get(
+        self,
+        primitive: Primitive,
+    ) -> RegisteredOperationSemantics | None:
+        return self._rules.get(primitive)
 
     def get(self, primitive: Primitive) -> RegisteredOperationSemantics:
         try:
@@ -38,11 +49,169 @@ class PrimitiveRegistry:
 
         return rule
 
+    def validate(self) -> None:
+        errors: list[str] = []
+
+        for primitive, rule in self._rules.items():
+            if isinstance(rule, NestedOperationSemantics):
+                if not isinstance(
+                    rule.analysis,
+                    (CallAnalysisSemantics, ScanAnalysisSemantics),
+                ):
+                    errors.append(
+                        f"{primitive.name}: unsupported nested analysis "
+                        f"{type(rule.analysis).__name__}"
+                    )
+
+                continue
+
+            localizer = rule.localization.localize_route
+            if localizer is not None and rule.route is no_route:
+                errors.append(
+                    f"{primitive.name}: route localizer is registered "
+                    "but the operation has no route resolver"
+                )
+
+        if errors:
+            formatted = "\n".join(f"  - {error}" for error in errors)
+            raise ValueError(f"Invalid primitive semantics registry:\n{formatted}")
+
+    def describe(
+        self,
+        primitive: Primitive,
+    ) -> str:
+        rule = self.get(primitive)
+        if isinstance(rule, NestedOperationSemantics):
+            return "\n".join(
+                (
+                    f"{primitive.name}: nested",
+                    f"  analysis: {type(rule.analysis).__name__}",
+                )
+            )
+
+        has_route = rule.route is not no_route
+
+        if not has_route:
+            route_localization = "n/a"
+        elif rule.localization.localize_route is None:
+            route_localization = "unsupported"
+        else:
+            route_localization = "supported"
+
+        return "\n".join(
+            (
+                f"{primitive.name}: ordinary",
+                "  derivatives: supported",
+                (
+                    "  demand: conservative"
+                    if rule.demand is conservative_demand
+                    else "  demand: specialized"
+                ),
+                (
+                    "  contribution: barrier"
+                    if rule.contribution is contribution_barrier
+                    else "  contribution: specialized"
+                ),
+                ("  routing: none" if not has_route else "  routing: supported"),
+                f"  route localization: {route_localization}",
+                (
+                    "  lowering: generic bind"
+                    if rule.lowering is None
+                    else "  lowering: specialized"
+                ),
+            )
+        )
+
+    def overview(self) -> str:
+        rows: list[tuple[str, ...]] = []
+
+        for primitive, rule in sorted(
+            self._rules.items(),
+            key=lambda item: item[0].name,
+        ):
+            if isinstance(rule, NestedOperationSemantics):
+                rows.append(
+                    (
+                        primitive.name,
+                        "nested",
+                        type(rule.analysis).__name__,
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                    )
+                )
+                continue
+
+            has_route = rule.route is not no_route
+            has_localizer = rule.localization.localize_route is not None
+
+            rows.append(
+                (
+                    primitive.name,
+                    "ordinary",
+                    _rule_name(rule.demand),
+                    (
+                        "barrier"
+                        if rule.contribution is contribution_barrier
+                        else _rule_name(rule.contribution)
+                    ),
+                    "yes" if has_route else "-",
+                    ("yes" if has_localizer else "no" if has_route else "-"),
+                    (
+                        _rule_name(rule.lowering)
+                        if rule.lowering is not None
+                        else "bind"
+                    ),
+                )
+            )
+
+        return _format_table(
+            (
+                "primitive",
+                "kind",
+                "demand/analysis",
+                "contribution",
+                "routing",
+                "localization",
+                "lowering",
+            ),
+            rows,
+        )
+
+
+def _rule_name(rule: object) -> str:
+    return getattr(rule, "__name__", type(rule).__name__)
+
+
+def _format_table(
+    headers: tuple[str, ...],
+    rows: list[tuple[str, ...]],
+) -> str:
+    widths = [
+        max(len(headers[i]), *(len(row[i]) for row in rows))
+        for i in range(len(headers))
+    ]
+
+    def format_row(row: tuple[str, ...]) -> str:
+        return "  ".join(
+            value.ljust(width) for value, width in zip(row, widths, strict=True)
+        )
+
+    return "\n".join(
+        (
+            format_row(headers),
+            format_row(tuple("-" * width for width in widths)),
+            *(format_row(row) for row in rows),
+        )
+    )
+
 
 def get_primitive_registry() -> PrimitiveRegistry:
     """Return the global primitive registry."""
     reg = PrimitiveRegistry()
     register_builtin_rules(reg)
+    reg.validate()
     return reg
 
 
