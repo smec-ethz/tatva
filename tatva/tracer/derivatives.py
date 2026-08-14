@@ -282,7 +282,7 @@ def _trace_ordinary_eqn(
     n_dofs: int,
 ) -> tuple[DependencySet, ...]:
     eqn = resolved.plan.eqn
-    rule = SEMANTICS.get(eqn.primitive)
+    rule = SEMANTICS.get_ordinary(eqn.primitive)
 
     ctx = RuleContext(
         eqn=eqn,

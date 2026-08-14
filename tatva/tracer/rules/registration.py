@@ -4,8 +4,10 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from jax import custom_derivatives, lax
+from jax.extend.core import primitives
 
 from tatva.tracer import lowerings
+from tatva.tracer.nested import CallKind
 from tatva.tracer.routing import (
     resolve_dynamic_slice_route,
     resolve_dynamic_update_slice_route,
@@ -20,9 +22,12 @@ from tatva.tracer.rules.elementwise import (
 )
 from tatva.tracer.rules.structural import RESHAPE_LIKE
 from tatva.tracer.semantics import (
+    CallAnalysisSemantics,
     DerivativeRule,
     LocalizationSemantics,
+    NestedOperationSemantics,
     OperationSemantics,
+    ScanAnalysisSemantics,
     no_hessian,
 )
 
@@ -493,10 +498,39 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
         ),
     )
     reg.register(
-        lax.linalg.lu_p,
+        primitives.lu_p,
         OperationSemantics(
             derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
             demand=linalg.lu_demand,
+        ),
+    )
+
+
+def _register_nested_rules(
+    reg: PrimitiveRegistry,
+) -> None:
+    reg.register(
+        primitives.jit_p,
+        NestedOperationSemantics(
+            analysis=CallAnalysisSemantics(
+                call_kind=CallKind.JIT,
+            )
+        ),
+    )
+
+    reg.register(
+        primitives.remat_p,
+        NestedOperationSemantics(
+            analysis=CallAnalysisSemantics(
+                call_kind=CallKind.REMAT,
+            )
+        ),
+    )
+
+    reg.register(
+        primitives.scan_p,
+        NestedOperationSemantics(
+            analysis=ScanAnalysisSemantics(),
         ),
     )
 
@@ -511,6 +545,8 @@ def _register_unstable_api_rules(reg: PrimitiveRegistry) -> None:
 
 
 def register_builtin_rules(reg: PrimitiveRegistry) -> None:
+    _register_nested_rules(reg)
+
     _register_zero_deps_rules(reg)
     _register_elementwise_unary_rules(reg)
     _register_elementwise_binary_rules(reg)

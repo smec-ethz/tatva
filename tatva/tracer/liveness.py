@@ -122,7 +122,7 @@ def _backprop_ordinary(
     output_demands: tuple[Demand, ...],
 ) -> tuple[Demand, ...]:
     eqn = resolved.plan.eqn
-    rule = SEMANTICS.get(eqn.primitive)
+    rule = SEMANTICS.get_ordinary(eqn.primitive)
 
     result = rule.demand(
         DemandContext(

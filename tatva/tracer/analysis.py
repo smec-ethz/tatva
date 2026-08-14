@@ -9,9 +9,9 @@ primitives should be interpreted.
 The analysis distinguishes ordinary primitives from higher-order/nested
 constructs such as calls, maps, and scans:
 
-- `CallSpec` represents transparent call-like wrappers such as `jit` and remat.
-- `MapSpec` represents independent repeated applications of a body JAXPR,
-  including carry-free scans.
+- `CallSpec` represents transparent call-like wrappers such as jit and remat.
+- `MapSpec` is Tatva's normalized representation for independent repeated applications. In
+  JAX 0.11 this is produced from carry-free scans.
 - `ScanSpec` represents recurrent scans whose carry creates dependencies between
   iterations.
 
@@ -38,7 +38,6 @@ from dataclasses import dataclass
 
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
-from tatva.tracer.helpers import _shape_of
 from tatva.tracer.nested import (
     CallKind,
     CallSpec,
@@ -49,6 +48,12 @@ from tatva.tracer.nested import (
     normalize_nested_jaxpr,
 )
 from tatva.tracer.registry import SEMANTICS
+from tatva.tracer.semantics import (
+    CallAnalysisSemantics,
+    NestedAnalysisSemantics,
+    NestedOperationSemantics,
+    ScanAnalysisSemantics,
+)
 
 
 @dataclass(frozen=True)
@@ -151,13 +156,16 @@ def analyze(
             concrete_outputs_by_eqn[index] = required_outputs
 
         # Nested primitive.
-        nested = _analyze_nested(eqn, concrete_outputs=required_outputs)
+        semantics = SEMANTICS.get(eqn.primitive)
 
-        if nested is not None:
+        if isinstance(semantics, NestedOperationSemantics):
+            nested = _analyze_nested(
+                eqn, semantics=semantics.analysis, concrete_outputs=required_outputs
+            )
             nested_plans[index] = nested
 
-            # Any child input needed concretely becomes a concrete
-            # requirement on the corresponding outer equation input.
+            # any child input needed concretely becomes a concrete requirement on the
+            # corresponding outer equation input
             for input_index in nested.concrete_inputs:
                 if input_index >= len(eqn.invars):
                     raise ValueError(
@@ -167,18 +175,14 @@ def analyze(
                     )
 
                 atom = eqn.invars[input_index]
-
                 if isinstance(atom, Var):
                     required.add(atom)
 
             continue
 
-        # Ordinary primitive.
-        rule = SEMANTICS.get(eqn.primitive)
-
         # A route-aware primitive can explicitly request particular
         # inputs to be concretely available.
-        for input_index in rule.concrete_inputs(eqn):
+        for input_index in semantics.concrete_inputs(eqn):
             if input_index < 0 or input_index >= len(eqn.invars):
                 raise ValueError(
                     f"{eqn.primitive.name}.concrete_inputs returned "
@@ -234,23 +238,23 @@ def analyze(
 def _analyze_nested(
     eqn: JaxprEqn,
     *,
+    semantics: NestedAnalysisSemantics,
     concrete_outputs: frozenset[int],
-) -> NestedPlan | None:
-    match eqn.primitive.name:
-        case "jit" | "pjit":
-            return _analyze_call(
-                eqn, kind=CallKind.JIT, concrete_outputs=concrete_outputs
-            )
-        case "remat2":
-            return _analyze_call(
-                eqn, kind=CallKind.REMAT, concrete_outputs=concrete_outputs
-            )
-        case "scan":
-            return _analyze_scan(eqn, concrete_outputs=concrete_outputs)
-        case "map":
-            return _analyze_map(eqn, concrete_outputs=concrete_outputs)
-        case _:
-            return None
+) -> NestedPlan:
+    if isinstance(semantics, CallAnalysisSemantics):
+        return _analyze_call(
+            eqn,
+            kind=semantics.call_kind,
+            concrete_outputs=concrete_outputs,
+        )
+
+    if isinstance(semantics, ScanAnalysisSemantics):
+        return _analyze_scan(
+            eqn,
+            concrete_outputs=concrete_outputs,
+        )
+
+    raise TypeError(f"unsupported nested analysis semantics {type(semantics).__name__}")
 
 
 def _analyze_call(
@@ -456,44 +460,4 @@ def _analyze_carry_free_scan(
         body=body_plan,
         consts=nested.consts,
         concrete_inputs=concrete_inputs,
-    )
-
-
-def _analyze_map(
-    eqn: JaxprEqn,
-    *,
-    concrete_outputs: frozenset[int],
-) -> NestedPlan:
-    nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
-
-    # Your historical map representation apparently used the same
-    # scan-style convention. Keep this isolated here because "map"
-    # is not something I would bake into generic code.
-    num_consts = int(eqn.params.get("num_consts", 0))
-
-    body_plan = analyze(
-        nested.jaxpr,
-        concrete_outputs=concrete_outputs,
-    )
-
-    # Prefer explicit length metadata if present.
-    length = eqn.params.get("length")
-
-    if length is None:
-        # Infer from first mapped outer operand.
-        mapped_inputs = eqn.invars[num_consts:]
-        if not mapped_inputs:
-            raise ValueError("map has no mapped inputs from which to infer length")
-
-        shape = _shape_of(mapped_inputs[0])
-        if not shape:
-            raise ValueError("map input must have a leading mapped axis")
-
-        length = shape[0]
-
-    return NestedPlan(
-        spec=MapSpec(num_consts=num_consts, length=int(length), reverse=False),
-        body=body_plan,
-        consts=nested.consts,
-        concrete_inputs=body_plan.concrete_inputs,
     )

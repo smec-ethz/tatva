@@ -224,7 +224,7 @@ def _materialize_ordinary(
 ) -> ResolvedEqn:
     eqn = eqn_plan.eqn
 
-    rule = SEMANTICS.get(eqn.primitive)
+    rule = SEMANTICS.get_ordinary(eqn.primitive)
 
     # First ensure all values explicitly needed for routing exist.
     for input_index in rule.concrete_inputs(eqn):
