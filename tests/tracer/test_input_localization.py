@@ -1,12 +1,11 @@
 import jax.numpy as jnp
 import numpy as np
 
-from tatva.tracer import input_localization
 from tatva.tracer.api import trace
 from tatva.tracer.capture import CapturedJaxpr
 
 
-def test_input_localization_batches_gather_demand_per_rank(monkeypatch):
+def test_dead_gather_indices_do_not_prevent_local_execution():
     u = jnp.arange(6.0)
     coords = jnp.stack((u, u + 1), axis=1)
     connectivity = jnp.array(
@@ -23,43 +22,21 @@ def test_input_localization_batches_gather_demand_per_rank(monkeypatch):
         terms += 0.01 * jnp.sum(gathered_coords, axis=(1, 2))
         return jnp.sum(terms)
 
-    calls = 0
-    original = input_localization.backpropagate_demand
-
-    def counted_backpropagate_demand(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(
-        input_localization,
-        "backpropagate_demand",
-        counted_backpropagate_demand,
-    )
-
     captured = CapturedJaxpr.from_fn(energy, u, coords, connectivity)
     distributed = trace(captured).partition(n_parts=2)
 
-    # One auxiliary localization traversal per rank, not one per gather.
-    assert calls == 2
-
     local_values = []
     for rank in range(2):
-        local_args, local_kwargs = distributed.localize_inputs(
-            rank, u, coords, connectivity
-        )
+        local = distributed.for_rank(rank)
+        local_args, local_kwargs = local.localize_inputs(u, coords, connectivity)
         local_u, local_coords, local_connectivity = local_args
 
         assert not local_kwargs
         assert local_u.shape == (3,)
         assert local_coords.shape == (3, 2)
-        assert local_connectivity.shape == (2, 2)
-        assert int(local_connectivity.min()) >= 0
-        assert int(local_connectivity.max()) < local_coords.shape[0]
+        assert local_connectivity is None
 
-        local_values.append(
-            distributed.local_function(rank)(*local_args, **local_kwargs)
-        )
+        local_values.append(local.local_function()(*local_args, **local_kwargs))
 
     np.testing.assert_allclose(
         sum(local_values), energy(u, coords, connectivity), rtol=1e-6
@@ -94,22 +71,20 @@ def test_distinct_index_inputs_may_use_distinct_operand_maps():
 
     local_values = []
     for rank in range(2):
-        local_args, local_kwargs = distributed.localize_inputs(
-            rank,
+        local = distributed.for_rank(rank)
+        local_args, local_kwargs = local.localize_inputs(
             u,
             auxiliary,
             u_indices,
             auxiliary_indices,
         )
-        local_u, local_auxiliary, local_u_indices, local_auxiliary_indices = local_args
+        _, _, local_u_indices, local_auxiliary_indices = local_args
 
         assert not local_kwargs
-        assert int(local_u_indices.max()) < local_u.shape[0]
-        assert int(local_auxiliary_indices.max()) < local_auxiliary.shape[0]
+        assert local_u_indices is None
+        assert local_auxiliary_indices is None
 
-        local_values.append(
-            distributed.local_function(rank)(*local_args, **local_kwargs)
-        )
+        local_values.append(local.local_function()(*local_args, **local_kwargs))
 
     np.testing.assert_allclose(
         sum(local_values),

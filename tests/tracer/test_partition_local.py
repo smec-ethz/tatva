@@ -61,7 +61,6 @@ def test_partition_local_matches_all_rank_reference():
         assert reference_rank.rank == rank
         assert reference_rank.local_plan is reference.local_plans[rank]
         assert reference_rank.halo_plan is reference.halo_plans[rank]
-        assert reference_rank.input_plan is reference.input_plans[rank]
 
         local = traced.partition_local(
             comm=_ReferenceComm(reference, rank),
