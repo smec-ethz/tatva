@@ -121,7 +121,6 @@ class TraceResult[**P, R]:
         n_parts: int,
         partitioning: NDArray[np.int64]
         | typing.Literal["metis", "contiguous"] = "contiguous",
-        # localize: LocalizeOverrides | None = None,
     ) -> DistributedFunctional[P, R]:
         contribution_partition, dof_to_part = self._partition_metadata(
             n_parts=n_parts,
@@ -165,7 +164,6 @@ class TraceResult[**P, R]:
         comm: PartitionCommunicator,
         partitioning: NDArray[np.int64]
         | typing.Literal["metis", "contiguous"] = "contiguous",
-        localize: LocalizeOverrides | None = None,
     ) -> RankLocalFunctional[P, R]:
         """Collectively compile only this communicator rank's local functional.
 
@@ -342,14 +340,13 @@ class RankLocalFunctional[**P, R]:
         signature and PyTree structure after any semantic reconstruction has been applied.
 
         Args:
-            rank: Rank for which the local input representation is constructed.
             *args, **kwargs: Global input arguments matching the captured functional
                 signature.
 
         Returns:
             args, kwargs
                 Rank-local positional and keyword arguments suitable for
-                ``local_function(rank)``. Dead leaves may be ``None`` unless an enclosing
+                ``local_function()``. Dead leaves may be ``None`` unless an enclosing
                 ``__tatva_localize__`` implementation reconstructs them.
         """
         return self.localize_inputs_with_specializers({}, *args, **kwargs)
