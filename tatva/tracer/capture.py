@@ -61,31 +61,15 @@ def make_captured_jaxpr[**P, R](
 
 
 @dataclass(frozen=True, slots=True)
-class InputOrigin:
-    flat_index: int
-    parameter_index: int
-    parameter_name: str
-    key_path: tuple[Any, ...]
-
-    @property
-    def display_path(self) -> str:
-        suffix = jax.tree_util.keystr(self.key_path)
-        return f"{self.parameter_name}{suffix}"
-
-
-@dataclass(frozen=True, slots=True)
 class CallABI:
-    """Canonical mapping between a Python function call and flat JAXPR inputs.
-
-    The canonical tree is one entry per declared function parameter,
-    in signature order. Therefore positional-vs-keyword spelling does not
-    affect the flat ABI.
-    """
+    """Canonical mapping between a Python call and flat JAXPR inputs."""
 
     signature: inspect.Signature
-    parameter_names: tuple[str, ...]
     treedef: jax.tree_util.PyTreeDef
-    input_origins: tuple[InputOrigin, ...]
+
+    @property
+    def parameter_names(self) -> tuple[str, ...]:
+        return tuple(self.signature.parameters)
 
     @classmethod
     def from_call(
@@ -101,72 +85,69 @@ class CallABI:
 
         parameter_names = tuple(signature.parameters)
         canonical = tuple(bound.arguments[name] for name in parameter_names)
-        # flat, treedef = jax.tree_util.tree_flatten(canonical)
-        path_leaves, treedef = jax.tree_util.tree_flatten_with_path(canonical)
-        flat: list[Any] = []
-        origins: list[InputOrigin] = []
-
-        for flat_index, (path, value) in enumerate(path_leaves):
-            if not path or not isinstance(path[0], jax.tree_util.SequenceKey):
-                raise TypeError(
-                    "canonical call PyTree did not start with a parameter tuple index"
-                )
-
-            parameter_index = int(path[0].idx)
-            if parameter_index < 0 or parameter_index >= len(parameter_names):
-                raise RuntimeError("invalid parameter index in canonical PyTree path")
-
-            flat.append(value)
-            origins.append(
-                InputOrigin(
-                    flat_index,
-                    parameter_index,
-                    parameter_names[parameter_index],
-                    path[1:],
-                )
-            )
+        flat, treedef = jax.tree_util.tree_flatten(canonical)
 
         return (
-            cls(
-                signature=signature,
-                parameter_names=parameter_names,
-                treedef=treedef,
-                input_origins=tuple(origins),
-            ),
+            cls(signature=signature, treedef=treedef),
             tuple(flat),
         )
 
     def bind(
         self,
-        *args,
-        **kwargs,
+        *args: Any,
+        **kwargs: Any,
     ) -> inspect.BoundArguments:
         bound = self.signature.bind(*args, **kwargs)
         bound.apply_defaults()
         return bound
 
-    def flatten_call(
+    def flatten_bound(
         self,
-        *args,
-        **kwargs,
+        bound: inspect.BoundArguments,
     ) -> tuple[Any, ...]:
-        bound = self.bind(*args, **kwargs)
         canonical = tuple(bound.arguments[name] for name in self.parameter_names)
-        flat, treedef = jax.tree_util.tree_flatten(canonical)
 
-        if treedef != self.treedef:
+        try:
+            return tuple(self.treedef.flatten_up_to(canonical))
+        except ValueError as exc:
             raise ValueError(
-                "call argument pytree differs from the "
+                "call argument PyTree differs from the "
                 "structure used when the functional was captured"
-            )
-
-        return tuple(flat)
+            ) from exc
 
     def unflatten(
         self,
         flat: tuple[Any, ...],
     ) -> inspect.BoundArguments:
-        canonical = jax.tree_util.tree_unflatten(self.treedef, flat)
+        canonical = self.treedef.unflatten(flat)
         arguments = dict(zip(self.parameter_names, canonical, strict=True))
 
         return inspect.BoundArguments(self.signature, arguments)
+
+    def parameter_trees(
+        self,
+    ) -> tuple[
+        tuple[
+            str,
+            jax.tree_util.PyTreeDef,
+            slice,
+        ],
+        ...,
+    ]:
+        """Top-level parameter trees and their flat ABI ranges."""
+
+        trees = self.treedef.children()
+        if len(trees) != len(self.parameter_names):
+            raise RuntimeError(
+                "canonical call tree does not match the Python function signature"
+            )
+
+        offset = 0
+        result = []
+
+        for name, tree in zip(self.parameter_names, trees, strict=True):
+            stop = offset + tree.num_leaves
+            result.append((name, tree, slice(offset, stop)))
+            offset = stop
+
+        return tuple(result)

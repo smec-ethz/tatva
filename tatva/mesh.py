@@ -20,13 +20,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Literal, NamedTuple, Self
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Self
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from tatva.tracer.input_localization import LocalizationContext
 
 
 class ElementType(Enum):
@@ -65,6 +68,34 @@ class Mesh:
 
     elements: Array
     """Connectivity of the mesh elements, shape (n_elements, nodes_per_element)"""
+
+    def __tatva_localize__(
+        self,
+        children: tuple[Any, ...],
+        ctx: LocalizationContext,
+    ) -> Mesh:
+        """Semantic recreation of a local Mesh from the input demand of the localization tracer."""
+        # conn returned from demand tracing will be None, so we have to reconstruct it
+        # here from the coords layout and the global connectivity.
+        local_coords, _conn = children
+        coords_layout = ctx.child_layout(0)
+
+        if coords_layout is None:
+            raise RuntimeError("mesh coordinates are dead")
+
+        # Domain-specific cell selection
+        node_indices = coords_layout.global_axis_indices(0)
+        # Create a boolean mask for elements that contain any of the specified nodes
+        mask = np.all(np.isin(self.elements, node_indices), axis=1)
+        # Find the unique element indices that are required
+        required_elements = np.unique(np.nonzero(mask)[0])
+        global_connectivity = self.elements[required_elements]
+        local_connectivity = coords_layout.global_to_local_axis(0, global_connectivity)
+
+        return Mesh(
+            coords=local_coords,
+            elements=jnp.asarray(local_connectivity),
+        )
 
     def _replace(self, **changes: Any) -> Self:
         """Returns a new instance of the Mesh with the specified changes. Same as
