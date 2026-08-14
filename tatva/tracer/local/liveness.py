@@ -22,21 +22,7 @@ import numpy as np
 from jax.extend.core import Literal, Var
 from numpy.typing import NDArray
 
-from tatva.tracer.contributions import ValueRef
-from tatva.tracer.demand import (
-    Demand,
-    TensorDemand,
-    axis_indices,
-    lift_leading_axis_demand,
-    merge_demands,
-    take_leading_axis_demand,
-)
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.materialize import (
-    JaxprInstance,
-    ResolvedEqn,
-)
-from tatva.tracer.nested import (
+from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallContext,
     CallInvocation,
@@ -48,9 +34,23 @@ from tatva.tracer.nested import (
     TraversalOrder,
     dispatch_nested,
 )
-from tatva.tracer.registry import SEMANTICS
-from tatva.tracer.semantics import (
+from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.semantics import (
     DemandContext,
+)
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import (
+    Demand,
+    TensorDemand,
+    axis_indices,
+    lift_leading_axis_demand,
+    merge_demands,
+    take_leading_axis_demand,
+)
+from tatva.tracer.program.contributions import ValueRef
+from tatva.tracer.program.materialize import (
+    JaxprInstance,
+    ResolvedEqn,
 )
 
 

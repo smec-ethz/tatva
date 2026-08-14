@@ -8,7 +8,7 @@ import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
-from tatva.tracer.model import Shape
+from tatva.tracer.core.routes import Shape
 
 
 @dataclass

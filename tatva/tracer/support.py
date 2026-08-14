@@ -5,12 +5,12 @@ from enum import Enum
 
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn
 
-from tatva.tracer.local_plan import (
+from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.semantics import NestedOperationSemantics
+from tatva.tracer.local.plan import (
     LocalJaxprPlan,
     pending_routes,
 )
-from tatva.tracer.registry import SEMANTICS
-from tatva.tracer.semantics import NestedOperationSemantics
 
 
 class SupportCapability(Enum):

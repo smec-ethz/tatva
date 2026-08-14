@@ -58,13 +58,7 @@ import scipy.sparse as sps
 from jax.core import Atom
 from jax.extend.core import Jaxpr, Literal, Var
 
-from tatva.tracer.dependencies import DependencySet, HessianAccumulator
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.materialize import (
-    JaxprInstance,
-    ResolvedEqn,
-)
-from tatva.tracer.nested import (
+from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallContext,
     CallInvocation,
@@ -76,8 +70,14 @@ from tatva.tracer.nested import (
     collect_logical_output,
     dispatch_nested,
 )
-from tatva.tracer.registry import SEMANTICS
-from tatva.tracer.semantics import RuleContext
+from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.semantics import RuleContext
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.program.materialize import (
+    JaxprInstance,
+    ResolvedEqn,
+)
 
 
 @dataclass(frozen=True)

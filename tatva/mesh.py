@@ -29,7 +29,7 @@ from jax import Array
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
-    from tatva.tracer.input_localization import LocalizationContext
+    from tatva.tracer.local.inputs import LocalizationContext
 
 
 class ElementType(Enum):

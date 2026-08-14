@@ -10,9 +10,9 @@ import jax
 import jax.numpy as jnp
 
 from tatva.tracer.capture import CallABI
-from tatva.tracer.halo import HaloPlan
-from tatva.tracer.layout import TensorLayout
-from tatva.tracer.lowering import extract_local_value
+from tatva.tracer.distribution.halo import HaloPlan
+from tatva.tracer.local.layout import TensorLayout
+from tatva.tracer.lowering.executor import extract_local_value
 
 
 @dataclass(frozen=True, slots=True)

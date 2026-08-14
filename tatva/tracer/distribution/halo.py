@@ -22,7 +22,7 @@ from typing import Any, Protocol
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from tatva.tracer.layout import TensorLayout
+from tatva.tracer.local.layout import TensorLayout
 
 
 class HaloCommunicator(Protocol):

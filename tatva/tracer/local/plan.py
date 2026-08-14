@@ -31,13 +31,7 @@ from typing import cast
 
 from jax.extend.core import JaxprEqn, Literal, Var
 
-from tatva.tracer.layout import TensorLayout
-from tatva.tracer.liveness import JaxprDemandTrace
-from tatva.tracer.localize import (
-    LocalRoute,
-)
-from tatva.tracer.materialize import JaxprInstance, ResolvedEqn
-from tatva.tracer.nested import (
+from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallContext,
     CallInvocation,
@@ -52,11 +46,17 @@ from tatva.tracer.nested import (
     TraversalOrder,
     dispatch_nested,
 )
-from tatva.tracer.registry import SEMANTICS
-from tatva.tracer.routing import (
+from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.routes import (
     Route,
 )
-from tatva.tracer.semantics import RouteLocalizationContext
+from tatva.tracer.core.semantics import RouteLocalizationContext
+from tatva.tracer.local.layout import TensorLayout
+from tatva.tracer.local.liveness import JaxprDemandTrace
+from tatva.tracer.local.localize import (
+    LocalRoute,
+)
+from tatva.tracer.program.materialize import JaxprInstance, ResolvedEqn
 
 
 @dataclass(frozen=True, slots=True)

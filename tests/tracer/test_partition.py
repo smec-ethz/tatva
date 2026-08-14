@@ -1,8 +1,11 @@
 import numpy as np
 import scipy.sparse as sps
 
-from tatva.tracer.dependencies import DependencySet
-from tatva.tracer.partition import _contiguous_owners, dependency_partition_owners
+from tatva.tracer.distribution.partition import (
+    _contiguous_owners,
+    dependency_partition_owners,
+)
+from tatva.tracer.program.dependencies import DependencySet
 
 
 def test_contiguous_owners():

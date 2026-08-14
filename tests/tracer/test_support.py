@@ -4,7 +4,7 @@ from jax import lax
 from jax.extend.core import Primitive
 from jax.extend.core import primitives as jax_primitives
 
-from tatva.tracer.registry import SEMANTICS
+from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.support import (
     registration_issues,
 )

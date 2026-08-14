@@ -11,32 +11,32 @@ import scipy.sparse as sps
 from numpy.typing import NDArray
 
 from tatva.sparse._coloring import csr_to_adjacency
-from tatva.tracer.analysis import JaxprPlan, analyze
 from tatva.tracer.capture import CapturedJaxpr, make_captured_jaxpr
-from tatva.tracer.contributions import ContributionTrace, detect_contributions
-from tatva.tracer.derivatives import DerivativeTrace, trace_derivatives
-from tatva.tracer.halo import (
+from tatva.tracer.distribution.halo import (
     HaloCommunicator,
     HaloPlan,
     build_halo_plans,
     build_local_halo_plan,
 )
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.input_localization import (
-    LocalizeOverrides,
-    localize_inputs,
-)
-from tatva.tracer.layout import TensorLayout
-from tatva.tracer.liveness import DemandSeed, backpropagate_demand
-from tatva.tracer.local_plan import LocalJaxprPlan, build_local_plan
-from tatva.tracer.lowering import build_local_executable
-from tatva.tracer.materialize import JaxprInstance, materialize_plan
-from tatva.tracer.partition import (
+from tatva.tracer.distribution.partition import (
     ContributionPartition,
     OwnedContribution,
     dof_owner_from_contributions,
     partition_contributions,
 )
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.inputs import (
+    LocalizeOverrides,
+    localize_inputs,
+)
+from tatva.tracer.local.layout import TensorLayout
+from tatva.tracer.local.liveness import DemandSeed, backpropagate_demand
+from tatva.tracer.local.plan import LocalJaxprPlan, build_local_plan
+from tatva.tracer.lowering.executor import build_local_executable
+from tatva.tracer.program.analysis import JaxprPlan, analyze
+from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
+from tatva.tracer.program.derivatives import DerivativeTrace, trace_derivatives
+from tatva.tracer.program.materialize import JaxprInstance, materialize_plan
 from tatva.tracer.support import require_local_routes, require_registered_operations
 
 

@@ -1,13 +1,13 @@
 import numpy as np
 import pytest
 
-from tatva.tracer.demand import (
+from tatva.tracer.local.demand import (
     TensorDemand,
     _FullAxis,
     _IndexAxis,
     _RangeAxis,
 )
-from tatva.tracer.layout import (
+from tatva.tracer.local.layout import (
     TensorLayout,
     finalize_layout,
 )

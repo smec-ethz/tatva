@@ -18,27 +18,7 @@ from jax import Array, lax
 from jax.extend.core import Literal, Var
 from numpy.typing import NDArray
 
-from tatva.tracer.contributions import ContributionTrace
-from tatva.tracer.demand import (
-    TensorDemand,
-    _FullAxis,
-    _IndexAxis,
-    _RangeAxis,
-)
-from tatva.tracer.layout import TensorLayout
-from tatva.tracer.local_plan import (
-    LocalEqnPlan,
-    LocalJaxprPlan,
-    LocalNestedPlan,
-)
-from tatva.tracer.localize import (
-    LocalDynamicSliceRoute,
-    LocalGatherRoute,
-    LocalScatterRoute,
-    LocalSelectNRoute,
-)
-from tatva.tracer.lowerings import LoweringContext, lower_bind
-from tatva.tracer.nested import (
+from tatva.tracer.core.nested import (
     CallContext,
     MapContext,
     RepeatedInvocation,
@@ -47,8 +27,28 @@ from tatva.tracer.nested import (
     TraversalOrder,
     dispatch_nested,
 )
-from tatva.tracer.partition import OwnedContribution
-from tatva.tracer.registry import SEMANTICS
+from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.distribution.partition import OwnedContribution
+from tatva.tracer.local.demand import (
+    TensorDemand,
+    _FullAxis,
+    _IndexAxis,
+    _RangeAxis,
+)
+from tatva.tracer.local.layout import TensorLayout
+from tatva.tracer.local.localize import (
+    LocalDynamicSliceRoute,
+    LocalGatherRoute,
+    LocalScatterRoute,
+    LocalSelectNRoute,
+)
+from tatva.tracer.local.plan import (
+    LocalEqnPlan,
+    LocalJaxprPlan,
+    LocalNestedPlan,
+)
+from tatva.tracer.lowering.rules import LoweringContext, lower_bind
+from tatva.tracer.program.contributions import ContributionTrace
 
 
 def extract_local_value(

@@ -1,15 +1,14 @@
 import numpy as np
 import pytest
 
-from tatva.tracer.demand import TensorDemand
-from tatva.tracer.layout import TensorLayout
-from tatva.tracer.localize import (
+from tatva.tracer.core.routes import DynamicSliceRoute, GatherRoute, ScatterRoute
+from tatva.tracer.local.demand import TensorDemand
+from tatva.tracer.local.layout import TensorLayout
+from tatva.tracer.local.localize import (
     localize_dynamic_slice_route,
     localize_gather_route,
     localize_scatter_route,
 )
-from tatva.tracer.model import DynamicSliceRoute, ScatterRoute
-from tatva.tracer.routing import GatherRoute
 
 
 def test_localize_gather_route():

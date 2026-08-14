@@ -1,7 +1,7 @@
 import numpy as np
 from jax.extend.core import Literal, Var
 
-from tatva.tracer.semantics import (
+from tatva.tracer.core.semantics import (
     ContributionCoefficient,
     ContributionContext,
     ContributionDecision,

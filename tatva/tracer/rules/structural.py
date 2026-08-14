@@ -8,7 +8,15 @@ import scipy.sparse as sps
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
-from tatva.tracer.demand import (
+from tatva.tracer.core.semantics import (
+    DemandContext,
+    DerivativeRule,
+    OperationSemantics,
+    no_hessian,
+    no_prepare,
+)
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import (
     AxisSubset,
     Demand,
     TensorDemand,
@@ -18,18 +26,10 @@ from tatva.tracer.demand import (
     _RangeAxis,
     axis_indices,
 )
-from tatva.tracer.dependencies import DependencySet
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.semantics import (
-    DemandContext,
-    DerivativeRule,
-    OperationSemantics,
-    no_hessian,
-    no_prepare,
-)
+from tatva.tracer.program.dependencies import DependencySet
 
 if TYPE_CHECKING:
-    from tatva.tracer.semantics import RuleContext
+    from tatva.tracer.core.semantics import RuleContext
 
 
 def reshape_like_dependencies(

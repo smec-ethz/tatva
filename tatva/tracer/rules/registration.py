@@ -6,22 +6,14 @@ from typing import TYPE_CHECKING
 from jax import custom_derivatives, lax
 from jax.extend.core import primitives
 
-from tatva.tracer import lowerings
-from tatva.tracer.nested import CallKind
-from tatva.tracer.routing import (
+from tatva.tracer.core.nested import CallKind
+from tatva.tracer.core.routes import (
     resolve_dynamic_slice_route,
     resolve_dynamic_update_slice_route,
     resolve_gather_route,
     resolve_select_n_route,
 )
-from tatva.tracer.rules.elementwise import (
-    ELEMENTWISE_BINARY_BASIC,
-    INTEGER_POW,
-    LINEAR_UNARY,
-    NONLINEAR_UNARY,
-)
-from tatva.tracer.rules.structural import RESHAPE_LIKE
-from tatva.tracer.semantics import (
+from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     DerivativeRule,
     LocalizationSemantics,
@@ -30,6 +22,14 @@ from tatva.tracer.semantics import (
     ScanAnalysisSemantics,
     no_hessian,
 )
+from tatva.tracer.lowering import rules as lowerings
+from tatva.tracer.rules.elementwise import (
+    ELEMENTWISE_BINARY_BASIC,
+    INTEGER_POW,
+    LINEAR_UNARY,
+    NONLINEAR_UNARY,
+)
+from tatva.tracer.rules.structural import RESHAPE_LIKE
 
 from . import (
     contributions as contribution_rules,
@@ -47,7 +47,7 @@ from . import (
 from .zero_dependency import IOTA, ZERO_DEPENDENCY
 
 if TYPE_CHECKING:
-    from tatva.tracer.registry import PrimitiveRegistry
+    from tatva.tracer.core.registry import PrimitiveRegistry
 
 
 def _register_zero_deps_rules(reg: PrimitiveRegistry) -> None:

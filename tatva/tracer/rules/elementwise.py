@@ -5,19 +5,19 @@ from typing import TYPE_CHECKING
 
 from jax.extend.core import Literal
 
-from tatva.tracer.demand import Demand, TensorDemand, _FullAxis
-from tatva.tracer.dependencies import DependencySet, HessianAccumulator
-from tatva.tracer.helpers import _shape_of
-from tatva.tracer.semantics import (
+from tatva.tracer.core.semantics import (
     DemandContext,
     DerivativeRule,
     OperationSemantics,
     no_hessian,
     no_prepare,
 )
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import Demand, TensorDemand, _FullAxis
+from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
 
 if TYPE_CHECKING:
-    from tatva.tracer.semantics import RuleContext
+    from tatva.tracer.core.semantics import RuleContext
 
 
 # --------------------------------

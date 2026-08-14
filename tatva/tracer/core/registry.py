@@ -1,7 +1,6 @@
 from jax.extend.core import Primitive
 
-from tatva.tracer.rules.registration import register_builtin_rules
-from tatva.tracer.semantics import (
+from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     NestedOperationSemantics,
     OperationSemantics,
@@ -11,6 +10,7 @@ from tatva.tracer.semantics import (
     contribution_barrier,
     no_route,
 )
+from tatva.tracer.rules.registration import register_builtin_rules
 
 
 class PrimitiveRegistry:

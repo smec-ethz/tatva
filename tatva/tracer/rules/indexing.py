@@ -4,18 +4,26 @@ import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
-from tatva.tracer.demand import Demand, TensorDemand
-from tatva.tracer.dependencies import DependencySet
+from tatva.tracer.core.routes import (
+    DynamicSliceRoute,
+    DynamicUpdateSliceRoute,
+    SelectNRoute,
+)
+from tatva.tracer.core.semantics import (
+    DemandContext,
+    RouteLocalizationContext,
+    RuleContext,
+)
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.localize import (
+from tatva.tracer.local.demand import Demand, TensorDemand
+from tatva.tracer.local.localize import (
     LocalDynamicSliceRoute,
     LocalSelectNRoute,
     localize_dynamic_slice_route,
     localize_select_n_route,
 )
-from tatva.tracer.model import DynamicSliceRoute, DynamicUpdateSliceRoute, SelectNRoute
+from tatva.tracer.program.dependencies import DependencySet
 from tatva.tracer.rules.elementwise import inverse_elementwise_broadcast
-from tatva.tracer.semantics import DemandContext, RouteLocalizationContext, RuleContext
 
 
 def prepare_select_n(ctx: RuleContext) -> SelectNRoute:

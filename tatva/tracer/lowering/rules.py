@@ -10,7 +10,7 @@ import numpy as np
 from jax import lax
 from jax.scipy.linalg import lu_solve
 
-from tatva.tracer.localize import (
+from tatva.tracer.local.localize import (
     LocalDynamicSliceRoute,
     LocalGatherRoute,
     LocalScatterRoute,
@@ -20,7 +20,7 @@ from tatva.tracer.localize import (
 from tatva.tracer.rules.structural import slice_row_map
 
 if TYPE_CHECKING:
-    from tatva.tracer.local_plan import LocalEqnPlan
+    from tatva.tracer.local.plan import LocalEqnPlan
 
 
 @dataclass(frozen=True)
