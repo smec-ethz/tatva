@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 import typing
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import jax.numpy as jnp
 import numpy as np
@@ -23,8 +23,8 @@ from tatva.tracer.halo import (
 )
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.input_localization import (
-    InputLocalizationPlan,
-    build_input_localization_plan,
+    LocalizeOverrides,
+    localize_inputs,
 )
 from tatva.tracer.layout import TensorLayout
 from tatva.tracer.liveness import DemandSeed, backpropagate_demand
@@ -120,6 +120,7 @@ class TraceResult[**P, R]:
         n_parts: int,
         partitioning: NDArray[np.int64]
         | typing.Literal["metis", "contiguous"] = "contiguous",
+        # localize: LocalizeOverrides | None = None,
     ) -> DistributedFunctional[P, R]:
         contribution_partition, dof_to_part = self._partition_metadata(
             n_parts=n_parts,
@@ -146,22 +147,12 @@ class TraceResult[**P, R]:
 
         halo_plans = build_halo_plans(compute_layouts, dof_to_part)
 
-        input_plans = tuple(
-            build_input_localization_plan(
-                captured=self.captured,
-                local_plan=local_plan,
-                halo=halo_plan,
-            )
-            for local_plan, halo_plan in zip(local_plans, halo_plans, strict=True)
-        )
-
         return DistributedFunctional(
             traced=self,
             partition=contribution_partition,
             dof_owner=dof_to_part,
             local_plans=tuple(local_plans),
             halo_plans=halo_plans,
-            input_plans=input_plans,
         )
 
     def partition_local(
@@ -170,6 +161,7 @@ class TraceResult[**P, R]:
         comm: PartitionCommunicator,
         partitioning: NDArray[np.int64]
         | typing.Literal["metis", "contiguous"] = "contiguous",
+        localize: LocalizeOverrides | None = None,
     ) -> RankLocalFunctional[P, R]:
         """Collectively compile only this communicator rank's local functional.
 
@@ -218,11 +210,6 @@ class TraceResult[**P, R]:
             dof_to_part,
             comm=comm,
         )
-        input_plan = build_input_localization_plan(
-            captured=self.captured,
-            local_plan=local_plan,
-            halo=halo_plan,
-        )
 
         return RankLocalFunctional(
             traced=self,
@@ -232,7 +219,6 @@ class TraceResult[**P, R]:
             dof_owner=dof_to_part,
             local_plan=local_plan,
             halo_plan=halo_plan,
-            input_plan=input_plan,
         )
 
 
@@ -243,19 +229,17 @@ class DistributedFunctional[**P, R]:
     dof_owner: NDArray[np.int64]
     local_plans: tuple[LocalJaxprPlan, ...]
     halo_plans: tuple[HaloPlan, ...]
-    input_plans: tuple[InputLocalizationPlan, ...]
 
     def __post_init__(self) -> None:
         n_parts = self.partition.n_parts
         counts = (
             len(self.local_plans),
             len(self.halo_plans),
-            len(self.input_plans),
         )
-        if counts != (n_parts, n_parts, n_parts):
+        if counts != (n_parts, n_parts):
             raise ValueError(
                 "distributed plan counts do not match partition count: "
-                f"{counts} != {(n_parts, n_parts, n_parts)}"
+                f"{counts} != {(n_parts, n_parts)}"
             )
 
     @property
@@ -275,18 +259,7 @@ class DistributedFunctional[**P, R]:
             dof_owner=self.dof_owner,
             local_plan=self.local_plans[rank],
             halo_plan=self.halo_plans[rank],
-            input_plan=self.input_plans[rank],
         )
-
-    def local_function(self, rank: int) -> typing.Callable[P, R]:
-        """Compatibility shortcut for ``for_rank(rank).local_function()``."""
-        return self.for_rank(rank).local_function()
-
-    def localize_inputs(
-        self, rank: int, *args: P.args, **kwargs: P.kwargs
-    ) -> tuple[tuple[typing.Any, ...], dict[str, typing.Any]]:
-        """Compatibility shortcut for ``for_rank(rank).localize_inputs()``."""
-        return self.for_rank(rank).localize_inputs(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -305,7 +278,6 @@ class RankLocalFunctional[**P, R]:
     dof_owner: NDArray[np.int64]
     local_plan: LocalJaxprPlan
     halo_plan: HaloPlan
-    input_plan: InputLocalizationPlan
 
     def local_function(self) -> typing.Callable[P, R]:
         """Build the executable for this rank's already-localized inputs."""
@@ -320,7 +292,8 @@ class RankLocalFunctional[**P, R]:
 
         @functools.wraps(self.traced.captured.fn)
         def _local_function(*args, **kwargs):
-            flat = call_abi.flatten_call(*args, **kwargs)
+            bound = call_abi.bind(*args, **kwargs)
+            flat = call_abi.flatten_bound(bound)
             executable_inputs = []
 
             for index, (value, layout) in enumerate(
@@ -329,6 +302,8 @@ class RankLocalFunctional[**P, R]:
                 if layout is None:
                     continue
                 if index == 0:
+                    # this is the DOF input, which is sliced according to the halo plan
+                    # storage_layout -> compute_layout
                     value = value[jnp.asarray(compute_rows)]
                 executable_inputs.append(value)
 
@@ -340,12 +315,58 @@ class RankLocalFunctional[**P, R]:
         self,
         *args: P.args,
         **kwargs: P.kwargs,
-    ) -> tuple[tuple[typing.Any, ...], dict[str, typing.Any]]:
-        """Localize a global call using this rank's input reconstruction plan."""
-        flat = self.traced.captured.call_abi.flatten_call(*args, **kwargs)
-        local_flat = self.input_plan.apply_flat(flat)
-        local_bound = self.traced.captured.call_abi.unflatten(local_flat)
-        return local_bound.args, dict(local_bound.kwargs)
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Construct the rank-local form of the functional's input arguments.
+
+        Input leaves that are required by the local program are sliced according to the
+        compiler-derived input layouts. Leaves that are not required by the local program
+        are replaced by ``None``. A ``None`` value therefore means that the corresponding
+        input is dead for execution on this rank; it does not necessarily mean that the
+        value is semantically meaningless to the enclosing user object.
+
+        User-defined PyTree types can reconstruct a meaningful rank-local representation
+        by implementing ``__tatva_localize__``. The method is invoked bottom-up after its
+        child values have been localized, allowing, for example, a mesh object to rebuild
+        local connectivity from localized coordinates even when the original connectivity
+        leaf is dead and has therefore become ``None``.
+
+        Use ``localize_inputs_with_specializers`` instead to override the default
+        localization behavior for specific PyTree types. The ``specializers`` mapping is
+        consulted before any ``__tatva_localize__`` method is called.
+
+        The returned positional and keyword arguments preserve the original function
+        signature and PyTree structure after any semantic reconstruction has been applied.
+
+        Args:
+            rank: Rank for which the local input representation is constructed.
+            *args, **kwargs: Global input arguments matching the captured functional
+                signature.
+
+        Returns:
+            args, kwargs
+                Rank-local positional and keyword arguments suitable for
+                ``local_function(rank)``. Dead leaves may be ``None`` unless an enclosing
+                ``__tatva_localize__`` implementation reconstructs them.
+        """
+        return self.localize_inputs_with_specializers({}, *args, **kwargs)
+
+    def localize_inputs_with_specializers(
+        self,
+        specializers: LocalizeOverrides,
+        /,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        local_bound = localize_inputs(
+            self.rank,
+            self.traced.captured.call_abi,
+            self.halo_plan,
+            specializers,
+            self.local_plan.input_layouts,
+            args=args,
+            kwargs=kwargs,
+        )
+        return local_bound
 
 
 def trace[**P, R](captured: CapturedJaxpr[P, R]) -> TraceResult[P, R]:
