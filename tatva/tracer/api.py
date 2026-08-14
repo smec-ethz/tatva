@@ -37,6 +37,7 @@ from tatva.tracer.partition import (
     dof_owner_from_contributions,
     partition_contributions,
 )
+from tatva.tracer.support import require_local_routes, require_registered_operations
 
 
 class PartitionCommunicator(HaloCommunicator, typing.Protocol):
@@ -140,6 +141,9 @@ class TraceResult[**P, R]:
             demand = backpropagate_demand(self.resolved, seeds)
             local_plans.append(build_local_plan(self.resolved, demand))
 
+        local_plans = tuple(local_plans)
+        require_local_routes(local_plans)
+
         compute_layouts = tuple(plan.input_layouts[0] for plan in local_plans)
         if any(layout is None for layout in compute_layouts):
             raise RuntimeError("DOF input unexpectedly dead")
@@ -151,7 +155,7 @@ class TraceResult[**P, R]:
             traced=self,
             partition=contribution_partition,
             dof_owner=dof_to_part,
-            local_plans=tuple(local_plans),
+            local_plans=local_plans,
             halo_plans=halo_plans,
         )
 
@@ -381,6 +385,9 @@ def trace[**P, R](captured: CapturedJaxpr[P, R]) -> TraceResult[P, R]:
             f"First input must be a flat DOF vector, got shape {dof_shape}"
         )
     n_dofs = dof_shape[0]
+
+    # fail once with all unsupported operations instead of discovering the first missing registration during analysis
+    require_registered_operations(jaxpr)
 
     # 1. Static structural analysis
     analysis = analyze(jaxpr)
