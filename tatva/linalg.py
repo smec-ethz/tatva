@@ -140,6 +140,8 @@ dimension can grow large, use ``@`` and let XLA call the GEMM -- large matrices 
 the case that machinery was built for, and there it wins.
 """
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -165,7 +167,7 @@ def inv(J: Array) -> Array:
     """
     if J.ndim != 2:
         raise ValueError(
-            f"tensor_kernels.inv takes a single matrix, got shape {J.shape}. Batch with jax.vmap "
+            f"tatva.linalg.inv takes a single matrix, got shape {J.shape}. Batch with jax.vmap "
             "rather than passing a stack"
         )
 
@@ -204,7 +206,7 @@ def inv(J: Array) -> Array:
     return jnp.linalg.inv(J)
 
 
-def _tensordot(A: Array, B: Array) -> Array:
+def _dot_broadcast(A: Array, B: Array) -> Array:
     """
     Contracts the last axis of `A` with the first axis of `B` and leaves every other
     axis free: (q,) or (p, q), against (q, ...). That single rule covers both shapes
@@ -231,7 +233,7 @@ def _tensordot(A: Array, B: Array) -> Array:
     """
     if A.ndim > 2:
         raise ValueError(
-            f"tensor_kernels.tensordot takes a single vector or matrix as A, got shape {A.shape}. "
+            f"tatva.linalg._dot_broadcast takes a single vector or matrix as A, got shape {A.shape}. "
             "Batch with jax.vmap rather than passing a stack: this builds the full "
             "outer product before reducing, so a batch axis materialises it in full."
         )
@@ -262,20 +264,6 @@ def _dot(A: Array, B: Array) -> Array:
     return A @ B
 
 
-def _broadcast(A: Array, B: Array) -> Array:
-    """The contraction as broadcast-multiply-reduce. Never lowers to a `dot`.
-    Hence never cross the boundary with cublas for GEMM on GPU.
-
-    Args:
-        A: a single vector or matrix, shape (q,) or (p, q).
-        B: a single tensor, shape (q, ...) or (q, r).
-
-    Returns:
-        The contraction, shape (p, ...) or (...), with axes in the order they appear in `B` after the contracted axis.
-    """
-    return _tensordot(A, B)
-
-
 def _dot_on_cpu_broadcast_elsewhere(A: Array, B: Array) -> Array:
     """
     The only spec-dependent dispatch, and the only place a backend is consulted.
@@ -283,7 +271,7 @@ def _dot_on_cpu_broadcast_elsewhere(A: Array, B: Array) -> Array:
     But only for matrix-matrix products: `dot` is not fused for vector-vector or matrix-vector.
     On GPU, we avoid `dot` altogether and use use _broadcast form instead.
     """
-    return jax.lax.platform_dependent(A, B, cpu=_dot, default=_broadcast)
+    return jax.lax.platform_dependent(A, B, cpu=_dot, default=_dot_broadcast)
 
 
 # Currently in tatva we have four contractions: matmul, vecmat, row_contract, and vec_contract:
@@ -296,8 +284,8 @@ _VEC_CONTRACT = "a,a...->..."  # (q,) x (q, ...): N against nodal values
 _known_implementations = {
     _MATMUL: _dot_on_cpu_broadcast_elsewhere,  # matrix-matrix: dot on CPU, broadcast otherwise
     _VECMAT: _dot,  # vector-matrix: dot everywhere
-    _ROW_CONTRACT: _broadcast,  # row-contract: broadcast everywhere
-    _VEC_CONTRACT: _broadcast,  # vec-contract: broadcast everywhere
+    _ROW_CONTRACT: _dot_broadcast,  # row-contract: broadcast everywhere
+    _VEC_CONTRACT: _dot_broadcast,  # vec-contract: broadcast everywhere
 }
 
 # (A.ndim, B.ndim); None means "any rank >= 1", i.e. the spec has an ellipsis there.
@@ -341,7 +329,7 @@ def _canonicalise(spec: str) -> str:
     cleaned = spec.replace(" ", "")
     if cleaned.count("->") != 1 or cleaned.count(",") != 1:
         raise ValueError(
-            f"linalg.contract could not parse the spec {spec!r}. Expected exactly one ',' "
+            f"tatva.linalg.contract could not parse the spec {spec!r}. Expected exactly one ',' "
             "and one '->', as in 'in,nj->ij'."
         )
     lhs, out = cleaned.split("->")
@@ -357,7 +345,7 @@ def _canonicalise(spec: str) -> str:
                 continue
             if not token.isalpha():
                 raise ValueError(
-                    f"linalg.contract could not parse the spec {spec!r}: {token!r} is not an "
+                    f"tatva.linalg.contract could not parse the spec {spec!r}: {token!r} is not an "
                     "index letter."
                 )
             if token not in renaming:
@@ -403,7 +391,7 @@ def contract(spec: str, A: Array, B: Array) -> Array:
     if implementation is None:
         supported = ", ".join(repr(s) for s in _known_implementations)
         raise ValueError(
-            f"linalg.contract has no implementation for {spec!r} (canonically {canonical!r})."
+            f"tatva.linalg.contract has no implementation for {spec!r} (canonically {canonical!r})."
             f" Supported contractions are {supported}. This is deliberate rather than a "
             "gap: each entry is a measured decision about how to spell the contraction "
             "so it does not lower to a `dot`. Add an entry, with the measurement, rather "
@@ -416,16 +404,56 @@ def contract(spec: str, A: Array, B: Array) -> Array:
     if A.ndim != expected_a or (expected_b is not None and B.ndim != expected_b):
         wanted = f"({expected_a}, {expected_b if expected_b is not None else '>=1'})"
         raise ValueError(
-            f"linalg.contract({spec!r}, ...) wants operand ranks {wanted}, got {got} from "
+            f"tatva.linalg.contract({spec!r}, ...) wants operand ranks {wanted}, got {got} from "
             f"shapes {A.shape} and {B.shape}. These take a single tensor each -- batch "
             "with jax.vmap, which fuses the contraction into the surrounding work "
             "instead of materialising it."
         )
     if A.shape[-1] != B.shape[0]:
         raise ValueError(
-            f"linalg.contract({spec!r}, ...) contracts A's last axis with B's first, but "
+            f"tatva.linalg.contract({spec!r}, ...) contracts A's last axis with B's first, but "
             f"they are {A.shape[-1]} and {B.shape[0]} from shapes {A.shape} and "
             f"{B.shape}."
         )
 
     return implementation(A, B)
+
+
+def einsum(spec: Any, *operands: Any, **kwargs: Any) -> Array:
+    """
+    Drop-in replacement for jnp.einsum that uses a custom implementation if available.
+    This is necessary for internal optimization based on the hardware backend. Check `tatva.linalg.contract`
+    for more details. If the custom implementation is not available, falls back to jnp.einsum.
+
+    Only a two-operand spec naming one of the measured contractions takes the `contract`
+    path; three or more operands, an implicit output, the interleaved calling convention
+    and an unmeasured contraction all go to jnp.einsum. The `contract` path ignores the
+    keyword arguments such as ``precision``, `preferred_element_type``  so call jnp.einsum
+    directly when one of those has to hold.
+
+    Args:
+        spec: einsum-style subscripts, e.g. ``"in,nj->ij"``.
+        operands: the tensors to contract.
+        kwargs: forwarded verbatim to jnp.einsum on every path that reaches it.
+
+    Returns:
+        The contraction.
+    """
+    # the interleaved form, einsum(A, [0, 1], B, [1, 2], [0, 2]), passes an array first
+    # and names no contraction to look up
+    if not isinstance(spec, str):
+        return jnp.einsum(spec, *operands, **kwargs)
+
+    try:
+        # convert the spec to canonical form, to match keys in the known implementations
+        canonical = _canonicalise(spec)
+    except ValueError:
+        # a spec `contract` cannot name: implicit output, a single operand, or more than
+        # two. There is nothing to look up, so fall back to jnp.einsum
+        return jnp.einsum(spec, *operands, **kwargs)
+
+    # look up the implementation for the canonical spec
+    if canonical not in _known_implementations or len(operands) != 2:
+        return jnp.einsum(spec, *operands, **kwargs)
+
+    return contract(spec, *operands)

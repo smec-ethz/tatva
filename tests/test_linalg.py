@@ -93,7 +93,7 @@ def test_tensordot_matches_jnp_tensordot(a_shape, b_shape):
     rng = np.random.default_rng(2)
     A = jnp.asarray(rng.random(a_shape))
     B = jnp.asarray(rng.random(b_shape))
-    assert jnp.allclose(linalg._tensordot(A, B), jnp.tensordot(A, B, axes=1))
+    assert jnp.allclose(linalg._dot_broadcast(A, B), jnp.tensordot(A, B, axes=1))
 
 
 def test_tensordot_is_not_jnp_matmul_for_rank3_operands():
@@ -108,9 +108,9 @@ def test_tensordot_is_not_jnp_matmul_for_rank3_operands():
     A = jnp.asarray(rng.random((2, 3)))
     B = jnp.asarray(rng.random((3, 3, 4)))
 
-    assert linalg._tensordot(A, B).shape == (2, 3, 4)
+    assert linalg._dot_broadcast(A, B).shape == (2, 3, 4)
     assert jnp.matmul(A, B).shape == (3, 2, 4)
-    assert jnp.allclose(linalg._tensordot(A, B), jnp.tensordot(A, B, axes=1))
+    assert jnp.allclose(linalg._dot_broadcast(A, B), jnp.tensordot(A, B, axes=1))
 
 
 def test_tensordot_vmaps_over_a_batch():
@@ -118,7 +118,7 @@ def test_tensordot_vmaps_over_a_batch():
     A = jnp.asarray(rng.random((16, 2, 3)))
     B = jnp.asarray(rng.random((16, 3, 4)))
     assert jnp.allclose(
-        jax.vmap(linalg._tensordot)(A, B), jnp.einsum("epq,eqr->epr", A, B)
+        jax.vmap(linalg._dot_broadcast)(A, B), jnp.einsum("epq,eqr->epr", A, B)
     )
 
 
@@ -127,7 +127,7 @@ def test_tensordot_rejects_a_stack_of_matrices():
     (p, q, r) product, so a batch axis allocates it in full. Use jax.vmap.
     """
     with pytest.raises(ValueError, match="single vector or matrix"):
-        linalg._tensordot(jnp.zeros((5, 2, 3)), jnp.zeros((3, 4)))
+        linalg._dot_broadcast(jnp.zeros((5, 2, 3)), jnp.zeros((3, 4)))
 
 
 # --------------------------------------------------------------------------------
@@ -251,7 +251,7 @@ def test_contract_matmul_branches_agree_where_it_dispatches():
     rng = np.random.default_rng(11)
     A = jnp.asarray(rng.random((2, 4)))
     B = jnp.asarray(rng.random((4, 3)))
-    assert jnp.allclose(A @ B, linalg._tensordot(A, B))
+    assert jnp.allclose(A @ B, linalg._dot_broadcast(A, B))
 
 
 def test_every_contract_spec_in_the_library_is_in_the_table():
@@ -326,6 +326,86 @@ def test_contract_vmaps_over_elements(spec, a_shape, b_shape, einsum):
     B = jnp.asarray(rng.random((16, *b_shape)))
     batched = jax.vmap(lambda a, b: linalg.contract(spec, a, b))(A, B)
     assert jnp.allclose(batched, jnp.einsum(einsum, A, B))
+
+
+# --------------------------------------------------------------------------------
+# einsum: the drop-in wrapper over contract
+# --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("spec", "shapes", "path"),
+    [
+        # in the table: must reach the measured implementation
+        ("in,nj->ij", [(2, 4), (4, 2)], "contract"),
+        ("pq,qr->pr", [(2, 4), (4, 2)], "contract"),  # same contraction, other letters
+        ("in,n...->i...", [(2, 4), (4, 3)], "contract"),
+        ("n,n...->...", [(4,), (4, 3)], "contract"),
+        # not in the table: falls back rather than raising, which is what makes this a
+        # drop-in replacement
+        ("eq,q->eq", [(64, 4), (4,)], "jnp.einsum"),  # sums nothing
+        ("ij,jk->ki", [(2, 3), (3, 4)], "jnp.einsum"),  # transposed output
+        ("ij->ji", [(2, 3)], "jnp.einsum"),  # one operand, contract cannot parse it
+        ("ij,jk", [(2, 3), (3, 4)], "jnp.einsum"),  # implicit output
+        ("ij,jk,kl->il", [(2, 3), (3, 4), (4, 2)], "jnp.einsum"),  # three operands
+    ],
+)
+def test_einsum_takes_the_contract_path_only_for_a_measured_spec(
+    spec, shapes, path, monkeypatch
+):
+    """Which path a call takes is the whole point of the wrapper and is invisible in the
+    result -- both paths compute the same numbers, only the HLO differs. A table spec
+    that falls through to jnp.einsum silently reintroduces the `dot` this module exists
+    to avoid, so the path is asserted directly.
+    """
+    rng = np.random.default_rng(14)
+    arrays = [jnp.asarray(rng.random(shape)) for shape in shapes]
+    reference = jnp.einsum(spec, *arrays)
+
+    taken: list[str] = []
+    real_contract, real_einsum = linalg.contract, jnp.einsum
+    monkeypatch.setattr(
+        linalg,
+        "contract",
+        lambda s, *o: (taken.append("contract"), real_contract(s, *o))[1],
+    )
+    monkeypatch.setattr(
+        jnp,
+        "einsum",
+        lambda s, *o, **k: (taken.append("jnp.einsum"), real_einsum(s, *o, **k))[1],
+    )
+
+    result = linalg.einsum(spec, *arrays)
+
+    assert taken == [path]
+    assert jnp.allclose(result, reference)
+
+
+def test_every_einsum_spec_in_the_library_stays_off_the_dot_path():
+    """The counterpart to `test_every_contract_spec_in_the_library_is_in_the_table`.
+
+    `linalg.einsum` falls back rather than refusing, so an unmeasured spec written at a
+    call site is accepted quietly and lowers to the `dot` this module exists to avoid --
+    the silent regression the fallback makes possible. Every literal in the package must
+    therefore either resolve to a table entry or sum nothing at all.
+    """
+    package = pathlib.Path(linalg.__file__).parent
+    literals = {
+        match.group(1)
+        for path in package.rglob("*.py")
+        for match in re.finditer(
+            r"""linalg\.einsum\(\s*["']([^"']+)["']""", path.read_text()
+        )
+    }
+
+    for spec in sorted(literals):
+        canonical = linalg._canonicalise(spec)
+        assert canonical in linalg._known_implementations, (
+            f"{spec!r} is used in the package and sums over a shared index, but "
+            f"canonicalises to {canonical!r}, which has no entry in "
+            "_known_implementations -- linalg.einsum will hand it to jnp.einsum and it "
+            "will lower to a dot. Add a measured entry, or use jnp.einsum knowingly."
+        )
 
 
 # --------------------------------------------------------------------------------
