@@ -41,6 +41,21 @@ def test_lifter_applies_dirichlet_and_periodic_constraints():
     np.testing.assert_array_equal(lifter.reduce(lifted), u_reduced)
 
 
+def test_lifter_deduplicates_overlapping_constraints():
+    lifter = Lifter(
+        7,
+        Fixed(jnp.array([0, 2], dtype=jnp.int32)),
+        Periodic(
+            dofs=jnp.array([2, 6], dtype=jnp.int32),
+            master_dofs=jnp.array([1, 5], dtype=jnp.int32),
+        ),
+    )
+
+    np.testing.assert_array_equal(lifter.constrained_dofs, [0, 2, 6])
+    np.testing.assert_array_equal(lifter.free_dofs, [1, 3, 4, 5])
+    assert lifter.size_reduced == 4
+
+
 def test_constraints_and_lifter_are_hashable():
     periodic = Periodic(
         dofs=jnp.array([2], dtype=jnp.int32),
