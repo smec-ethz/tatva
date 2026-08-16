@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.sparse as sps
 
-from tatva.tracer.distribution.partition import (
+from tatva.tracer.lowering.partition import (
     _contiguous_owners,
     dependency_partition_owners,
 )

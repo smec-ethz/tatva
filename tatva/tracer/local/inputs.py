@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 
 from tatva.tracer.capture import CallABI
-from tatva.tracer.distribution.halo import HaloPlan
+from tatva.tracer.local.dof_plan import LocalDofPlan
 from tatva.tracer.local.layout import TensorLayout
 from tatva.tracer.lowering.executor import extract_local_value
 
@@ -20,7 +20,7 @@ class LocalizationContext:
     """Compiler facts exposed while reconstructing one PyTree node."""
 
     rank: int
-    halo: HaloPlan
+    dof_plan: LocalDofPlan
 
     # One tuple per immediate child of the node being reconstructed.
     # Each tuple contains all compiler layouts below that child.
@@ -84,7 +84,7 @@ def _localize_flat_inputs(
     *,
     global_flat: tuple[Any, ...],
     input_layouts: tuple[TensorLayout | None, ...],
-    halo: HaloPlan,
+    dof_plan: LocalDofPlan,
 ) -> tuple[Any | None, ...]:
     if len(global_flat) != len(input_layouts):
         raise RuntimeError("call ABI and local input layouts disagree")
@@ -97,7 +97,7 @@ def _localize_flat_inputs(
         if flat_index == 0:
             # Canonical DOF input:
             # user-facing local form is owned + ghost storage.
-            local.append(jnp.asarray(value)[jnp.asarray(halo.storage.global_dofs)])
+            local.append(jnp.asarray(value)[jnp.asarray(dof_plan.storage.global_dofs)])
             continue
 
         if layout is None:
@@ -136,7 +136,7 @@ def _localize_tree(
         ]
     ],
     rank: int,
-    halo: HaloPlan,
+    halo: LocalDofPlan,
     specializers: Mapping[
         LocalizeKey,
         InputLocalizer,
@@ -157,7 +157,7 @@ def _localize_tree(
 
         ctx = LocalizationContext(
             rank=rank,
-            halo=halo,
+            dof_plan=halo,
             child_layouts=((layout,),),
         )
 
@@ -198,7 +198,7 @@ def _localize_tree(
 
     ctx = LocalizationContext(
         rank=rank,
-        halo=halo,
+        dof_plan=halo,
         child_layouts=child_layouts,
     )
 
@@ -242,7 +242,7 @@ def _localize_tree(
 def localize_inputs(
     rank: int,
     call_abi: CallABI,
-    halo: HaloPlan,
+    dof_plan: LocalDofPlan,
     specializers: LocalizeOverrides,
     input_layouts: tuple[TensorLayout | None, ...],
     args: tuple[Any, ...],
@@ -251,7 +251,7 @@ def localize_inputs(
     global_bound = call_abi.bind(*args, **kwargs)
     global_flat = call_abi.flatten_bound(global_bound)
     local_flat = _localize_flat_inputs(
-        global_flat=global_flat, input_layouts=input_layouts, halo=halo
+        global_flat=global_flat, input_layouts=input_layouts, dof_plan=dof_plan
     )
 
     localized_arguments: dict[str, Any] = {}
@@ -266,7 +266,7 @@ def localize_inputs(
             global_value=global_value,
             leaves=leaves,
             rank=rank,
-            halo=halo,
+            halo=dof_plan,
             specializers=specializers,
             parameter_name=parameter_name,
             is_parameter_root=True,

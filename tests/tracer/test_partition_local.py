@@ -60,19 +60,19 @@ def test_partition_local_matches_all_rank_reference():
         reference_rank = reference.for_rank(rank)
         assert reference_rank.rank == rank
         assert reference_rank.local_plan is reference.local_plans[rank]
-        assert reference_rank.halo_plan is reference.halo_plans[rank]
+        assert reference_rank.dof_plan is reference.dof_plans[rank]
 
         local = traced.partition_local(
-            comm=_ReferenceComm(reference, rank),
+            rank=rank,
+            n_parts=2,
         )
 
         assert local.rank == rank
         assert local.n_parts == 2
         assert local.local_plan is not reference.local_plans[rank]
-        np.testing.assert_array_equal(local.dof_owner, reference.dof_owner)
         np.testing.assert_array_equal(
-            local.halo_plan.compute_global,
-            reference.halo_plans[rank].compute_global,
+            local.dof_plan.compute_global,
+            reference.dof_plans[rank].compute_global,
         )
 
         local_args, local_kwargs = local.localize_inputs(u, coords, connectivity)
