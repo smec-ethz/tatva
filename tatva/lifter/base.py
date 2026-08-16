@@ -17,10 +17,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Concatenate,
     Literal,
     ParamSpec,
@@ -267,16 +267,32 @@ class Lifter:
 
     def _compute_sizes(self) -> tuple[Array, Array, int]:
         """Compute free/constrained dofs and reduced size."""
-        all_dofs = jnp.arange(self.size)
-
         if not self.constraints:
             # base case: no constraints
-            return all_dofs, jnp.array([], dtype=jnp.int32), self.size
+            return (
+                jnp.asarray(np.arange(self.size), dtype=int),
+                jnp.asarray([], dtype=int),
+                self.size,
+            )
 
-        constrained = jnp.concatenate([cond.dofs for cond in self.constraints])
-        constrained = jnp.unique(constrained)
-        free = jnp.setdiff1d(all_dofs, constrained, assume_unique=True)
-        return free, constrained, free.size
+        # Lifter construction is host-side setup: these indices determine static
+        # sizes and cannot depend on traced runtime values. Using JAX here would
+        # compile arange, unique, scatter, and flatnonzero as separate kernels for
+        # every new problem shape.
+        constrained = np.unique(
+            np.concatenate(
+                [np.asarray(condition.dofs) for condition in self.constraints]
+            )
+        ).astype(np.int64, copy=False)
+        mask = np.ones(self.size, dtype=bool)
+        mask[constrained] = False
+        free = np.flatnonzero(mask)
+
+        return (
+            jnp.asarray(free, dtype=int),
+            jnp.asarray(constrained, dtype=int),
+            int(free.size),
+        )
 
     def adapt_sparsity(self, sparsity: sps.csr_matrix) -> sps.csr_matrix:
         """Augment and reduce the sparsity pattern to account for all constraints. From

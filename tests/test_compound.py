@@ -57,6 +57,17 @@ def test_compound_index_helpers():
     np.testing.assert_array_equal(np.array(SimpleState.phi[1]), np.array([7]))
 
 
+def test_compound_field_indices_support_traced_indices():
+    @jax.jit
+    def indices(rows):
+        return SimpleState.u[rows, 1]
+
+    np.testing.assert_array_equal(
+        indices(jnp.array([0, -1], dtype=jnp.int32)),
+        jnp.array([1, 4]),
+    )
+
+
 def test_pytree_roundtrip_and_addition():
     arr_a = jnp.arange(SimpleState.size, dtype=jnp.float64)
     arr_b = jnp.arange(SimpleState.size, dtype=jnp.float64) * 2

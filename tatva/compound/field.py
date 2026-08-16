@@ -17,13 +17,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
 from math import prod
-from typing import TYPE_CHECKING, Callable, Self, TypeVar, overload
+from typing import TYPE_CHECKING, Self, TypeVar, overload
 
 import jax.numpy as jnp
-from jax import Array
+import numpy as np
+from jax import Array, core
 
 from tatva.compound.field_types import FieldType, _FieldType
 
@@ -32,6 +34,17 @@ if TYPE_CHECKING:
 
 
 T_Compound = TypeVar("T_Compound", bound="Compound")
+
+
+def _is_traced_index(value: int | slice | Array) -> bool:
+    if isinstance(value, core.Tracer):
+        return True
+    if isinstance(value, slice):
+        return any(
+            isinstance(part, core.Tracer)
+            for part in (value.start, value.stop, value.step)
+        )
+    return False
 
 
 class FieldSize(IntEnum):
@@ -154,11 +167,40 @@ class _FieldBase:
             )
         return arr.at[self._slice].set(value.reshape(-1))
 
-    def _indices_impl(self, arg: tuple[int | slice | Array, ...]) -> Array:
-        if self._base_offset is None:
-            raise RuntimeError(
-                "Field indexing metadata is not set. This should be set during Compound initialization."
+    def _indices_numpy(self, arg: tuple[int | slice | Array, ...]) -> Array:
+        """Construct concrete setup indices on the host."""
+        assert self._base_offset is not None
+
+        axis_indices: list[np.ndarray] = []
+        for sub, extent in zip(arg, self.shape, strict=True):
+            if isinstance(sub, (int, np.integer)):
+                idx = int(sub) if sub >= 0 else int(sub) + extent
+                axis_indices.append(np.asarray([idx], dtype=np.int64))
+            elif isinstance(sub, slice):
+                start, stop, step = sub.indices(extent)
+                axis_indices.append(np.arange(start, stop, step, dtype=np.int64))
+            else:
+                values = np.asarray(sub, dtype=np.int64).reshape(-1)
+                axis_indices.append(np.where(values < 0, values + extent, values))
+
+        if not axis_indices:
+            return jnp.asarray([self._base_offset], dtype=int)
+
+        grid_shape = tuple(values.size for values in axis_indices)
+        index = np.full(grid_shape, self._base_offset, dtype=np.int64)
+        for axis, (stride, values) in enumerate(
+            zip(self._strides, axis_indices, strict=True)
+        ):
+            broadcast_shape = tuple(
+                values.size if i == axis else 1 for i in range(len(axis_indices))
             )
+            index += np.reshape(values * stride, broadcast_shape)
+
+        return jnp.asarray(index.reshape(-1), dtype=int)
+
+    def _indices_jax(self, arg: tuple[int | slice | Array, ...]) -> Array:
+        """Construct indices when at least one index is a JAX tracer."""
+        assert self._base_offset is not None
 
         axis_indices: list[Array] = []
         for sub, extent in zip(arg, self.shape, strict=True):
@@ -172,8 +214,6 @@ class _FieldBase:
                 values = jnp.asarray(sub, dtype=int).reshape(-1)
                 axis_indices.append(jnp.where(values < 0, values + extent, values))
 
-        # no axes means this is a scalar field, return the base offset as the only index
-        # this is only reached if the field shape is (), and arg is an empty tuple too
         if not axis_indices:
             return jnp.asarray([self._base_offset], dtype=int)
 
@@ -185,11 +225,18 @@ class _FieldBase:
             broadcast_shape = tuple(
                 len(values) if i == axis else 1 for i in range(len(axis_indices))
             )
-            index = index + jnp.reshape(
-                values * stride,
-                broadcast_shape,
-            )
+            index = index + jnp.reshape(values * stride, broadcast_shape)
         return index.reshape(-1)
+
+    def _indices_impl(self, arg: tuple[int | slice | Array, ...]) -> Array:
+        if self._base_offset is None:
+            raise RuntimeError(
+                "Field indexing metadata is not set. This should be set during Compound initialization."
+            )
+
+        if any(_is_traced_index(sub) for sub in arg):
+            return self._indices_jax(arg)
+        return self._indices_numpy(arg)
 
     def indices(
         self, arg: int | slice | Array | tuple[int | slice | Array, ...]
