@@ -3,10 +3,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from tatva.tracer.api import CapturedJaxpr, trace
-from tatva.tracer.distribution.partition import partition_contributions
 from tatva.tracer.local.liveness import DemandSeed, backpropagate_demand
 from tatva.tracer.local.plan import build_local_plan
 from tatva.tracer.lowering.executor import build_local_executable
+from tatva.tracer.lowering.partition import partition_contributions
 
 
 def _bind_reverse(energy, reverse):

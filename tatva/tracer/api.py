@@ -12,19 +12,12 @@ from numpy.typing import NDArray
 
 from tatva.sparse._coloring import csr_to_adjacency
 from tatva.tracer.capture import CapturedJaxpr, make_captured_jaxpr
-from tatva.tracer.distribution.halo import (
-    HaloCommunicator,
-    HaloPlan,
-    build_halo_plans,
-    build_local_halo_plan,
-)
-from tatva.tracer.distribution.partition import (
-    ContributionPartition,
-    OwnedContribution,
-    dof_owner_from_contributions,
-    partition_contributions,
-)
 from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.dof_plan import (
+    LocalDofPlan,
+    build_local_dof_plan,
+    build_local_dof_plans,
+)
 from tatva.tracer.local.inputs import (
     LocalizeOverrides,
     localize_inputs,
@@ -33,20 +26,17 @@ from tatva.tracer.local.layout import TensorLayout
 from tatva.tracer.local.liveness import DemandSeed, backpropagate_demand
 from tatva.tracer.local.plan import LocalJaxprPlan, build_local_plan
 from tatva.tracer.lowering.executor import build_local_executable
+from tatva.tracer.lowering.partition import (
+    ContributionPartition,
+    OwnedContribution,
+    dof_owner_from_contributions,
+    partition_contributions,
+)
 from tatva.tracer.program.analysis import JaxprPlan, analyze
 from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
 from tatva.tracer.program.derivatives import DerivativeTrace, trace_derivatives
 from tatva.tracer.program.materialize import JaxprInstance, materialize_plan
 from tatva.tracer.support import require_local_routes, require_registered_operations
-
-
-class PartitionCommunicator(HaloCommunicator, typing.Protocol):
-    """Collectives used by `TraceResult.partition_local`.
-
-    `mpi4py.MPI.Comm` implements this interface.
-    """
-
-    def bcast(self, obj: typing.Any, root: int = 0) -> typing.Any: ...
 
 
 @dataclass(frozen=True)
@@ -148,47 +138,35 @@ class TraceResult[**P, R]:
             raise RuntimeError("DOF input unexpectedly dead")
         compute_layouts = cast(tuple[TensorLayout, ...], compute_layouts)
 
-        halo_plans = build_halo_plans(compute_layouts, dof_to_part)
+        dof_plans = build_local_dof_plans(compute_layouts, dof_to_part)
 
         return DistributedFunctional(
             traced=self,
             partition=contribution_partition,
-            dof_owner=dof_to_part,
             local_plans=local_plans,
-            halo_plans=halo_plans,
+            dof_plans=dof_plans,
         )
 
     def partition_local(
         self,
         *,
-        comm: PartitionCommunicator,
+        rank: int,
+        n_parts: int,
         partitioning: NDArray[np.int64]
         | typing.Literal["metis", "contiguous"] = "contiguous",
     ) -> RankLocalFunctional[P, R]:
-        """Collectively compile only this communicator rank's local functional.
-
-        Every rank must call this method with the same traced functional and
-        partitioning configuration. Static analysis remains replicated, while
-        demand propagation, local planning, input localization, and executable
-        construction are performed only for the calling rank.
-
-        Halo planning performs one host-side ``alltoall`` of ghost DOF request
-        arrays. For METIS, rank zero computes the DOF partition and broadcasts
-        it before local planning. MPI is optional; an ``mpi4py.MPI.Comm`` can be
-        passed directly when Tatva's MPI extras are installed.
-        """
-        rank = int(comm.Get_rank())
-        n_parts = int(comm.Get_size())
+        """Build the rank-local view of a distributed functional."""
         if rank < 0 or rank >= n_parts:
-            raise ValueError(f"communicator rank {rank} is outside [0, {n_parts})")
+            raise ValueError(f"rank {rank} is outside [0, {n_parts})")
 
-        effective_partitioning = partitioning
-        if isinstance(partitioning, str) and partitioning == "metis":
-            root_partition = self._metis_dof_partition(n_parts) if rank == 0 else None
-            broadcast = comm.bcast(root_partition, root=0)
-            effective_partitioning = np.asarray(broadcast, dtype=np.int64)
+        if partitioning == "metis":
+            # because this runs on every rank, this only works if METIS is DETERMINISTIC!
+            # if turns out to be wrong, we must bcast the partitioning instead
+            effective_partitioning = self._metis_dof_partition(n_parts)
+        else:
+            effective_partitioning = partitioning
 
-        contribution_partition, dof_to_part = self._partition_metadata(
+        contribution_partition, dof_owner = self._partition_metadata(
             n_parts=n_parts,
             partitioning=effective_partitioning,
         )
@@ -207,10 +185,11 @@ class TraceResult[**P, R]:
         if compute_layout is None:
             raise RuntimeError("DOF input unexpectedly dead")
 
-        halo_plan = build_local_halo_plan(
+        dof_plan = build_local_dof_plan(
             compute_layout,
-            dof_to_part,
-            comm=comm,
+            dof_owner,
+            rank=rank,
+            n_ranks=n_parts,
         )
 
         return RankLocalFunctional(
@@ -218,9 +197,8 @@ class TraceResult[**P, R]:
             rank=rank,
             n_parts=n_parts,
             owned=owned,
-            dof_owner=dof_to_part,
             local_plan=local_plan,
-            halo_plan=halo_plan,
+            dof_plan=dof_plan,
         )
 
 
@@ -228,15 +206,14 @@ class TraceResult[**P, R]:
 class DistributedFunctional[**P, R]:
     traced: TraceResult[P, R]
     partition: ContributionPartition
-    dof_owner: NDArray[np.int64]
     local_plans: tuple[LocalJaxprPlan, ...]
-    halo_plans: tuple[HaloPlan, ...]
+    dof_plans: tuple[LocalDofPlan, ...]
 
     def __post_init__(self) -> None:
         n_parts = self.partition.n_parts
         counts = (
             len(self.local_plans),
-            len(self.halo_plans),
+            len(self.dof_plans),
         )
         if counts != (n_parts, n_parts):
             raise ValueError(
@@ -258,28 +235,26 @@ class DistributedFunctional[**P, R]:
             rank=rank,
             n_parts=self.n_parts,
             owned=self.partition.for_part(rank),
-            dof_owner=self.dof_owner,
             local_plan=self.local_plans[rank],
-            halo_plan=self.halo_plans[rank],
+            dof_plan=self.dof_plans[rank],
         )
 
 
 @dataclass(frozen=True)
 class RankLocalFunctional[**P, R]:
-    """Compiled partition state owned by one communicator rank.
-
-    Unlike :class:`DistributedFunctional`, this object does not retain plans
-    for other ranks. Its halo send/receive schedules were negotiated
-    collectively during :meth:`TraceResult.partition_local`.
-    """
+    """Compiled partition state owned by one communicator rank."""
 
     traced: TraceResult[P, R]
     rank: int
     n_parts: int
     owned: tuple[OwnedContribution, ...]
-    dof_owner: NDArray[np.int64]
     local_plan: LocalJaxprPlan
-    halo_plan: HaloPlan
+    dof_plan: LocalDofPlan
+
+    @property
+    def hessian(self) -> sps.csr_matrix:
+        l2g = self.dof_plan.storage.global_dofs
+        return self.traced.hessian[l2g][:, l2g]
 
     def local_function(self) -> typing.Callable[P, R]:
         """Build the executable for this rank's already-localized inputs."""
@@ -288,7 +263,7 @@ class RankLocalFunctional[**P, R]:
             contributions=self.traced.contributions,
             owned=self.owned,
         )
-        compute_rows = self.halo_plan.compute_rows
+        compute_rows = self.dof_plan.compute_rows
         call_abi = self.traced.captured.call_abi
         input_layouts = self.local_plan.input_layouts
 
@@ -361,7 +336,7 @@ class RankLocalFunctional[**P, R]:
         local_bound = localize_inputs(
             self.rank,
             self.traced.captured.call_abi,
-            self.halo_plan,
+            self.dof_plan,
             specializers,
             self.local_plan.input_layouts,
             args=args,

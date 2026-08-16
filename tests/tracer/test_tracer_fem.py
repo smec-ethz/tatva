@@ -9,7 +9,7 @@ from jax_autovmap import autovmap
 from tatva import Mesh, Operator
 from tatva.compound import Compound, field
 from tatva.element.base import Tri3
-from tatva.lifter import Fixed, Lifter, Periodic
+from tatva.lifter import Fixed, Lifter, Periodic, RuntimeValue
 from tatva.tracer.api import CapturedJaxpr, trace
 
 jax.config.update("jax_enable_x64", True)
@@ -95,7 +95,7 @@ def test_tracer_fem():
 
     lifter = Lifter(
         mesh.coords.shape[0] * 2,
-        Fixed(Solution.u[corner_0]),
+        Fixed(Solution.u[corner_0], RuntimeValue("u", 0.0)),
         Periodic(Solution.u[right, :], Solution.u[left, :]),
         Periodic(Solution.u[top, :], Solution.u[bottom, :]),
     )
@@ -124,6 +124,23 @@ def test_tracer_fem():
     )
 
     # profile this, and must run
-    result = trace(cap)
-    # inspect hessian
-    print(result.hessian.nnz)
+    traced = trace(cap)
+
+    n_parts = 6
+    rank = 0
+    distributed = traced.partition(n_parts=n_parts, partitioning="metis")
+    local = distributed.for_rank(rank)
+    energy_local = local.local_function()
+    inp = local.localize_inputs(
+        jnp.zeros(lifter.size_reduced), lifter=lifter.at("u").set(1.0), mat=mat, op=op
+    )
+    z_local, op_local, lifter_local, mat_local = inp[0]
+
+    # execute the local function
+
+    energy_local(
+        jnp.zeros(local.dof_plan.storage.local_size),
+        op_local,
+        lifter_local.at("u").set(1e-4),
+        mat_local,
+    )

@@ -28,7 +28,6 @@ from tatva.tracer.core.nested import (
     dispatch_nested,
 )
 from tatva.tracer.core.registry import SEMANTICS
-from tatva.tracer.distribution.partition import OwnedContribution
 from tatva.tracer.local.demand import (
     TensorDemand,
     _FullAxis,
@@ -47,6 +46,7 @@ from tatva.tracer.local.plan import (
     LocalJaxprPlan,
     LocalNestedPlan,
 )
+from tatva.tracer.lowering.partition import OwnedContribution
 from tatva.tracer.lowering.rules import LoweringContext, lower_bind
 from tatva.tracer.program.contributions import ContributionTrace
 
