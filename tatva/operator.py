@@ -140,22 +140,17 @@ class Operator(Generic[ElementT]):
         coords = self.mesh.coords
         elements = self.mesh.elements
 
-        # JAX rebuilds this pytree with placeholder leaves in a few places for tracing, e.g.
-        # `Traced.lower()`, which unflattens the input tree with `ArgInfo`
-        # objects to build `args_info`. Those carry no shape or dtype, so the checks
-        # below are meaningless there. The real leaves were already validated when the
-        # Operator was first constructed; skip rather than crash on a rebuild.
-        if not hasattr(coords, "ndim") or not hasattr(elements, "ndim"):
-            return
-
-        if coords.ndim != 2:
+        if len(coords.shape) != 2:  # we use shape to allow lowering of operator methods
+            # as jax.stages.ArgInfo only contains shape and type information
             raise ValueError(
                 "Mesh coordinates must be a 2D array shaped (n_nodes, n_dim)."
             )
         if coords.shape[0] == 0:
             raise ValueError("Mesh must contain at least one node.")
 
-        if elements.ndim != 2:
+        if (
+            len(elements.shape) != 2
+        ):  # we use shape to allow lowering of operator methods
             raise ValueError(
                 "Mesh elements must be a 2D array shaped (n_elements, n_nodes_per_element)."
             )
@@ -164,8 +159,9 @@ class Operator(Generic[ElementT]):
         if not jnp.issubdtype(elements.dtype, jnp.integer):
             raise TypeError("Mesh element connectivity must contain integer indices.")
 
-        flat_elements = elements.ravel()
-        try:
+        if not isinstance(elements, (jax.core.Tracer, jax.stages.ArgInfo)):
+            # min/max checks cannot be performed while tracing and lowering stage
+            flat_elements = elements.ravel()
             if flat_elements.min() < 0:
                 raise ValueError(
                     "Mesh element connectivity contains negative node indices."
@@ -174,8 +170,6 @@ class Operator(Generic[ElementT]):
                 raise ValueError(
                     "Mesh element connectivity references nodes outside the mesh coordinates array."
                 )
-        except TracerBoolConversionError:
-            pass
 
     def get_integration_weights(self) -> Array:
         """Returns the integration weights for the quadrature points of the mesh. This is
