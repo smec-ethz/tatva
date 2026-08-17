@@ -40,6 +40,10 @@ def no_input_demand(ctx: DemandContext) -> tuple[Demand, ...]:
     return ()
 
 
+def no_op_demand(ctx: DemandContext) -> tuple[Demand, ...]:
+    return tuple(None for _ in ctx.eqn.invars)
+
+
 IOTA = OperationSemantics(
     DerivativeRule(
         no_prepare,
@@ -56,4 +60,13 @@ ZERO_DEPENDENCY = OperationSemantics(
         no_hessian,
     ),
     demand=elementwise_demand,
+)
+
+NO_OP = OperationSemantics(
+    DerivativeRule(
+        no_prepare,
+        no_output_dependencies,
+        no_hessian,
+    ),
+    demand=no_op_demand,
 )

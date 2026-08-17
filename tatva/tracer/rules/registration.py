@@ -44,7 +44,7 @@ from . import (
     reductions,
     structural,
 )
-from .zero_dependency import IOTA, ZERO_DEPENDENCY
+from .zero_dependency import IOTA, NO_OP, ZERO_DEPENDENCY
 
 if TYPE_CHECKING:
     from tatva.tracer.core.registry import PrimitiveRegistry
@@ -96,6 +96,14 @@ def _register_zero_deps_rules(reg: PrimitiveRegistry) -> None:
             contribution=contribution_rules.transparent_unary,
         ),
     )
+
+    try:
+        from jax._src.debugging import debug_callback_p, debug_print_p
+
+        reg.register(debug_print_p, NO_OP)
+        reg.register(debug_callback_p, NO_OP)
+    except ImportError:
+        pass
 
 
 def _register_elementwise_unary_rules(reg: PrimitiveRegistry) -> None:
