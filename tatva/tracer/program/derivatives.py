@@ -737,38 +737,29 @@ def _same_structural_instance(
         if type(lhs_nested) is not type(rhs_nested):
             return False
 
-        if lhs_nested is None:
-            continue
-
-        if isinstance(lhs_nested, CallInvocation):
-            if not isinstance(rhs_nested, CallInvocation):
-                return False
-            lhs_nested = cast(CallInvocation[JaxprInstance], lhs_nested)
-            rhs_nested = cast(CallInvocation[JaxprInstance], rhs_nested)
-            if not _same_structural_instance(lhs_nested.body, rhs_nested.body):
-                return False
-
-        elif isinstance(lhs_nested, RepeatedInvocation):
-            if not isinstance(rhs_nested, RepeatedInvocation):
-                return False
-            lhs_nested = cast(RepeatedInvocation[JaxprInstance], lhs_nested)
-            rhs_nested = cast(RepeatedInvocation[JaxprInstance], rhs_nested)
-            if lhs_nested.kind is not rhs_nested.kind:
-                return False
-            if len(lhs_nested.iterations) != len(rhs_nested.iterations):
-                return False
-
-            for a, b in zip(lhs_nested.iterations, rhs_nested.iterations):
-                if a.index != b.index:
-                    return False
-
-                if not _same_structural_instance(a.body, b.body):
-                    return False
-
-        else:
+        if not _same_structural_nested(lhs_nested, rhs_nested):
             return False
 
     return True
+
+
+def _same_structural_nested(
+    lhs: AnyNestedInvocation[JaxprInstance] | None,
+    rhs: AnyNestedInvocation[JaxprInstance] | None,
+) -> bool:
+    if lhs is None or rhs is None:
+        return lhs is rhs
+    if lhs.kind is not rhs.kind or lhs.eqn_index != rhs.eqn_index:
+        return False
+    lhs_children = lhs.children()
+    rhs_children = rhs.children()
+    if len(lhs_children) != len(rhs_children):
+        return False
+    return all(
+        a.logical_index == b.logical_index
+        and _same_structural_instance(a.payload, b.payload)
+        for a, b in zip(lhs_children, rhs_children)
+    )
 
 
 def _map_iterations_are_structurally_equal(

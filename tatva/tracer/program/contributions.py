@@ -34,7 +34,13 @@ from typing import cast
 from jax.core import Atom
 from jax.extend.core import Literal, Var
 
-from tatva.tracer.core.nested import CallInvocation, CallSpec, FramePath
+from tatva.tracer.core.nested import (
+    CallContext,
+    FramePath,
+    MapContext,
+    ScanContext,
+    dispatch_nested,
+)
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.routes import Shape
 from tatva.tracer.core.semantics import (
@@ -218,91 +224,97 @@ def _producer_map(
 # -----------------------------------------------------------------------------
 
 
-def _trace_call(
-    resolved: ResolvedEqn,
-    output_index: int,
-    path: FramePath,
-    coefficient: ContributionCoefficient,
-    mode: ContributionMode,
-    *,
-    partition_axes: PartitionAxesPolicy,
-) -> tuple[list[_RootCandidate], list[_Seed]]:
-    """Trace transparently through a call/remat child frame."""
-    nested = resolved.nested
-    if not isinstance(nested, CallInvocation):
-        raise InvalidMaterializedJaxprError(
-            "_trace_call received a non-call nested instance"
-        )
+@dataclass(frozen=True)
+class _ContributionNestedHandler:
+    # Satisfies the `NestedHandler` interface for contribution detection. The handler
+    # is invoked for each nested frame, and may trace through call-like frames or
+    # treat other nested constructs as opaque structured boundaries.
 
-    eqn = resolved.plan.eqn
-    child = cast(JaxprInstance, nested.body)
-    child_jaxpr = child.plan.jaxpr
+    resolved: ResolvedEqn
+    output_index: int
+    path: FramePath
+    seed: _Seed
+    partition_axes: PartitionAxesPolicy
 
-    if output_index >= len(child_jaxpr.outvars):
-        raise InvalidMaterializedJaxprError(
-            f"{eqn.primitive.name} output mapping is inconsistent"
-        )
+    def call(
+        self, context: CallContext[JaxprInstance]
+    ) -> tuple[list[_RootCandidate], list[_Seed]]:
+        return self._trace_call(context)
 
-    child_path = path + (nested.children()[0].frame_step,)
-    child_result = _walk_frame(
-        child,
-        child_path,
-        [
-            _Seed(
-                atom=child_jaxpr.outvars[output_index],
-                coefficient=coefficient,
-                mode=mode,
-            )
-        ],
-        partition_axes=partition_axes,
-    )
+    def map(
+        self, context: MapContext[JaxprInstance]
+    ) -> tuple[list[_RootCandidate], list[_Seed]]:
+        return ([self._trace_opaque_nested()], [])
 
-    nested_plan = resolved.plan.nested
-    if nested_plan is None or not isinstance(nested_plan.spec, CallSpec):
-        raise InvalidMaterializedJaxprError(
-            f"{eqn.primitive.name} call has no call boundary specification"
-        )
+    def scan(
+        self, context: ScanContext[JaxprInstance]
+    ) -> tuple[list[_RootCandidate], list[_Seed]]:
+        return ([self._trace_opaque_nested()], [])
 
-    forwarded: list[_Seed] = []
-    for request in child_result.inputs:
-        try:
-            outer_index = nested_plan.spec.outer_input_index(
-                request.input_index, outer_arity=len(eqn.invars)
-            )
-        except IndexError as exc:
+    def _trace_call(
+        self, context: CallContext[JaxprInstance]
+    ) -> tuple[list[_RootCandidate], list[_Seed]]:
+        """Trace transparently through a call/remat child frame."""
+        nested = context.invocation
+        eqn = self.resolved.plan.eqn
+        child = nested.body
+        child_jaxpr = child.plan.jaxpr
+
+        if self.output_index >= len(child_jaxpr.outvars):
             raise InvalidMaterializedJaxprError(
-                f"{eqn.primitive.name} child input mapping is inconsistent"
-            ) from exc
-
-        forwarded.append(
-            _Seed(
-                atom=eqn.invars[outer_index],
-                coefficient=request.coefficient,
-                mode=request.mode,
+                f"{eqn.primitive.name} output mapping is inconsistent"
             )
+
+        child_path = self.path + (nested.children()[0].frame_step,)
+        child_result = _walk_frame(
+            child,
+            child_path,
+            [
+                _Seed(
+                    atom=child_jaxpr.outvars[self.output_index],
+                    coefficient=self.seed.coefficient,
+                    mode=self.seed.mode,
+                )
+            ],
+            partition_axes=self.partition_axes,
         )
 
-    return child_result.roots, forwarded
+        forwarded: list[_Seed] = []
+        for request in child_result.inputs:
+            try:
+                outer_index = context.spec.outer_input_index(
+                    request.input_index, outer_arity=len(eqn.invars)
+                )
+            except IndexError as exc:
+                raise InvalidMaterializedJaxprError(
+                    f"{eqn.primitive.name} child input mapping is inconsistent"
+                ) from exc
 
+            forwarded.append(
+                _Seed(
+                    atom=eqn.invars[outer_index],
+                    coefficient=request.coefficient,
+                    mode=request.mode,
+                )
+            )
 
-def _trace_opaque_nested(
-    resolved: ResolvedEqn,
-    path: FramePath,
-    atom: Var,
-    coefficient: ContributionCoefficient,
-    mode: ContributionMode,
-    *,
-    partition_axes: PartitionAxesPolicy,
-) -> _RootCandidate:
-    """Handle any non-call nested construct as an opaque structured boundary."""
-    if mode is ContributionMode.DOMAIN:
-        return _root_candidate(path, atom, coefficient, partition_axes=partition_axes)
+        return child_result.roots, forwarded
 
-    name = resolved.plan.eqn.primitive.name
-    raise UnsupportedContributionError(
-        f"nested primitive {name!r} produces the scalar objective "
-        "without an additive reduction"
-    )
+    def _trace_opaque_nested(self) -> _RootCandidate:
+        """Handle any non-call nested construct as an opaque structured boundary."""
+        if self.seed.mode is ContributionMode.DOMAIN:
+            return _root_candidate(
+                self.path,
+                cast(Var, self.seed.atom),
+                self.seed.coefficient,
+                partition_axes=self.partition_axes,
+            )
+
+        name = self.resolved.plan.eqn.primitive.name
+        raise UnsupportedContributionError(
+            f"nested primitive {name!r} produces the scalar objective "
+            "without an additive reduction"
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -370,30 +382,24 @@ def _walk_frame(
 
         resolved, output_index = producer
 
-        if isinstance(resolved.nested, CallInvocation):
-            child_roots, forwarded = _trace_call(
-                resolved,
-                output_index,
-                path,
-                seed.coefficient,
-                seed.mode,
-                partition_axes=partition_axes,
+        if resolved.nested is not None:
+            if resolved.plan.nested is None:
+                raise InvalidMaterializedJaxprError(
+                    f"{resolved.plan.eqn.primitive.name} has nested instance but no nested plan"
+                )
+            child_roots, forwarded = dispatch_nested(
+                resolved.plan.nested.spec,
+                resolved.nested,
+                _ContributionNestedHandler(
+                    resolved=resolved,
+                    output_index=output_index,
+                    path=path,
+                    seed=seed,
+                    partition_axes=partition_axes,
+                ),
             )
             roots.extend(child_roots)
             stack.extend(forwarded)
-            continue
-
-        if resolved.nested is not None:
-            roots.append(
-                _trace_opaque_nested(
-                    resolved,
-                    path,
-                    atom,
-                    seed.coefficient,
-                    seed.mode,
-                    partition_axes=partition_axes,
-                )
-            )
             continue
 
         semantics = SEMANTICS.get_ordinary(resolved.plan.eqn.primitive)
