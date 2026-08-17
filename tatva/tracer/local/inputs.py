@@ -147,7 +147,10 @@ def _localize_tree(
     children, node_treedef = _one_level(global_value)
 
     # JAX leaf
-    if jax.tree_util.treedef_is_leaf(node_treedef):
+    # ``treedef_is_leaf`` also returns true for leafless PyTree nodes such as
+    # ``{}``.  A JAX leaf is instead the one-level traversal whose sole child
+    # is the original object itself.
+    if len(children) == 1 and children[0] is global_value:
         try:
             local_value, layout = next(leaves)
         except StopIteration:
