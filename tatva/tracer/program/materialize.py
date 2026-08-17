@@ -643,38 +643,6 @@ def materialize_plan(
     )
 
 
-def resolved_eqn(
-    instance: JaxprInstance,
-    eqn_index: int,
-) -> ResolvedEqn:
-    for resolved in instance.eqns:
-        if resolved.plan.index == eqn_index:
-            return resolved
-
-    raise KeyError(f"equation index {eqn_index} is not present in this JaxprInstance")
-
-
-def resolve_frame(
-    root: JaxprInstance,
-    path: FramePath,
-) -> JaxprInstance:
-    """Resolve an invocation-qualified frame path into its JaxprInstance."""
-    current = root
-
-    for step in path:
-        resolved = resolved_eqn(current, step.eqn_index)
-        nested = resolved.nested
-
-        if nested is None:
-            raise ValueError(
-                f"frame step expects {step.kind.name.lower()} at equation "
-                f"{step.eqn_index}"
-            )
-        current = nested.child_at(step)
-
-    return current
-
-
 # --------------------------------------
 # Concrete primitive evaluation rules
 # --------------------------------------
