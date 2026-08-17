@@ -39,7 +39,6 @@ from dataclasses import dataclass
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
 from tatva.tracer.core.nested import (
-    CallKind,
     CallSpec,
     MapSpec,
     NestedJaxpr,
@@ -244,7 +243,7 @@ def _analyze_nested(
     if isinstance(semantics, CallAnalysisSemantics):
         return _analyze_call(
             eqn,
-            kind=semantics.call_kind,
+            semantics=semantics,
             concrete_outputs=concrete_outputs,
         )
 
@@ -260,10 +259,17 @@ def _analyze_nested(
 def _analyze_call(
     eqn: JaxprEqn,
     *,
-    kind: CallKind,
+    semantics: CallAnalysisSemantics,
     concrete_outputs: frozenset[int],
 ) -> NestedPlan:
-    nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
+    target = semantics.target(eqn)
+    nested = normalize_nested_jaxpr(target.body)
+
+    spec = CallSpec(
+        call_kind=semantics.call_kind,
+        input_indices=target.input_indices,
+    )
+    input_indices = spec.resolved_input_indices(len(eqn.invars))
 
     if len(nested.jaxpr.outvars) != len(eqn.outvars):
         raise ValueError(
@@ -271,19 +277,23 @@ def _analyze_call(
             f"but nested Jaxpr has {len(nested.jaxpr.outvars)} outputs"
         )
 
-    if len(nested.jaxpr.invars) != len(eqn.invars):
+    if len(nested.jaxpr.invars) != len(input_indices):
         raise ValueError(
-            f"{eqn.primitive.name} has {len(eqn.invars)} outer inputs "
+            f"{eqn.primitive.name} call boundary selects {len(input_indices)} inputs "
             f"but nested Jaxpr has {len(nested.jaxpr.invars)} inputs"
         )
 
     body = analyze(nested.jaxpr, concrete_outputs=concrete_outputs)
+    concrete_inputs = frozenset(
+        spec.outer_input_index(child_index, outer_arity=len(eqn.invars))
+        for child_index in body.concrete_inputs
+    )
 
     return NestedPlan(
-        spec=CallSpec(call_kind=kind),
+        spec=spec,
         body=body,
         consts=nested.consts,
-        concrete_inputs=body.concrete_inputs,
+        concrete_inputs=concrete_inputs,
     )
 
 

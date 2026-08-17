@@ -99,9 +99,11 @@ def _register_zero_deps_rules(reg: PrimitiveRegistry) -> None:
 
     try:
         from jax._src.debugging import debug_callback_p, debug_print_p
+        from jax._src.lax.control_flow import platform_index_p
 
         reg.register(debug_print_p, NO_OP)
         reg.register(debug_callback_p, NO_OP)
+        reg.register(platform_index_p, IOTA)
     except ImportError:
         pass
 
@@ -487,7 +489,6 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
         lax.linalg.cholesky_p,
         lax.linalg.eig_p,
         lax.linalg.eigh_p,
-        lax.linalg.triangular_solve_p,
         custom_derivatives.custom_jvp_call_p,
         custom_derivatives.custom_vjp_call_p,
     ):
@@ -499,11 +500,10 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
         )
 
     reg.register(
-        lax.linear_solve_p,
+        lax.linalg.triangular_solve_p,
         OperationSemantics(
             derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
-            demand=linalg.custom_linear_solve_demand,
-            lowering=lowerings.lower_custom_linear_solve,
+            demand=linalg.triangular_solve_demand,
         ),
     )
     reg.register(
@@ -532,6 +532,16 @@ def _register_nested_rules(
         NestedOperationSemantics(
             analysis=CallAnalysisSemantics(
                 call_kind=CallKind.REMAT,
+            )
+        ),
+    )
+
+    reg.register(
+        lax.linear_solve_p,
+        NestedOperationSemantics(
+            analysis=CallAnalysisSemantics(
+                call_kind=CallKind.CUSTOM_LINEAR_SOLVE,
+                target=linalg.custom_linear_solve_call_target,
             )
         ),
     )

@@ -10,6 +10,7 @@ from tatva import Mesh, Operator
 from tatva.compound import Compound, field
 from tatva.element.base import Tri3
 from tatva.lifter import Fixed, Lifter, Periodic, RuntimeValue
+from tatva.tracer import trace_fn
 from tatva.tracer.api import CapturedJaxpr, trace
 
 jax.config.update("jax_enable_x64", True)
@@ -128,7 +129,7 @@ def test_tracer_fem():
 
     n_parts = 6
     rank = 0
-    distributed = traced.partition(n_parts=n_parts, partitioning="metis")
+    distributed = traced.partition(n_parts=n_parts, partitioning="contiguous")
     local = distributed.for_rank(rank)
     energy_local = local.local_function()
     inp = local.localize_inputs(
@@ -144,3 +145,32 @@ def test_tracer_fem():
         lifter_local.at("u").set(1e-4),
         mat_local,
     )
+
+
+def test_local_grad_u_sum_matches_original():
+    n = 4
+    mesh = Mesh.unit_square(n, n)
+
+    @autovmap(grad_u=2)
+    def dummy_density(grad_u: Array) -> Array:
+        return jnp.sum(grad_u)
+
+    def energy_functional(
+        z: Array,  # flat array of reduced dofs
+        op: Operator,  # fem operator
+    ) -> Array:
+        u = z.reshape((-1, 2))
+        grad_u = op.grad(u)
+        psi = dummy_density(grad_u)
+        return op.integrate(psi)
+
+    op = Operator(mesh, Tri3())
+    traced = trace_fn(energy_functional, jnp.zeros(mesh.coords.shape[0] * 2), op=op)
+    local = traced.partition_local(rank=0, n_parts=1)
+    energy_local = local.local_function()
+
+    random_x = jax.random.normal(jax.random.PRNGKey(0), (mesh.coords.size,)) * 1e-3
+    e_original = energy_functional(random_x, op)
+    e_local = energy_local(random_x, op)
+
+    assert np.isclose(e_original, e_local)

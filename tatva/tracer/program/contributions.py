@@ -34,7 +34,7 @@ from typing import cast
 from jax.core import Atom
 from jax.extend.core import Literal, Var
 
-from tatva.tracer.core.nested import CallInvocation, FramePath
+from tatva.tracer.core.nested import CallInvocation, CallSpec, FramePath
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.routes import Shape
 from tatva.tracer.core.semantics import (
@@ -257,16 +257,26 @@ def _trace_call(
         partition_axes=partition_axes,
     )
 
+    nested_plan = resolved.plan.nested
+    if nested_plan is None or not isinstance(nested_plan.spec, CallSpec):
+        raise InvalidMaterializedJaxprError(
+            f"{eqn.primitive.name} call has no call boundary specification"
+        )
+
     forwarded: list[_Seed] = []
     for request in child_result.inputs:
-        if request.input_index >= len(eqn.invars):
+        try:
+            outer_index = nested_plan.spec.outer_input_index(
+                request.input_index, outer_arity=len(eqn.invars)
+            )
+        except IndexError as exc:
             raise InvalidMaterializedJaxprError(
                 f"{eqn.primitive.name} child input mapping is inconsistent"
-            )
+            ) from exc
 
         forwarded.append(
             _Seed(
-                atom=eqn.invars[request.input_index],
+                atom=eqn.invars[outer_index],
                 coefficient=request.coefficient,
                 mode=request.mode,
             )

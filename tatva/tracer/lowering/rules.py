@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.scipy.linalg import lu_solve
 
 from tatva.tracer.local.localize import (
     LocalDynamicSliceRoute,
@@ -343,35 +342,3 @@ def lower_select_n(
         output = output.at[jnp.asarray(case_route.output_rows)].set(source)
 
     return (jnp.reshape(output, route.output_shape),)
-
-
-def lower_custom_linear_solve(
-    ctx: LoweringContext,
-) -> tuple[Any, ...]:
-    eqn = ctx.plan.eqn
-    lengths = eqn.params["const_lengths"]
-
-    n_matvec = int(lengths.matvec)
-    n_vecmat = int(lengths.vecmat)
-    n_solve = int(lengths.solve)
-    n_transpose = int(lengths.transpose_solve)
-
-    if n_solve != 2:
-        raise NotImplementedError(
-            "only LU-backed custom_linear_solve with two solve constants is supported"
-        )
-
-    solve_start = n_matvec + n_vecmat
-    rhs_start = solve_start + n_solve + n_transpose
-
-    if len(ctx.inputs) - rhs_start != 1:
-        raise NotImplementedError(
-            "custom_linear_solve with PyTree/multiple RHS leaves is not yet supported"
-        )
-
-    lu = _input(ctx, solve_start)
-    pivots = _input(ctx, solve_start + 1)
-    rhs = _input(ctx, rhs_start)
-    result = lu_solve((lu, pivots), rhs)
-
-    return (result,)

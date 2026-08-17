@@ -5,8 +5,13 @@ from enum import Enum
 
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn
 
+from tatva.tracer.core.nested import normalize_nested_jaxpr
 from tatva.tracer.core.registry import SEMANTICS
-from tatva.tracer.core.semantics import NestedOperationSemantics
+from tatva.tracer.core.semantics import (
+    CallAnalysisSemantics,
+    NestedOperationSemantics,
+    ScanAnalysisSemantics,
+)
 from tatva.tracer.local.plan import (
     LocalJaxprPlan,
     pending_routes,
@@ -49,20 +54,30 @@ class SupportPreflightError(RuntimeError):
         super().__init__("\n".join(lines))
 
 
-def _nested_jaxpr(
+def _nested_jaxprs(
     eqn: JaxprEqn,
-) -> Jaxpr:
-    value = eqn.params.get("jaxpr")
+    semantics: NestedOperationSemantics,
+) -> tuple[Jaxpr, ...]:
+    analysis = semantics.analysis
 
-    if isinstance(value, ClosedJaxpr):
-        return value.jaxpr
+    if isinstance(analysis, CallAnalysisSemantics):
+        target = analysis.target(eqn)
 
-    if isinstance(value, Jaxpr):
-        return value
+        return (normalize_nested_jaxpr(target.body).jaxpr,)
 
-    raise RuntimeError(
-        f"nested primitive {eqn.primitive.name!r} does not contain a 'jaxpr' parameter"
-    )
+    if isinstance(analysis, ScanAnalysisSemantics):
+        value = eqn.params.get("jaxpr")
+
+        if value is None:
+            raise RuntimeError(
+                f"scan-like primitive "
+                f"{eqn.primitive.name!r} does not "
+                "contain a 'jaxpr' parameter"
+            )
+
+        return (normalize_nested_jaxpr(value).jaxpr,)
+
+    raise TypeError(f"unsupported nested analysis semantics {type(analysis).__name__}")
 
 
 def registration_issues(
@@ -97,8 +112,8 @@ def registration_issues(
             if not isinstance(semantics, NestedOperationSemantics):
                 continue
 
-            child = _nested_jaxpr(eqn)
-            visit(child, eqn_path)
+            for child in _nested_jaxprs(eqn, semantics):
+                visit(child, eqn_path)
 
     visit(jaxpr, ())
 

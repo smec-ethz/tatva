@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Protocol
 
-from jax.extend.core import JaxprEqn, Literal
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
 
 from tatva.tracer.core.nested import CallKind
 from tatva.tracer.core.routes import ConcreteEnv, Route
@@ -196,8 +196,33 @@ class OperationSemantics[T]:
 
 # Nested-operation semantics
 @dataclass(frozen=True, slots=True)
+class CallTarget:
+    """Executable child of a call-like primitive.
+
+    input_indices maps child input i to outer equation input input_indices[i]. None means
+    the normal identity boundary used by jit/remat.
+    """
+
+    body: object
+    input_indices: tuple[int, ...] | None = None
+
+
+type CallTargetRule = Callable[[JaxprEqn], CallTarget]
+
+
+def direct_call_target(eqn: JaxprEqn) -> CallTarget:
+    value = eqn.params.get("jaxpr")
+    if not isinstance(value, (Jaxpr, ClosedJaxpr)):
+        raise TypeError(
+            f"call-like primitive {eqn.primitive.name} does not contain a Jaxpr-valued 'jaxpr' parameter"
+        )
+    return CallTarget(body=value)
+
+
+@dataclass(frozen=True, slots=True)
 class CallAnalysisSemantics:
     call_kind: CallKind
+    target: CallTargetRule = direct_call_target
 
 
 @dataclass(frozen=True, slots=True)
