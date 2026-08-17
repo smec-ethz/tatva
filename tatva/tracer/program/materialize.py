@@ -266,7 +266,8 @@ def _materialize_call(
 ) -> ResolvedEqn:
     eqn = eqn_plan.eqn
 
-    child_inputs = tuple(_read(parent_env, atom) for atom in eqn.invars)
+    outer_inputs = tuple(_read(parent_env, atom) for atom in eqn.invars)
+    child_inputs = spec.select_inputs(outer_inputs)
 
     child = _materialize_jaxpr(
         nested_plan.body,

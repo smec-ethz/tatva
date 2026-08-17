@@ -356,9 +356,11 @@ def _trace_call(
 ]:
     nested = context.invocation
 
+    child_input_deps = context.spec.select_inputs(input_deps)
+
     body_trace = _trace_jaxpr(
         instance=nested.body,
-        input_deps=input_deps,
+        input_deps=child_input_deps,
         acc=acc,
         n_dofs=n_dofs,
     )

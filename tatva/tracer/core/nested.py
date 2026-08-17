@@ -17,6 +17,7 @@ class NestedKind(Enum):
 class CallKind(Enum):
     JIT = auto()
     REMAT = auto()
+    CUSTOM_LINEAR_SOLVE = auto()
 
 
 class TraversalOrder(Enum):
@@ -29,9 +30,38 @@ class TraversalOrder(Enum):
 class CallSpec:
     call_kind: CallKind
 
+    # child invar i receives outer equation invar input_indices[i]
+    # None means the ordinary identity boundary:
+    #   child.invars == outer.eqn.invars
+    input_indices: tuple[int, ...] | None = None
+
     @property
     def kind(self) -> NestedKind:
         return NestedKind.CALL
+
+    def resolved_input_indices(self, outer_arity: int) -> tuple[int, ...]:
+        indices = (
+            tuple(range(outer_arity))
+            if self.input_indices is None
+            else self.input_indices
+        )
+        for index in indices:
+            if index < 0 or index >= outer_arity:
+                raise IndexError(
+                    f"call boundary input index {index} outside outer arity {outer_arity}"
+                )
+        return indices
+
+    def select_inputs[T](self, inputs: Sequence[T]) -> tuple[T, ...]:
+        return tuple(inputs[i] for i in self.resolved_input_indices(len(inputs)))
+
+    def outer_input_index(self, child_index: int, *, outer_arity: int) -> int:
+        indices = self.resolved_input_indices(outer_arity)
+        if child_index < 0 or child_index >= len(indices):
+            raise IndexError(
+                f"call child input {child_index} outside child arity {len(indices)}"
+            )
+        return indices[child_index]
 
 
 class RepeatedSpec:
@@ -332,9 +362,16 @@ class NestedJaxpr:
     consts: tuple[object, ...]
 
 
-def normalize_nested_jaxpr(value: Jaxpr | ClosedJaxpr) -> NestedJaxpr:
+def normalize_nested_jaxpr(value: object) -> NestedJaxpr:
     if isinstance(value, ClosedJaxpr):
         return NestedJaxpr(value.jaxpr, tuple(value.consts))
     if isinstance(value, Jaxpr):
         return NestedJaxpr(value, ())
-    raise TypeError(f"expected Jaxpr or ClosedJaxpr, got {type(value)!r}")
+
+    jaxpr = getattr(value, "jaxpr", None)
+    if isinstance(jaxpr, Jaxpr):
+        return NestedJaxpr(jaxpr, tuple(getattr(value, "consts", ())))
+
+    raise TypeError(
+        f"expected Jaxpr, ClosedJaxpr, or Jaxpr wrapper; got {type(value)!r}"
+    )

@@ -209,16 +209,74 @@ def _frame_outputs(
 
 
 def _lower_call(
+    plan: LocalEqnPlan,
     context: CallContext[LocalJaxprPlan],
     inputs: tuple[Any | None, ...],
 ) -> tuple[Any | None, ...]:
     body = context.invocation.body
-    child_inputs = tuple(
-        value for value, layout in zip(inputs, body.input_layouts) if layout is not None
-    )
+    input_indices = context.spec.resolved_input_indices(len(inputs))
 
-    env = _execute_frame(body, child_inputs)
-    return _frame_outputs(body, env)
+    if len(input_indices) != len(body.input_layouts):
+        raise RuntimeError(
+            f"{plan.primitive_name}: call boundary selects {len(input_indices)} inputs "
+            f"but child plan has {len(body.input_layouts)} inputs"
+        )
+
+    child_inputs: list[Any] = []
+
+    for child_index, outer_index in enumerate(input_indices):
+        target_layout = body.input_layouts[child_index]
+        if target_layout is None:
+            continue
+
+        value = inputs[outer_index]
+        source_layout = plan.input_layouts[outer_index]
+
+        if value is None or source_layout is None:
+            raise RuntimeError(
+                f"{plan.primitive_name}: live child input {child_index} "
+                f"maps to dead outer input {outer_index}"
+            )
+
+        child_inputs.append(
+            _project_local_value(
+                value,
+                source_layout=source_layout,
+                target_layout=target_layout,
+            )
+        )
+
+    env = _execute_frame(body, tuple(child_inputs))
+    child_outputs = _frame_outputs(body, env)
+
+    result: list[Any | None] = []
+    for output_index, (value, source_layout, target_layout) in enumerate(
+        zip(
+            child_outputs,
+            body.output_layouts,
+            plan.output_layouts,
+            strict=True,
+        )
+    ):
+        if target_layout is None:
+            result.append(None)
+            continue
+
+        if value is None or source_layout is None:
+            raise RuntimeError(
+                f"{plan.primitive_name}: live outer output {output_index} "
+                "is unavailable from child call"
+            )
+
+        result.append(
+            _project_local_value(
+                value,
+                source_layout=source_layout,
+                target_layout=target_layout,
+            )
+        )
+
+    return tuple(result)
 
 
 def _lower_map(
@@ -741,7 +799,7 @@ class _LowerNestedHandler:
     inputs: tuple[Any | None, ...]
 
     def call(self, context: CallContext[LocalJaxprPlan]):
-        return _lower_call(context, self.inputs)
+        return _lower_call(self.plan, context, self.inputs)
 
     def map(self, context: MapContext[LocalJaxprPlan]):
         return _lower_map(self.plan, context, self.inputs)
@@ -1425,6 +1483,7 @@ class LocalExecutable:
     contribution_terms: tuple[LocalContributionTerm, ...]
     function: Callable
 
+    # unused, only used in a test
     def pack_global_inputs(
         self,
         *global_inputs,

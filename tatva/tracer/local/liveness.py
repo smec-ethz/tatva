@@ -159,8 +159,19 @@ def _backprop_call(
         output_demands=output_demands,
     )
 
+    outer_demands: list[Demand] = [None] * len(resolved.plan.eqn.invars)
+    input_indices = context.spec.resolved_input_indices(len(outer_demands))
+
+    if len(child.input_demands) != len(input_indices):
+        raise RuntimeError(
+            f"{resolved.plan.eqn.primitive.name} child demand/input boundary mismatch"
+        )
+
+    for outer_index, demand in zip(input_indices, child.input_demands, strict=True):
+        outer_demands[outer_index] = merge_demands(outer_demands[outer_index], demand)
+
     return (
-        child.input_demands,
+        tuple(outer_demands),
         CallInvocation(eqn_index=nested.eqn_index, body=child),
     )
 
