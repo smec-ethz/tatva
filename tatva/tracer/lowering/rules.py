@@ -342,3 +342,54 @@ def lower_select_n(
         output = output.at[jnp.asarray(case_route.output_rows)].set(source)
 
     return (jnp.reshape(output, route.output_shape),)
+
+
+def lower_sort(
+    ctx: LoweringContext,
+) -> tuple[Any | None, ...]:
+    """Sort complete local copies, then project each live output layout."""
+    operands = []
+
+    for index, (value, layout) in enumerate(
+        zip(ctx.inputs, ctx.plan.input_layouts, strict=True)
+    ):
+        if value is None:
+            raise RuntimeError(f"sort: runtime input {index} is dead")
+
+        if layout is not None and not layout.is_full:
+            raise RuntimeError(
+                f"sort: operand {index} must use a full global layout, "
+                f"got {layout.local_shape} of {layout.global_shape}"
+            )
+
+        operands.append(value)
+
+    result = lax.sort(
+        tuple(operands),
+        dimension=ctx.plan.eqn.params["dimension"],
+        is_stable=ctx.plan.eqn.params["is_stable"],
+        num_keys=ctx.plan.eqn.params["num_keys"],
+    )
+
+    # lax.sort returns an array for its unary form and a tuple for co-sorts.
+    sorted_values = result if isinstance(result, tuple) else (result,)
+    outputs: list[Any | None] = []
+
+    for value, layout in zip(sorted_values, ctx.plan.output_layouts, strict=True):
+        if layout is None:
+            outputs.append(None)
+            continue
+
+        projected = value
+        for axis in range(layout.ndim):
+            if layout.local_shape[axis] == layout.global_shape[axis]:
+                continue
+            projected = jnp.take(
+                projected,
+                jnp.asarray(layout.global_axis_indices(axis)),
+                axis=axis,
+            )
+
+        outputs.append(projected)
+
+    return tuple(outputs)

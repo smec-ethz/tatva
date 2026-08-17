@@ -517,6 +517,14 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
             demand=linalg.lu_demand,
         ),
     )
+    reg.register(
+        lax.sort_p,
+        OperationSemantics(
+            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
+            demand=opaque.sort_demand,
+            lowering=lowerings.lower_sort,
+        ),
+    )
 
 
 def _register_nested_rules(
