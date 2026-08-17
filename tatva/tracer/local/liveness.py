@@ -30,6 +30,8 @@ from tatva.tracer.core.nested import (
     CondInvocation,
     FrameStep,
     IndexedChild,
+    LinearSolveContext,
+    LinearSolveInvocation,
     MapContext,
     RepeatedInvocation,
     ScanContext,
@@ -438,6 +440,54 @@ class _DemandNestedHandler:
             context,
             self.output_demands,
             self.seed_node.children.get(child_step),
+        )
+
+    def linear_solve(self, context: LinearSolveContext[JaxprInstance]):
+        eqn = self.resolved.plan.eqn
+        outer: list[Demand] = [None] * len(eqn.invars)
+        traces = []
+        # The solution demand enters the solve callback runtime RHS. Captured
+        # requirements from every callback are merged into their parent slots.
+        for callback, child_node in zip(
+            context.spec.callbacks(), context.invocation.children(), strict=True
+        ):
+            # Every callback must remain executable in the reconstructed
+            # primitive.  The requested solution layout is therefore also the
+            # callback-result seed; only solve's runtime RHS maps back to the
+            # parent RHS operand below.
+            outputs = tuple(
+                TensorDemand.full(_shape_of(atom))
+                for atom in child_node.payload.plan.jaxpr.outvars
+            )
+            child = _backprop_jaxpr(
+                child_node.payload,
+                self.seed_node.children.get(child_node.frame_step, _SeedNode()),
+                output_demands=outputs,
+            )
+            traces.append(child)
+            for binding, demand in zip(
+                callback.inputs, child.input_demands, strict=True
+            ):
+                if binding.runtime:
+                    if callback.name == "solve" and demand is not None:
+                        outer[context.spec.rhs_indices[0]] = merge_demands(
+                            outer[context.spec.rhs_indices[0]], demand
+                        )
+                elif demand is not None:
+                    i = binding.outer_input_index
+                    assert i is not None
+                    outer[i] = merge_demands(outer[i], demand)
+            # Captures are closure operands of an executable callback. Keep
+            # them live even when a callback body's structural demand rule
+            # cannot see through an opaque linear-algebra primitive.
+            for binding in callback.inputs:
+                if binding.outer_input_index is not None:
+                    i = binding.outer_input_index
+                    outer[i] = merge_demands(
+                        outer[i], TensorDemand.full(_shape_of(eqn.invars[i]))
+                    )
+        return tuple(outer), LinearSolveInvocation(
+            context.invocation.eqn_index, *traces
         )
 
 

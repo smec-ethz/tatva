@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from jax.extend.core import JaxprEqn
-
 from tatva.tracer.core.semantics import (
-    CallTarget,
     DemandContext,
     conservative_demand,
 )
@@ -57,34 +54,6 @@ def _expand_batch_demand(
     return TensorDemand.from_axes(
         shape,
         batch_demand.axes + tuple(_FullAxis() for _ in range(len(shape) - batch_rank)),
-    )
-
-
-def custom_linear_solve_primal_inputs(eqn: JaxprEqn) -> tuple[int, ...]:
-    """Outer operands consumed by the captured primal ``solve`` JAXPR."""
-    lengths = eqn.params["const_lengths"]
-
-    n_matvec = int(lengths.matvec)
-    n_vecmat = int(lengths.vecmat)
-    n_solve = int(lengths.solve)
-    n_transpose_solve = int(lengths.transpose_solve)
-
-    solve_start = n_matvec + n_vecmat
-    rhs_start = solve_start + n_solve + n_transpose_solve
-
-    solve_inputs = tuple(range(solve_start, solve_start + n_solve))
-    rhs_inputs = tuple(range(rhs_start, len(eqn.invars)))
-
-    return solve_inputs + rhs_inputs
-
-
-def custom_linear_solve_call_target(eqn: JaxprEqn) -> CallTarget:
-    """Expose the captured primal solve as an ordinary nested call body."""
-    jaxpr = eqn.params["jaxprs"]
-
-    return CallTarget(
-        body=jaxpr.solve,
-        input_indices=custom_linear_solve_primal_inputs(eqn),
     )
 
 

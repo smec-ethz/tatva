@@ -235,8 +235,16 @@ class CondAnalysisSemantics:
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class LinearSolveAnalysisSemantics:
+    pass
+
+
 type NestedAnalysisSemantics = (
-    CallAnalysisSemantics | ScanAnalysisSemantics | CondAnalysisSemantics
+    CallAnalysisSemantics
+    | ScanAnalysisSemantics
+    | CondAnalysisSemantics
+    | LinearSolveAnalysisSemantics
 )
 
 

@@ -21,6 +21,7 @@ from numpy.typing import NDArray
 from tatva.tracer.core.nested import (
     CallContext,
     CondContext,
+    LinearSolveContext,
     MapContext,
     RepeatedInvocation,
     ScanContext,
@@ -860,6 +861,69 @@ def _lower_nested(
     )
 
 
+def _lower_linear_solve(
+    plan: LocalEqnPlan,
+    context: LinearSolveContext[LocalJaxprPlan],
+    inputs: tuple[Any | None, ...],
+) -> tuple[Any | None, ...]:
+    """Reconstruct the primitive so JAX retains implicit differentiation."""
+
+    def callback(body, bindings):
+        def fn(*runtime_args):
+            rhs = runtime_args[-1]
+            values = []
+            for index, binding in enumerate(bindings):
+                if binding.runtime:
+                    values.append(rhs)
+                else:
+                    value = inputs[binding.outer_input_index]
+                    if value is None:
+                        raise RuntimeError(
+                            "live custom_linear_solve capture is unavailable"
+                        )
+                    source = plan.input_layouts[binding.outer_input_index]
+                    target = body.input_layouts[index]
+                    values.append(
+                        value
+                        if source is None or target is None
+                        else _project_local_value(
+                            value, source_layout=source, target_layout=target
+                        )
+                    )
+            # Child local plans may omit dead captured values, so pass precisely
+            # the live inputs in JAXPR order.
+            local = tuple(
+                v
+                for v, layout in zip(values, body.input_layouts, strict=True)
+                if layout is not None
+            )
+            return _frame_outputs(body, _execute_frame(body, local))[0]
+
+        return fn
+
+    spec = context.spec
+    rhs = inputs[spec.rhs_indices[0]]
+    if rhs is None:
+        return (None,)
+    result = lax.custom_linear_solve(
+        callback(context.invocation.matvec, spec.matvec.inputs),
+        rhs,
+        solve=callback(context.invocation.solve, spec.solve.inputs),
+        transpose_solve=callback(
+            context.invocation.transpose_solve, spec.transpose_solve.inputs
+        ),
+        symmetric=False,
+        has_aux=False,
+    )
+    source_layout = context.invocation.solve.output_layouts[0]
+    target_layout = plan.output_layouts[0]
+    if source_layout is not None and target_layout is not None:
+        result = _project_local_value(
+            result, source_layout=source_layout, target_layout=target_layout
+        )
+    return (result,)
+
+
 @dataclass(frozen=True)
 class _LowerNestedHandler:
     plan: LocalEqnPlan
@@ -876,6 +940,9 @@ class _LowerNestedHandler:
 
     def cond(self, context: CondContext[LocalJaxprPlan]):
         return _lower_cond(self.plan, context, self.inputs)
+
+    def linear_solve(self, context: LinearSolveContext[LocalJaxprPlan]):
+        return _lower_linear_solve(self.plan, context, self.inputs)
 
 
 def _lower_eqn(
