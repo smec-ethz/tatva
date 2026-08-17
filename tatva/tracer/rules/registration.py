@@ -89,6 +89,14 @@ def _register_zero_deps_rules(reg: PrimitiveRegistry) -> None:
     ):
         reg.register(primitive, ZERO_DEPENDENCY)
 
+    reg.register(
+        lax.stop_gradient_p,
+        replace(
+            ZERO_DEPENDENCY,
+            contribution=contribution_rules.transparent_unary,
+        ),
+    )
+
 
 def _register_elementwise_unary_rules(reg: PrimitiveRegistry) -> None:
     reg.register(
@@ -110,7 +118,6 @@ def _register_elementwise_unary_rules(reg: PrimitiveRegistry) -> None:
     for primitive in (
         lax.copy_p,
         lax.convert_element_type_p,
-        lax.stop_gradient_p,
     ):
         reg.register(
             primitive,
@@ -119,12 +126,6 @@ def _register_elementwise_unary_rules(reg: PrimitiveRegistry) -> None:
                 contribution=contribution_rules.transparent_unary,
             ),
         )
-
-    # stop_gradient is wrong right now. It is registered under LINEAR_UNARY in
-    # rules/__init__.py:206–217, which propagates its input dependency. It must produce a zero
-    # DependencySet. Otherwise something like sin(stop_gradient(u)) incorrectly generates
-    # Hessian couplings. This also illustrates why value-provenance and derivative-dependence
-    # must be separate analyses.
 
     for primitive in (
         lax.sin_p,
