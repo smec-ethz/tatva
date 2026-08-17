@@ -15,6 +15,7 @@ primitive demand rules.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -46,6 +47,7 @@ from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import (
     Demand,
     TensorDemand,
+    _FullAxis,
     axis_indices,
     lift_leading_axis_demand,
     merge_demands,
@@ -56,6 +58,73 @@ from tatva.tracer.program.materialize import (
     JaxprInstance,
     ResolvedEqn,
 )
+
+
+def _expand_batch_demand(
+    batch_demand: TensorDemand,
+    *,
+    shape: tuple[int, ...],
+    batch_shape: tuple[int, ...],
+) -> Demand:
+    """Keep selected leading batches and require complete solve-local axes."""
+    batch_rank = len(batch_shape)
+    if shape[:batch_rank] != batch_shape:
+        return None
+    return TensorDemand.from_axes(
+        shape,
+        batch_demand.axes + tuple(_FullAxis() for _ in shape[batch_rank:]),
+    )
+
+
+def _linear_solve_batch_demand(
+    context: LinearSolveContext[JaxprInstance],
+    output_demands: tuple[Demand, ...],
+) -> tuple[tuple[int, ...], TensorDemand] | None:
+    """Return the supported non-broadcasted matrix-solve batch demand.
+
+    We deliberately support the same layout as the LU and triangular-solve
+    rules: a non-empty leading batch prefix followed by two solve axes.
+    """
+    # The outer equation is obtained by the caller; callback validation lives
+    # here because it needs the materialized callback bodies.
+    if len(output_demands) != 1 or output_demands[0] is None:
+        return None
+
+    demand = output_demands[0]
+    assert demand is not None
+    if len(demand.shape) < 3:
+        return None
+
+    batch_shape = demand.shape[:-2]
+    if not batch_shape:
+        return None
+
+    for callback, child in zip(
+        context.spec.callbacks(), context.invocation.children(), strict=True
+    ):
+        if len(child.payload.plan.jaxpr.outvars) != 1:
+            return None
+
+        if (
+            _shape_of(child.payload.plan.jaxpr.outvars[0])[: len(batch_shape)]
+            != batch_shape
+        ):
+            return None
+
+        runtime_index = next(
+            (index for index, binding in enumerate(callback.inputs) if binding.runtime),
+            None,
+        )
+        if runtime_index is None:
+            return None
+
+        runtime_shape = _shape_of(child.payload.plan.jaxpr.invars[runtime_index])
+        if runtime_shape != demand.shape:
+            return None
+
+    return batch_shape, TensorDemand.from_axes(
+        batch_shape, demand.axes[: len(batch_shape)]
+    )  # ty: ignore[invalid-return-type]
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,17 +515,38 @@ class _DemandNestedHandler:
         eqn = self.resolved.plan.eqn
         outer: list[Demand] = [None] * len(eqn.invars)
         traces = []
-        # The solution demand enters the solve callback runtime RHS. Captured
-        # requirements from every callback are merged into their parent slots.
+        batch = _linear_solve_batch_demand(context, self.output_demands)
+        if (
+            batch is None
+            or _shape_of(eqn.invars[context.spec.rhs_indices[0]])
+            != self.output_demands[0].shape  # ty: ignore[unresolved-attribute]
+        ):
+            warnings.warn(
+                "custom_linear_solve does not have a supported batched matrix "
+                "layout; using conservative full callback demands",
+                UserWarning,
+                stacklevel=2,
+            )
+            batch_shape = None
+            batch_demand = None
+        else:
+            batch_shape, batch_demand = batch
+
+        # The solution demand enters every executable callback.  Only solve's
+        # runtime RHS maps back to the outer RHS operand.
         for callback, child_node in zip(
             context.spec.callbacks(), context.invocation.children(), strict=True
         ):
-            # Every callback must remain executable in the reconstructed
-            # primitive.  The requested solution layout is therefore also the
-            # callback-result seed; only solve's runtime RHS maps back to the
-            # parent RHS operand below.
             outputs = tuple(
-                TensorDemand.full(_shape_of(atom))
+                (
+                    TensorDemand.full(_shape_of(atom))
+                    if (batch_demand is None or batch_shape is None)
+                    else _expand_batch_demand(
+                        batch_demand,
+                        shape=_shape_of(atom),
+                        batch_shape=batch_shape,
+                    )
+                )
                 for atom in child_node.payload.plan.jaxpr.outvars
             )
             child = _backprop_jaxpr(
@@ -465,6 +555,7 @@ class _DemandNestedHandler:
                 output_demands=outputs,
             )
             traces.append(child)
+
             for binding, demand in zip(
                 callback.inputs, child.input_demands, strict=True
             ):
@@ -477,15 +568,24 @@ class _DemandNestedHandler:
                     i = binding.outer_input_index
                     assert i is not None
                     outer[i] = merge_demands(outer[i], demand)
+
             # Captures are closure operands of an executable callback. Keep
             # them live even when a callback body's structural demand rule
             # cannot see through an opaque linear-algebra primitive.
             for binding in callback.inputs:
                 if binding.outer_input_index is not None:
                     i = binding.outer_input_index
-                    outer[i] = merge_demands(
-                        outer[i], TensorDemand.full(_shape_of(eqn.invars[i]))
+                    required = (
+                        TensorDemand.full(_shape_of(eqn.invars[i]))
+                        if (batch_demand is None or batch_shape is None)
+                        else _expand_batch_demand(
+                            batch_demand,
+                            shape=_shape_of(eqn.invars[i]),
+                            batch_shape=batch_shape,
+                        )
                     )
+                    outer[i] = merge_demands(outer[i], required)
+
         return tuple(outer), LinearSolveInvocation(
             context.invocation.eqn_index, *traces
         )

@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax import lax
 
 from tatva.tracer.api import trace
@@ -116,7 +117,8 @@ def test_local_custom_linear_solve_preserves_implicit_ad_not_solve_body_ad():
     dof_fn = lambda values: jnp.sum(
         jnp.reshape(implicit_scalar_solve(values[0], values[1]), (1,))
     )
-    local_dof_fn = _local_executable(dof_fn, jnp.asarray([a, b]))
+    with pytest.warns(UserWarning, match="supported batched matrix layout"):
+        local_dof_fn = _local_executable(dof_fn, jnp.asarray([a, b]))
     local_implicit_scalar_solve = lambda aa, bb: local_dof_fn(jnp.asarray([aa, bb]))
 
     local_da, local_db = jax.grad(local_implicit_scalar_solve, argnums=(0, 1))(a, b)

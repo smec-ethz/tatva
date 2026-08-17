@@ -866,7 +866,20 @@ def _lower_linear_solve(
     context: LinearSolveContext[LocalJaxprPlan],
     inputs: tuple[Any | None, ...],
 ) -> tuple[Any | None, ...]:
-    """Reconstruct the primitive so JAX retains implicit differentiation."""
+    """Reconstruct ``custom_linear_solve`` instead of executing ``solve`` directly.
+
+    JAX owns the implicit differentiation rule of the reconstructed primitive. This is
+    essential because the primal ``solve`` callback can be correct while being
+    deliberately unsuitable for algorithmic differentiation (for example, by containing
+    ``stop_gradient``).  Each localized callback closes over its captured parent values,
+    projects them into its own local layout, and uses its final runtime argument as the
+    RHS; JAX passes ``(matvec, rhs)`` to the solve callbacks and just ``rhs`` to matvec.
+
+    The current local ABI supports one RHS/result, ``has_aux=False``, and an explicit
+    transpose solve.  Unsupported solve layouts are handled earlier by liveness with
+    conservative full demands; captures must still be live in the parent local plan when
+    this function is traced.
+    """
 
     def callback(body, bindings):
         def fn(*runtime_args):
@@ -905,6 +918,7 @@ def _lower_linear_solve(
     rhs = inputs[spec.rhs_indices[0]]
     if rhs is None:
         return (None,)
+
     result = lax.custom_linear_solve(
         callback(context.invocation.matvec, spec.matvec.inputs),
         rhs,
@@ -915,12 +929,15 @@ def _lower_linear_solve(
         symmetric=False,
         has_aux=False,
     )
+
     source_layout = context.invocation.solve.output_layouts[0]
     target_layout = plan.output_layouts[0]
+
     if source_layout is not None and target_layout is not None:
         result = _project_local_value(
             result, source_layout=source_layout, target_layout=target_layout
         )
+
     return (result,)
 
 

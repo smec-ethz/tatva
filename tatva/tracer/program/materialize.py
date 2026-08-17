@@ -61,7 +61,6 @@ from tatva.tracer.core.nested import (
     CallSpec,
     CondInvocation,
     CondSpec,
-    FramePath,
     IndexedChild,
     LinearSolveInvocation,
     LinearSolveSpec,

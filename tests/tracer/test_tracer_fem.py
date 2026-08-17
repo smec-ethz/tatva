@@ -130,12 +130,26 @@ def test_tracer_fem():
     n_parts = 6
     rank = 0
     distributed = traced.partition(n_parts=n_parts, partitioning="contiguous")
+    op_slice = next(
+        flat_slice
+        for name, _tree, flat_slice in cap.call_abi.parameter_trees()
+        if name == "op"
+    )
+    for plan in distributed.local_plans:
+        coordinate_layout = next(
+            layout
+            for layout in plan.input_layouts[op_slice]
+            if layout is not None and layout.global_shape == mesh.coords.shape
+        )
+        assert not coordinate_layout.is_full
+        assert coordinate_layout.local_shape[0] < mesh.coords.shape[0]
+
     local = distributed.for_rank(rank)
     energy_local = local.local_function()
     inp = local.localize_inputs(
         jnp.zeros(lifter.size_reduced), lifter=lifter.at("u").set(1.0), mat=mat, op=op
     )
-    z_local, op_local, lifter_local, mat_local = inp[0]
+    _z_local, op_local, lifter_local, mat_local = inp[0]
 
     # execute the local function
 
