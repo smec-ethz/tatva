@@ -230,7 +230,14 @@ class ScanAnalysisSemantics:
     pass
 
 
-type NestedAnalysisSemantics = CallAnalysisSemantics | ScanAnalysisSemantics
+@dataclass(frozen=True, slots=True)
+class CondAnalysisSemantics:
+    pass
+
+
+type NestedAnalysisSemantics = (
+    CallAnalysisSemantics | ScanAnalysisSemantics | CondAnalysisSemantics
+)
 
 
 @dataclass(frozen=True, slots=True)

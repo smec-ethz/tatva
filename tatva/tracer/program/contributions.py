@@ -36,6 +36,7 @@ from jax.extend.core import Literal, Var
 
 from tatva.tracer.core.nested import (
     CallContext,
+    CondContext,
     FramePath,
     MapContext,
     ScanContext,
@@ -251,8 +252,13 @@ class _ContributionNestedHandler:
     ) -> tuple[list[_RootCandidate], list[_Seed]]:
         return ([self._trace_opaque_nested()], [])
 
+    def cond(
+        self, context: CondContext[JaxprInstance]
+    ) -> tuple[list[_RootCandidate], list[_Seed]]:
+        return self._trace_call(context)
+
     def _trace_call(
-        self, context: CallContext[JaxprInstance]
+        self, context: CallContext[JaxprInstance] | CondContext[JaxprInstance]
     ) -> tuple[list[_RootCandidate], list[_Seed]]:
         """Trace transparently through a call/remat child frame."""
         nested = context.invocation

@@ -2,6 +2,7 @@ from jax.extend.core import Primitive
 
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
+    CondAnalysisSemantics,
     NestedOperationSemantics,
     OperationSemantics,
     RegisteredOperationSemantics,
@@ -32,21 +33,27 @@ class PrimitiveRegistry:
         return self._rules.get(primitive)
 
     def get(self, primitive: Primitive) -> RegisteredOperationSemantics:
-        try:
-            return self._rules[primitive]
-        except KeyError:
-            raise NotImplementedError(
-                f"No semantics registered for {primitive.name}"
-            ) from None
+        rule = self.try_get(primitive)
+        if rule is None:
+            raise KeyError(f"No semantics registered for primitive {primitive.name}")
+        return rule
 
     def get_ordinary(self, primitive: Primitive) -> OperationSemantics:
         rule = self.get(primitive)
-        if isinstance(rule, NestedOperationSemantics):
+        if not isinstance(rule, OperationSemantics):
             raise TypeError(
-                f"Primitive {primitive.name} is a nested operation; "
-                "ordinary primitive semantics were requested"
+                f"Expected ordinary OperationSemantics for {primitive.name}, "
+                f"got {type(rule).__name__}"
             )
+        return rule
 
+    def get_nested(self, primitive: Primitive) -> NestedOperationSemantics:
+        rule = self.get(primitive)
+        if not isinstance(rule, NestedOperationSemantics):
+            raise TypeError(
+                f"Expected NestedOperationSemantics for {primitive.name}, "
+                f"got {type(rule).__name__}"
+            )
         return rule
 
     def validate(self) -> None:
@@ -56,7 +63,11 @@ class PrimitiveRegistry:
             if isinstance(rule, NestedOperationSemantics):
                 if not isinstance(
                     rule.analysis,
-                    (CallAnalysisSemantics, ScanAnalysisSemantics),
+                    (
+                        CallAnalysisSemantics,
+                        ScanAnalysisSemantics,
+                        CondAnalysisSemantics,
+                    ),
                 ):
                     errors.append(
                         f"{primitive.name}: unsupported nested analysis "

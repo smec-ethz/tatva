@@ -9,6 +9,7 @@ from tatva.tracer.core.nested import normalize_nested_jaxpr
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
+    CondAnalysisSemantics,
     NestedOperationSemantics,
     ScanAnalysisSemantics,
 )
@@ -76,6 +77,16 @@ def _nested_jaxprs(
             )
 
         return (normalize_nested_jaxpr(value).jaxpr,)
+
+    if isinstance(analysis, CondAnalysisSemantics):
+        branches = eqn.params.get("branches")
+
+        if branches is None:
+            raise RuntimeError(
+                f"cond primitive {eqn.primitive.name!r} does not contain a 'branches' parameter"
+            )
+
+        return tuple(normalize_nested_jaxpr(b).jaxpr for b in branches)
 
     raise TypeError(f"unsupported nested analysis semantics {type(analysis).__name__}")
 

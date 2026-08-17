@@ -40,6 +40,7 @@ from jax.extend.core import Jaxpr, JaxprEqn, Var
 
 from tatva.tracer.core.nested import (
     CallSpec,
+    CondSpec,
     MapSpec,
     NestedJaxpr,
     NestedSpec,
@@ -49,6 +50,7 @@ from tatva.tracer.core.nested import (
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
+    CondAnalysisSemantics,
     NestedAnalysisSemantics,
     NestedOperationSemantics,
     ScanAnalysisSemantics,
@@ -60,9 +62,17 @@ class NestedPlan:
     """A phase-independent nested body plus its control-flow specification."""
 
     spec: NestedSpec
-    body: JaxprPlan
-    consts: tuple[object, ...]
+    branches: tuple[JaxprPlan, ...]
+    branch_consts: tuple[tuple[object, ...], ...]
     concrete_inputs: frozenset[int]
+
+    @property
+    def body(self) -> JaxprPlan:
+        return self.branches[0]
+
+    @property
+    def consts(self) -> tuple[object, ...]:
+        return self.branch_consts[0]
 
 
 @dataclass(frozen=True)
@@ -253,6 +263,12 @@ def _analyze_nested(
             concrete_outputs=concrete_outputs,
         )
 
+    if isinstance(semantics, CondAnalysisSemantics):
+        return _analyze_cond(
+            eqn,
+            concrete_outputs=concrete_outputs,
+        )
+
     raise TypeError(f"unsupported nested analysis semantics {type(semantics).__name__}")
 
 
@@ -291,9 +307,56 @@ def _analyze_call(
 
     return NestedPlan(
         spec=spec,
-        body=body,
-        consts=nested.consts,
+        branches=(body,),
+        branch_consts=(nested.consts,),
         concrete_inputs=concrete_inputs,
+    )
+
+
+def _analyze_cond(
+    eqn: JaxprEqn,
+    *,
+    concrete_outputs: frozenset[int],
+) -> NestedPlan:
+    branches_raw = eqn.params.get("branches")
+    if branches_raw is None:
+        raise ValueError(f"{eqn.primitive.name} is missing 'branches' parameter")
+
+    branches = tuple(normalize_nested_jaxpr(b) for b in branches_raw)
+    spec = CondSpec(num_branches=len(branches))
+
+    num_operands = len(eqn.invars) - 1
+    if num_operands < 0:
+        raise ValueError(f"{eqn.primitive.name} has no branch selector input")
+
+    for idx, b in enumerate(branches):
+        if len(b.jaxpr.outvars) != len(eqn.outvars):
+            raise ValueError(
+                f"{eqn.primitive.name} has {len(eqn.outvars)} outer outputs "
+                f"but branch {idx} has {len(b.jaxpr.outvars)} outputs"
+            )
+        if len(b.jaxpr.invars) != num_operands:
+            raise ValueError(
+                f"{eqn.primitive.name} has {num_operands} operand inputs "
+                f"but branch {idx} has {len(b.jaxpr.invars)} inputs"
+            )
+
+    branch_plans = tuple(
+        analyze(b.jaxpr, concrete_outputs=concrete_outputs) for b in branches
+    )
+
+    concrete_inputs = {0}
+    for b_plan in branch_plans:
+        for child_index in b_plan.concrete_inputs:
+            concrete_inputs.add(
+                spec.outer_input_index(child_index, outer_arity=len(eqn.invars))
+            )
+
+    return NestedPlan(
+        spec=spec,
+        branches=branch_plans,
+        branch_consts=tuple(b.consts for b in branches),
+        concrete_inputs=frozenset(concrete_inputs),
     )
 
 
@@ -375,8 +438,8 @@ def _analyze_scan(
                 length=length,
                 reverse=reverse,
             ),
-            body=body_plan,
-            consts=nested.consts,
+            branches=(body_plan,),
+            branch_consts=(nested.consts,),
             concrete_inputs=frozenset(required_outer_inputs),
         )
 
@@ -428,8 +491,8 @@ def _analyze_scan(
             length=length,
             reverse=reverse,
         ),
-        body=body_plan,
-        consts=nested.consts,
+        branches=(body_plan,),
+        branch_consts=(nested.consts,),
         concrete_inputs=scan_concrete_inputs,
     )
 
@@ -467,7 +530,7 @@ def _analyze_carry_free_scan(
 
     return NestedPlan(
         spec=MapSpec(num_consts=num_consts, length=length, reverse=reverse),
-        body=body_plan,
-        consts=nested.consts,
+        branches=(body_plan,),
+        branch_consts=(nested.consts,),
         concrete_inputs=concrete_inputs,
     )

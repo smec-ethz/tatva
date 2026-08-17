@@ -36,6 +36,9 @@ from tatva.tracer.core.nested import (
     CallContext,
     CallInvocation,
     CallSpec,
+    CondContext,
+    CondInvocation,
+    CondSpec,
     IndexedChild,
     MapContext,
     MapSpec,
@@ -195,6 +198,24 @@ def _plan_call(
     )
 
 
+def _plan_cond(
+    instance: CondInvocation[JaxprInstance],
+    trace: CondInvocation[JaxprDemandTrace],
+    spec: CondSpec,
+) -> LocalNestedPlan:
+    return LocalNestedPlan(
+        spec=spec,
+        invocation=CondInvocation(
+            instance.eqn_index,
+            instance.branch_index,
+            _build_local_jaxpr_plan(
+                instance.body,
+                trace.body,
+            ),
+        ),
+    )
+
+
 def _plan_map(
     instance: RepeatedInvocation[JaxprInstance],
     trace: RepeatedInvocation[JaxprDemandTrace],
@@ -293,6 +314,13 @@ class _LocalPlanNestedHandler:
         return _plan_scan(
             context.invocation,
             cast(RepeatedInvocation[JaxprDemandTrace], self.trace),
+            context.spec,
+        )
+
+    def cond(self, context: CondContext[JaxprInstance]) -> LocalNestedPlan:
+        return _plan_cond(
+            context.invocation,
+            cast(CondInvocation[JaxprDemandTrace], self.trace),
             context.spec,
         )
 
