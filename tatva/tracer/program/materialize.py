@@ -59,6 +59,8 @@ from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallInvocation,
     CallSpec,
+    CondInvocation,
+    CondSpec,
     FramePath,
     IndexedChild,
     MapSpec,
@@ -456,6 +458,65 @@ def _materialize_map(
     )
 
 
+def _materialize_cond(
+    eqn_plan: EqnPlan,
+    nested_plan: NestedPlan,
+    spec: CondSpec,
+    parent_env: ConcreteEnv,
+) -> ResolvedEqn:
+    eqn = eqn_plan.eqn
+    pred_val = _read(parent_env, eqn.invars[0])
+    if pred_val is None:
+        raise DynamicRoutingError(
+            f"cond equation {eqn_plan.index} predicate depends on dynamic "
+            "DOF values that are unavailable during planning"
+        )
+    branch_index = int(np.asarray(pred_val))
+    if branch_index < 0 or branch_index >= spec.num_branches:
+        raise DynamicRoutingError(
+            f"cond equation {eqn_plan.index} branch index {branch_index} "
+            f"out of range [0, {spec.num_branches})"
+        )
+
+    operand_inputs = tuple(
+        _read(parent_env, atom) for atom in spec.select_inputs(eqn.invars)
+    )
+    for child_index in nested_plan.branches[branch_index].concrete_inputs:
+        if operand_inputs[child_index] is None:
+            outer_index = spec.outer_input_index(
+                child_index, outer_arity=len(eqn.invars)
+            )
+            raise DynamicRoutingError(
+                f"cond branch {branch_index} input {child_index} (outer input {outer_index}) "
+                "is required concretely for routing inside the branch, but is unavailable"
+            )
+
+    child = _materialize_jaxpr(
+        nested_plan.branches[branch_index],
+        input_values=operand_inputs,
+        const_values=nested_plan.branch_consts[branch_index],
+    )
+
+    for output_index in eqn_plan.concrete_outputs:
+        val = child.output_values[output_index]
+        if val is None:
+            raise DynamicRoutingError(
+                f"cond output {output_index} is required concretely but "
+                "the active branch computation did not materialize it"
+            )
+        _write(parent_env, eqn.outvars[output_index], val)
+
+    return ResolvedEqn(
+        plan=eqn_plan,
+        route=None,
+        nested=CondInvocation(
+            eqn_index=eqn_plan.index,
+            branch_index=branch_index,
+            body=child,
+        ),
+    )
+
+
 def _materialize_eqn(
     eqn_plan: EqnPlan,
     env: ConcreteEnv,
@@ -484,6 +545,9 @@ class _MaterializeNestedHandler:
 
     def scan(self, spec: ScanSpec) -> ResolvedEqn:
         return _materialize_scan(self.eqn_plan, self.nested_plan, spec, self.env)
+
+    def cond(self, spec: CondSpec) -> ResolvedEqn:
+        return _materialize_cond(self.eqn_plan, self.nested_plan, spec, self.env)
 
 
 def _materialize_jaxpr(
@@ -663,6 +727,21 @@ def _eval_iota(_inputs, params):
     return (np.broadcast_to(np.arange(shp[dim]).reshape(newshp), shp),)
 
 
+try:
+    from jax._src.lax.control_flow import platform_index_p
+
+    @register(platform_index_p)
+    def _eval_platform_index(_inputs, params):
+        platforms = params.get("platforms", ("cpu",))
+        import jax
+
+        backend = jax.default_backend()
+        idx = platforms.index(backend) if backend in platforms else 0
+        return (np.int32(idx),)
+except ImportError:
+    pass
+
+
 @register(lax.select_n_p)
 def eval_select_n(inputs, _params):
     selector = np.asarray(inputs[0])
@@ -675,3 +754,9 @@ def eval_select_n(inputs, _params):
         result = np.where(selector == index, case, result)
 
     return (result,)
+
+
+@register(lax.clamp_p)
+def eval_clamp(inputs, _params):
+    min_val, x_val, max_val = inputs
+    return (np.clip(np.asarray(x_val), np.asarray(min_val), np.asarray(max_val)),)

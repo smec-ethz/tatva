@@ -12,6 +12,7 @@ class NestedKind(Enum):
     CALL = auto()
     MAP = auto()
     SCAN = auto()
+    COND = auto()
 
 
 class CallKind(Enum):
@@ -64,6 +65,28 @@ class CallSpec:
         return indices[child_index]
 
 
+@dataclass(frozen=True)
+class CondSpec:
+    num_branches: int
+
+    @property
+    def kind(self) -> NestedKind:
+        return NestedKind.COND
+
+    def select_inputs[T](self, inputs: Sequence[T]) -> tuple[T, ...]:
+        """Extract operand inputs (skipping index 0, the branch selector)."""
+        return tuple(inputs[1:])
+
+    def outer_input_index(self, child_index: int, *, outer_arity: int) -> int:
+        """Map child operand index to outer equation index (offset by +1)."""
+        outer_index = 1 + child_index
+        if outer_index >= outer_arity:
+            raise IndexError(
+                f"cond child index {child_index} outside outer arity {outer_arity}"
+            )
+        return outer_index
+
+
 class RepeatedSpec:
     length: int
     reverse: bool
@@ -96,13 +119,14 @@ class ScanSpec(RepeatedSpec):
         return NestedKind.SCAN
 
 
-type NestedSpec = CallSpec | MapSpec | ScanSpec
+type NestedSpec = CallSpec | MapSpec | ScanSpec | CondSpec
 
 
 class NestedSpecHandler[R](Protocol):
     def call(self, spec: CallSpec) -> R: ...
     def map(self, spec: MapSpec) -> R: ...
     def scan(self, spec: ScanSpec) -> R: ...
+    def cond(self, spec: CondSpec) -> R: ...
 
 
 def dispatch_nested_spec[R](spec: NestedSpec, handler: NestedSpecHandler[R]) -> R:
@@ -112,6 +136,8 @@ def dispatch_nested_spec[R](spec: NestedSpec, handler: NestedSpecHandler[R]) -> 
         return handler.map(spec)
     if isinstance(spec, ScanSpec):
         return handler.scan(spec)
+    if isinstance(spec, CondSpec):
+        return handler.cond(spec)
     raise AssertionError(f"unsupported nested spec {spec!r}")
 
 
@@ -269,7 +295,46 @@ class RepeatedInvocation[T]:
         return RepeatedInvocation(eqn_index, spec.kind, iterations)
 
 
-type AnyNestedInvocation[T] = CallInvocation[T] | RepeatedInvocation[T]
+@dataclass(frozen=True)
+class CondInvocation[T]:
+    eqn_index: int
+    branch_index: int
+    body: T
+
+    @property
+    def kind(self) -> NestedKind:
+        return NestedKind.COND
+
+    def children(
+        self, order: TraversalOrder = TraversalOrder.EXECUTION
+    ) -> tuple[NestedChild[T], ...]:
+        del order
+        step = FrameStep(
+            eqn_index=self.eqn_index,
+            kind=NestedKind.COND,
+            iteration=self.branch_index,
+        )
+        return (NestedChild(self.body, step, self.branch_index),)
+
+    def child_at(self, step: FrameStep) -> T:
+        _validate_step(self.eqn_index, self.kind, step)
+        if step.iteration != self.branch_index:
+            raise KeyError(
+                f"cond has active branch {self.branch_index}, requested {step.iteration}"
+            )
+        return self.body
+
+    def map_children[U](self, fn: Callable[[NestedChild[T]], U]) -> CondInvocation[U]:
+        return CondInvocation(
+            self.eqn_index,
+            self.branch_index,
+            fn(self.children()[0]),
+        )
+
+
+type AnyNestedInvocation[T] = (
+    CallInvocation[T] | RepeatedInvocation[T] | CondInvocation[T]
+)
 
 
 @dataclass(frozen=True)
@@ -290,7 +355,13 @@ class ScanContext[T]:
     invocation: RepeatedInvocation[T]
 
 
-type NestedContext[T] = CallContext[T] | MapContext[T] | ScanContext[T]
+@dataclass(frozen=True)
+class CondContext[T]:
+    spec: CondSpec
+    invocation: CondInvocation[T]
+
+
+type NestedContext[T] = CallContext[T] | MapContext[T] | ScanContext[T] | CondContext[T]
 
 
 def _validate_step(eqn_index: int, kind: NestedKind, step: FrameStep) -> None:
@@ -305,6 +376,7 @@ class NestedHandler[T, R](Protocol):
     def call(self, context: CallContext[T]) -> R: ...
     def map(self, context: MapContext[T]) -> R: ...
     def scan(self, context: ScanContext[T]) -> R: ...
+    def cond(self, context: CondContext[T]) -> R: ...
 
 
 def dispatch_nested[T, R](
@@ -327,6 +399,8 @@ def dispatch_nested[T, R](
         and node.kind is NestedKind.SCAN
     ):
         return handler.scan(ScanContext(spec, cast(RepeatedInvocation[T], node)))
+    if isinstance(spec, CondSpec) and isinstance(node, CondInvocation):
+        return handler.cond(CondContext(spec, cast(CondInvocation[T], node)))
     raise TypeError(
         f"nested spec/invocation mismatch: {spec.kind.name.lower()} spec with "
         f"{node.kind.name.lower()} invocation"

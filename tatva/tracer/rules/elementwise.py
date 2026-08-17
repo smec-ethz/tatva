@@ -278,3 +278,33 @@ ELEMENTWISE_BINARY_BASIC = OperationSemantics(
     ),
     demand=elementwise_demand,
 )
+
+
+def prepare_elementwise_nary(ctx: RuleContext) -> tuple[DependencySet, ...]:
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    return tuple(
+        dep.reshape(*output_shape) if dep.shape != output_shape else dep
+        for dep in ctx.input_deps
+    )
+
+
+def nary_union_dependencies(
+    ctx: RuleContext,
+    prepared: tuple[DependencySet, ...],
+) -> tuple[DependencySet, ...]:
+    if not prepared:
+        return (DependencySet.empty(_shape_of(ctx.eqn.outvars[0]), ctx.n_dofs),)
+    res = prepared[0]
+    for other in prepared[1:]:
+        res = res | other
+    return (res,)
+
+
+ELEMENTWISE_NARY_BASIC = OperationSemantics(
+    DerivativeRule(
+        prepare=prepare_elementwise_nary,
+        dependencies=nary_union_dependencies,
+        hessian=no_hessian,
+    ),
+    demand=elementwise_demand,
+)

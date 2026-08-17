@@ -20,6 +20,7 @@ from numpy.typing import NDArray
 
 from tatva.tracer.core.nested import (
     CallContext,
+    CondContext,
     MapContext,
     RepeatedInvocation,
     ScanContext,
@@ -266,6 +267,72 @@ def _lower_call(
             raise RuntimeError(
                 f"{plan.primitive_name}: live outer output {output_index} "
                 "is unavailable from child call"
+            )
+
+        result.append(
+            _project_local_value(
+                value,
+                source_layout=source_layout,
+                target_layout=target_layout,
+            )
+        )
+
+    return tuple(result)
+
+
+def _lower_cond(
+    plan: LocalEqnPlan,
+    context: CondContext[LocalJaxprPlan],
+    inputs: tuple[Any | None, ...],
+) -> tuple[Any | None, ...]:
+    body = context.invocation.body
+    child_inputs: list[Any] = []
+
+    for child_index in range(len(body.input_layouts)):
+        target_layout = body.input_layouts[child_index]
+        if target_layout is None:
+            continue
+
+        outer_index = context.spec.outer_input_index(
+            child_index, outer_arity=len(inputs)
+        )
+        value = inputs[outer_index]
+        source_layout = plan.input_layouts[outer_index]
+
+        if value is None or source_layout is None:
+            raise RuntimeError(
+                f"{plan.primitive_name}: live child input {child_index} "
+                f"maps to dead outer input {outer_index}"
+            )
+
+        child_inputs.append(
+            _project_local_value(
+                value,
+                source_layout=source_layout,
+                target_layout=target_layout,
+            )
+        )
+
+    env = _execute_frame(body, tuple(child_inputs))
+    child_outputs = _frame_outputs(body, env)
+
+    result: list[Any | None] = []
+    for output_index, (value, source_layout, target_layout) in enumerate(
+        zip(
+            child_outputs,
+            body.output_layouts,
+            plan.output_layouts,
+            strict=True,
+        )
+    ):
+        if target_layout is None:
+            result.append(None)
+            continue
+
+        if value is None or source_layout is None:
+            raise RuntimeError(
+                f"{plan.primitive_name}: live outer output {output_index} "
+                "is unavailable from child cond"
             )
 
         result.append(
@@ -806,6 +873,9 @@ class _LowerNestedHandler:
 
     def scan(self, context: ScanContext[LocalJaxprPlan]):
         return _lower_scan(self.plan, context, self.inputs)
+
+    def cond(self, context: CondContext[LocalJaxprPlan]):
+        return _lower_cond(self.plan, context, self.inputs)
 
 
 def _lower_eqn(

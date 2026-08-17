@@ -2,6 +2,9 @@ import pytest
 
 from tatva.tracer.core.nested import (
     CallInvocation,
+    CondContext,
+    CondInvocation,
+    CondSpec,
     FrameStep,
     IndexedChild,
     MapContext,
@@ -12,6 +15,20 @@ from tatva.tracer.core.nested import (
     collect_logical_output,
     dispatch_nested,
 )
+
+
+def test_cond_invocation_owns_its_frame_step_and_child_lookup():
+    invocation = CondInvocation(eqn_index=5, branch_index=1, body="branch_1")
+    child = invocation.children()[0]
+
+    assert invocation.kind is NestedKind.COND
+    assert child.frame_step == FrameStep(5, NestedKind.COND, iteration=1)
+    assert child.logical_index == 1
+    assert invocation.child_at(child.frame_step) == "branch_1"
+
+    mapped = invocation.map_children(lambda c: c.payload.upper())
+    assert mapped.body == "BRANCH_1"
+    assert mapped.branch_index == 1
 
 
 def test_call_invocation_owns_its_frame_step_and_child_lookup():

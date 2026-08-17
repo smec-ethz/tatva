@@ -62,6 +62,8 @@ from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallContext,
     CallInvocation,
+    CondContext,
+    CondInvocation,
     IndexedChild,
     MapContext,
     RepeatedInvocation,
@@ -273,6 +275,14 @@ class _DerivativeNestedHandler:
             n_dofs=self.n_dofs,
         )
 
+    def cond(self, context: CondContext[JaxprInstance]):
+        return _trace_cond(
+            context=context,
+            input_deps=self.input_deps,
+            acc=self.acc,
+            n_dofs=self.n_dofs,
+        )
+
 
 def _trace_ordinary_eqn(
     *,
@@ -369,6 +379,39 @@ def _trace_call(
         body_trace.output_deps,
         NestedDerivativeTrace(
             invocation=CallInvocation(nested.eqn_index, body_trace), template=None
+        ),
+    )
+
+
+def _trace_cond(
+    *,
+    context: CondContext[JaxprInstance],
+    input_deps: tuple[DependencySet, ...],
+    acc: HessianAccumulator,
+    n_dofs: int,
+) -> tuple[
+    tuple[DependencySet, ...],
+    NestedDerivativeTrace,
+]:
+    nested = context.invocation
+    child_input_deps = context.spec.select_inputs(input_deps)
+
+    body_trace = _trace_jaxpr(
+        instance=nested.body,
+        input_deps=child_input_deps,
+        acc=acc,
+        n_dofs=n_dofs,
+    )
+
+    return (
+        body_trace.output_deps,
+        NestedDerivativeTrace(
+            invocation=CondInvocation(
+                nested.eqn_index,
+                nested.branch_index,
+                body_trace,
+            ),
+            template=None,
         ),
     )
 

@@ -15,6 +15,7 @@ from tatva.tracer.core.routes import (
 )
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
+    CondAnalysisSemantics,
     DerivativeRule,
     LocalizationSemantics,
     NestedOperationSemantics,
@@ -25,6 +26,7 @@ from tatva.tracer.core.semantics import (
 from tatva.tracer.lowering import rules as lowerings
 from tatva.tracer.rules.elementwise import (
     ELEMENTWISE_BINARY_BASIC,
+    ELEMENTWISE_NARY_BASIC,
     INTEGER_POW,
     LINEAR_UNARY,
     NONLINEAR_UNARY,
@@ -191,6 +193,8 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
         lax.max_p,
     ):
         reg.register(primitive, ELEMENTWISE_BINARY_BASIC)
+
+    reg.register(lax.clamp_p, ELEMENTWISE_NARY_BASIC)
 
     reg.register(
         lax.mul_p,
@@ -550,6 +554,13 @@ def _register_nested_rules(
         primitives.scan_p,
         NestedOperationSemantics(
             analysis=ScanAnalysisSemantics(),
+        ),
+    )
+
+    reg.register(
+        lax.cond_p,
+        NestedOperationSemantics(
+            analysis=CondAnalysisSemantics(),
         ),
     )
 

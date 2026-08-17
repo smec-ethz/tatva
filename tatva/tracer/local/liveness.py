@@ -26,6 +26,8 @@ from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallContext,
     CallInvocation,
+    CondContext,
+    CondInvocation,
     FrameStep,
     IndexedChild,
     MapContext,
@@ -173,6 +175,40 @@ def _backprop_call(
     return (
         tuple(outer_demands),
         CallInvocation(eqn_index=nested.eqn_index, body=child),
+    )
+
+
+def _backprop_cond(
+    resolved: ResolvedEqn,
+    context: CondContext[JaxprInstance],
+    output_demands: tuple[Demand, ...],
+    child_seed: _SeedNode | None,
+) -> tuple[
+    tuple[Demand, ...],
+    CondInvocation[JaxprDemandTrace],
+]:
+    nested = context.invocation
+
+    child = _backprop_jaxpr(
+        nested.body,
+        child_seed or _SeedNode(),
+        output_demands=output_demands,
+    )
+
+    outer_demands: list[Demand] = [None] * len(resolved.plan.eqn.invars)
+    for child_index, demand in enumerate(child.input_demands):
+        outer_index = context.spec.outer_input_index(
+            child_index, outer_arity=len(outer_demands)
+        )
+        outer_demands[outer_index] = merge_demands(outer_demands[outer_index], demand)
+
+    return (
+        tuple(outer_demands),
+        CondInvocation(
+            eqn_index=nested.eqn_index,
+            branch_index=nested.branch_index,
+            body=child,
+        ),
     )
 
 
@@ -391,6 +427,17 @@ class _DemandNestedHandler:
     ) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
         return _backprop_scan(
             self.resolved, context, self.output_demands, self.seed_node
+        )
+
+    def cond(
+        self, context: CondContext[JaxprInstance]
+    ) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
+        child_step = context.invocation.children()[0].frame_step
+        return _backprop_cond(
+            self.resolved,
+            context,
+            self.output_demands,
+            self.seed_node.children.get(child_step),
         )
 
 
