@@ -67,27 +67,6 @@ type Route = (
 type RouteEnv = Mapping[JaxprEqn, Route]
 
 
-def resolve_routes(
-    eqns: tuple[JaxprEqn, ...],
-    concrete: ConcreteEnv,
-) -> RouteEnv:
-    # Import lazily: rules import Route for their type signatures, while route
-    # resolution needs the populated semantic registry only at execution time.
-    from tatva.tracer.core.registry import SEMANTICS
-
-    routes: dict[JaxprEqn, Route] = {}
-
-    for eqn in eqns:
-        rule = SEMANTICS.get_ordinary(eqn.primitive)
-
-        route = rule.route(eqn, concrete)
-
-        if route is not None:
-            routes[eqn] = route
-
-    return routes
-
-
 def resolve_gather_route(
     eqn: JaxprEqn,
     concrete: ConcreteEnv,

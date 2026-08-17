@@ -429,9 +429,6 @@ class CondContext[T]:
     invocation: CondInvocation[T]
 
 
-type NestedContext[T] = CallContext[T] | MapContext[T] | ScanContext[T] | CondContext[T]
-
-
 @dataclass(frozen=True)
 class LinearSolveContext[T]:
     spec: LinearSolveSpec

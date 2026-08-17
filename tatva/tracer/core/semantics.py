@@ -140,11 +140,6 @@ class DemandContext:
     route: Route | None
 
 
-@dataclass(frozen=True)
-class DemandResult:
-    inputs: tuple[TensorDemand | None, ...]
-
-
 type ConcreteInputRule = Callable[[JaxprEqn], tuple[int, ...]]
 type RouteRule = Callable[[JaxprEqn, ConcreteEnv], Route | None]
 type DemandRule = Callable[[DemandContext], tuple[Demand, ...]]
