@@ -17,6 +17,7 @@ from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     CondAnalysisSemantics,
     DerivativeRule,
+    LinearSolveAnalysisSemantics,
     LocalizationSemantics,
     NestedOperationSemantics,
     OperationSemantics,
@@ -550,12 +551,7 @@ def _register_nested_rules(
 
     reg.register(
         lax.linear_solve_p,
-        NestedOperationSemantics(
-            analysis=CallAnalysisSemantics(
-                call_kind=CallKind.CUSTOM_LINEAR_SOLVE,
-                target=linalg.custom_linear_solve_call_target,
-            )
-        ),
+        NestedOperationSemantics(analysis=LinearSolveAnalysisSemantics()),
     )
 
     reg.register(

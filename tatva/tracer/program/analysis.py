@@ -39,8 +39,11 @@ from dataclasses import dataclass
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
 from tatva.tracer.core.nested import (
+    CallbackBinding,
     CallSpec,
     CondSpec,
+    LinearSolveCallbackSpec,
+    LinearSolveSpec,
     MapSpec,
     NestedJaxpr,
     NestedSpec,
@@ -51,6 +54,7 @@ from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     CondAnalysisSemantics,
+    LinearSolveAnalysisSemantics,
     NestedAnalysisSemantics,
     NestedOperationSemantics,
     ScanAnalysisSemantics,
@@ -268,8 +272,69 @@ def _analyze_nested(
             eqn,
             concrete_outputs=concrete_outputs,
         )
+    if isinstance(semantics, LinearSolveAnalysisSemantics):
+        return _analyze_linear_solve(eqn, concrete_outputs=concrete_outputs)
 
     raise TypeError(f"unsupported nested analysis semantics {type(semantics).__name__}")
+
+
+def _analyze_linear_solve(
+    eqn: JaxprEqn, *, concrete_outputs: frozenset[int]
+) -> NestedPlan:
+    """Analyze all executable custom-linear-solve callbacks.
+
+    JAX stores captured callback constants in consecutive operand blocks; each
+    callback receives those captures followed by one runtime vector argument.
+    """
+    if bool(eqn.params.get("has_aux", False)):
+        raise NotImplementedError("custom_linear_solve(has_aux=True) is not supported")
+    if len(eqn.outvars) != 1 or len(eqn.invars) < 1:
+        raise NotImplementedError(
+            "custom_linear_solve currently requires one RHS/result"
+        )
+    lengths = eqn.params["const_lengths"]
+    jaxprs = eqn.params["jaxprs"]
+    sizes = (int(lengths.matvec), int(lengths.solve), int(lengths.transpose_solve))
+    starts = (
+        0,
+        int(lengths.matvec) + int(lengths.vecmat),
+        int(lengths.matvec) + int(lengths.vecmat) + int(lengths.solve),
+    )
+    rhs_start = starts[2] + int(lengths.transpose_solve)
+    rhs_indices = tuple(range(rhs_start, len(eqn.invars)))
+    if len(rhs_indices) != 1:
+        raise NotImplementedError("custom_linear_solve currently requires one RHS")
+    raw = (jaxprs.matvec, jaxprs.solve, jaxprs.transpose_solve)
+    names = ("matvec", "solve", "transpose_solve")
+    bodies: list[JaxprPlan] = []
+    consts: list[tuple[object, ...]] = []
+    callbacks: list[LinearSolveCallbackSpec] = []
+    concrete: set[int] = set()
+    for name, value, start, size in zip(names, raw, starts, sizes, strict=True):
+        child = normalize_nested_jaxpr(value)
+        bindings = tuple(CallbackBinding(i) for i in range(start, start + size)) + (
+            CallbackBinding(),
+        )
+        if len(child.jaxpr.invars) != len(bindings):
+            raise ValueError(f"custom_linear_solve {name} callback input mismatch")
+        # Callback output routing is independent of solution demand, but it is
+        # still traversed so captured concrete requirements are propagated.
+        # The runtime vector is unavailable during planning, so solution demand
+        # must not be converted into a concrete callback-output requirement.
+        body = analyze(child.jaxpr)
+        for i in body.concrete_inputs:
+            binding = bindings[i]
+            if binding.outer_input_index is not None:
+                concrete.add(binding.outer_input_index)
+        bodies.append(body)
+        consts.append(child.consts)
+        callbacks.append(LinearSolveCallbackSpec(name, bindings))
+    return NestedPlan(
+        spec=LinearSolveSpec(*callbacks, rhs_indices=rhs_indices, has_aux=False),
+        branches=tuple(bodies),
+        branch_consts=tuple(consts),
+        concrete_inputs=frozenset(concrete),
+    )
 
 
 def _analyze_call(

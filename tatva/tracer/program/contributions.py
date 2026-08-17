@@ -38,6 +38,7 @@ from tatva.tracer.core.nested import (
     CallContext,
     CondContext,
     FramePath,
+    LinearSolveContext,
     MapContext,
     ScanContext,
     dispatch_nested,
@@ -256,6 +257,11 @@ class _ContributionNestedHandler:
         self, context: CondContext[JaxprInstance]
     ) -> tuple[list[_RootCandidate], list[_Seed]]:
         return self._trace_call(context)
+
+    def linear_solve(
+        self, context: LinearSolveContext[JaxprInstance]
+    ) -> tuple[list[_RootCandidate], list[_Seed]]:
+        return ([self._trace_opaque_nested()], [])
 
     def _trace_call(
         self, context: CallContext[JaxprInstance] | CondContext[JaxprInstance]

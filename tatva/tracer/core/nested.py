@@ -13,12 +13,12 @@ class NestedKind(Enum):
     MAP = auto()
     SCAN = auto()
     COND = auto()
+    LINEAR_SOLVE = auto()
 
 
 class CallKind(Enum):
     JIT = auto()
     REMAT = auto()
-    CUSTOM_LINEAR_SOLVE = auto()
 
 
 class TraversalOrder(Enum):
@@ -119,7 +119,40 @@ class ScanSpec(RepeatedSpec):
         return NestedKind.SCAN
 
 
-type NestedSpec = CallSpec | MapSpec | ScanSpec | CondSpec
+@dataclass(frozen=True)
+class CallbackBinding:
+    """A callback argument: either an outer operand or its runtime argument."""
+
+    outer_input_index: int | None = None
+
+    @property
+    def runtime(self) -> bool:
+        return self.outer_input_index is None
+
+
+@dataclass(frozen=True)
+class LinearSolveCallbackSpec:
+    name: str
+    inputs: tuple[CallbackBinding, ...]
+
+
+@dataclass(frozen=True)
+class LinearSolveSpec:
+    matvec: LinearSolveCallbackSpec
+    solve: LinearSolveCallbackSpec
+    transpose_solve: LinearSolveCallbackSpec
+    rhs_indices: tuple[int, ...]
+    has_aux: bool
+
+    @property
+    def kind(self) -> NestedKind:
+        return NestedKind.LINEAR_SOLVE
+
+    def callbacks(self) -> tuple[LinearSolveCallbackSpec, ...]:
+        return (self.matvec, self.solve, self.transpose_solve)
+
+
+type NestedSpec = CallSpec | MapSpec | ScanSpec | CondSpec | LinearSolveSpec
 
 
 class NestedSpecHandler[R](Protocol):
@@ -127,6 +160,7 @@ class NestedSpecHandler[R](Protocol):
     def map(self, spec: MapSpec) -> R: ...
     def scan(self, spec: ScanSpec) -> R: ...
     def cond(self, spec: CondSpec) -> R: ...
+    def linear_solve(self, spec: LinearSolveSpec) -> R: ...
 
 
 def dispatch_nested_spec[R](spec: NestedSpec, handler: NestedSpecHandler[R]) -> R:
@@ -138,6 +172,8 @@ def dispatch_nested_spec[R](spec: NestedSpec, handler: NestedSpecHandler[R]) -> 
         return handler.scan(spec)
     if isinstance(spec, CondSpec):
         return handler.cond(spec)
+    if isinstance(spec, LinearSolveSpec):
+        return handler.linear_solve(spec)
     raise AssertionError(f"unsupported nested spec {spec!r}")
 
 
@@ -325,15 +361,47 @@ class CondInvocation[T]:
         return self.body
 
     def map_children[U](self, fn: Callable[[NestedChild[T]], U]) -> CondInvocation[U]:
-        return CondInvocation(
-            self.eqn_index,
-            self.branch_index,
-            fn(self.children()[0]),
+        return CondInvocation(self.eqn_index, self.branch_index, fn(self.children()[0]))
+
+
+@dataclass(frozen=True)
+class LinearSolveInvocation[T]:
+    eqn_index: int
+    matvec: T
+    solve: T
+    transpose_solve: T
+
+    @property
+    def kind(self) -> NestedKind:
+        return NestedKind.LINEAR_SOLVE
+
+    def children(
+        self, order: TraversalOrder = TraversalOrder.EXECUTION
+    ) -> tuple[NestedChild[T], ...]:
+        del order
+        return tuple(
+            NestedChild(value, FrameStep(self.eqn_index, NestedKind.LINEAR_SOLVE, i), i)
+            for i, value in enumerate((self.matvec, self.solve, self.transpose_solve))
         )
+
+    def child_at(self, step: FrameStep) -> T:
+        _validate_step(self.eqn_index, self.kind, step)
+        if step.iteration not in (0, 1, 2):
+            raise KeyError("linear solve callback index must be 0, 1, or 2")
+        return (self.matvec, self.solve, self.transpose_solve)[step.iteration]
+
+    def map_children[U](
+        self, fn: Callable[[NestedChild[T]], U]
+    ) -> LinearSolveInvocation[U]:
+        children = self.children()
+        return LinearSolveInvocation(self.eqn_index, *(fn(c) for c in children))
 
 
 type AnyNestedInvocation[T] = (
-    CallInvocation[T] | RepeatedInvocation[T] | CondInvocation[T]
+    CallInvocation[T]
+    | RepeatedInvocation[T]
+    | CondInvocation[T]
+    | LinearSolveInvocation[T]
 )
 
 
@@ -364,6 +432,21 @@ class CondContext[T]:
 type NestedContext[T] = CallContext[T] | MapContext[T] | ScanContext[T] | CondContext[T]
 
 
+@dataclass(frozen=True)
+class LinearSolveContext[T]:
+    spec: LinearSolveSpec
+    invocation: LinearSolveInvocation[T]
+
+
+type NestedContext[T] = (
+    CallContext[T]
+    | MapContext[T]
+    | ScanContext[T]
+    | CondContext[T]
+    | LinearSolveContext[T]
+)
+
+
 def _validate_step(eqn_index: int, kind: NestedKind, step: FrameStep) -> None:
     if step.eqn_index != eqn_index or step.kind is not kind:
         raise ValueError(
@@ -377,6 +460,7 @@ class NestedHandler[T, R](Protocol):
     def map(self, context: MapContext[T]) -> R: ...
     def scan(self, context: ScanContext[T]) -> R: ...
     def cond(self, context: CondContext[T]) -> R: ...
+    def linear_solve(self, context: LinearSolveContext[T]) -> R: ...
 
 
 def dispatch_nested[T, R](
@@ -401,6 +485,10 @@ def dispatch_nested[T, R](
         return handler.scan(ScanContext(spec, cast(RepeatedInvocation[T], node)))
     if isinstance(spec, CondSpec) and isinstance(node, CondInvocation):
         return handler.cond(CondContext(spec, cast(CondInvocation[T], node)))
+    if isinstance(spec, LinearSolveSpec) and isinstance(node, LinearSolveInvocation):
+        return handler.linear_solve(
+            LinearSolveContext(spec, cast(LinearSolveInvocation[T], node))
+        )
     raise TypeError(
         f"nested spec/invocation mismatch: {spec.kind.name.lower()} spec with "
         f"{node.kind.name.lower()} invocation"

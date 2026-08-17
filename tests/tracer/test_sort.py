@@ -74,9 +74,7 @@ def test_partitioned_sort_keeps_global_inputs_and_local_sorted_rows():
 
 def test_multi_operand_sort_preserves_cosorted_pairing_after_localization():
     def objective(keys, values):
-        sorted_keys, sorted_values = lax.sort(
-            (keys, values), dimension=0, num_keys=1
-        )
+        sorted_keys, sorted_values = lax.sort((keys, values), dimension=0, num_keys=1)
         return jnp.sum(sorted_keys * sorted_values)
 
     keys = jnp.array([3.0, 1.0, 4.0, 2.0])

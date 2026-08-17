@@ -63,6 +63,8 @@ from tatva.tracer.core.nested import (
     CondSpec,
     FramePath,
     IndexedChild,
+    LinearSolveInvocation,
+    LinearSolveSpec,
     MapSpec,
     RepeatedInvocation,
     ScanSpec,
@@ -517,6 +519,35 @@ def _materialize_cond(
     )
 
 
+def _materialize_linear_solve(
+    eqn_plan: EqnPlan,
+    nested_plan: NestedPlan,
+    spec: LinearSolveSpec,
+    parent_env: ConcreteEnv,
+) -> ResolvedEqn:
+    """Materialize callback captures; callback runtime vectors are intentionally absent."""
+    eqn = eqn_plan.eqn
+    outer = tuple(_read(parent_env, atom) for atom in eqn.invars)
+    children: list[JaxprInstance] = []
+    for callback, body, consts in zip(
+        spec.callbacks(), nested_plan.branches, nested_plan.branch_consts, strict=True
+    ):
+        inputs = tuple(
+            None if binding.runtime else outer[binding.outer_input_index]
+            for binding in callback.inputs
+        )
+        children.append(
+            _materialize_jaxpr(body, input_values=inputs, const_values=consts)
+        )
+    if eqn_plan.concrete_outputs:
+        raise DynamicRoutingError(
+            "custom_linear_solve output cannot be required concretely during planning"
+        )
+    return ResolvedEqn(
+        eqn_plan, route=None, nested=LinearSolveInvocation(eqn_plan.index, *children)
+    )
+
+
 def _materialize_eqn(
     eqn_plan: EqnPlan,
     env: ConcreteEnv,
@@ -548,6 +579,11 @@ class _MaterializeNestedHandler:
 
     def cond(self, spec: CondSpec) -> ResolvedEqn:
         return _materialize_cond(self.eqn_plan, self.nested_plan, spec, self.env)
+
+    def linear_solve(self, spec: LinearSolveSpec) -> ResolvedEqn:
+        return _materialize_linear_solve(
+            self.eqn_plan, self.nested_plan, spec, self.env
+        )
 
 
 def _materialize_jaxpr(

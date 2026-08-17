@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn
+from jax.extend.core import Jaxpr, JaxprEqn
 
 from tatva.tracer.core.nested import normalize_nested_jaxpr
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     CondAnalysisSemantics,
+    LinearSolveAnalysisSemantics,
     NestedOperationSemantics,
     ScanAnalysisSemantics,
 )
@@ -87,6 +88,13 @@ def _nested_jaxprs(
             )
 
         return tuple(normalize_nested_jaxpr(b).jaxpr for b in branches)
+
+    if isinstance(analysis, LinearSolveAnalysisSemantics):
+        jaxprs = eqn.params["jaxprs"]
+        return tuple(
+            normalize_nested_jaxpr(value).jaxpr
+            for value in (jaxprs.matvec, jaxprs.solve, jaxprs.transpose_solve)
+        )
 
     raise TypeError(f"unsupported nested analysis semantics {type(analysis).__name__}")
 

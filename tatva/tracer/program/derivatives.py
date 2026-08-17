@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import cast
 
 import numpy as np
 import scipy.sparse as sps
@@ -65,6 +64,8 @@ from tatva.tracer.core.nested import (
     CondContext,
     CondInvocation,
     IndexedChild,
+    LinearSolveContext,
+    LinearSolveInvocation,
     MapContext,
     RepeatedInvocation,
     ScanContext,
@@ -281,6 +282,45 @@ class _DerivativeNestedHandler:
             input_deps=self.input_deps,
             acc=self.acc,
             n_dofs=self.n_dofs,
+        )
+
+    def linear_solve(self, context: LinearSolveContext[JaxprInstance]):
+        # Implicit solve AD is not represented by the primal callback bodies.
+        # Keep the outer operation conservative and retain callback traces for
+        # diagnostics/local planning only.
+        rhs = self.input_deps[context.spec.rhs_indices[0]]
+        traces = []
+        for spec, child in zip(
+            context.spec.callbacks(), context.invocation.children(), strict=True
+        ):
+            deps = tuple(
+                rhs if binding.runtime else self.input_deps[binding.outer_input_index]
+                for binding in spec.inputs
+            )
+            traces.append(
+                _trace_jaxpr(
+                    instance=child.payload,
+                    input_deps=deps,
+                    acc=self.acc,
+                    n_dofs=self.n_dofs,
+                )
+            )
+        union = (
+            sps.vstack([dep.total_union().csr for dep in self.input_deps], format="csr")
+            .sum(axis=0)
+            .astype(bool)
+        )
+        result = tuple(
+            DependencySet(
+                sps.vstack(
+                    [sps.csr_matrix(union)] * int(np.prod(_shape_of(out))), format="csr"
+                ),
+                _shape_of(out),
+            )
+            for out in self.resolved.plan.eqn.outvars
+        )
+        return result, NestedDerivativeTrace(
+            LinearSolveInvocation(context.invocation.eqn_index, *traces), template=None
         )
 
 

@@ -40,6 +40,9 @@ from tatva.tracer.core.nested import (
     CondInvocation,
     CondSpec,
     IndexedChild,
+    LinearSolveContext,
+    LinearSolveInvocation,
+    LinearSolveSpec,
     MapContext,
     MapSpec,
     NestedSpec,
@@ -292,6 +295,18 @@ def _plan_scan(
     )
 
 
+def _plan_linear_solve(
+    instance: LinearSolveInvocation[JaxprInstance],
+    trace: LinearSolveInvocation[JaxprDemandTrace],
+    spec: LinearSolveSpec,
+) -> LocalNestedPlan:
+    children = tuple(
+        _build_local_jaxpr_plan(i.payload, t.payload)
+        for i, t in zip(instance.children(), trace.children(), strict=True)
+    )
+    return LocalNestedPlan(spec, LinearSolveInvocation(instance.eqn_index, *children))
+
+
 @dataclass(frozen=True)
 class _LocalPlanNestedHandler:
     trace: AnyNestedInvocation[JaxprDemandTrace]
@@ -321,6 +336,15 @@ class _LocalPlanNestedHandler:
         return _plan_cond(
             context.invocation,
             cast(CondInvocation[JaxprDemandTrace], self.trace),
+            context.spec,
+        )
+
+    def linear_solve(
+        self, context: LinearSolveContext[JaxprInstance]
+    ) -> LocalNestedPlan:
+        return _plan_linear_solve(
+            context.invocation,
+            cast(LinearSolveInvocation[JaxprDemandTrace], self.trace),
             context.spec,
         )
 
