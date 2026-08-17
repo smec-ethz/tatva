@@ -1,8 +1,30 @@
 import jax.numpy as jnp
 import numpy as np
 
+from tatva.lifter import Lifter
 from tatva.tracer.api import trace
 from tatva.tracer.capture import CapturedJaxpr
+from tatva.tracer.local.inputs import _localize_tree
+
+
+def test_localize_tree_preserves_leafless_pytree_children():
+    lifter = Lifter(6)
+    free_dofs = jnp.array([0, 1, 2])
+    constrained_dofs = jnp.array([], dtype=jnp.int32)
+
+    localized = _localize_tree(
+        global_value=lifter,
+        leaves=iter(((free_dofs, None), (constrained_dofs, None))),
+        rank=0,
+        halo=None,  # The default Lifter reconstruction does not use the DOF plan.
+        specializers={},
+        parameter_name="lifter",
+        is_parameter_root=True,
+    )
+
+    assert localized.value._runtime_values == {}
+    np.testing.assert_array_equal(localized.value.free_dofs, free_dofs)
+    np.testing.assert_array_equal(localized.value.constrained_dofs, constrained_dofs)
 
 
 def test_dead_gather_indices_do_not_prevent_local_execution():
