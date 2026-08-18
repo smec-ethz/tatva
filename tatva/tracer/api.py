@@ -34,11 +34,12 @@ from tatva.tracer.lowering.partition import (
     partition_contribution_blocks,
 )
 from tatva.tracer.program.analysis import JaxprPlan, analyze
+from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
 from tatva.tracer.program.derivatives import DerivativeTrace, trace_derivatives
 from tatva.tracer.program.incidence import (
     BlockDofIncidence,
-    tagged_block_dof_incidence,
+    plan_tagged_block_dof_incidence,
 )
 from tatva.tracer.program.materialize import JaxprInstance, materialize_plan
 from tatva.tracer.support import require_local_routes, require_registered_operations
@@ -53,8 +54,15 @@ class TraceResult[**P, R]:
 
     def incidence(self, block_size: int = 1) -> BlockDofIncidence:
         """Sparse block↔DOF incidence, built lazily on first planning use."""
-        return tagged_block_dof_incidence(
-            self.resolved,
+        resolver, frame = ConcreteResolver.root(
+            self.captured.closed_jaxpr,
+            self.captured.flat_args,
+            self.analysis,
+        )
+        return plan_tagged_block_dof_incidence(
+            self.analysis,
+            frame,
+            resolver,
             self.contributions,
             block_size=block_size,
         )
@@ -123,8 +131,15 @@ class TraceResult[**P, R]:
         if needs_finer_blocks:
             # Preserve the configured coarse default while ensuring every rank
             # can receive work from each structurally partitionable root.
-            incidence = tagged_block_dof_incidence(
-                self.resolved,
+            resolver, frame = ConcreteResolver.root(
+                self.captured.closed_jaxpr,
+                self.captured.flat_args,
+                self.analysis,
+            )
+            incidence = plan_tagged_block_dof_incidence(
+                self.analysis,
+                frame,
+                resolver,
                 self.contributions,
                 block_size=1,
             )

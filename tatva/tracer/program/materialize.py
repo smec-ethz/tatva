@@ -510,9 +510,7 @@ def _materialize_linear_solve(
             outer_index = binding.outer_input_index
             inputs.append(None if outer_index is None else outer[outer_index])
         children.append(
-            _materialize_jaxpr(
-                body, input_values=tuple(inputs), const_values=consts
-            )
+            _materialize_jaxpr(body, input_values=tuple(inputs), const_values=consts)
         )
     if eqn_plan.concrete_outputs:
         raise DynamicRoutingError(
