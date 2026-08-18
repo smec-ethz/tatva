@@ -13,12 +13,14 @@ import numpy as np
 from jax.extend.core import JaxprEqn, Literal
 from numpy.typing import NDArray
 
+from tatva.tracer.core.concrete import ConcreteRegion
 from tatva.tracer.core.routes import (
     ConcreteEnv,
     _compute_gather_route_rows,
     _compute_scatter_target_rows,
 )
 from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import Demand, TensorDemand
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +95,69 @@ def _read_concrete(concrete: ConcreteEnv, atom):
     return atom.val if isinstance(atom, Literal) else concrete.get(atom)
 
 
+def _concrete_array(value):
+    return value.values if isinstance(value, ConcreteRegion) else value
+
+
+def _gather_index_rows(
+    eqn: JaxprEqn, output_rows: NDArray[np.int64]
+) -> NDArray[np.int64]:
+    output_shape = _shape_of(eqn.outvars[0])
+    indices_shape = _shape_of(eqn.invars[1])
+    offset_dims = {int(axis) for axis in eqn.params["dimension_numbers"].offset_dims}
+    output_batch_dims = tuple(
+        axis for axis in range(len(output_shape)) if axis not in offset_dims
+    )
+    if len(output_batch_dims) != len(indices_shape) - 1:
+        raise NotImplementedError("unsupported gather output/index batch geometry")
+    coords = np.stack(np.unravel_index(output_rows, output_shape), axis=1)
+    batch = coords[:, output_batch_dims]
+    vector_size = indices_shape[-1]
+    components = np.tile(np.arange(vector_size, dtype=np.int64), len(output_rows))
+    flattened = [
+        np.repeat(batch[:, axis], vector_size) for axis in range(len(indices_shape) - 1)
+    ]
+    flattened.append(components)
+    return np.ravel_multi_index(tuple(flattened), indices_shape).reshape(
+        len(output_rows), vector_size
+    )
+
+
+def gather_route_concrete_demands(
+    eqn: JaxprEqn, request: RouteRequest
+) -> tuple[Demand, ...]:
+    rows = _output_rows(eqn, request)
+    demands: list[Demand] = [None] * len(eqn.invars)
+    demands[1] = TensorDemand.from_rows_hull(
+        _shape_of(eqn.invars[1]), _gather_index_rows(eqn, rows).ravel()
+    )
+    return tuple(demands)
+
+
+def _selector_rows(eqn: JaxprEqn, output_rows: NDArray[np.int64]) -> NDArray[np.int64]:
+    selector_shape = _shape_of(eqn.invars[0])
+    if not selector_shape:
+        return np.zeros(output_rows.size, dtype=np.int64)
+    output_shape = _shape_of(eqn.outvars[0])
+    coords = np.stack(np.unravel_index(output_rows, output_shape), axis=1)
+    coords = coords[:, -len(selector_shape) :]
+    for axis, extent in enumerate(selector_shape):
+        if extent == 1:
+            coords[:, axis] = 0
+    return np.ravel_multi_index(tuple(coords.T), selector_shape).astype(np.int64)
+
+
+def select_route_concrete_demands(
+    eqn: JaxprEqn, request: RouteRequest
+) -> tuple[Demand, ...]:
+    rows = _output_rows(eqn, request)
+    demands: list[Demand] = [None] * len(eqn.invars)
+    demands[0] = TensorDemand.from_rows_hull(
+        _shape_of(eqn.invars[0]), _selector_rows(eqn, rows)
+    )
+    return tuple(demands)
+
+
 def _starts(
     eqn: JaxprEqn,
     concrete: ConcreteEnv,
@@ -106,7 +171,7 @@ def _starts(
         value = _read_concrete(concrete, atom)
         if value is None:
             return None
-        values.append(int(np.asarray(value)))
+        values.append(int(np.asarray(_concrete_array(value))))
     max_starts = tuple(dim - size for dim, size in zip(operand_shape, region_shape))
     return tuple(
         min(max(value, 0), maximum) for value, maximum in zip(values, max_starts)
@@ -130,7 +195,7 @@ def resolve_gather_route_fragment(
     output_rows = _output_rows(eqn, request)
     source_rows, index_rows = _compute_gather_route_rows(
         eqn,
-        np.asarray(indices),
+        indices,
         output_rows,
     )
     return GatherRouteFragment(
@@ -170,7 +235,9 @@ def resolve_scatter_route_fragment(
         update_rows = np.arange(
             start, min(start + chunk_size, n_updates), dtype=np.int64
         )
-        targets = _compute_scatter_target_rows(eqn, np.asarray(indices), update_rows)
+        targets = _compute_scatter_target_rows(
+            eqn, np.asarray(_concrete_array(indices)), update_rows
+        )
         if targets is None:
             return None
         keep = np.isin(targets, wanted)
@@ -199,23 +266,30 @@ def resolve_select_n_route_fragment(
         return None
     output_rows = _output_rows(eqn, request)
     output_shape = _shape_of(eqn.outvars[0])
-    values = np.asarray(selector)
-    if values.ndim > len(output_shape):
+    selector_shape = _shape_of(eqn.invars[0])
+    if len(selector_shape) > len(output_shape):
         return None
-    padded_shape = (1,) * (len(output_shape) - values.ndim) + values.shape
+    padded_shape = (1,) * (len(output_shape) - len(selector_shape)) + selector_shape
     if any(
         source not in (1, target) for source, target in zip(padded_shape, output_shape)
     ):
         return None
-    if values.ndim == 0:
-        selected = np.full(output_rows.size, int(values), dtype=np.int64)
+    if not selector_shape:
+        selected = np.full(
+            output_rows.size,
+            int(np.asarray(_concrete_array(selector))),
+            dtype=np.int64,
+        )
     else:
-        coords = np.stack(np.unravel_index(output_rows, output_shape), axis=1)
-        coords = coords[:, -values.ndim :]
-        for axis, size in enumerate(values.shape):
-            if size == 1:
-                coords[:, axis] = 0
-        selected = np.asarray(values[tuple(coords.T)], dtype=np.int64).ravel()
+        selector_rows = _selector_rows(eqn, output_rows)
+        if isinstance(selector, ConcreteRegion):
+            selected = np.asarray(
+                selector.read_rows(selector_rows), dtype=np.int64
+            ).ravel()
+        else:
+            selected = (
+                np.asarray(selector).ravel()[selector_rows].astype(np.int64, copy=False)
+            )
     n_cases = len(eqn.invars) - 1
     if np.any(selected < 0) or np.any(selected >= n_cases):
         return None

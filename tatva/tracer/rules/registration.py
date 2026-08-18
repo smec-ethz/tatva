@@ -8,10 +8,12 @@ from jax.extend.core import primitives
 
 from tatva.tracer.core.nested import CallKind
 from tatva.tracer.core.route_fragments import (
+    gather_route_concrete_demands,
     resolve_dynamic_slice_route_fragment,
     resolve_dynamic_update_slice_route_fragment,
     resolve_gather_route_fragment,
     resolve_select_n_route_fragment,
+    select_route_concrete_demands,
 )
 from tatva.tracer.core.routes import (
     resolve_dynamic_slice_route,
@@ -40,6 +42,9 @@ from tatva.tracer.rules.elementwise import (
 )
 from tatva.tracer.rules.structural import RESHAPE_LIKE
 
+from . import (
+    concrete as concrete_rules,
+)
 from . import (
     contributions as contribution_rules,
 )
@@ -215,6 +220,9 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
             demand=elementwise.elementwise_demand,
             tagged_demand=tagged.elementwise,
             contribution=contribution_rules.scalar_multiply,
+            regional_concrete=concrete_rules.regional_bind(
+                elementwise.elementwise_demand
+            ),
         ),
     )
     reg.register(
@@ -228,6 +236,9 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
             demand=elementwise.elementwise_demand,
             tagged_demand=tagged.elementwise,
             contribution=contribution_rules.scalar_divide,
+            regional_concrete=concrete_rules.regional_bind(
+                elementwise.elementwise_demand
+            ),
         ),
     )
     reg.register(
@@ -240,6 +251,9 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
             ),
             demand=elementwise.elementwise_demand,
             tagged_demand=tagged.elementwise,
+            regional_concrete=concrete_rules.regional_bind(
+                elementwise.elementwise_demand
+            ),
         ),
     )
     reg.register(
@@ -252,6 +266,9 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
             ),
             demand=elementwise.elementwise_demand,
             tagged_demand=tagged.elementwise,
+            regional_concrete=concrete_rules.regional_bind(
+                elementwise.elementwise_demand
+            ),
         ),
     )
     reg.register(
@@ -264,6 +281,9 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
             ),
             demand=elementwise.elementwise_demand,
             tagged_demand=tagged.elementwise,
+            regional_concrete=concrete_rules.regional_bind(
+                elementwise.elementwise_demand
+            ),
         ),
     )
 
@@ -275,6 +295,9 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             RESHAPE_LIKE,
             contribution=contribution_rules.transparent_unary,
             lowering=lowerings.lower_reshape,
+            regional_concrete=concrete_rules.regional_reshape(
+                structural.demand_reshape_squeeze
+            ),
         ),
     )
     reg.register(
@@ -282,6 +305,9 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
         replace(
             RESHAPE_LIKE,
             contribution=contribution_rules.transparent_unary,
+            regional_concrete=concrete_rules.regional_reshape(
+                structural.demand_reshape_squeeze
+            ),
         ),
     )
     reg.register(
@@ -295,6 +321,9 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             demand=structural.demand_broadcast_in_dim,
             tagged_demand=tagged.broadcast_in_dim,
             lowering=lowerings.lower_broadcast_in_dim,
+            regional_concrete=concrete_rules.regional_broadcast(
+                structural.demand_broadcast_in_dim
+            ),
         ),
     )
     reg.register(
@@ -308,6 +337,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             demand=structural.demand_transpose,
             tagged_demand=tagged.transpose,
             contribution=contribution_rules.transparent_unary,
+            regional_concrete=concrete_rules.regional_bind(structural.demand_transpose),
         ),
     )
     reg.register(
@@ -321,6 +351,9 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             demand=structural.demand_slice,
             tagged_demand=tagged.slice_,
             lowering=lowerings.lower_slice,
+            regional_concrete=concrete_rules.regional_projected_unary(
+                structural.demand_slice
+            ),
         ),
     )
     reg.register(
@@ -334,6 +367,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             demand=structural.demand_rev,
             tagged_demand=tagged.rev,
             contribution=contribution_rules.transparent_unary,
+            regional_concrete=concrete_rules.regional_bind(structural.demand_rev),
         ),
     )
     reg.register(
@@ -347,6 +381,9 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             demand=structural.demand_concatenate,
             tagged_demand=tagged.concatenate,
             lowering=lowerings.lower_concatenate,
+            regional_concrete=concrete_rules.regional_bind(
+                structural.demand_concatenate
+            ),
         ),
     )
     reg.register(
@@ -399,6 +436,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda _eqn: (1,),
             route=resolve_gather_route,
             route_fragment=resolve_gather_route_fragment,
+            route_concrete_demands=gather_route_concrete_demands,
             demand=gather_scatter.gather_demand,
             tagged_demand=tagged.gather,
             localization=LocalizationSemantics(
@@ -436,8 +474,12 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda _eqn: (0,),
             route=resolve_select_n_route,
             route_fragment=resolve_select_n_route_fragment,
+            route_concrete_demands=select_route_concrete_demands,
             demand=indexing.select_n_demand,
             tagged_demand=tagged.select_n,
+            regional_concrete=concrete_rules.regional_bind(
+                elementwise.elementwise_demand
+            ),
             localization=LocalizationSemantics(
                 localize_route=indexing.localize_select_n,
             ),
@@ -488,6 +530,9 @@ def _register_reduction_rules(reg: PrimitiveRegistry) -> None:
         replace(
             reductions.REDUCE_BASIC,
             contribution=contribution_rules.reduce_sum,
+            regional_concrete=concrete_rules.regional_bind(
+                reductions.reduce_sum_demand
+            ),
         ),
     )
 
@@ -495,7 +540,15 @@ def _register_reduction_rules(reg: PrimitiveRegistry) -> None:
         lax.reduce_max_p,
         lax.reduce_min_p,
     ):
-        reg.register(primitive, reductions.REDUCE_BASIC)
+        reg.register(
+            primitive,
+            replace(
+                reductions.REDUCE_BASIC,
+                regional_concrete=concrete_rules.regional_bind(
+                    reductions.reduce_sum_demand
+                ),
+            ),
+        )
 
     reg.register(lax.reduce_prod_p, reductions.REDUCE_PROD)
     reg.register(lax.reduce_and_p, reductions.ZERO_REDUCTION)
@@ -556,6 +609,9 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
             demand=opaque.sort_demand,
             tagged_demand=tagged.sort,
             lowering=lowerings.lower_sort,
+            regional_concrete=concrete_rules.full(
+                "sort requires a globally ordered invocation-local input"
+            ),
         ),
     )
 
