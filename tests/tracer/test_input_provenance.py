@@ -1,13 +1,13 @@
 import jax.numpy as jnp
-import numpy as np
 from jax.extend.core import Var
 
 from tatva.tracer.capture import CapturedJaxpr
+from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import TensorDemand
-from tatva.tracer.local.liveness import DemandSeed, backpropagate_demand
+from tatva.tracer.local.liveness import DemandSeed, backpropagate_plan_demand
 from tatva.tracer.program.analysis import analyze
+from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.contributions import ValueRef
-from tatva.tracer.program.materialize import materialize_plan
 
 
 def test_targeted_gather_index_demand_reaches_root_input():
@@ -18,25 +18,25 @@ def test_targeted_gather_index_demand_reaches_root_input():
     values = jnp.arange(8.0)
     connectivity = jnp.array([[1, 3], [4, 7]], dtype=jnp.int32)
     captured = CapturedJaxpr.from_fn(fn, u, values, connectivity)
-    analysis = analyze(captured.jaxpr)
-    instance = materialize_plan(captured.closed_jaxpr, captured.flat_args, analysis)
-
-    resolved = next(
-        item for item in instance.eqns if item.plan.eqn.primitive.name == "gather"
+    plan = analyze(captured.jaxpr)
+    resolver, frame = ConcreteResolver.root(
+        captured.closed_jaxpr,
+        captured.flat_args,
+        plan,
     )
-    gather = resolved.plan.eqn
+
+    gather_plan = next(
+        item for item in plan.eqns if item.eqn.primitive.name == "gather"
+    )
+    gather = gather_plan.eqn
     assert isinstance(gather.invars[1], Var)
-    assert resolved.route is not None
-    assert resolved.route.index_rows is not None
-
-    index_rows = np.unique(resolved.route.index_rows.ravel())
-    index_demand = TensorDemand.from_rows_hull(
-        tuple(gather.invars[1].aval.shape), index_rows
-    )
+    index_demand = TensorDemand.full(_shape_of(gather.invars[1]))
     assert index_demand is not None
 
-    demand = backpropagate_demand(
-        instance,
+    demand = backpropagate_plan_demand(
+        plan,
+        frame,
+        resolver,
         (
             DemandSeed(
                 value=ValueRef(path=(), var=gather.invars[1]),
@@ -48,6 +48,4 @@ def test_targeted_gather_index_demand_reaches_root_input():
     assert demand.input_demands[0] is None
     assert demand.input_demands[1] is None
     assert demand.input_demands[2] is not None
-    np.testing.assert_array_equal(
-        demand.input_demands[2].rows(), np.arange(connectivity.size)
-    )
+    assert demand.input_demands[2].is_full

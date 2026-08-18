@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import functools
 import typing
-from dataclasses import dataclass
-from typing import Any, cast
+from dataclasses import dataclass, field
+from typing import Any
 
 import jax.numpy as jnp
-import numpy as np
-import scipy.sparse as sps
 from numpy.typing import ArrayLike, NDArray
 
 from tatva.tracer.capture import CapturedJaxpr, make_captured_jaxpr
@@ -16,18 +14,10 @@ from tatva.tracer.local.derivatives import LocalDerivativeTrace, trace_local_der
 from tatva.tracer.local.dof_plan import (
     LocalDofPlan,
     build_local_dof_plan,
-    build_local_dof_plans,
     validate_dof_owner,
 )
-from tatva.tracer.local.inputs import (
-    LocalizeOverrides,
-    localize_inputs,
-)
-from tatva.tracer.local.layout import TensorLayout
-from tatva.tracer.local.liveness import (
-    DemandSeed,
-    backpropagate_plan_demand,
-)
+from tatva.tracer.local.inputs import LocalizeOverrides, localize_inputs
+from tatva.tracer.local.liveness import DemandSeed, backpropagate_plan_demand
 from tatva.tracer.local.plan import LocalJaxprPlan, build_rank_local_plan
 from tatva.tracer.lowering.executor import build_local_executable
 from tatva.tracer.lowering.partition import (
@@ -37,93 +27,70 @@ from tatva.tracer.lowering.partition import (
     dof_owner_from_incidence,
     partition_contribution_blocks,
 )
-from tatva.tracer.program.analysis import JaxprPlan, analyze
+from tatva.tracer.program.analysis import JaxprPlan
+from tatva.tracer.program.analysis import analyze as analyze_jaxpr
 from tatva.tracer.program.concrete_resolver import ConcreteResolver
-from tatva.tracer.program.contributions import (
-    ContributionBlock,
-    ContributionTrace,
-    detect_contributions,
-)
-from tatva.tracer.program.derivatives import DerivativeTrace, trace_derivatives
+from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
 from tatva.tracer.program.incidence import (
-    BlockDofIncidence,
     generate_contribution_blocks,
     plan_tagged_block_dof_incidence,
 )
-from tatva.tracer.program.materialize import JaxprInstance, materialize_plan
 from tatva.tracer.support import require_local_routes, require_registered_operations
 
 
 @dataclass(frozen=True)
-class TraceResult[**P, R]:
-    captured: CapturedJaxpr[P, R]
-    analysis: JaxprPlan
-    contributions: ContributionTrace
+class LocalArguments:
+    """Rank-local arguments ready to pass to a compiled local functional."""
 
-    @functools.cached_property
-    def resolved(self) -> JaxprInstance:
-        """Materialize the invocation tree only for post-partition consumers."""
-        return materialize_plan(
-            self.captured.closed_jaxpr,
-            self.captured.flat_args,
-            self.analysis,
-        )
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
 
-    def incidence(self, blocks: tuple[ContributionBlock, ...]) -> BlockDofIncidence:
-        """Sparse block↔DOF incidence, built lazily on first planning use."""
-        resolver, frame = ConcreteResolver.root(
-            self.captured.closed_jaxpr,
-            self.captured.flat_args,
-            self.analysis,
-        )
-        return plan_tagged_block_dof_incidence(
-            self.analysis,
-            frame,
-            resolver,
-            self.contributions,
-            blocks=blocks,
-        )
 
-    @functools.cached_property
-    def _global_derivatives(self) -> DerivativeTrace:
-        return trace_derivatives(
-            self.resolved,
-            n_dofs=_shape_of(self.captured.jaxpr.invars[0])[0],
-        )
+@dataclass(frozen=True, eq=False)
+class FunctionalAnalysis[**P, R]:
+    """Structural analysis of a captured functional.
 
-    def analyze_global_derivatives(self) -> DerivativeTrace:
-        """Explicitly materialize and analyze global derivative sparsity."""
-        return self._global_derivatives
+    The compiler artifacts are intentionally private. Expensive global inspection is
+    available from :mod:`tatva.tracer.diagnostics`; normal execution proceeds through
+    :meth:`distribute`.
+    """
 
-    def global_hessian_sparsity(self) -> sps.csr_matrix:
-        """Return global structural Hessian sparsity.
+    _captured: CapturedJaxpr[P, R]
+    _plan: JaxprPlan
+    _contributions: ContributionTrace
 
-        This is an explicit, potentially expensive global analysis operation.
-        Distributed planning and compilation do not call it.
-        """
-        return self.analyze_global_derivatives().hessian
-
-    def _partition_metadata(
+    def distribute(
         self,
         *,
-        n_parts: int,
+        parts: int,
+        blocks_per_part: int = 4,
         dof_owner: ArrayLike | None = None,
-        block_factor: int = 4,
-    ) -> tuple[ContributionPartition, NDArray[np.int64]]:
-        if n_parts <= 0:
-            raise ValueError("n_parts must be positive")
-        if block_factor <= 0:
-            raise ValueError("block_factor must be positive")
+    ) -> DistributionPlan[P, R]:
+        """Build global partition metadata without materializing rank-local plans."""
+        if parts <= 0:
+            raise ValueError("parts must be positive")
+        if blocks_per_part <= 0:
+            raise ValueError("blocks_per_part must be positive")
 
         blocks = generate_contribution_blocks(
-            self.contributions,
-            blocks_per_root=block_factor * n_parts,
+            self._contributions,
+            blocks_per_root=blocks_per_part * parts,
         )
-        incidence = self.incidence(blocks=blocks)
-
+        resolver, frame = ConcreteResolver.root(
+            self._captured.closed_jaxpr,
+            self._captured.flat_args,
+            self._plan,
+        )
+        incidence = plan_tagged_block_dof_incidence(
+            self._plan,
+            frame,
+            resolver,
+            self._contributions,
+            blocks=blocks,
+        )
         contribution_partition, block_to_part = partition_contribution_blocks(
             incidence,
-            n_parts=n_parts,
+            n_parts=parts,
             strategy=PartitionStrategy.INCIDENCE,
         )
 
@@ -131,200 +98,127 @@ class TraceResult[**P, R]:
             owner = dof_owner_from_incidence(
                 incidence,
                 block_to_part=block_to_part,
-                n_parts=n_parts,
+                n_parts=parts,
             )
         else:
-            owner = validate_dof_owner(dof_owner, n_ranks=n_parts)
+            owner = validate_dof_owner(dof_owner, n_ranks=parts)
 
-        return contribution_partition, owner
-
-    def partition(
-        self,
-        *,
-        n_parts: int,
-        dof_owner: ArrayLike | None = None,
-        block_factor: int = 4,
-    ) -> DistributedFunctional[P, R]:
-        contribution_partition, dof_to_part = self._partition_metadata(
-            n_parts=n_parts,
-            dof_owner=dof_owner,
-            block_factor=block_factor,
+        return DistributionPlan(
+            _functional=self,
+            _partition=contribution_partition,
+            _dof_owner=owner,
         )
 
-        local_plans = []
-        resolver, frame = ConcreteResolver.root(
-            self.captured.closed_jaxpr,
-            self.captured.flat_args,
-            self.analysis,
-        )
-        for rank in range(n_parts):
-            owned = contribution_partition.for_part(rank)
-            seeds = tuple(
-                DemandSeed(
-                    value=self.contributions.root(item.root_id).value,
-                    demand=item.demand,
-                )
-                for item in owned
-            )
-            demand = backpropagate_plan_demand(self.analysis, frame, resolver, seeds)
-            local_plans.append(
-                build_rank_local_plan(self.analysis, frame, resolver, demand)
-            )
 
-        local_plans = tuple(local_plans)
-        require_local_routes(local_plans)
+@dataclass(frozen=True, eq=False)
+class DistributionPlan[**P, R]:
+    """Global contribution/ownership metadata with lazy rank construction."""
 
-        compute_layouts = tuple(plan.input_layouts[0] for plan in local_plans)
-        if any(layout is None for layout in compute_layouts):
-            raise RuntimeError("DOF input unexpectedly dead")
-        compute_layouts = cast(tuple[TensorLayout, ...], compute_layouts)
+    _functional: FunctionalAnalysis[P, R]
+    _partition: ContributionPartition
+    _dof_owner: NDArray
+    _rank_cache: dict[int, LocalFunctional[P, R]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
-        dof_plans = build_local_dof_plans(compute_layouts, dof_to_part)
+    @property
+    def parts(self) -> int:
+        return self._partition.n_parts
 
-        return DistributedFunctional(
-            traced=self,
-            partition=contribution_partition,
-            local_plans=local_plans,
-            dof_plans=dof_plans,
-        )
+    def rank(self, rank: int) -> LocalFunctional[P, R]:
+        """Lazily construct and cache one rank-local functional."""
+        if rank < 0 or rank >= self.parts:
+            raise ValueError(f"rank {rank} is out of bounds for {self.parts}")
+        if rank in self._rank_cache:
+            return self._rank_cache[rank]
 
-    def partition_local(
-        self,
-        *,
-        rank: int,
-        n_parts: int,
-        dof_owner: ArrayLike | None = None,
-        block_factor: int = 4,
-    ) -> RankLocalFunctional[P, R]:
-        """Build the rank-local view of a distributed functional."""
-        if rank < 0 or rank >= n_parts:
-            raise ValueError(f"rank {rank} is outside [0, {n_parts})")
-
-        contribution_partition, dof_owner = self._partition_metadata(
-            n_parts=n_parts,
-            dof_owner=dof_owner,
-            block_factor=block_factor,
-        )
-        owned = contribution_partition.for_part(rank)
+        functional = self._functional
+        owned = self._partition.for_part(rank)
         seeds = tuple(
             DemandSeed(
-                value=self.contributions.root(item.root_id).value,
+                value=functional._contributions.root(item.root_id).value,
                 demand=item.demand,
             )
             for item in owned
         )
         resolver, frame = ConcreteResolver.root(
-            self.captured.closed_jaxpr,
-            self.captured.flat_args,
-            self.analysis,
+            functional._captured.closed_jaxpr,
+            functional._captured.flat_args,
+            functional._plan,
         )
-        demand = backpropagate_plan_demand(self.analysis, frame, resolver, seeds)
-        local_plan = build_rank_local_plan(self.analysis, frame, resolver, demand)
+        demand = backpropagate_plan_demand(
+            functional._plan,
+            frame,
+            resolver,
+            seeds,
+        )
+        local_plan = build_rank_local_plan(
+            functional._plan,
+            frame,
+            resolver,
+            demand,
+        )
+        require_local_routes((local_plan,))
 
         compute_layout = local_plan.input_layouts[0]
         if compute_layout is None:
             raise RuntimeError("DOF input unexpectedly dead")
 
-        dof_plan = build_local_dof_plan(
+        dofs = build_local_dof_plan(
             compute_layout,
-            dof_owner,
+            self._dof_owner,
             rank=rank,
-            n_ranks=n_parts,
+            n_ranks=self.parts,
         )
-
-        return RankLocalFunctional(
-            traced=self,
+        local = LocalFunctional(
             rank=rank,
-            n_parts=n_parts,
-            owned=owned,
-            local_plan=local_plan,
-            dof_plan=dof_plan,
+            parts=self.parts,
+            dofs=dofs,
+            _captured=functional._captured,
+            _contributions=functional._contributions,
+            _owned=owned,
+            _plan=local_plan,
         )
+        self._rank_cache[rank] = local
+        return local
+
+    def all_ranks(self) -> tuple[LocalFunctional[P, R], ...]:
+        """Explicitly construct the local functional for every rank."""
+        return tuple(self.rank(rank) for rank in range(self.parts))
 
 
-@dataclass(frozen=True)
-class DistributedFunctional[**P, R]:
-    traced: TraceResult[P, R]
-    partition: ContributionPartition
-    local_plans: tuple[LocalJaxprPlan, ...]
-    dof_plans: tuple[LocalDofPlan, ...]
+@dataclass(frozen=True, eq=False)
+class LocalFunctional[**P, R]:
+    """Self-contained program and storage layout for one rank."""
 
-    def __post_init__(self) -> None:
-        n_parts = self.partition.n_parts
-        counts = (
-            len(self.local_plans),
-            len(self.dof_plans),
-        )
-        if counts != (n_parts, n_parts):
-            raise ValueError(
-                "distributed plan counts do not match partition count: "
-                f"{counts} != {(n_parts, n_parts)}"
-            )
-
-    @property
-    def n_parts(self) -> int:
-        return self.partition.n_parts
-
-    def for_rank(self, rank: int) -> RankLocalFunctional[P, R]:
-        """Return the canonical single-rank view of this all-ranks result."""
-        if rank < 0 or rank >= self.n_parts:
-            raise ValueError(f"rank {rank} is out of bounds for {self.n_parts}")
-
-        return RankLocalFunctional(
-            traced=self.traced,
-            rank=rank,
-            n_parts=self.n_parts,
-            owned=self.partition.for_part(rank),
-            local_plan=self.local_plans[rank],
-            dof_plan=self.dof_plans[rank],
-        )
-
-
-@dataclass(frozen=True)
-class RankLocalFunctional[**P, R]:
-    """Compiled partition state owned by one communicator rank."""
-
-    traced: TraceResult[P, R]
     rank: int
-    n_parts: int
-    owned: tuple[OwnedContribution, ...]
-    local_plan: LocalJaxprPlan
-    dof_plan: LocalDofPlan
+    parts: int
+    dofs: LocalDofPlan
+    _captured: CapturedJaxpr[P, R]
+    _contributions: ContributionTrace
+    _owned: tuple[OwnedContribution, ...]
+    _plan: LocalJaxprPlan
 
     @functools.cached_property
-    def _local_derivatives(self) -> LocalDerivativeTrace:
-        executable = build_local_executable(
-            self.local_plan,
-            contributions=self.traced.contributions,
-            owned=self.owned,
-        )
-        return trace_local_derivatives(
-            executable,
-            self.dof_plan,
-            self.traced.captured.flat_args,
+    def _executable(self):
+        return build_local_executable(
+            self._plan,
+            contributions=self._contributions,
+            owned=self._owned,
         )
 
-    def analyze_derivatives(self) -> LocalDerivativeTrace:
-        """Analyze this rank's objective in storage-local DOF coordinates."""
-        return self._local_derivatives
+    @functools.cached_property
+    def _compiled(self) -> typing.Callable[..., R]:
+        executable = self._executable
+        compute_rows = self.dofs.compute_rows
+        call_abi = self._captured.call_abi
+        input_layouts = self._plan.input_layouts
 
-    def hessian_sparsity(self) -> sps.csr_matrix:
-        """Return this rank's storage-local structural Hessian sparsity."""
-        return self.analyze_derivatives().hessian
-
-    def local_function(self) -> typing.Callable[P, R]:
-        """Build the executable for this rank's already-localized inputs."""
-        executable = build_local_executable(
-            self.local_plan,
-            contributions=self.traced.contributions,
-            owned=self.owned,
-        )
-        compute_rows = self.dof_plan.compute_rows
-        call_abi = self.traced.captured.call_abi
-        input_layouts = self.local_plan.input_layouts
-
-        @functools.wraps(self.traced.captured.fn)
-        def _local_function(*args, **kwargs):
+        @functools.wraps(self._captured.fn)
+        def local_function(*args, **kwargs):
             bound = call_abi.bind(*args, **kwargs)
             flat = call_abi.flatten_bound(bound)
             executable_inputs = []
@@ -335,75 +229,62 @@ class RankLocalFunctional[**P, R]:
                 if layout is None:
                     continue
                 if index == 0:
-                    # this is the DOF input, which is sliced according to the halo plan
-                    # storage_layout -> compute_layout
                     value = value[jnp.asarray(compute_rows)]
                 executable_inputs.append(value)
 
             return executable(*executable_inputs)
 
-        return _local_function
+        return local_function
 
-    def localize_inputs(
+    def compile(self) -> typing.Callable[..., R]:
+        """Return the cached executable over rank-local inputs."""
+        return self._compiled
+
+    @functools.cached_property
+    def _derivatives(self) -> LocalDerivativeTrace:
+        return trace_local_derivatives(
+            self._executable,
+            self.dofs,
+            self._captured.flat_args,
+        )
+
+    def derivatives(self) -> LocalDerivativeTrace:
+        """Analyze derivatives in storage-local DOF coordinates."""
+        return self._derivatives
+
+    def localize(
         self,
         *args: P.args,
         **kwargs: P.kwargs,
-    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        """Construct the rank-local form of the functional's input arguments.
+    ) -> LocalArguments:
+        """Transform global arguments into this rank's input representation."""
+        return self.localize_with({}, *args, **kwargs)
 
-        Input leaves that are required by the local program are sliced according to the
-        compiler-derived input layouts. Leaves that are not required by the local program
-        are replaced by ``None``. A ``None`` value therefore means that the corresponding
-        input is dead for execution on this rank; it does not necessarily mean that the
-        value is semantically meaningless to the enclosing user object.
-
-        User-defined PyTree types can reconstruct a meaningful rank-local representation
-        by implementing ``__tatva_localize__``. The method is invoked bottom-up after its
-        child values have been localized, allowing, for example, a mesh object to rebuild
-        local connectivity from localized coordinates even when the original connectivity
-        leaf is dead and has therefore become ``None``.
-
-        Use ``localize_inputs_with_specializers`` instead to override the default
-        localization behavior for specific PyTree types. The ``specializers`` mapping is
-        consulted before any ``__tatva_localize__`` method is called.
-
-        The returned positional and keyword arguments preserve the original function
-        signature and PyTree structure after any semantic reconstruction has been applied.
-
-        Args:
-            *args, **kwargs: Global input arguments matching the captured functional
-                signature.
-
-        Returns:
-            args, kwargs
-                Rank-local positional and keyword arguments suitable for
-                ``local_function()``. Dead leaves may be ``None`` unless an enclosing
-                ``__tatva_localize__`` implementation reconstructs them.
-        """
-        return self.localize_inputs_with_specializers({}, *args, **kwargs)
-
-    def localize_inputs_with_specializers(
+    def localize_with(
         self,
         specializers: LocalizeOverrides,
         /,
         *args: P.args,
         **kwargs: P.kwargs,
-    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        local_bound = localize_inputs(
+    ) -> LocalArguments:
+        """Localize inputs with overrides for user-defined PyTree types."""
+        local_args, local_kwargs = localize_inputs(
             self.rank,
-            self.traced.captured.call_abi,
-            self.dof_plan,
+            self._captured.call_abi,
+            self.dofs,
             specializers,
-            self.local_plan.input_layouts,
+            self._plan.input_layouts,
             args=args,
             kwargs=kwargs,
         )
-        return local_bound
+        return LocalArguments(args=local_args, kwargs=local_kwargs)
 
 
-def trace[**P, R](captured: CapturedJaxpr[P, R]) -> TraceResult[P, R]:
+def analyze_captured[**P, R](
+    captured: CapturedJaxpr[P, R],
+) -> FunctionalAnalysis[P, R]:
+    """Structurally analyze an already captured functional."""
     jaxpr = captured.jaxpr
-
     if not jaxpr.invars:
         raise ValueError("Functional JAXPR has no inputs")
 
@@ -413,43 +294,25 @@ def trace[**P, R](captured: CapturedJaxpr[P, R]) -> TraceResult[P, R]:
             f"First input must be a flat DOF vector, got shape {dof_shape}"
         )
 
-    # fail once with all unsupported operations instead of discovering the first missing registration during analysis
     require_registered_operations(jaxpr)
-
-    # 1. Static structural analysis
-    analysis = analyze(jaxpr)
-
-    # 2. Structural contribution detection with lazy concrete scalar lookup.
+    plan = analyze_jaxpr(jaxpr)
     resolver, frame = ConcreteResolver.root(
         captured.closed_jaxpr,
         captured.flat_args,
-        analysis,
+        plan,
     )
-    contributions = detect_contributions(
-        analysis,
-        frame,
-        resolver,
-    )
-
-    return TraceResult(
-        captured=captured,
-        analysis=analysis,
-        contributions=contributions,
+    contributions = detect_contributions(plan, frame, resolver)
+    return FunctionalAnalysis(
+        _captured=captured,
+        _plan=plan,
+        _contributions=contributions,
     )
 
 
-def trace_fn[**P, R](
-    fn: typing.Callable[P, R], *args: P.args, **kwargs: P.kwargs
-) -> TraceResult[P, R]:
-    """Capture and structurally analyze a functional.
-
-    Derivative sparsity is not traced until explicitly requested on the
-    returned global or rank-local result.
-
-    Args:
-        fn: A Python callable to trace.
-        *args: Positional arguments to pass to `fn` for tracing.
-        **kwargs: Keyword arguments to pass to `fn` for tracing.
-    """
-    captured = make_captured_jaxpr(fn, *args, **kwargs)
-    return trace(captured)
+def analyze[**P, R](
+    fn: typing.Callable[P, R],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> FunctionalAnalysis[P, R]:
+    """Capture and structurally analyze a functional."""
+    return analyze_captured(make_captured_jaxpr(fn, *args, **kwargs))

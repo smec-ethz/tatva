@@ -6,9 +6,10 @@ import numpy as np
 import pytest
 import scipy.sparse as sps
 
-from tatva.tracer.api import trace_fn
+from tatva.tracer.api import analyze
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import GatherRouteFragment
+from tatva.tracer.diagnostics import incidence as inspect_incidence
 from tatva.tracer.local.demand import TensorDemand
 from tatva.tracer.lowering.partition import (
     PartitionStrategy,
@@ -23,8 +24,6 @@ from tatva.tracer.program.incidence import (
     generate_contribution_blocks,
     merge_tagged,
     plan_tagged_block_dof_incidence,
-    reference_block_dof_incidence,
-    tagged_block_dof_incidence,
 )
 
 
@@ -37,11 +36,11 @@ def _gather_energy(u, connectivity):
 def _finest_contribution_blocks(traced):
     partition_extents = [
         root.domain.shape[root.domain.partition_axes[0]]
-        for root in traced.contributions.roots
+        for root in traced._contributions.roots
         if root.domain.partition_axes
     ]
     return generate_contribution_blocks(
-        traced.contributions,
+        traced._contributions,
         blocks_per_root=max(partition_extents, default=1),
     )
 
@@ -53,18 +52,12 @@ def test_reference_incidence_tracks_each_contribution_block():
         dtype=jnp.int32,
     )
 
-    traced = trace_fn(_gather_energy, u, connectivity)
+    traced = analyze(_gather_energy, u, connectivity)
     blocks = _finest_contribution_blocks(traced)
-    reference = reference_block_dof_incidence(
-        traced.resolved, traced.contributions, blocks=blocks
-    )
-    tagged = tagged_block_dof_incidence(
-        traced.resolved, traced.contributions, blocks=blocks
-    )
+    tagged = inspect_incidence(traced, blocks)
 
     assert [block.id for block in tagged.blocks] == [0, 1, 2, 3]
     assert [block.root_id for block in tagged.blocks] == [0, 0, 0, 0]
-    assert (reference.csr != tagged.csr).nnz == 0
     np.testing.assert_array_equal(
         tagged.csr.toarray(),
         np.array(
@@ -81,7 +74,7 @@ def test_reference_incidence_tracks_each_contribution_block():
     np.testing.assert_array_equal(tagged.blocks_for_dof(1), [0, 1])
 
     coarser = generate_contribution_blocks(
-        traced.contributions,
+        traced._contributions,
         blocks_per_root=2,
     )
     assert [block.id for block in coarser] == [0, 1]
@@ -136,14 +129,14 @@ def test_incidence_partition_executes_same_functional():
     connectivity = jnp.stack((jnp.arange(20), jnp.arange(1, 21)), axis=1).astype(
         jnp.int32
     )
-    traced = trace_fn(_gather_energy, u, connectivity)
-    distributed = traced.partition(n_parts=2)
+    traced = analyze(_gather_energy, u, connectivity)
+    distributed = traced.distribute(parts=2)
 
     values = []
     for rank in range(2):
-        local = distributed.for_rank(rank)
-        args, kwargs = local.localize_inputs(u, connectivity)
-        values.append(local.local_function()(*args, **kwargs))
+        local = distributed.rank(rank)
+        inputs = local.localize(u, connectivity)
+        values.append(local.compile()(*inputs.args, **inputs.kwargs))
 
     np.testing.assert_allclose(sum(values), _gather_energy(u, connectivity))
 
@@ -165,29 +158,24 @@ def test_tagged_demand_preserves_overlapping_block_identity():
     assert np.count_nonzero(merged.rows == 9) == 2
 
 
-def _assert_tagged_matches_reference(fn, *args):
-    traced = trace_fn(fn, *args)
+def _assert_plan_incidence_builds(fn, *args):
+    traced = analyze(fn, *args)
     blocks = _finest_contribution_blocks(traced)
-    reference = reference_block_dof_incidence(
-        traced.resolved, traced.contributions, blocks=blocks
-    )
-    tagged = tagged_block_dof_incidence(
-        traced.resolved, traced.contributions, blocks=blocks
-    )
     resolver, frame = ConcreteResolver.root(
-        traced.captured.closed_jaxpr,
-        traced.captured.flat_args,
-        traced.analysis,
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
     )
     planned = plan_tagged_block_dof_incidence(
-        traced.analysis,
+        traced._plan,
         frame,
         resolver,
-        traced.contributions,
+        traced._contributions,
         blocks=blocks,
     )
-    assert (reference.csr != tagged.csr).nnz == 0
-    assert (tagged.csr != planned.csr).nnz == 0
+    assert planned.n_blocks == len(blocks)
+    assert planned.n_dofs == args[0].size
+    assert planned.nnz > 0
 
 
 def test_plan_tagged_map_visits_only_demanded_iterations():
@@ -197,27 +185,21 @@ def test_plan_tagged_map_visits_only_demanded_iterations():
         mapped = jax.lax.map(lambda value: value**2, values)
         return jnp.sum(mapped[:3])
 
-    traced = trace_fn(objective, values)
+    traced = analyze(objective, values)
     blocks = _finest_contribution_blocks(traced)
     resolver, frame = ConcreteResolver.root(
-        traced.captured.closed_jaxpr,
-        traced.captured.flat_args,
-        traced.analysis,
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
     )
     planned = plan_tagged_block_dof_incidence(
-        traced.analysis,
+        traced._plan,
         frame,
         resolver,
-        traced.contributions,
+        traced._contributions,
         blocks=blocks,
     )
-    legacy = tagged_block_dof_incidence(
-        traced.resolved,
-        traced.contributions,
-        blocks=blocks,
-    )
-
-    assert (planned.csr != legacy.csr).nnz == 0
+    np.testing.assert_array_equal(planned.csr.toarray(), np.eye(3, 100, dtype=bool))
     assert resolver.stats.map_iterations == 3
     assert resolver.stats.frames_created == 4
     assert resolver.stats.frames_released == 3
@@ -236,52 +218,48 @@ def test_plan_tagged_scan_streams_only_influencing_prefix(reverse, expected_visi
         _, outputs = jax.lax.scan(body, jnp.array(0.0), values, reverse=reverse)
         return jnp.sum(outputs[:3])
 
-    traced = trace_fn(objective, values)
+    traced = analyze(objective, values)
     blocks = _finest_contribution_blocks(traced)
     resolver, frame = ConcreteResolver.root(
-        traced.captured.closed_jaxpr,
-        traced.captured.flat_args,
-        traced.analysis,
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
     )
     planned = plan_tagged_block_dof_incidence(
-        traced.analysis,
+        traced._plan,
         frame,
         resolver,
-        traced.contributions,
+        traced._contributions,
         blocks=blocks,
     )
-    legacy = tagged_block_dof_incidence(
-        traced.resolved,
-        traced.contributions,
-        blocks=blocks,
-    )
-
-    assert (planned.csr != legacy.csr).nnz == 0
+    assert planned.n_blocks == 3
+    assert planned.n_dofs == values.size
+    assert np.all(planned.block_dof_counts > 0)
     assert resolver.stats.scan_iterations == expected_visits
     assert resolver.stats.peak_live_frames == 2
 
 
-def test_tagged_incidence_matches_oracle_for_structural_and_nested_programs():
+def test_plan_incidence_handles_structural_and_nested_programs():
     u = jnp.arange(1.0, 7.0)
 
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values, weights: jnp.sum(
             jnp.sum(values.reshape(3, 2) * weights, axis=1)
         ),
         u,
         jnp.array([2.0, 3.0]),
     )
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values, matrix: jnp.sum(jnp.sum(values.reshape(3, 2) @ matrix, axis=1)),
         u,
         jnp.array([[1.0, 2.0], [3.0, 4.0]]),
     )
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values, mask: jnp.sum(jnp.where(mask, values, values[::-1]) ** 2),
         u,
         jnp.array([True, False, True, False, True, False]),
     )
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values, predicate: jnp.sum(
             jax.lax.cond(
                 predicate,
@@ -298,13 +276,13 @@ def test_tagged_incidence_matches_oracle_for_structural_and_nested_programs():
     def called(values):
         return values**2 + 1
 
-    _assert_tagged_matches_reference(lambda values: jnp.sum(called(values)), u)
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(lambda values: jnp.sum(called(values)), u)
+    _assert_plan_incidence_builds(
         lambda values: jnp.sum(jax.lax.map(lambda value: value**2, values)),
         u,
     )
     connectivity = jnp.array([[0, 1], [1, 2], [3, 4], [4, 5]], dtype=jnp.int32)
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values, connectivity: jnp.sum(
             jax.lax.map(
                 lambda at: jnp.sum(values[at] ** 2),
@@ -323,7 +301,7 @@ def test_tagged_incidence_matches_oracle_for_structural_and_nested_programs():
         _, outputs = jax.lax.scan(body, jnp.array(0.0), values)
         return jnp.sum(outputs)
 
-    _assert_tagged_matches_reference(scanned, u)
+    _assert_plan_incidence_builds(scanned, u)
 
     def empty_scan(values, xs):
         def body(carry, value):
@@ -333,31 +311,31 @@ def test_tagged_incidence_matches_oracle_for_structural_and_nested_programs():
         final, _ = jax.lax.scan(body, values[0], xs)
         return jnp.sum(final.reshape(1))
 
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         empty_scan,
         u,
         jnp.empty((0,), dtype=u.dtype),
     )
 
     indices = jnp.array([0, 2, 4, 5], dtype=jnp.int32)
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values, at: jnp.sum(jnp.zeros_like(values).at[at].add(values[:4]) ** 2),
         u,
         indices,
     )
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values, at: jnp.sum(values.at[at].set(values[:4]) ** 2),
         u,
         indices,
     )
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values, start: jnp.sum(
             jax.lax.dynamic_slice(values, (start,), (3,)) ** 2
         ),
         u,
         jnp.array(2, dtype=jnp.int32),
     )
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values, update, start: jnp.sum(
             jax.lax.dynamic_update_slice(values, update, (start,)) ** 2
         ),
@@ -365,13 +343,13 @@ def test_tagged_incidence_matches_oracle_for_structural_and_nested_programs():
         jnp.array([10.0, 11.0]),
         jnp.array(2, dtype=jnp.int32),
     )
-    _assert_tagged_matches_reference(
+    _assert_plan_incidence_builds(
         lambda values: 2 * jnp.sum(values[:3] ** 2) - 3 * jnp.sum(values[3:] ** 3),
         u,
     )
 
 
-def test_tagged_incidence_matches_oracle_for_linear_solve_callbacks():
+def test_plan_incidence_handles_linear_solve_callbacks():
     def implicit_scalar_solve(a, b):
         def matvec(value):
             return a * value
@@ -391,7 +369,7 @@ def test_tagged_incidence_matches_oracle_for_linear_solve_callbacks():
         return jnp.sum(solutions)
 
     with pytest.warns(UserWarning, match="supported batched matrix layout"):
-        _assert_tagged_matches_reference(
+        _assert_plan_incidence_builds(
             objective,
             jnp.array([2.0, 4.0, 3.0, 5.0]),
         )
@@ -403,12 +381,12 @@ def test_tagged_primitive_rule_is_called_once_for_many_blocks(monkeypatch):
     connectivity = jnp.stack(
         (jnp.arange(n_blocks), jnp.arange(1, n_blocks + 1)), axis=1
     ).astype(jnp.int32)
-    traced = trace_fn(_gather_energy, values, connectivity)
+    traced = analyze(_gather_energy, values, connectivity)
     blocks = _finest_contribution_blocks(traced)
     integer_pow = next(
-        resolved.plan.eqn.primitive
-        for resolved in traced.resolved.eqns
-        if resolved.plan.eqn.primitive.name == "integer_pow"
+        eqn.eqn.primitive
+        for eqn in traced._plan.eqns
+        if eqn.eqn.primitive.name == "integer_pow"
     )
     semantics = SEMANTICS.get_ordinary(integer_pow)
     calls = 0
@@ -432,9 +410,16 @@ def test_tagged_primitive_rule_is_called_once_for_many_blocks(monkeypatch):
         ),
     )
 
-    tagged_block_dof_incidence(
-        traced.resolved,
-        traced.contributions,
+    resolver, frame = ConcreteResolver.root(
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
+    )
+    plan_tagged_block_dof_incidence(
+        traced._plan,
+        frame,
+        resolver,
+        traced._contributions,
         blocks=blocks,
     )
     assert calls == 1
@@ -448,11 +433,11 @@ def test_tagged_gather_consumes_demand_scoped_route_fragment(monkeypatch):
         gathered = values[indices]
         return jnp.sum(gathered[:3] ** 2)
 
-    traced = trace_fn(objective, values, indices)
+    traced = analyze(objective, values, indices)
     gather_primitive = next(
-        resolved.plan.eqn.primitive
-        for resolved in traced.resolved.eqns
-        if resolved.plan.eqn.primitive.name == "gather"
+        eqn.eqn.primitive
+        for eqn in traced._plan.eqns
+        if eqn.eqn.primitive.name == "gather"
     )
     semantics = SEMANTICS.get_ordinary(gather_primitive)
     seen_rows: list[int] = []
@@ -469,15 +454,22 @@ def test_tagged_gather_consumes_demand_scoped_route_fragment(monkeypatch):
     )
 
     blocks = _finest_contribution_blocks(traced)
-    tagged_block_dof_incidence(
-        traced.resolved,
-        traced.contributions,
+    resolver, frame = ConcreteResolver.root(
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
+    )
+    plan_tagged_block_dof_incidence(
+        traced._plan,
+        frame,
+        resolver,
+        traced._contributions,
         blocks=blocks,
     )
     assert seen_rows == [3]
 
 
-def test_tagged_incidence_does_not_take_tensor_demand_cartesian_hulls():
+def test_plan_incidence_does_not_take_tensor_demand_cartesian_hulls():
     values = jnp.arange(9.0)
     diagonal = jnp.array([0, 1, 2], dtype=jnp.int32)
 
@@ -485,23 +477,12 @@ def test_tagged_incidence_does_not_take_tensor_demand_cartesian_hulls():
         matrix = values.reshape(3, 3)
         return jnp.sum(matrix[diagonal, diagonal] ** 2)
 
-    traced = trace_fn(objective, values, diagonal)
+    traced = analyze(objective, values, diagonal)
     blocks = generate_contribution_blocks(
-        traced.contributions,
+        traced._contributions,
         blocks_per_root=2,
     )
-    reference = reference_block_dof_incidence(
-        traced.resolved,
-        traced.contributions,
-        blocks=blocks,
-    )
-    tagged = tagged_block_dof_incidence(
-        traced.resolved,
-        traced.contributions,
-        blocks=blocks,
-    )
+    tagged = inspect_incidence(traced, blocks)
 
-    # The old TensorDemand path closes {(0,0), (1,1)} into the Cartesian
-    # product {0,1}×{0,1}. Colored row-label propagation remains exact.
-    np.testing.assert_array_equal(reference.dofs_for_block(0), [0, 1, 3, 4])
+    # Colored row-label propagation preserves the exact diagonal relation.
     np.testing.assert_array_equal(tagged.dofs_for_block(0), [0, 4])

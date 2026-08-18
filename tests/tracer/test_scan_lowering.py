@@ -2,11 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from tatva.tracer.api import CapturedJaxpr, trace
-from tatva.tracer.local.liveness import DemandSeed, backpropagate_demand
-from tatva.tracer.local.plan import build_local_plan
-from tatva.tracer.lowering.executor import build_local_executable
-from tatva.tracer.lowering.partition import partition_contributions
+from tatva.tracer.api import analyze
 
 
 def _bind_reverse(energy, reverse):
@@ -17,24 +13,10 @@ def _bind_reverse(energy, reverse):
 
 
 def _lower_part(fn, u, *, n_parts=1, part=0):
-    traced = trace(CapturedJaxpr.from_fn(fn, u))
-    partition = partition_contributions(traced.contributions, n_parts=n_parts)
-    owned = partition.for_part(part)
-    seeds = tuple(
-        DemandSeed(
-            value=traced.contributions.root(item.root_id).value,
-            demand=item.demand,
-        )
-        for item in owned
-    )
-    demand = backpropagate_demand(traced.resolved, seeds)
-    plan = build_local_plan(traced.resolved, demand)
-    executable = build_local_executable(
-        plan,
-        contributions=traced.contributions,
-        owned=owned,
-    )
-    return executable(*executable.pack_global_inputs(u))
+    traced = analyze(fn, u)
+    local = traced.distribute(parts=n_parts).rank(part)
+    inputs = local.localize(u)
+    return local.compile()(*inputs.args, **inputs.kwargs)
 
 
 def test_scan_lowering_matches_forward_and_reverse_scans():
