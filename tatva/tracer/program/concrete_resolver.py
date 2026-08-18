@@ -1,6 +1,7 @@
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any, Self
 
 import numpy as np
@@ -8,6 +9,7 @@ from jax import lax
 from jax.core import Atom
 from jax.extend.core import ClosedJaxpr, JaxprEqn, Literal, Primitive, Var
 
+from tatva.tracer.core.concrete import ConcreteRegion
 from tatva.tracer.core.nested import (
     CallSpec,
     CondSpec,
@@ -21,13 +23,42 @@ from tatva.tracer.core.nested import (
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import RouteFragment, RouteRequest
 from tatva.tracer.core.routes import Route
-from tatva.tracer.core.semantics import no_route_fragment
-from tatva.tracer.local.demand import TensorDemand
+from tatva.tracer.core.semantics import (
+    DemandContext,
+    FullConcrete,
+    RegionalConcrete,
+    RegionalConcreteContext,
+    UnsupportedConcrete,
+    no_route_fragment,
+)
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import TensorDemand, axis_indices
 from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 
 
 class DynamicRoutingError(RuntimeError):
     """Planning-time routing depends on a value unavailable without the DOFs."""
+
+
+class ConcreteFallback(Enum):
+    GLOBAL = auto()
+    ERROR = auto()
+
+
+class ConcreteEvaluationError(RuntimeError):
+    """Demand-scoped concrete evaluation cannot be performed safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConcreteEscalation:
+    path: FramePath
+    eqn_index: int
+    primitive: str
+    requested: TensorDemand
+    promoted_shape: tuple[int, ...]
+    promoted_entries: int
+    reason: str
+    source: str | None = None
 
 
 type ConcreteEvalRule = Callable[[tuple[Any, ...], dict[str, Any]], tuple[Any, ...]]
@@ -88,6 +119,7 @@ class _FrameState:
     producers: dict[Var, tuple[EqnPlan, int]]
     unavailable: dict[Var, str]
     resolving: set[Var]
+    regions: dict[Var, list[ConcreteRegion]]
 
 
 @dataclass
@@ -100,16 +132,28 @@ class ConcreteResolverStats:
     peak_live_frames: int = 0
     map_iterations: int = 0
     scan_iterations: int = 0
+    regional_value_requests: int = 0
+    regional_cache_hits: int = 0
+    regional_evaluated_eqns: int = 0
+    regional_entries: int = 0
+    full_escalations: int = 0
 
 
 class ConcreteResolver:
-    def __init__(self):
+    def __init__(self, *, fallback: ConcreteFallback = ConcreteFallback.GLOBAL):
         self._frames: dict[FramePath, _FrameState] = {}
+        self.fallback = fallback
+        self.escalations: list[ConcreteEscalation] = []
         self.stats = ConcreteResolverStats()
 
     @classmethod
     def root(
-        cls, closed_jaxpr: ClosedJaxpr, flat_args: tuple[Any, ...], plan: JaxprPlan
+        cls,
+        closed_jaxpr: ClosedJaxpr,
+        flat_args: tuple[Any, ...],
+        plan: JaxprPlan,
+        *,
+        fallback: ConcreteFallback = ConcreteFallback.GLOBAL,
     ) -> tuple[Self, ConcreteFrame]:
         if closed_jaxpr.jaxpr is not plan.jaxpr:
             raise ValueError("plan does not match closed_jaxpr")
@@ -119,7 +163,7 @@ class ConcreteResolver:
         if not plan.jaxpr.invars:
             raise ValueError("cannot create a concrete resolver without JAXPR inputs")
 
-        resolver = cls()
+        resolver = cls(fallback=fallback)
         frame = ConcreteFrame(plan, ())
         values: dict[Var, ConcreteValue] = {}
 
@@ -142,6 +186,7 @@ class ConcreteResolver:
             producers=producers,
             unavailable=unavailable,
             resolving=set(),
+            regions={},
         )
         resolver.stats.frames_created = 1
         resolver.stats.peak_live_frames = 1
@@ -149,10 +194,19 @@ class ConcreteResolver:
 
     def value(
         self, frame: ConcreteFrame, atom: Atom, demand: TensorDemand | None = None
-    ) -> ConcreteValue:
-        # Phase 4 computes complete concrete values. The argument establishes
-        # the API that later phases will use for sliced concrete evaluation.
-        del demand
+    ) -> ConcreteValue | ConcreteRegion:
+        if demand is None:
+            return self._full_value(frame, atom)
+        if demand.shape != _shape_of(atom):
+            raise ValueError(
+                f"concrete demand shape {demand.shape} does not match "
+                f"value shape {_shape_of(atom)}"
+            )
+        self.stats.value_requests += 1
+        self.stats.regional_value_requests += 1
+        return self._regional_value(frame, atom, demand)
+
+    def _full_value(self, frame: ConcreteFrame, atom: Atom) -> ConcreteValue:
         self.stats.value_requests += 1
 
         if isinstance(atom, Literal):
@@ -217,6 +271,233 @@ class ConcreteResolver:
             )
         return state.values[atom]
 
+    def _regional_value(
+        self, frame: ConcreteFrame, atom: Atom, demand: TensorDemand
+    ) -> ConcreteRegion:
+        if isinstance(atom, Literal):
+            return ConcreteRegion.from_full(np.asarray(atom.val), demand)
+        if not isinstance(atom, Var):
+            raise TypeError(f"unsupported JAXPR atom {type(atom)!r}")
+
+        state = self._state(frame)
+        for cached in state.regions.get(atom, ()):
+            projected = cached.project(demand)
+            if projected is not None:
+                self.stats.regional_cache_hits += 1
+                return projected
+
+        if atom in state.values:
+            region = ConcreteRegion.from_full(state.values[atom], demand)
+            self._cache_region(state, atom, region)
+            return region
+        if atom in state.unavailable:
+            label = state.unavailable[atom]
+            raise DynamicRoutingError(
+                f"regional concrete evaluation reached {label} ({atom}), which "
+                "is unavailable during planning"
+            )
+
+        binding = state.bindings.get(atom)
+        if binding is not None:
+            region = self._regional_binding(binding, demand)
+            self._cache_region(state, atom, region)
+            return region
+
+        producer = state.producers.get(atom)
+        if producer is None:
+            raise DynamicRoutingError(
+                f"no concrete value or producer is available for {atom} in frame "
+                f"{frame.path}"
+            )
+        eqn_plan, output_index = producer
+        if eqn_plan.nested is None:
+            region = self._regional_ordinary(frame, eqn_plan, output_index, demand)
+        else:
+            region = self._regional_nested(frame, eqn_plan, output_index, demand)
+        self._cache_region(state, atom, region)
+        return region
+
+    def _regional_binding(
+        self, binding: _ParentBinding, demand: TensorDemand
+    ) -> ConcreteRegion:
+        if binding.leading_index is None:
+            parent = self.value(binding.frame, binding.atom, demand)
+            assert isinstance(parent, ConcreteRegion)
+            return ConcreteRegion(parent.values, demand)
+
+        parent_shape = _shape_of(binding.atom)
+        if parent_shape[1:] != demand.shape:
+            raise ValueError("mapped concrete binding shape mismatch")
+        child_rows = demand.rows()
+        child_size = int(np.prod(demand.shape, dtype=np.int64))
+        parent_rows = binding.leading_index * child_size + child_rows
+        parent_demand = TensorDemand.from_rows_hull(parent_shape, parent_rows)
+        if parent_demand is None:
+            raise RuntimeError("non-empty child demand produced no parent demand")
+        parent = self.value(binding.frame, binding.atom, parent_demand)
+        assert isinstance(parent, ConcreteRegion)
+        return ConcreteRegion(np.squeeze(parent.values, axis=0), demand)
+
+    def _regional_ordinary(
+        self,
+        frame: ConcreteFrame,
+        eqn_plan: EqnPlan,
+        output_index: int,
+        demand: TensorDemand,
+    ) -> ConcreteRegion:
+        eqn = eqn_plan.eqn
+        semantics = SEMANTICS.get_ordinary(eqn.primitive)
+        ctx = RegionalConcreteContext(eqn, output_index, demand)
+        decision = semantics.regional_concrete(ctx)
+        if isinstance(decision, FullConcrete):
+            return self._escalate(
+                frame, eqn_plan, output_index, demand, decision.reason
+            )
+        if isinstance(decision, UnsupportedConcrete):
+            raise ConcreteEvaluationError(
+                f"{eqn.primitive.name} cannot be evaluated concretely: "
+                f"{decision.reason}"
+            )
+        if not isinstance(decision, RegionalConcrete):
+            raise TypeError("regional concrete rule returned an invalid plan")
+
+        output_demands = [None] * len(eqn.outvars)
+        output_demands[output_index] = demand
+        input_demands = decision.backpropagate(
+            DemandContext(eqn, tuple(output_demands), None)
+        )
+        if len(input_demands) != len(eqn.invars):
+            raise ConcreteEvaluationError(
+                f"{eqn.primitive.name} regional demand returned the wrong arity"
+            )
+        inputs: list[Any] = []
+        for input_atom, input_demand in zip(eqn.invars, input_demands, strict=True):
+            if isinstance(input_atom, Literal):
+                inputs.append(input_atom.val)
+            elif input_demand is None:
+                raise ConcreteEvaluationError(
+                    f"{eqn.primitive.name} omitted demand for non-literal input"
+                )
+            else:
+                input_region = self.value(frame, input_atom, input_demand)
+                assert isinstance(input_region, ConcreteRegion)
+                value = input_region.values
+                dtype = getattr(input_atom.aval, "dtype", None)
+                if dtype is not None:
+                    value = value.astype(dtype, copy=False)
+                inputs.append(value)
+        output = np.asarray(decision.evaluate(ctx, tuple(inputs)))
+        region = ConcreteRegion(output, demand)
+        self.stats.regional_evaluated_eqns += 1
+        return region
+
+    def _regional_nested(
+        self,
+        frame: ConcreteFrame,
+        eqn_plan: EqnPlan,
+        output_index: int,
+        demand: TensorDemand,
+    ) -> ConcreteRegion:
+        nested = eqn_plan.nested
+        assert nested is not None
+        spec = nested.spec
+        if isinstance(spec, CallSpec):
+            child = self.call_frame(frame, eqn_plan)
+            try:
+                result = self.value(
+                    child, child.plan.jaxpr.outvars[output_index], demand
+                )
+                assert isinstance(result, ConcreteRegion)
+                return ConcreteRegion(result.values, demand)
+            finally:
+                self.release(child)
+        if isinstance(spec, CondSpec):
+            _branch, child = self.cond_frame(frame, eqn_plan)
+            try:
+                result = self.value(
+                    child, child.plan.jaxpr.outvars[output_index], demand
+                )
+                assert isinstance(result, ConcreteRegion)
+                return ConcreteRegion(result.values, demand)
+            finally:
+                self.release(child)
+        if isinstance(spec, MapSpec):
+            return self._regional_map(frame, eqn_plan, spec, output_index, demand)
+        return self._escalate(
+            frame,
+            eqn_plan,
+            output_index,
+            demand,
+            f"{type(spec).__name__} requires invocation-wide concrete evaluation",
+        )
+
+    def _regional_map(
+        self,
+        frame: ConcreteFrame,
+        eqn_plan: EqnPlan,
+        spec: MapSpec,
+        output_index: int,
+        demand: TensorDemand,
+    ) -> ConcreteRegion:
+        output_shape = _shape_of(eqn_plan.eqn.outvars[output_index])
+        logical_indices = axis_indices(demand.axes[0], extent=output_shape[0])
+        child_demand = TensorDemand.from_axes(output_shape[1:], demand.axes[1:])
+        if child_demand is None:
+            raise RuntimeError("mapped output demand produced no child demand")
+        values = []
+        for logical_index in logical_indices:
+            child = self.map_frame(frame, eqn_plan, int(logical_index))
+            try:
+                region = self.value(
+                    child,
+                    child.plan.jaxpr.outvars[output_index],
+                    child_demand,
+                )
+                assert isinstance(region, ConcreteRegion)
+                values.append(region.values)
+            finally:
+                self.release(child)
+        return ConcreteRegion(np.stack(values, axis=0), demand)
+
+    def _escalate(
+        self,
+        frame: ConcreteFrame,
+        eqn_plan: EqnPlan,
+        output_index: int,
+        demand: TensorDemand,
+        reason: str,
+    ) -> ConcreteRegion:
+        eqn = eqn_plan.eqn
+        shape = _shape_of(eqn.outvars[output_index])
+        if demand.is_full:
+            full = self._full_value(frame, eqn.outvars[output_index])
+            return ConcreteRegion.from_full(full, demand)
+        escalation = ConcreteEscalation(
+            path=frame.path,
+            eqn_index=eqn_plan.index,
+            primitive=eqn.primitive.name,
+            requested=demand,
+            promoted_shape=shape,
+            promoted_entries=int(np.prod(shape, dtype=np.int64)),
+            reason=reason,
+            source=str(eqn.source_info) if eqn.source_info is not None else None,
+        )
+        if self.fallback is ConcreteFallback.ERROR:
+            raise ConcreteEvaluationError(
+                f"regional concrete evaluation for {eqn.primitive.name} "
+                f"requires FULL {shape}: {reason}"
+            )
+        self.escalations.append(escalation)
+        self.stats.full_escalations += 1
+        full = self._full_value(frame, eqn.outvars[output_index])
+        return ConcreteRegion.from_full(full, demand)
+
+    def _cache_region(
+        self, state: _FrameState, atom: Var, region: ConcreteRegion
+    ) -> None:
+        state.regions.setdefault(atom, []).append(region)
+        self.stats.regional_entries += region.values.size
+
     def route(self, frame: ConcreteFrame, eqn_plan: EqnPlan) -> Route | None:
         """Resolve an ordinary equation's complete structural route lazily."""
         semantics, concrete = self._route_inputs(frame, eqn_plan)
@@ -225,7 +506,7 @@ class ConcreteResolver:
     def route_fragment(
         self, frame: ConcreteFrame, eqn_plan: EqnPlan, request: RouteRequest
     ) -> RouteFragment | None:
-        semantics, concrete = self._route_inputs(frame, eqn_plan)
+        semantics, concrete = self._route_inputs(frame, eqn_plan, request=request)
         if semantics.route_fragment is no_route_fragment:
             return None
         return semantics.route_fragment(eqn_plan.eqn, concrete, request)
@@ -385,7 +666,13 @@ class ConcreteResolver:
         del self._frames[frame.path]
         self.stats.frames_released += 1
 
-    def _route_inputs(self, frame: ConcreteFrame, eqn_plan: EqnPlan):
+    def _route_inputs(
+        self,
+        frame: ConcreteFrame,
+        eqn_plan: EqnPlan,
+        *,
+        request: RouteRequest | None = None,
+    ):
         self._state(frame)
         if not any(candidate is eqn_plan for candidate in frame.plan.eqns):
             raise ValueError("equation plan does not belong to the concrete frame")
@@ -394,7 +681,16 @@ class ConcreteResolver:
         eqn = eqn_plan.eqn
         semantics = SEMANTICS.get_ordinary(eqn.primitive)
         concrete: ConcreteEnv = {}
-        for input_index in semantics.concrete_inputs(eqn):
+        concrete_indices = semantics.concrete_inputs(eqn)
+        demands = None
+        if request is not None and semantics.route_concrete_demands is not None:
+            demands = semantics.route_concrete_demands(eqn, request)
+            if len(demands) != len(eqn.invars):
+                raise ValueError(
+                    f"{eqn.primitive.name}.route_concrete_demands returned "
+                    "the wrong arity"
+                )
+        for input_index in concrete_indices:
             if input_index < 0 or input_index >= len(eqn.invars):
                 raise ValueError(
                     f"{eqn.primitive.name}.concrete_inputs returned invalid "
@@ -402,10 +698,60 @@ class ConcreteResolver:
                 )
             atom = eqn.invars[input_index]
             if isinstance(atom, Var):
-                concrete[atom] = self.value(frame, atom)
+                if request is None:
+                    concrete[atom] = self._full_value(frame, atom)
+                else:
+                    demand = None if demands is None else demands[input_index]
+                    if demand is None:
+                        demand = TensorDemand.full(_shape_of(atom))
+                    if demand is None:
+                        raise RuntimeError("concrete route input has an empty shape")
+                    if demands is None and demand.is_full and demand.size > 1:
+                        requested = TensorDemand.from_rows_hull(
+                            _shape_of(eqn.outvars[0]), request.output_rows
+                        )
+                        if requested is not None and not requested.is_full:
+                            self._record_route_escalation(
+                                frame,
+                                eqn_plan,
+                                requested,
+                                demand,
+                                input_index,
+                            )
+                    concrete[atom] = self.value(frame, atom, demand)
             elif not isinstance(atom, Literal):
                 raise TypeError(f"unsupported JAXPR atom {type(atom)!r}")
         return semantics, concrete
+
+    def _record_route_escalation(
+        self,
+        frame: ConcreteFrame,
+        eqn_plan: EqnPlan,
+        requested: TensorDemand,
+        promoted: TensorDemand,
+        input_index: int,
+    ) -> None:
+        eqn = eqn_plan.eqn
+        reason = f"route construction requires complete concrete input {input_index}"
+        if self.fallback is ConcreteFallback.ERROR:
+            raise ConcreteEvaluationError(
+                f"regional route resolution for {eqn.primitive.name} requires "
+                f"FULL input {input_index} {_shape_of(eqn.invars[input_index])}: "
+                f"{reason}"
+            )
+        self.escalations.append(
+            ConcreteEscalation(
+                path=frame.path,
+                eqn_index=eqn_plan.index,
+                primitive=eqn.primitive.name,
+                requested=requested,
+                promoted_shape=promoted.shape,
+                promoted_entries=promoted.size,
+                reason=reason,
+                source=str(eqn.source_info) if eqn.source_info is not None else None,
+            )
+        )
+        self.stats.full_escalations += 1
 
     def _nested(self, eqn_plan: EqnPlan, spec_type):
         nested = eqn_plan.nested
@@ -453,6 +799,7 @@ class ConcreteResolver:
             producers=_build_producer_index(plan),
             unavailable=unavailable_map,
             resolving=set(),
+            regions={},
         )
         self.stats.frames_created += 1
         self.stats.peak_live_frames = max(

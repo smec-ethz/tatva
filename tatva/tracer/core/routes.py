@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, TypeGuard
 
 import numpy as np
 from jax.extend.core import JaxprEqn, Var
@@ -13,8 +13,18 @@ from tatva.tracer.helpers import _shape_of
 type Shape = tuple[int, ...]
 
 # these 2 are also in program/concrete_resolver.py.... should probably be unified
-type ConcreteValue = NDArray[Any] | np.generic | bool | int | float | complex
+type ConcreteValue = Any
 type ConcreteEnv = Mapping[Var, ConcreteValue]
+
+
+class _RegionalRows(Protocol):
+    global_shape: tuple[int, ...]
+
+    def read_rows(self, global_rows: NDArray[np.int64]) -> NDArray[Any]: ...
+
+
+def _is_regional_rows(value: object) -> TypeGuard[_RegionalRows]:
+    return hasattr(value, "read_rows") and hasattr(value, "global_shape")
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +216,10 @@ def _compute_gather_route_rows(
     operand_shape = _shape_of(eqn.invars[0])
     output_shape = _shape_of(eqn.outvars[0])
 
-    indices = np.asarray(indices)
+    regional = _is_regional_rows(indices)
+    indices_shape = (
+        tuple(indices.global_shape) if regional else tuple(np.asarray(indices).shape)
+    )
     output_rows = np.asarray(output_rows, dtype=np.int64).ravel()
 
     dnums = eqn.params["dimension_numbers"]
@@ -226,13 +239,13 @@ def _compute_gather_route_rows(
     operand_rank = len(operand_shape)
     output_rank = len(output_shape)
 
-    if indices.ndim < 1:
+    if len(indices_shape) < 1:
         raise NotImplementedError("gather scalar index arrays are not supported")
 
     if len(slice_sizes) != operand_rank:
         raise ValueError("gather slice_sizes rank does not match operand rank")
 
-    index_vector_size = indices.shape[-1]
+    index_vector_size = indices_shape[-1]
 
     if index_vector_size != len(start_index_map):
         raise ValueError("gather index-vector size does not match start_index_map")
@@ -264,7 +277,7 @@ def _compute_gather_route_rows(
     output_batch_dims = tuple(
         axis for axis in range(output_rank) if axis not in offset_set
     )
-    expected_batch_rank = indices.ndim - 1
+    expected_batch_rank = len(indices_shape) - 1
 
     if len(output_batch_dims) != expected_batch_rank:
         raise NotImplementedError("unsupported gather output/index batch geometry")
@@ -276,23 +289,37 @@ def _compute_gather_route_rows(
 
     # Index vector for every output row
     if index_vector_size:
-        if indices.ndim == 1:
-            index_vectors = np.broadcast_to(
-                indices.reshape(1, index_vector_size),
+        if len(indices_shape) == 1:
+            index_rows = np.broadcast_to(
+                np.arange(index_vector_size, dtype=np.int64),
                 (n_output, index_vector_size),
-            )
+            ).copy()
         else:
-            key = tuple(batch_coords[:, axis] for axis in range(indices.ndim - 1))
-
-            index_vectors = np.asarray(indices[key], dtype=np.int64).reshape(
-                n_output, index_vector_size
+            components = np.tile(np.arange(index_vector_size, dtype=np.int64), n_output)
+            flattened_coords = [
+                np.repeat(batch_coords[:, axis], index_vector_size)
+                for axis in range(len(indices_shape) - 1)
+            ]
+            flattened_coords.append(components)
+            index_rows = np.ravel_multi_index(
+                tuple(flattened_coords), indices_shape
+            ).reshape(n_output, index_vector_size)
+        if regional:
+            index_vectors = np.asarray(
+                indices.read_rows(index_rows), dtype=np.int64
+            ).reshape(n_output, index_vector_size)
+        else:
+            index_vectors = (
+                np.asarray(indices)
+                .ravel()[index_rows]
+                .reshape(n_output, index_vector_size)
             )
     else:
         index_vectors = np.empty((n_output, 0), dtype=np.int64)
 
     if index_vector_size == 0:
         index_rows = np.empty((n_output, 0), dtype=np.int64)
-    elif indices.ndim == 1:
+    elif len(indices_shape) == 1:
         index_rows = np.broadcast_to(
             np.arange(index_vector_size, dtype=np.int64), (n_output, index_vector_size)
         ).copy()
@@ -300,11 +327,11 @@ def _compute_gather_route_rows(
         components = np.tile(np.arange(index_vector_size, dtype=np.int64), n_output)
         flattened_coords = [
             np.repeat(batch_coords[:, axis], index_vector_size)
-            for axis in range(indices.ndim - 1)
+            for axis in range(len(indices_shape) - 1)
         ]
         flattened_coords.append(components)
         index_rows = np.ravel_multi_index(
-            tuple(flattened_coords), indices.shape
+            tuple(flattened_coords), indices_shape
         ).reshape(n_output, index_vector_size)
 
     # Start coordinate in operand space

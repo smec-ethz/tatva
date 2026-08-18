@@ -4,7 +4,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
 
@@ -22,6 +22,44 @@ if TYPE_CHECKING:
     from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
 
 type ContributionCoefficient = int | float | complex
+
+
+@dataclass(frozen=True, slots=True)
+class RegionalConcreteContext:
+    eqn: JaxprEqn
+    output_index: int
+    demand: TensorDemand
+
+
+type RegionalConcreteEvaluator = Callable[
+    [RegionalConcreteContext, tuple[Any, ...]], Any
+]
+
+
+@dataclass(frozen=True, slots=True)
+class RegionalConcrete:
+    backpropagate: DemandRule
+    evaluate: RegionalConcreteEvaluator
+
+
+@dataclass(frozen=True, slots=True)
+class FullConcrete:
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class UnsupportedConcrete:
+    reason: str
+
+
+type RegionalConcretePlan = RegionalConcrete | FullConcrete | UnsupportedConcrete
+type RegionalConcreteRule = Callable[[RegionalConcreteContext], RegionalConcretePlan]
+
+
+def full_concrete_evaluation(ctx: RegionalConcreteContext) -> FullConcrete:
+    return FullConcrete(
+        f"{ctx.eqn.primitive.name} has no regional concrete evaluation rule"
+    )
 
 
 class ContributionMode(Enum):
@@ -174,6 +212,7 @@ type RouteRule = Callable[[JaxprEqn, ConcreteEnv], Route | None]
 type RouteFragmentRule = Callable[
     [JaxprEqn, ConcreteEnv, RouteRequest], RouteFragment | None
 ]
+type RouteConcreteDemandRule = Callable[[JaxprEqn, RouteRequest], tuple[Demand, ...]]
 type DemandRule = Callable[[DemandContext], tuple[Demand, ...]]
 type TaggedDemandRule = Callable[[TaggedDemandContext], tuple[Tagged, ...]]
 
@@ -217,8 +256,10 @@ class OperationSemantics[T]:
     concrete_inputs: ConcreteInputRule = no_concrete_inputs
     route: RouteRule = no_route
     route_fragment: RouteFragmentRule = no_route_fragment
+    route_concrete_demands: RouteConcreteDemandRule | None = None
     demand: DemandRule = conservative_demand
     tagged_demand: TaggedDemandRule = conservative_tagged_demand
+    regional_concrete: RegionalConcreteRule = full_concrete_evaluation
     contribution: ContributionRule = contribution_barrier
     localization: LocalizationSemantics = NO_LOCALIZATION
     lowering: LoweringRule | None = None

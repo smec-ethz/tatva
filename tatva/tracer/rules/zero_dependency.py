@@ -12,7 +12,7 @@ from tatva.tracer.core.semantics import (
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import Demand
 from tatva.tracer.program.dependencies import DependencySet
-from tatva.tracer.rules import tagged
+from tatva.tracer.rules import concrete, tagged
 from tatva.tracer.rules.elementwise import elementwise_demand
 
 if TYPE_CHECKING:
@@ -53,6 +53,7 @@ IOTA = OperationSemantics(
     ),
     demand=no_input_demand,
     tagged_demand=tagged.no_input,
+    regional_concrete=concrete.regional_iota,
 )
 
 ZERO_DEPENDENCY = OperationSemantics(
@@ -63,6 +64,7 @@ ZERO_DEPENDENCY = OperationSemantics(
     ),
     demand=elementwise_demand,
     tagged_demand=tagged.elementwise,
+    regional_concrete=concrete.regional_bind(elementwise_demand),
 )
 
 NO_OP = OperationSemantics(

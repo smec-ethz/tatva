@@ -10,6 +10,7 @@ from tatva.tracer.core.semantics import (
     ScanAnalysisSemantics,
     conservative_demand,
     contribution_barrier,
+    full_concrete_evaluation,
     no_route,
 )
 from tatva.tracer.rules.registration import register_builtin_rules
@@ -132,6 +133,11 @@ class PrimitiveRegistry:
                     if rule.lowering is None
                     else "  lowering: specialized"
                 ),
+                (
+                    "  regional concrete: full fallback"
+                    if rule.regional_concrete is full_concrete_evaluation
+                    else "  regional concrete: specialized"
+                ),
             )
         )
 
@@ -148,6 +154,7 @@ class PrimitiveRegistry:
                         primitive.name,
                         "nested",
                         type(rule.analysis).__name__,
+                        "-",
                         "-",
                         "-",
                         "-",
@@ -176,6 +183,11 @@ class PrimitiveRegistry:
                         if rule.lowering is not None
                         else "bind"
                     ),
+                    (
+                        "full"
+                        if rule.regional_concrete is full_concrete_evaluation
+                        else _rule_name(rule.regional_concrete)
+                    ),
                 )
             )
 
@@ -188,6 +200,7 @@ class PrimitiveRegistry:
                 "routing",
                 "localization",
                 "lowering",
+                "regional concrete",
             ),
             rows,
         )

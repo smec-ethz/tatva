@@ -15,7 +15,7 @@ from tatva.tracer.core.semantics import (
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import Demand, TensorDemand, _FullAxis
 from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
-from tatva.tracer.rules import tagged
+from tatva.tracer.rules import concrete, tagged
 
 if TYPE_CHECKING:
     from tatva.tracer.core.semantics import RuleContext
@@ -255,6 +255,7 @@ LINEAR_UNARY = OperationSemantics(
     ),
     demand=elementwise_demand,
     tagged_demand=tagged.elementwise,
+    regional_concrete=concrete.regional_bind(elementwise_demand),
 )
 NONLINEAR_UNARY = OperationSemantics(
     DerivativeRule(
@@ -264,6 +265,7 @@ NONLINEAR_UNARY = OperationSemantics(
     ),
     demand=elementwise_demand,
     tagged_demand=tagged.elementwise,
+    regional_concrete=concrete.regional_bind(elementwise_demand),
 )
 INTEGER_POW = OperationSemantics(
     DerivativeRule(
@@ -273,6 +275,7 @@ INTEGER_POW = OperationSemantics(
     ),
     demand=elementwise_demand,
     tagged_demand=tagged.elementwise,
+    regional_concrete=concrete.regional_bind(elementwise_demand),
 )
 ELEMENTWISE_BINARY_BASIC = OperationSemantics(
     DerivativeRule(
@@ -282,6 +285,7 @@ ELEMENTWISE_BINARY_BASIC = OperationSemantics(
     ),
     demand=elementwise_demand,
     tagged_demand=tagged.elementwise,
+    regional_concrete=concrete.regional_bind(elementwise_demand),
 )
 
 
