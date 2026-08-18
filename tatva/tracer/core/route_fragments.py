@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from jax.extend.core import JaxprEqn
+from jax.extend.core import JaxprEqn, Literal
 from numpy.typing import NDArray
 
 from tatva.tracer.core.routes import (
@@ -89,6 +89,10 @@ def _output_rows(eqn: JaxprEqn, request: RouteRequest) -> NDArray[np.int64]:
     return rows
 
 
+def _read_concrete(concrete: ConcreteEnv, atom):
+    return atom.val if isinstance(atom, Literal) else concrete.get(atom)
+
+
 def _starts(
     eqn: JaxprEqn,
     concrete: ConcreteEnv,
@@ -99,7 +103,7 @@ def _starts(
 ) -> tuple[int, ...] | None:
     values: list[int] = []
     for atom in eqn.invars[first_start:]:
-        value = concrete.get(atom)
+        value = _read_concrete(concrete, atom)
         if value is None:
             return None
         values.append(int(np.asarray(value)))
@@ -119,7 +123,7 @@ def resolve_gather_route_fragment(
     Requested row order and duplicates are preserved so callers can align
     labels or other sparse payloads directly with the returned arrays.
     """
-    indices = concrete.get(eqn.invars[1])
+    indices = _read_concrete(concrete, eqn.invars[1])
     if indices is None:
         return None
 
@@ -149,7 +153,7 @@ def resolve_scatter_route_fragment(
     """
     if len(eqn.invars) < 3:
         return None
-    indices = concrete.get(eqn.invars[1])
+    indices = _read_concrete(concrete, eqn.invars[1])
     if indices is None:
         return None
     output_rows = _output_rows(eqn, request)
@@ -190,7 +194,7 @@ def resolve_select_n_route_fragment(
 ) -> SelectNRouteFragment | None:
     if len(eqn.invars) < 2:
         return None
-    selector = concrete.get(eqn.invars[0])
+    selector = _read_concrete(concrete, eqn.invars[0])
     if selector is None:
         return None
     output_rows = _output_rows(eqn, request)
