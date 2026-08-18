@@ -13,6 +13,7 @@ from tatva.tracer.core.semantics import (
     RegionalConcrete,
     RegionalConcreteContext,
     RegionalConcretePlan,
+    UnsupportedConcrete,
 )
 from tatva.tracer.local.demand import Demand
 from tatva.tracer.local.layout import TensorLayout
@@ -38,6 +39,13 @@ def regional_bind(
 def full(reason: str):
     def plan(_ctx: RegionalConcreteContext) -> RegionalConcretePlan:
         return FullConcrete(reason)
+
+    return plan
+
+
+def unsupported(reason: str):
+    def plan(_ctx: RegionalConcreteContext) -> RegionalConcretePlan:
+        return UnsupportedConcrete(reason)
 
     return plan
 

@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from jax import custom_derivatives, lax
+from jax._src.lax import lax as lax_internal
 from jax.extend.core import primitives
 
 from tatva.tracer.core.nested import CallKind
@@ -59,13 +60,20 @@ from . import (
     structural,
     tagged,
 )
-from .zero_dependency import IOTA, NO_OP, ZERO_DEPENDENCY
+from .zero_dependency import EMPTY, IOTA, NO_OP, ZERO_DEPENDENCY
 
 if TYPE_CHECKING:
     from tatva.tracer.core.registry import PrimitiveRegistry
 
 
 def _register_zero_deps_rules(reg: PrimitiveRegistry) -> None:
+    reg.register(
+        lax_internal.empty_p,
+        replace(
+            EMPTY,
+            lowering=lowerings.lower_empty,
+        ),
+    )
     reg.register(
         lax.iota_p,
         replace(
