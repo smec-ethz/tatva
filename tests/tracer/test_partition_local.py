@@ -2,8 +2,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import tatva.tracer.api as tracer_api
-from tatva.tracer.api import CapturedJaxpr, trace
+import tatva.tracer.diagnostics as tracer_diagnostics
+from tatva.tracer.api import analyze
 from tatva.tracer.core.nested import MapSpec
 from tatva.tracer.local.liveness import DemandSeed, backpropagate_plan_demand
 from tatva.tracer.local.plan import build_rank_local_plan
@@ -43,7 +43,7 @@ class _ReferenceComm:
         return obj
 
 
-def test_partition_local_matches_all_rank_reference():
+def test_distribution_constructs_and_caches_ranks_lazily():
     u = jnp.arange(6.0)
     coords = jnp.stack((u, u + 1), axis=1)
     connectivity = jnp.array(
@@ -58,40 +58,23 @@ def test_partition_local_matches_all_rank_reference():
         terms += 0.01 * jnp.sum(gathered_coords, axis=(1, 2))
         return jnp.sum(terms)
 
-    traced = trace(CapturedJaxpr.from_fn(energy, u, coords, connectivity))
-    reference = traced.partition(n_parts=2)
-    assert reference.n_parts == 2
+    traced = analyze(energy, u, coords, connectivity)
+    reference = traced.distribute(parts=2)
+    assert reference.parts == 2
+    assert not reference._rank_cache
     local_values = []
 
     for rank in range(2):
-        reference_rank = reference.for_rank(rank)
+        reference_rank = reference.rank(rank)
         assert reference_rank.rank == rank
-        assert reference_rank.local_plan is reference.local_plans[rank]
-        assert reference_rank.dof_plan is reference.dof_plans[rank]
+        assert reference_rank.parts == 2
+        assert reference.rank(rank) is reference_rank
 
-        local = traced.partition_local(
-            rank=rank,
-            n_parts=2,
-        )
+        inputs = reference_rank.localize(u, coords, connectivity)
+        local_values.append(reference_rank.compile()(*inputs.args, **inputs.kwargs))
 
-        assert local.rank == rank
-        assert local.n_parts == 2
-        assert local.local_plan is not reference.local_plans[rank]
-        np.testing.assert_array_equal(
-            local.dof_plan.compute_global,
-            reference.dof_plans[rank].compute_global,
-        )
-
-        local_args, local_kwargs = local.localize_inputs(u, coords, connectivity)
-        local_values.append(local.local_function()(*local_args, **local_kwargs))
-
-        reference_args, reference_kwargs = reference_rank.localize_inputs(
-            u, coords, connectivity
-        )
-        np.testing.assert_allclose(
-            reference_rank.local_function()(*reference_args, **reference_kwargs),
-            local_values[-1],
-        )
+    assert set(reference._rank_cache) == {0, 1}
+    assert reference.all_ranks() == (reference.rank(0), reference.rank(1))
 
     np.testing.assert_allclose(
         sum(local_values),
@@ -106,17 +89,22 @@ def test_partition_paths_do_not_materialize_global_invocations(monkeypatch):
 
     u = jnp.arange(8.0)
     connectivity = jnp.array([[0, 1], [2, 3], [4, 5], [6, 7]])
-    traced = trace(CapturedJaxpr.from_fn(energy, u, connectivity))
+    traced = analyze(energy, u, connectivity)
 
     def unexpected_materialization(*_args, **_kwargs):
         raise AssertionError("distributed planning materialized the global plan")
 
-    monkeypatch.setattr(tracer_api, "materialize_plan", unexpected_materialization)
-    distributed = traced.partition(n_parts=2)
-    local = traced.partition_local(rank=0, n_parts=2)
+    monkeypatch.setattr(
+        tracer_diagnostics,
+        "materialize_plan",
+        unexpected_materialization,
+    )
+    distributed = traced.distribute(parts=2)
+    assert not distributed._rank_cache
+    local = distributed.rank(0)
 
-    assert all(not hasattr(plan, "instance") for plan in distributed.local_plans)
-    assert not hasattr(local.local_plan, "instance")
+    assert set(distributed._rank_cache) == {0}
+    assert not hasattr(local._plan, "instance")
 
 
 def test_partition_retains_only_rank_demanded_map_iterations():
@@ -125,9 +113,10 @@ def test_partition_retains_only_rank_demanded_map_iterations():
         return jnp.sum(terms)
 
     u = jnp.arange(12.0)
-    distributed = trace(CapturedJaxpr.from_fn(energy, u)).partition(n_parts=3)
+    distributed = analyze(energy, u).distribute(parts=3)
 
-    for plan in distributed.local_plans:
+    for local in distributed.all_ranks():
+        plan = local._plan
         mapped = [
             eqn.nested
             for eqn in plan.eqns
@@ -138,10 +127,10 @@ def test_partition_retains_only_rank_demanded_map_iterations():
         assert 0 < len(indices) < u.size
 
     values = []
-    for rank in range(distributed.n_parts):
-        local = distributed.for_rank(rank)
-        args, kwargs = local.localize_inputs(u)
-        values.append(local.local_function()(*args, **kwargs))
+    for rank in range(distributed.parts):
+        local = distributed.rank(rank)
+        inputs = local.localize(u)
+        values.append(local.compile()(*inputs.args, **inputs.kwargs))
     np.testing.assert_allclose(sum(values), energy(u))
 
 
@@ -150,26 +139,26 @@ def test_rank_planning_does_not_resolve_undemanded_map_iterations():
         return jnp.sum(jax.lax.map(lambda value: value**2, u))
 
     u = jnp.arange(32.0)
-    traced = trace(CapturedJaxpr.from_fn(energy, u))
+    traced = analyze(energy, u)
     block = generate_contribution_blocks(
-        traced.contributions,
+        traced._contributions,
         blocks_per_root=u.size,
     )[7]
-    root = traced.contributions.root(block.root_id)
+    root = traced._contributions.root(block.root_id)
     resolver, frame = ConcreteResolver.root(
-        traced.captured.closed_jaxpr,
-        traced.captured.flat_args,
-        traced.analysis,
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
     )
     demand = backpropagate_plan_demand(
-        traced.analysis,
+        traced._plan,
         frame,
         resolver,
         (DemandSeed(root.value, block.demand),),
     )
 
     assert resolver.stats.map_iterations == 1
-    plan = build_rank_local_plan(traced.analysis, frame, resolver, demand)
+    plan = build_rank_local_plan(traced._plan, frame, resolver, demand)
     assert resolver.stats.map_iterations == 2
     assert resolver.stats.frames_created - resolver.stats.frames_released == 1
     mapped = next(

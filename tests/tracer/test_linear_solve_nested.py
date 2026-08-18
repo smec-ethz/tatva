@@ -4,13 +4,9 @@ import numpy as np
 import pytest
 from jax import lax
 
-from tatva.tracer.api import trace
+from tatva.tracer.api import analyze, analyze_captured
 from tatva.tracer.capture import CapturedJaxpr
 from tatva.tracer.core.nested import LinearSolveSpec
-from tatva.tracer.local.liveness import DemandSeed, backpropagate_demand
-from tatva.tracer.local.plan import build_local_plan
-from tatva.tracer.lowering.executor import build_local_executable
-from tatva.tracer.lowering.partition import partition_contributions
 
 
 def _find_linear_solve(plan):
@@ -26,45 +22,22 @@ def _find_linear_solve(plan):
 
 
 def _local_executable(fn, dofs):
-    traced = trace(CapturedJaxpr.from_fn(fn, dofs))
-    owned = partition_contributions(traced.contributions, n_parts=1).for_part(0)
-    demand = backpropagate_demand(
-        traced.resolved,
-        tuple(
-            DemandSeed(traced.contributions.root(item.root_id).value, item.demand)
-            for item in owned
-        ),
-    )
-    plan = build_local_plan(traced.resolved, demand)
-    executable = build_local_executable(
-        plan, contributions=traced.contributions, owned=owned
-    )
-    return lambda x: executable(*executable.pack_global_inputs(x))
+    traced = analyze(fn, dofs)
+    local = traced.distribute(parts=1).rank(0)
+    executable = local.compile()
+    rows = jnp.asarray(local.dofs.storage.global_dofs)
+    return lambda x: executable(x[rows])
 
 
 def _partitioned_local_executables(fn, dofs, n_parts):
-    traced = trace(CapturedJaxpr.from_fn(fn, dofs))
-    partition = partition_contributions(traced.contributions, n_parts=n_parts)
+    traced = analyze(fn, dofs)
+    distributed = traced.distribute(parts=n_parts)
     result = []
     for part in range(n_parts):
-        owned = partition.for_part(part)
-        demand = backpropagate_demand(
-            traced.resolved,
-            tuple(
-                DemandSeed(traced.contributions.root(item.root_id).value, item.demand)
-                for item in owned
-            ),
-        )
-        executable = build_local_executable(
-            build_local_plan(traced.resolved, demand),
-            contributions=traced.contributions,
-            owned=owned,
-        )
-        result.append(
-            lambda x, executable=executable: executable(
-                *executable.pack_global_inputs(x)
-            )
-        )
+        local = distributed.rank(part)
+        executable = local.compile()
+        rows = jnp.asarray(local.dofs.storage.global_dofs)
+        result.append(lambda x, executable=executable, rows=rows: executable(x[rows]))
     return tuple(result)
 
 
@@ -72,9 +45,9 @@ def test_linear_solve_is_three_callback_nested_operation_and_lowers_implicitly()
     fn = lambda u: jnp.sum(u + jnp.linalg.inv(2.0 * jnp.eye(2))[0, 0])
     u = jnp.ones(1)
     captured = CapturedJaxpr.from_fn(fn, u)
-    traced = trace(captured)
+    traced = analyze_captured(captured)
 
-    nested = _find_linear_solve(traced.analysis).nested
+    nested = _find_linear_solve(traced._plan).nested
     assert isinstance(nested.spec, LinearSolveSpec)
     assert [callback.name for callback in nested.spec.callbacks()] == [
         "matvec",

@@ -10,8 +10,8 @@ from tatva import Mesh, Operator, linalg
 from tatva.compound import Compound, field
 from tatva.element.base import Tri3
 from tatva.lifter import Fixed, Lifter, Periodic, RuntimeValue
-from tatva.tracer import trace_fn
-from tatva.tracer.api import CapturedJaxpr, trace
+from tatva.tracer import analyze, analyze_captured
+from tatva.tracer.capture import CapturedJaxpr
 
 jax.config.update("jax_enable_x64", True)
 
@@ -125,17 +125,18 @@ def test_tracer_fem():
     )
 
     # profile this, and must run
-    traced = trace(cap)
+    traced = analyze_captured(cap)
 
     n_parts = 6
     rank = 0
-    distributed = traced.partition(n_parts=n_parts)
+    distributed = traced.distribute(parts=n_parts)
     op_slice = next(
         flat_slice
         for name, _tree, flat_slice in cap.call_abi.parameter_trees()
         if name == "op"
     )
-    for plan in distributed.local_plans:
+    for local_rank in distributed.all_ranks():
+        plan = local_rank._plan
         coordinate_layout = next(
             layout
             for layout in plan.input_layouts[op_slice]
@@ -144,17 +145,17 @@ def test_tracer_fem():
         assert not coordinate_layout.is_full
         assert coordinate_layout.local_shape[0] < mesh.coords.shape[0]
 
-    local = distributed.for_rank(rank)
-    energy_local = local.local_function()
-    inp = local.localize_inputs(
+    local = distributed.rank(rank)
+    energy_local = local.compile()
+    inputs = local.localize(
         jnp.zeros(lifter.size_reduced), lifter=lifter.at("u").set(1.0), mat=mat, op=op
     )
-    _z_local, op_local, lifter_local, mat_local = inp[0]
+    _z_local, op_local, lifter_local, mat_local = inputs.args
 
     # execute the local function
 
     energy_local(
-        jnp.zeros(local.dof_plan.storage.local_size),
+        jnp.zeros(local.dofs.storage.local_size),
         op_local,
         lifter_local.at("u").set(1e-4),
         mat_local,
@@ -179,9 +180,9 @@ def test_local_grad_u_sum_matches_original():
         return op.integrate(psi)
 
     op = Operator(mesh, Tri3())
-    traced = trace_fn(energy_functional, jnp.zeros(mesh.coords.shape[0] * 2), op=op)
-    local = traced.partition_local(rank=0, n_parts=1)
-    energy_local = local.local_function()
+    traced = analyze(energy_functional, jnp.zeros(mesh.coords.shape[0] * 2), op=op)
+    local = traced.distribute(parts=1).rank(0)
+    energy_local = local.compile()
 
     random_x = jax.random.normal(jax.random.PRNGKey(0), (mesh.coords.size,)) * 1e-3
     e_original = energy_functional(random_x, op)

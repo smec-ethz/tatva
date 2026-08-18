@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from tatva.lifter import Lifter
-from tatva.tracer.api import trace
+from tatva.tracer.api import analyze_captured
 from tatva.tracer.capture import CapturedJaxpr
 from tatva.tracer.local.inputs import _localize_tree
 
@@ -45,21 +45,21 @@ def test_dead_gather_indices_do_not_prevent_local_execution():
         return jnp.sum(terms)
 
     captured = CapturedJaxpr.from_fn(energy, u, coords, connectivity)
-    distributed = trace(captured).partition(n_parts=2)
+    distributed = analyze_captured(captured).distribute(parts=2)
 
     local_values = []
     for rank in range(2):
-        local = distributed.for_rank(rank)
-        local_args, local_kwargs = local.localize_inputs(u, coords, connectivity)
-        local_u, local_coords, local_connectivity = local_args
+        local = distributed.rank(rank)
+        inputs = local.localize(u, coords, connectivity)
+        local_u, local_coords, local_connectivity = inputs.args
 
-        assert not local_kwargs
+        assert not inputs.kwargs
         assert 0 < local_u.shape[0] < u.shape[0]
         assert local_coords.shape[1:] == coords.shape[1:]
         assert 0 < local_coords.shape[0] < coords.shape[0]
         assert local_connectivity is None
 
-        local_values.append(local.local_function()(*local_args, **local_kwargs))
+        local_values.append(local.compile()(*inputs.args, **inputs.kwargs))
 
     np.testing.assert_allclose(
         sum(local_values), energy(u, coords, connectivity), rtol=1e-6
@@ -90,24 +90,24 @@ def test_distinct_index_inputs_may_use_distinct_operand_maps():
         u_indices,
         auxiliary_indices,
     )
-    distributed = trace(captured).partition(n_parts=2)
+    distributed = analyze_captured(captured).distribute(parts=2)
 
     local_values = []
     for rank in range(2):
-        local = distributed.for_rank(rank)
-        local_args, local_kwargs = local.localize_inputs(
+        local = distributed.rank(rank)
+        inputs = local.localize(
             u,
             auxiliary,
             u_indices,
             auxiliary_indices,
         )
-        _, _, local_u_indices, local_auxiliary_indices = local_args
+        _, _, local_u_indices, local_auxiliary_indices = inputs.args
 
-        assert not local_kwargs
+        assert not inputs.kwargs
         assert local_u_indices is None
         assert local_auxiliary_indices is None
 
-        local_values.append(local.local_function()(*local_args, **local_kwargs))
+        local_values.append(local.compile()(*inputs.args, **inputs.kwargs))
 
     np.testing.assert_allclose(
         sum(local_values),

@@ -4,7 +4,7 @@ import numpy as np
 from jax import lax
 from jax.extend.core import Literal
 
-from tatva.tracer.api import CapturedJaxpr, trace
+from tatva.tracer.api import analyze
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.semantics import DemandContext
 from tatva.tracer.local.demand import TensorDemand
@@ -46,23 +46,21 @@ def test_partitioned_sort_keeps_global_inputs_and_local_sorted_rows():
 
     keys = jnp.array([4.0, 1.0, 3.0, 2.0])
     values = jnp.array([40.0, 10.0, 30.0, 20.0])
-    distributed = trace(CapturedJaxpr.from_fn(objective, keys, values)).partition(
-        n_parts=2
-    )
+    distributed = analyze(objective, keys, values).distribute(parts=2)
 
     local_values = []
     local_grads = []
     for rank in range(2):
-        local = distributed.for_rank(rank)
-        local_args, local_kwargs = local.localize_inputs(keys, values)
+        local = distributed.rank(rank)
+        inputs = local.localize(keys, values)
         # Sort's demand rule makes both operands available in their global form.
-        assert tuple(local_args[0].shape) == tuple(keys.shape)
-        assert tuple(local_args[1].shape) == tuple(values.shape)
+        assert tuple(inputs.args[0].shape) == tuple(keys.shape)
+        assert tuple(inputs.args[1].shape) == tuple(values.shape)
 
-        local_function = local.local_function()
-        local_values.append(local_function(*local_args, **local_kwargs))
-        local_grads.append(jax.grad(local_function, argnums=(0, 1))(*local_args))
-        assert "sort[" in str(jax.make_jaxpr(local_function)(*local_args))
+        local_function = local.compile()
+        local_values.append(local_function(*inputs.args, **inputs.kwargs))
+        local_grads.append(jax.grad(local_function, argnums=(0, 1))(*inputs.args))
+        assert "sort[" in str(jax.make_jaxpr(local_function)(*inputs.args))
 
     np.testing.assert_allclose(sum(local_values), objective(keys, values))
     global_grads = jax.grad(objective, argnums=(0, 1))(keys, values)
@@ -81,14 +79,12 @@ def test_multi_operand_sort_preserves_cosorted_pairing_after_localization():
     # This ordering is intentionally different from the key order: sorting
     # operands independently would produce 300 rather than the paired 200.
     values = jnp.array([20.0, 40.0, 10.0, 30.0])
-    distributed = trace(CapturedJaxpr.from_fn(objective, keys, values)).partition(
-        n_parts=2
-    )
+    distributed = analyze(objective, keys, values).distribute(parts=2)
 
     local_values = []
     for rank in range(2):
-        local = distributed.for_rank(rank)
-        local_args, local_kwargs = local.localize_inputs(keys, values)
-        local_values.append(local.local_function()(*local_args, **local_kwargs))
+        local = distributed.rank(rank)
+        inputs = local.localize(keys, values)
+        local_values.append(local.compile()(*inputs.args, **inputs.kwargs))
 
     np.testing.assert_allclose(sum(local_values), objective(keys, values))
