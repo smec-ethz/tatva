@@ -34,6 +34,18 @@ def _gather_energy(u, connectivity):
     return jnp.sum(terms)
 
 
+def _finest_contribution_blocks(traced):
+    partition_extents = [
+        root.domain.shape[root.domain.partition_axes[0]]
+        for root in traced.contributions.roots
+        if root.domain.partition_axes
+    ]
+    return generate_contribution_blocks(
+        traced.contributions,
+        blocks_per_root=max(partition_extents, default=1),
+    )
+
+
 def test_reference_incidence_tracks_each_contribution_block():
     u = jnp.arange(6.0)
     connectivity = jnp.array(
@@ -42,7 +54,7 @@ def test_reference_incidence_tracks_each_contribution_block():
     )
 
     traced = trace_fn(_gather_energy, u, connectivity)
-    blocks = generate_contribution_blocks(traced.contributions, block_size=1)
+    blocks = _finest_contribution_blocks(traced)
     reference = reference_block_dof_incidence(
         traced.resolved, traced.contributions, blocks=blocks
     )
@@ -68,7 +80,10 @@ def test_reference_incidence_tracks_each_contribution_block():
     np.testing.assert_array_equal(tagged.block_dof_counts, [2, 2, 2, 2])
     np.testing.assert_array_equal(tagged.blocks_for_dof(1), [0, 1])
 
-    coarser = generate_contribution_blocks(traced.contributions, block_size=2)
+    coarser = generate_contribution_blocks(
+        traced.contributions,
+        blocks_per_root=2,
+    )
     assert [block.id for block in coarser] == [0, 1]
     assert [block.demand.rows().tolist() for block in coarser] == [[0, 1], [2, 3]]
 
@@ -122,7 +137,7 @@ def test_incidence_partition_executes_same_functional():
         jnp.int32
     )
     traced = trace_fn(_gather_energy, u, connectivity)
-    distributed = traced.partition(n_parts=2, partitioning="incidence")
+    distributed = traced.partition(n_parts=2)
 
     values = []
     for rank in range(2):
@@ -152,7 +167,7 @@ def test_tagged_demand_preserves_overlapping_block_identity():
 
 def _assert_tagged_matches_reference(fn, *args):
     traced = trace_fn(fn, *args)
-    blocks = generate_contribution_blocks(traced.contributions, block_size=1)
+    blocks = _finest_contribution_blocks(traced)
     reference = reference_block_dof_incidence(
         traced.resolved, traced.contributions, blocks=blocks
     )
@@ -183,7 +198,7 @@ def test_plan_tagged_map_visits_only_demanded_iterations():
         return jnp.sum(mapped[:3])
 
     traced = trace_fn(objective, values)
-    blocks = generate_contribution_blocks(traced.contributions, block_size=1)
+    blocks = _finest_contribution_blocks(traced)
     resolver, frame = ConcreteResolver.root(
         traced.captured.closed_jaxpr,
         traced.captured.flat_args,
@@ -222,7 +237,7 @@ def test_plan_tagged_scan_streams_only_influencing_prefix(reverse, expected_visi
         return jnp.sum(outputs[:3])
 
     traced = trace_fn(objective, values)
-    blocks = generate_contribution_blocks(traced.contributions, block_size=1)
+    blocks = _finest_contribution_blocks(traced)
     resolver, frame = ConcreteResolver.root(
         traced.captured.closed_jaxpr,
         traced.captured.flat_args,
@@ -389,7 +404,7 @@ def test_tagged_primitive_rule_is_called_once_for_many_blocks(monkeypatch):
         (jnp.arange(n_blocks), jnp.arange(1, n_blocks + 1)), axis=1
     ).astype(jnp.int32)
     traced = trace_fn(_gather_energy, values, connectivity)
-    blocks = generate_contribution_blocks(traced.contributions, block_size=1)
+    blocks = _finest_contribution_blocks(traced)
     integer_pow = next(
         resolved.plan.eqn.primitive
         for resolved in traced.resolved.eqns
@@ -453,7 +468,12 @@ def test_tagged_gather_consumes_demand_scoped_route_fragment(monkeypatch):
         replace(semantics, tagged_demand=inspect_fragment),
     )
 
-    tagged_block_dof_incidence(traced.resolved, traced.contributions, block_size=1)
+    blocks = _finest_contribution_blocks(traced)
+    tagged_block_dof_incidence(
+        traced.resolved,
+        traced.contributions,
+        blocks=blocks,
+    )
     assert seen_rows == [3]
 
 
@@ -466,7 +486,10 @@ def test_tagged_incidence_does_not_take_tensor_demand_cartesian_hulls():
         return jnp.sum(matrix[diagonal, diagonal] ** 2)
 
     traced = trace_fn(objective, values, diagonal)
-    blocks = generate_contribution_blocks(traced.contributions, block_size=2)
+    blocks = generate_contribution_blocks(
+        traced.contributions,
+        blocks_per_root=2,
+    )
     reference = reference_block_dof_incidence(
         traced.resolved,
         traced.contributions,

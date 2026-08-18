@@ -8,15 +8,16 @@ from typing import Any, cast
 import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sps
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
-from tatva.sparse._coloring import csr_to_adjacency
 from tatva.tracer.capture import CapturedJaxpr, make_captured_jaxpr
 from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.derivatives import LocalDerivativeTrace, trace_local_derivatives
 from tatva.tracer.local.dof_plan import (
     LocalDofPlan,
     build_local_dof_plan,
     build_local_dof_plans,
+    validate_dof_owner,
 )
 from tatva.tracer.local.inputs import (
     LocalizeOverrides,
@@ -38,10 +39,15 @@ from tatva.tracer.lowering.partition import (
 )
 from tatva.tracer.program.analysis import JaxprPlan, analyze
 from tatva.tracer.program.concrete_resolver import ConcreteResolver
-from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
+from tatva.tracer.program.contributions import (
+    ContributionBlock,
+    ContributionTrace,
+    detect_contributions,
+)
 from tatva.tracer.program.derivatives import DerivativeTrace, trace_derivatives
 from tatva.tracer.program.incidence import (
     BlockDofIncidence,
+    generate_contribution_blocks,
     plan_tagged_block_dof_incidence,
 )
 from tatva.tracer.program.materialize import JaxprInstance, materialize_plan
@@ -63,7 +69,7 @@ class TraceResult[**P, R]:
             self.analysis,
         )
 
-    def incidence(self, block_size: int = 1) -> BlockDofIncidence:
+    def incidence(self, blocks: tuple[ContributionBlock, ...]) -> BlockDofIncidence:
         """Sparse block↔DOF incidence, built lazily on first planning use."""
         resolver, frame = ConcreteResolver.root(
             self.captured.closed_jaxpr,
@@ -75,117 +81,74 @@ class TraceResult[**P, R]:
             frame,
             resolver,
             self.contributions,
-            block_size=block_size,
+            blocks=blocks,
         )
 
     @functools.cached_property
-    def derivatives(self) -> DerivativeTrace:
+    def _global_derivatives(self) -> DerivativeTrace:
         return trace_derivatives(
             self.resolved,
             n_dofs=_shape_of(self.captured.jaxpr.invars[0])[0],
         )
 
-    @property
-    def hessian(self) -> sps.csr_matrix:
-        return self.derivatives.hessian
+    def analyze_global_derivatives(self) -> DerivativeTrace:
+        """Explicitly materialize and analyze global derivative sparsity."""
+        return self._global_derivatives
 
-    def _metis_dof_partition(self, n_parts: int) -> NDArray[np.int64]:
-        try:
-            import pymetis
-        except ImportError as exc:
-            raise ImportError(
-                "pymetis is required for graph partitioning, but it is not "
-                "installed. Please install pymetis to use this feature."
-            ) from exc
+    def global_hessian_sparsity(self) -> sps.csr_matrix:
+        """Return global structural Hessian sparsity.
 
-        sparsity = self.hessian
-        adjacency = csr_to_adjacency(
-            sparsity.shape[0], sparsity.indptr, sparsity.indices
-        )
-        _, parts = pymetis.part_graph(n_parts, adjacency=adjacency)
-        return np.asarray(parts, dtype=np.int64)
+        This is an explicit, potentially expensive global analysis operation.
+        Distributed planning and compilation do not call it.
+        """
+        return self.analyze_global_derivatives().hessian
 
     def _partition_metadata(
         self,
         *,
         n_parts: int,
-        partitioning: NDArray[np.int64]
-        | typing.Literal["metis", "contiguous", "incidence"],
+        dof_owner: ArrayLike | None = None,
+        block_factor: int = 4,
     ) -> tuple[ContributionPartition, NDArray[np.int64]]:
         if n_parts <= 0:
             raise ValueError("n_parts must be positive")
+        if block_factor <= 0:
+            raise ValueError("block_factor must be positive")
 
-        if isinstance(partitioning, np.ndarray):
-            dof_to_part: NDArray[np.int64] | None = np.asarray(
-                partitioning, dtype=np.int64
-            )
-        elif partitioning == "contiguous":
-            dof_to_part = None
-        elif partitioning == "metis":
-            dof_to_part = self._metis_dof_partition(n_parts)
-        elif partitioning == "incidence":
-            dof_to_part = None
-        else:
-            raise ValueError(f"unsupported partition method {partitioning!r}")
-
-        incidence = self.incidence(block_size=10)
-        blocks_per_root = {
-            root.id: sum(block.root_id == root.id for block in incidence.blocks)
-            for root in self.contributions.roots
-        }
-        needs_finer_blocks = any(
-            root.domain.partition_axes
-            and root.domain.shape[root.domain.partition_axes[0]] >= n_parts
-            and blocks_per_root[root.id] < n_parts
-            for root in self.contributions.roots
+        blocks = generate_contribution_blocks(
+            self.contributions,
+            blocks_per_root=block_factor * n_parts,
         )
-        if needs_finer_blocks:
-            # Preserve the configured coarse default while ensuring every rank
-            # can receive work from each structurally partitionable root.
-            resolver, frame = ConcreteResolver.root(
-                self.captured.closed_jaxpr,
-                self.captured.flat_args,
-                self.analysis,
-            )
-            incidence = plan_tagged_block_dof_incidence(
-                self.analysis,
-                frame,
-                resolver,
-                self.contributions,
-                block_size=1,
-            )
+        incidence = self.incidence(blocks=blocks)
 
-        strategy = (
-            PartitionStrategy.INCIDENCE
-            if isinstance(partitioning, str) and partitioning == "incidence"
-            else PartitionStrategy.CONTIGUOUS
-        )
         contribution_partition, block_to_part = partition_contribution_blocks(
             incidence,
             n_parts=n_parts,
-            strategy=strategy,
-            dof_to_part=dof_to_part,
+            strategy=PartitionStrategy.INCIDENCE,
         )
 
-        if dof_to_part is None:
-            dof_to_part = dof_owner_from_incidence(
+        if dof_owner is None:
+            owner = dof_owner_from_incidence(
                 incidence,
                 block_to_part=block_to_part,
                 n_parts=n_parts,
             )
+        else:
+            owner = validate_dof_owner(dof_owner, n_ranks=n_parts)
 
-        return contribution_partition, dof_to_part
+        return contribution_partition, owner
 
     def partition(
         self,
         *,
         n_parts: int,
-        partitioning: NDArray[np.int64]
-        | typing.Literal["metis", "contiguous", "incidence"] = "contiguous",
+        dof_owner: ArrayLike | None = None,
+        block_factor: int = 4,
     ) -> DistributedFunctional[P, R]:
         contribution_partition, dof_to_part = self._partition_metadata(
             n_parts=n_parts,
-            partitioning=partitioning,
+            dof_owner=dof_owner,
+            block_factor=block_factor,
         )
 
         local_plans = []
@@ -230,23 +193,17 @@ class TraceResult[**P, R]:
         *,
         rank: int,
         n_parts: int,
-        partitioning: NDArray[np.int64]
-        | typing.Literal["metis", "contiguous", "incidence"] = "contiguous",
+        dof_owner: ArrayLike | None = None,
+        block_factor: int = 4,
     ) -> RankLocalFunctional[P, R]:
         """Build the rank-local view of a distributed functional."""
         if rank < 0 or rank >= n_parts:
             raise ValueError(f"rank {rank} is outside [0, {n_parts})")
 
-        if isinstance(partitioning, str) and partitioning == "metis":
-            # because this runs on every rank, this only works if METIS is DETERMINISTIC!
-            # if turns out to be wrong, we must bcast the partitioning instead
-            effective_partitioning = self._metis_dof_partition(n_parts)
-        else:
-            effective_partitioning = partitioning
-
         contribution_partition, dof_owner = self._partition_metadata(
             n_parts=n_parts,
-            partitioning=effective_partitioning,
+            dof_owner=dof_owner,
+            block_factor=block_factor,
         )
         owned = contribution_partition.for_part(rank)
         seeds = tuple(
@@ -334,10 +291,26 @@ class RankLocalFunctional[**P, R]:
     local_plan: LocalJaxprPlan
     dof_plan: LocalDofPlan
 
-    @property
-    def hessian(self) -> sps.csr_matrix:
-        l2g = self.dof_plan.storage.global_dofs
-        return self.traced.hessian[l2g][:, l2g]
+    @functools.cached_property
+    def _local_derivatives(self) -> LocalDerivativeTrace:
+        executable = build_local_executable(
+            self.local_plan,
+            contributions=self.traced.contributions,
+            owned=self.owned,
+        )
+        return trace_local_derivatives(
+            executable,
+            self.dof_plan,
+            self.traced.captured.flat_args,
+        )
+
+    def analyze_derivatives(self) -> LocalDerivativeTrace:
+        """Analyze this rank's objective in storage-local DOF coordinates."""
+        return self._local_derivatives
+
+    def hessian_sparsity(self) -> sps.csr_matrix:
+        """Return this rank's storage-local structural Hessian sparsity."""
+        return self.analyze_derivatives().hessian
 
     def local_function(self) -> typing.Callable[P, R]:
         """Build the executable for this rank's already-localized inputs."""
@@ -468,7 +441,10 @@ def trace[**P, R](captured: CapturedJaxpr[P, R]) -> TraceResult[P, R]:
 def trace_fn[**P, R](
     fn: typing.Callable[P, R], *args: P.args, **kwargs: P.kwargs
 ) -> TraceResult[P, R]:
-    """Trace a function to a JAXPR and analyze its derivative structure.
+    """Capture and structurally analyze a functional.
+
+    Derivative sparsity is not traced until explicitly requested on the
+    returned global or rank-local result.
 
     Args:
         fn: A Python callable to trace.

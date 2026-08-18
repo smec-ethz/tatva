@@ -6,10 +6,12 @@ from tatva.tracer.api import (
     trace_fn,
 )
 from tatva.tracer.capture import CapturedJaxpr, make_captured_jaxpr
+from tatva.tracer.local.derivatives import LocalDerivativeTrace
 
 __all__ = (
     "CapturedJaxpr",
     "DistributedFunctional",
+    "LocalDerivativeTrace",
     "RankLocalFunctional",
     "TraceResult",
     "make_captured_jaxpr",

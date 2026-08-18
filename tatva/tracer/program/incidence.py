@@ -1067,16 +1067,11 @@ def backpropagate_plan_tagged_demand(
 def generate_contribution_blocks(
     contributions: ContributionTrace,
     *,
-    block_size: int = 1,
+    blocks_per_root: int,
 ) -> tuple[ContributionBlock, ...]:
-    """Overdecompose contribution roots along their first partition axis.
-
-    ``block_size`` counts complete slices along that axis.  Roots without a
-    declared partition axis remain one indivisible block.  IDs are dense and
-    deterministic in root/axis order.
-    """
-    if block_size <= 0:
-        raise ValueError("block_size must be positive")
+    """Overdecompose contribution roots along their first partition axis."""
+    if blocks_per_root is not None and blocks_per_root <= 0:
+        raise ValueError("blocks_per_root must be positive")
 
     blocks: list[ContributionBlock] = []
 
@@ -1097,16 +1092,17 @@ def generate_contribution_blocks(
 
         axis = root.domain.partition_axes[0]
         extent = shape[axis]
+        count = min(blocks_per_root, extent)
 
-        for start in range(0, extent, block_size):
-            demand = TensorDemand.axis_range(
-                shape,
-                axis,
-                start,
-                min(start + block_size, extent),
-            )
-            if demand is None:
-                continue
+        quotient, remainder = divmod(extent, count)
+        start = 0
+
+        for index in range(count):
+            width = quotient + (index < remainder)
+            stop = start + width
+            demand = TensorDemand.axis_range(shape, axis, start, stop)
+            assert demand is not None
+
             blocks.append(
                 ContributionBlock(
                     id=len(blocks),
@@ -1114,6 +1110,7 @@ def generate_contribution_blocks(
                     demand=demand,
                 )
             )
+            start = stop
 
     return tuple(blocks)
 
@@ -1185,8 +1182,7 @@ def reference_block_dof_incidence(
     resolved: JaxprInstance,
     contributions: ContributionTrace,
     *,
-    blocks: tuple[ContributionBlock, ...] | None = None,
-    block_size: int = 1,
+    blocks: tuple[ContributionBlock, ...],
 ) -> BlockDofIncidence:
     """Compute the Phase-1 reference incidence with one liveness pass per block."""
     if not resolved.plan.jaxpr.invars:
@@ -1196,12 +1192,6 @@ def reference_block_dof_incidence(
     if len(dof_shape) != 1:
         raise ValueError(f"first input must be a flat DOF vector, got {dof_shape}")
     n_dofs = dof_shape[0]
-
-    if blocks is None:
-        blocks = generate_contribution_blocks(
-            contributions,
-            block_size=block_size,
-        )
 
     rows: list[NDArray[np.int64]] = []
     cols: list[NDArray[np.int64]] = []
@@ -1260,7 +1250,7 @@ def tagged_block_dof_incidence(
     if blocks is None:
         blocks = generate_contribution_blocks(
             contributions,
-            block_size=block_size,
+            blocks_per_root=10,
         )
 
     seed_pairs: dict[
@@ -1322,28 +1312,24 @@ def plan_tagged_block_dof_incidence(
     resolver: ConcreteResolver,
     contributions: ContributionTrace,
     *,
-    blocks: tuple[ContributionBlock, ...] | None = None,
-    block_size: int = 1,
+    blocks: tuple[ContributionBlock, ...],
 ) -> BlockDofIncidence:
     """Compute block↔DOF incidence directly from a static analysis plan."""
     if frame.plan is not plan:
         raise ValueError("incidence plan does not match concrete frame")
     if not plan.jaxpr.invars:
         raise ValueError("functional JAXPR has no DOF input")
+
     dof_shape = _shape_of(plan.jaxpr.invars[0])
     if len(dof_shape) != 1:
         raise ValueError(f"first input must be a flat DOF vector, got {dof_shape}")
-    n_dofs = dof_shape[0]
-    if blocks is None:
-        blocks = generate_contribution_blocks(
-            contributions,
-            block_size=block_size,
-        )
 
+    n_dofs = dof_shape[0]
     seed_pairs: dict[
         ValueRef,
         tuple[list[NDArray[np.int64]], list[NDArray[np.int64]]],
     ] = {}
+
     for expected_id, block in enumerate(blocks):
         if block.id != expected_id:
             raise ValueError("contribution block IDs must be dense and ordered")

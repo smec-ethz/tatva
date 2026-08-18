@@ -112,8 +112,8 @@ def test_partition_paths_do_not_materialize_global_invocations(monkeypatch):
         raise AssertionError("distributed planning materialized the global plan")
 
     monkeypatch.setattr(tracer_api, "materialize_plan", unexpected_materialization)
-    distributed = traced.partition(n_parts=2, partitioning="incidence")
-    local = traced.partition_local(rank=0, n_parts=2, partitioning="incidence")
+    distributed = traced.partition(n_parts=2)
+    local = traced.partition_local(rank=0, n_parts=2)
 
     assert all(not hasattr(plan, "instance") for plan in distributed.local_plans)
     assert not hasattr(local.local_plan, "instance")
@@ -151,7 +151,10 @@ def test_rank_planning_does_not_resolve_undemanded_map_iterations():
 
     u = jnp.arange(32.0)
     traced = trace(CapturedJaxpr.from_fn(energy, u))
-    block = generate_contribution_blocks(traced.contributions, block_size=1)[7]
+    block = generate_contribution_blocks(
+        traced.contributions,
+        blocks_per_root=u.size,
+    )[7]
     root = traced.contributions.root(block.root_id)
     resolver, frame = ConcreteResolver.root(
         traced.captured.closed_jaxpr,
