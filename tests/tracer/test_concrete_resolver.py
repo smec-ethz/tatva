@@ -221,7 +221,7 @@ def test_closed_constant_and_literal_inputs_are_resolved():
     )
 
 
-def test_nested_concrete_producer_fails_explicitly():
+def test_nested_concrete_producer_is_resolved_lazily():
     @jax.jit
     def shift(indices):
         return indices + 1
@@ -236,12 +236,15 @@ def test_nested_concrete_producer_fails_explicitly():
     )
     gather = _eqn(plan, "gather")
 
-    with pytest.raises(NotImplementedError, match="deferred to Phase 5"):
-        resolver.route_fragment(
-            frame,
-            gather,
-            RouteRequest(np.array([0], dtype=np.int64)),
-        )
+    fragment = resolver.route_fragment(
+        frame,
+        gather,
+        RouteRequest(np.array([0], dtype=np.int64)),
+    )
+    assert fragment is not None
+    np.testing.assert_array_equal(fragment.source_rows, [1])
+    assert resolver.stats.frames_created == 2
+    assert resolver.stats.frames_released == 1
 
 
 def test_frame_and_equation_ownership_are_validated():

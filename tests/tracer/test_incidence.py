@@ -15,12 +15,14 @@ from tatva.tracer.lowering.partition import (
     dof_owner_from_incidence,
     partition_contribution_blocks,
 )
+from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.contributions import ContributionBlock
 from tatva.tracer.program.incidence import (
     BlockDofIncidence,
     TaggedDemand,
     generate_contribution_blocks,
     merge_tagged,
+    plan_tagged_block_dof_incidence,
     reference_block_dof_incidence,
     tagged_block_dof_incidence,
 )
@@ -157,7 +159,91 @@ def _assert_tagged_matches_reference(fn, *args):
     tagged = tagged_block_dof_incidence(
         traced.resolved, traced.contributions, blocks=blocks
     )
+    resolver, frame = ConcreteResolver.root(
+        traced.captured.closed_jaxpr,
+        traced.captured.flat_args,
+        traced.analysis,
+    )
+    planned = plan_tagged_block_dof_incidence(
+        traced.analysis,
+        frame,
+        resolver,
+        traced.contributions,
+        blocks=blocks,
+    )
     assert (reference.csr != tagged.csr).nnz == 0
+    assert (tagged.csr != planned.csr).nnz == 0
+
+
+def test_plan_tagged_map_visits_only_demanded_iterations():
+    values = jnp.arange(100.0)
+
+    def objective(values):
+        mapped = jax.lax.map(lambda value: value**2, values)
+        return jnp.sum(mapped[:3])
+
+    traced = trace_fn(objective, values)
+    blocks = generate_contribution_blocks(traced.contributions, block_size=1)
+    resolver, frame = ConcreteResolver.root(
+        traced.captured.closed_jaxpr,
+        traced.captured.flat_args,
+        traced.analysis,
+    )
+    planned = plan_tagged_block_dof_incidence(
+        traced.analysis,
+        frame,
+        resolver,
+        traced.contributions,
+        blocks=blocks,
+    )
+    legacy = tagged_block_dof_incidence(
+        traced.resolved,
+        traced.contributions,
+        blocks=blocks,
+    )
+
+    assert (planned.csr != legacy.csr).nnz == 0
+    assert resolver.stats.map_iterations == 3
+    assert resolver.stats.frames_created == 4
+    assert resolver.stats.frames_released == 3
+    assert resolver.stats.peak_live_frames == 2
+
+
+@pytest.mark.parametrize(("reverse", "expected_visits"), [(False, 3), (True, 100)])
+def test_plan_tagged_scan_streams_only_influencing_prefix(reverse, expected_visits):
+    values = jnp.arange(100.0)
+
+    def objective(values):
+        def body(carry, value):
+            next_carry = carry + value
+            return next_carry, next_carry**2
+
+        _, outputs = jax.lax.scan(body, jnp.array(0.0), values, reverse=reverse)
+        return jnp.sum(outputs[:3])
+
+    traced = trace_fn(objective, values)
+    blocks = generate_contribution_blocks(traced.contributions, block_size=1)
+    resolver, frame = ConcreteResolver.root(
+        traced.captured.closed_jaxpr,
+        traced.captured.flat_args,
+        traced.analysis,
+    )
+    planned = plan_tagged_block_dof_incidence(
+        traced.analysis,
+        frame,
+        resolver,
+        traced.contributions,
+        blocks=blocks,
+    )
+    legacy = tagged_block_dof_incidence(
+        traced.resolved,
+        traced.contributions,
+        blocks=blocks,
+    )
+
+    assert (planned.csr != legacy.csr).nnz == 0
+    assert resolver.stats.scan_iterations == expected_visits
+    assert resolver.stats.peak_live_frames == 2
 
 
 def test_tagged_incidence_matches_oracle_for_structural_and_nested_programs():
@@ -223,6 +309,20 @@ def test_tagged_incidence_matches_oracle_for_structural_and_nested_programs():
         return jnp.sum(outputs)
 
     _assert_tagged_matches_reference(scanned, u)
+
+    def empty_scan(values, xs):
+        def body(carry, value):
+            next_carry = carry + value
+            return next_carry, next_carry
+
+        final, _ = jax.lax.scan(body, values[0], xs)
+        return jnp.sum(final.reshape(1))
+
+    _assert_tagged_matches_reference(
+        empty_scan,
+        u,
+        jnp.empty((0,), dtype=u.dtype),
+    )
 
     indices = jnp.array([0, 2, 4, 5], dtype=jnp.int32)
     _assert_tagged_matches_reference(
