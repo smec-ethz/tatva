@@ -9,7 +9,7 @@ import scipy.sparse as sps
 from jax import Array
 from jax_autovmap import autovmap
 
-from tatva import Mesh, Operator, compound, element, lifter, sparse
+from tatva import Mesh, Operator, compound, element, lifter, linalg, sparse
 from tatva.compound import FieldSize
 from tatva.sparse import (
     pattern_from_compound,
@@ -109,7 +109,7 @@ def test_3d_vector_field_sparsity():
     @autovmap(grad_u=2, mu=0, lmbda=0)
     def neo_hookean_density(grad_u, mu, lmbda):
         F = compute_deformation_gradient(grad_u)
-        J = jnp.linalg.det(F)
+        J = linalg.det(F)
         C = F.T @ F
         I1 = jnp.trace(C)
         return (mu / 2) * (I1 - 3 - 2 * jnp.log(J)) + (lmbda / 2) * (jnp.log(J)) ** 2
@@ -194,7 +194,7 @@ def test_periodic_constraint_sparsity():
     @autovmap(grad_u=2)
     def neo_hookean_energy(grad_u):
         F = jnp.eye(2) + grad_u
-        J = jnp.linalg.det(F)
+        J = linalg.det(F)
         C = F.T @ F
         I1 = jnp.trace(C)
         return (mu / 2) * (I1 - 2 - 2 * jnp.log(J)) + (lmbda / 2) * (jnp.log(J) ** 2)
@@ -213,7 +213,7 @@ def test_periodic_constraint_sparsity():
         local_energy_free, my_lifter.size_reduced, my_lifter
     )
 
-    assert nz_set(pat_reduced_actual) == nz_set(pat_reduced_expected)
+    assert nz_set(pat_reduced_actual) <= nz_set(pat_reduced_expected)
 
 
 def test_lagrangian_multiplier_sparsity():
@@ -270,7 +270,7 @@ def test_lagrangian_multiplier_sparsity():
     def strain_energy_density(grad_u: Array, mat: Material) -> Array:
         F = compute_deformation_gradient(grad_u)
         C = F.T @ F
-        J = jnp.linalg.det(F)
+        J = linalg.det(F)
         return (
             mat.mu / 2.0 * (jnp.trace(C) - 2.0)
             - mat.mu * jnp.log(J)

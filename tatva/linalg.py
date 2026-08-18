@@ -206,6 +206,46 @@ def inv(J: Array) -> Array:
     return jnp.linalg.inv(J)
 
 
+def det(J: Array) -> Array:
+    """Closed-form determinant of a 1x1, 2x2 or 3x3 matrix.
+
+    Since JAX 0.11.1, `jnp.linalg.det` computes small determinants with a pivoted
+    formula wrapped in `@custom_jvp`. The `custom_jvp` stops XLA fusing into its
+    neighbours.
+
+    In `float32+, pivoting is the more stable choice therefore use `jnp.linalg.det`
+    then.
+
+    Args:
+        J: a single matrix, shape (d, d) with d in {1, 2, 3}.
+
+    Returns:
+        The determinant of J, a scalar.
+
+    """
+    if J.ndim != 2:
+        raise ValueError(
+            f"tatva.linalg.det takes a single matrix, got shape {J.shape}. Batch with jax.vmap "
+            "rather than passing a stack"
+        )
+
+    d = J.shape[-1]
+    if J.shape[-2] != d:
+        return jnp.linalg.det(J)  # not square: let JAX raise as before
+    if d == 1:
+        return J[0, 0]
+    if d == 2:
+        return J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
+    if d == 3:
+        m = J
+        return (
+            m[0, 0] * (m[1, 1] * m[2, 2] - m[1, 2] * m[2, 1])
+            + m[0, 1] * (m[1, 2] * m[2, 0] - m[1, 0] * m[2, 2])
+            + m[0, 2] * (m[1, 0] * m[2, 1] - m[1, 1] * m[2, 0])
+        )
+    return jnp.linalg.det(J)
+
+
 def _dot_broadcast(A: Array, B: Array) -> Array:
     """
     Contracts the last axis of `A` with the first axis of `B` and leaves every other
