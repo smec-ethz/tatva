@@ -7,6 +7,12 @@ from jax import custom_derivatives, lax
 from jax.extend.core import primitives
 
 from tatva.tracer.core.nested import CallKind
+from tatva.tracer.core.route_fragments import (
+    resolve_dynamic_slice_route_fragment,
+    resolve_dynamic_update_slice_route_fragment,
+    resolve_gather_route_fragment,
+    resolve_select_n_route_fragment,
+)
 from tatva.tracer.core.routes import (
     resolve_dynamic_slice_route,
     resolve_dynamic_update_slice_route,
@@ -392,6 +398,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             ),
             concrete_inputs=lambda _eqn: (1,),
             route=resolve_gather_route,
+            route_fragment=resolve_gather_route_fragment,
             demand=gather_scatter.gather_demand,
             tagged_demand=tagged.gather,
             localization=LocalizationSemantics(
@@ -428,6 +435,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             ),
             concrete_inputs=lambda _eqn: (0,),
             route=resolve_select_n_route,
+            route_fragment=resolve_select_n_route_fragment,
             demand=indexing.select_n_demand,
             tagged_demand=tagged.select_n,
             localization=LocalizationSemantics(
@@ -448,6 +456,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             ),
             concrete_inputs=lambda eqn: tuple(range(1, len(eqn.invars))),
             route=resolve_dynamic_slice_route,
+            route_fragment=resolve_dynamic_slice_route_fragment,
             demand=indexing.dynamic_slice_demand,
             tagged_demand=tagged.dynamic_slice,
             localization=LocalizationSemantics(
@@ -466,6 +475,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             ),
             concrete_inputs=lambda eqn: tuple(range(2, len(eqn.invars))),
             route=resolve_dynamic_update_slice_route,
+            route_fragment=resolve_dynamic_update_slice_route_fragment,
             demand=indexing.dynamic_update_slice_demand,
             tagged_demand=tagged.dynamic_update_slice,
         ),

@@ -8,6 +8,7 @@ import scipy.sparse as sps
 
 from tatva.tracer.api import trace_fn
 from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.route_fragments import GatherRouteFragment
 from tatva.tracer.local.demand import TensorDemand
 from tatva.tracer.lowering.partition import (
     PartitionStrategy,
@@ -230,10 +231,23 @@ def test_tagged_incidence_matches_oracle_for_structural_and_nested_programs():
         indices,
     )
     _assert_tagged_matches_reference(
+        lambda values, at: jnp.sum(values.at[at].set(values[:4]) ** 2),
+        u,
+        indices,
+    )
+    _assert_tagged_matches_reference(
         lambda values, start: jnp.sum(
             jax.lax.dynamic_slice(values, (start,), (3,)) ** 2
         ),
         u,
+        jnp.array(2, dtype=jnp.int32),
+    )
+    _assert_tagged_matches_reference(
+        lambda values, update, start: jnp.sum(
+            jax.lax.dynamic_update_slice(values, update, (start,)) ** 2
+        ),
+        u,
+        jnp.array([10.0, 11.0]),
         jnp.array(2, dtype=jnp.int32),
     )
     _assert_tagged_matches_reference(
@@ -309,6 +323,38 @@ def test_tagged_primitive_rule_is_called_once_for_many_blocks(monkeypatch):
         blocks=blocks,
     )
     assert calls == 1
+
+
+def test_tagged_gather_consumes_demand_scoped_route_fragment(monkeypatch):
+    values = jnp.arange(101.0)
+    indices = jnp.arange(100, dtype=jnp.int32)
+
+    def objective(values, indices):
+        gathered = values[indices]
+        return jnp.sum(gathered[:3] ** 2)
+
+    traced = trace_fn(objective, values, indices)
+    gather_primitive = next(
+        resolved.plan.eqn.primitive
+        for resolved in traced.resolved.eqns
+        if resolved.plan.eqn.primitive.name == "gather"
+    )
+    semantics = SEMANTICS.get_ordinary(gather_primitive)
+    seen_rows: list[int] = []
+
+    def inspect_fragment(ctx):
+        assert isinstance(ctx.route, GatherRouteFragment)
+        seen_rows.append(ctx.route.output_rows.size)
+        return semantics.tagged_demand(ctx)
+
+    monkeypatch.setitem(
+        SEMANTICS._rules,
+        gather_primitive,
+        replace(semantics, tagged_demand=inspect_fragment),
+    )
+
+    tagged_block_dof_incidence(traced.resolved, traced.contributions, block_size=1)
+    assert seen_rows == [3]
 
 
 def test_tagged_incidence_does_not_take_tensor_demand_cartesian_hulls():

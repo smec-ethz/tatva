@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Protocol
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
 
 from tatva.tracer.core.nested import CallKind
+from tatva.tracer.core.route_fragments import RouteFragment, RouteRequest
 from tatva.tracer.core.routes import ConcreteEnv, Route
 from tatva.tracer.core.tagged import Tagged, TaggedDemand, active_blocks
 from tatva.tracer.helpers import _shape_of
@@ -93,6 +94,14 @@ def no_route(eqn: JaxprEqn, env: ConcreteEnv) -> None:
     return None
 
 
+def no_route_fragment(
+    eqn: JaxprEqn,
+    env: ConcreteEnv,
+    request: RouteRequest,
+) -> None:
+    return None
+
+
 def conservative_demand(ctx: DemandContext) -> tuple[Demand, ...]:
     if not any(demand is not None for demand in ctx.output_demands):
         return tuple(None for _ in ctx.eqn.invars)
@@ -158,11 +167,14 @@ class DemandContext:
 class TaggedDemandContext:
     eqn: JaxprEqn
     output_demands: tuple[Tagged, ...]
-    route: Route | None
+    route: Route | RouteFragment | None
 
 
 type ConcreteInputRule = Callable[[JaxprEqn], tuple[int, ...]]
 type RouteRule = Callable[[JaxprEqn, ConcreteEnv], Route | None]
+type RouteFragmentRule = Callable[
+    [JaxprEqn, ConcreteEnv, RouteRequest], RouteFragment | None
+]
 type DemandRule = Callable[[DemandContext], tuple[Demand, ...]]
 type TaggedDemandRule = Callable[[TaggedDemandContext], tuple[Tagged, ...]]
 
@@ -205,6 +217,7 @@ class OperationSemantics[T]:
 
     concrete_inputs: ConcreteInputRule = no_concrete_inputs
     route: RouteRule = no_route
+    route_fragment: RouteFragmentRule = no_route_fragment
     demand: DemandRule = conservative_demand
     tagged_demand: TaggedDemandRule = conservative_tagged_demand
     contribution: ContributionRule = contribution_barrier

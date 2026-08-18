@@ -9,6 +9,7 @@ import scipy.sparse as sps
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
+from tatva.tracer.core.route_fragments import resolve_scatter_route_fragment
 from tatva.tracer.core.routes import (
     GatherRoute,
     ScatterRoute,
@@ -310,6 +311,7 @@ SCATTER_BASIC = OperationSemantics(
     ),
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
+    route_fragment=resolve_scatter_route_fragment,
     demand=scatter_set_demand,
     tagged_demand=tagged.scatter_set,
     localization=SCATTER_LOCALIZATION,
@@ -323,6 +325,7 @@ SCATTER_ACCUMULATE = OperationSemantics(
     ),
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
+    route_fragment=resolve_scatter_route_fragment,
     demand=scatter_accumulate_demand,
     tagged_demand=tagged.scatter_accumulate,
     localization=SCATTER_LOCALIZATION,
@@ -335,6 +338,7 @@ SCATTER_MUL = OperationSemantics(
     ),
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
+    route_fragment=resolve_scatter_route_fragment,
     demand=scatter_accumulate_demand,
     tagged_demand=tagged.scatter_accumulate,
     localization=SCATTER_LOCALIZATION,
