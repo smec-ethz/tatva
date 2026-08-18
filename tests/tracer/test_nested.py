@@ -2,9 +2,7 @@ import pytest
 
 from tatva.tracer.core.nested import (
     CallInvocation,
-    CondContext,
     CondInvocation,
-    CondSpec,
     FrameStep,
     IndexedChild,
     MapContext,

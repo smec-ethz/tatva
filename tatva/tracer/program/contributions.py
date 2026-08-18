@@ -40,15 +40,9 @@ from jax.core import Atom
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from tatva.tracer.core.nested import (
-    CallContext,
     CallSpec,
-    CondContext,
     CondSpec,
     FramePath,
-    LinearSolveContext,
-    MapContext,
-    ScanContext,
-    dispatch_nested,
 )
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.routes import Shape
@@ -64,10 +58,6 @@ from tatva.tracer.program.concrete_resolver import (
     ConcreteFrame,
     ConcreteResolver,
     DynamicRoutingError,
-)
-from tatva.tracer.program.materialize import (
-    JaxprInstance,
-    ResolvedEqn,
 )
 
 
@@ -230,19 +220,6 @@ def _root_candidate(
     )
 
 
-def _producer_map(
-    instance: JaxprInstance,
-) -> dict[Var, tuple[ResolvedEqn, int]]:
-    producers: dict[Var, tuple[ResolvedEqn, int]] = {}
-
-    for resolved in instance.eqns:
-        for output_index, outvar in enumerate(resolved.plan.eqn.outvars):
-            if isinstance(outvar, Var):
-                producers[outvar] = (resolved, output_index)
-
-    return producers
-
-
 def _plan_producer_map(
     plan: JaxprPlan,
 ) -> dict[Var, tuple[EqnPlan, int]]:
@@ -263,21 +240,6 @@ def _as_concrete_scalar(value: object | None) -> ContributionCoefficient | None:
     if array.shape != ():
         return None
     return cast(ContributionCoefficient, array.item())
-
-
-def _materialized_concrete_scalar(
-    instance: JaxprInstance,
-    eqn: JaxprEqn,
-    input_index: int,
-) -> ContributionCoefficient | None:
-    atom = eqn.invars[input_index]
-    if isinstance(atom, Literal):
-        value = atom.val
-    elif isinstance(atom, Var):
-        value = instance.concrete.get(atom)
-    else:
-        return None
-    return _as_concrete_scalar(value)
 
 
 def _resolved_concrete_scalar(
@@ -368,245 +330,8 @@ def _depends_on_opaque_nested(plan: JaxprPlan, atom: Atom) -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Nested-frame handling
-# -----------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _MaterializedContributionNestedHandler:
-    # Satisfies the `NestedHandler` interface for contribution detection. The handler
-    # is invoked for each nested frame, and may trace through call-like frames or
-    # treat other nested constructs as opaque structured boundaries.
-
-    resolved: ResolvedEqn
-    output_index: int
-    path: FramePath
-    seed: _Seed
-    partition_axes: PartitionAxesPolicy
-
-    def call(
-        self, context: CallContext[JaxprInstance]
-    ) -> tuple[list[_RootCandidate], list[_Seed]]:
-        return self._trace_call(context)
-
-    def map(
-        self, context: MapContext[JaxprInstance]
-    ) -> tuple[list[_RootCandidate], list[_Seed]]:
-        return ([self._trace_opaque_nested()], [])
-
-    def scan(
-        self, context: ScanContext[JaxprInstance]
-    ) -> tuple[list[_RootCandidate], list[_Seed]]:
-        return ([self._trace_opaque_nested()], [])
-
-    def cond(
-        self, context: CondContext[JaxprInstance]
-    ) -> tuple[list[_RootCandidate], list[_Seed]]:
-        return self._trace_call(context)
-
-    def linear_solve(
-        self, context: LinearSolveContext[JaxprInstance]
-    ) -> tuple[list[_RootCandidate], list[_Seed]]:
-        return ([self._trace_opaque_nested()], [])
-
-    def _trace_call(
-        self, context: CallContext[JaxprInstance] | CondContext[JaxprInstance]
-    ) -> tuple[list[_RootCandidate], list[_Seed]]:
-        """Trace transparently through a call/remat child frame."""
-        nested = context.invocation
-        eqn = self.resolved.plan.eqn
-        child = nested.body
-        child_jaxpr = child.plan.jaxpr
-
-        if self.output_index >= len(child_jaxpr.outvars):
-            raise InvalidMaterializedJaxprError(
-                f"{eqn.primitive.name} output mapping is inconsistent"
-            )
-
-        child_path = self.path + (nested.children()[0].frame_step,)
-        child_result = _walk_materialized_frame(
-            child,
-            child_path,
-            [
-                _Seed(
-                    atom=child_jaxpr.outvars[self.output_index],
-                    coefficient=self.seed.coefficient,
-                    mode=self.seed.mode,
-                )
-            ],
-            partition_axes=self.partition_axes,
-        )
-
-        forwarded: list[_Seed] = []
-        for request in child_result.inputs:
-            try:
-                outer_index = context.spec.outer_input_index(
-                    request.input_index, outer_arity=len(eqn.invars)
-                )
-            except IndexError as exc:
-                raise InvalidMaterializedJaxprError(
-                    f"{eqn.primitive.name} child input mapping is inconsistent"
-                ) from exc
-
-            forwarded.append(
-                _Seed(
-                    atom=eqn.invars[outer_index],
-                    coefficient=request.coefficient,
-                    mode=request.mode,
-                )
-            )
-
-        return child_result.roots, forwarded
-
-    def _trace_opaque_nested(self) -> _RootCandidate:
-        """Handle any non-call nested construct as an opaque structured boundary."""
-        if self.seed.mode is ContributionMode.DOMAIN:
-            return _root_candidate(
-                self.path,
-                cast(Var, self.seed.atom),
-                self.seed.coefficient,
-                partition_axes=self.partition_axes,
-            )
-
-        name = self.resolved.plan.eqn.primitive.name
-        raise UnsupportedContributionError(
-            f"nested primitive {name!r} produces the scalar objective "
-            "without an additive reduction"
-        )
-
-
-# -----------------------------------------------------------------------------
 # Backward traversal
 # -----------------------------------------------------------------------------
-
-
-def _walk_materialized_frame(
-    instance: JaxprInstance,
-    path: FramePath,
-    seeds: list[_Seed],
-    *,
-    partition_axes: PartitionAxesPolicy,
-) -> _FrameResult:
-    """Walk one materialized JAXPR frame backwards from the supplied seeds."""
-    jaxpr = instance.plan.jaxpr
-    producers = _producer_map(instance)
-    input_indices = {var: index for index, var in enumerate(jaxpr.invars)}
-    constvars = set(jaxpr.constvars)
-    stack = list(seeds)
-
-    roots: list[_RootCandidate] = []
-    input_requests: list[_InputRequest] = []
-
-    while stack:
-        seed = stack.pop()
-        atom = seed.atom
-
-        if seed.coefficient == 0:
-            continue
-        if isinstance(atom, Literal):
-            continue
-        if not isinstance(atom, Var):
-            raise InvalidMaterializedJaxprError(
-                f"unsupported JAXPR atom {type(atom)!r}"
-            )
-
-        input_index = input_indices.get(atom)
-        if input_index is not None:
-            input_requests.append(
-                _InputRequest(
-                    input_index=input_index,
-                    coefficient=seed.coefficient,
-                    mode=seed.mode,
-                )
-            )
-            continue
-
-        if atom in constvars:
-            if seed.mode is ContributionMode.DOMAIN:
-                roots.append(
-                    _root_candidate(
-                        path,
-                        atom,
-                        seed.coefficient,
-                        partition_axes=partition_axes,
-                    )
-                )
-            # Scalar constants do not create partitionable contributions.
-            continue
-
-        producer = producers.get(atom)
-        if producer is None:
-            raise InvalidMaterializedJaxprError(f"no producer found for {atom}")
-
-        resolved, output_index = producer
-
-        if resolved.nested is not None:
-            if resolved.plan.nested is None:
-                raise InvalidMaterializedJaxprError(
-                    f"{resolved.plan.eqn.primitive.name} has nested instance but no nested plan"
-                )
-            child_roots, forwarded = dispatch_nested(
-                resolved.plan.nested.spec,
-                resolved.nested,
-                _MaterializedContributionNestedHandler(
-                    resolved=resolved,
-                    output_index=output_index,
-                    path=path,
-                    seed=seed,
-                    partition_axes=partition_axes,
-                ),
-            )
-            roots.extend(child_roots)
-            stack.extend(forwarded)
-            continue
-
-        semantics = SEMANTICS.get_ordinary(resolved.plan.eqn.primitive)
-        eqn = resolved.plan.eqn
-
-        decision = semantics.contribution(
-            ContributionContext(
-                eqn=eqn,
-                output_index=output_index,
-                coefficient=seed.coefficient,
-                mode=seed.mode,
-                concrete_scalar=functools.partial(
-                    _materialized_concrete_scalar, instance, eqn
-                ),
-            )
-        )
-
-        if decision.invalid_reason is not None:
-            raise InvalidMaterializedJaxprError(decision.invalid_reason)
-
-        if decision.unsupported_reason is not None:
-            raise UnsupportedContributionError(decision.unsupported_reason)
-
-        if decision.root:
-            roots.append(
-                _root_candidate(
-                    path, atom, seed.coefficient, partition_axes=partition_axes
-                )
-            )
-
-        for request in decision.inputs:
-            if request.input_index < 0 or request.input_index >= len(eqn.invars):
-                raise InvalidMaterializedJaxprError(
-                    f"{eqn.primitive.name} contribution rule requested invalid "
-                    f"input {request.input_index}"
-                )
-
-            stack.append(
-                _Seed(
-                    atom=eqn.invars[request.input_index],
-                    coefficient=request.coefficient,
-                    mode=request.mode,
-                )
-            )
-
-    return _FrameResult(
-        roots=roots,
-        inputs=input_requests,
-    )
 
 
 def _trace_plan_nested(
@@ -900,29 +625,6 @@ def _validate_scalar_output(jaxpr: Jaxpr) -> Atom:
             f"got output shape {output_shape}"
         )
     return output
-
-
-def detect_materialized_contributions(
-    root: JaxprInstance,
-    *,
-    partition_axes: PartitionAxesPolicy = first_axis_partition,
-) -> ContributionTrace:
-    """Legacy materialized detector retained as a correctness oracle."""
-    jaxpr = root.plan.jaxpr
-    output = _validate_scalar_output(jaxpr)
-    result = _walk_materialized_frame(
-        root,
-        (),
-        [
-            _Seed(
-                atom=output,
-                coefficient=1,
-                mode=ContributionMode.SCALAR,
-            )
-        ],
-        partition_axes=partition_axes,
-    )
-    return _build_trace(jaxpr, result, partition_axes=partition_axes)
 
 
 def detect_contributions(
