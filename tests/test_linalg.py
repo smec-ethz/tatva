@@ -68,6 +68,46 @@ def test_inv_rejects_anything_that_is_not_a_single_matrix(shape):
 
 
 # --------------------------------------------------------------------------------
+# det
+# --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("d", [1, 2, 3])
+def test_det_matches_jnp_linalg_det(d):
+    J = _well_conditioned(d)
+    assert jnp.allclose(linalg.det(J), jnp.linalg.det(J))
+
+
+@pytest.mark.parametrize("d", [1, 2, 3])
+def test_det_returns_a_scalar(d):
+    """`jnp.linalg.det` reduces the matrix axes away; the closed form must too, or a
+    (1, 1) determinant would broadcast against everything downstream."""
+    assert linalg.det(_well_conditioned(d)).shape == ()
+
+
+@pytest.mark.parametrize("d", [1, 2, 3])
+def test_det_is_consistent_with_inv(d):
+    """det(J) * det(inv(J)) == 1 -- ties the two closed forms together, so a sign or
+    cofactor slip in either one shows up here."""
+    J = _well_conditioned(d)
+    assert jnp.allclose(linalg.det(J) * linalg.det(linalg.inv(J)), 1.0)
+
+
+@pytest.mark.parametrize("d", [2, 3])
+def test_det_vmaps_over_a_batch(d):
+    """Batching is vmap's job -- the kernel itself stays unbatched."""
+    rng = np.random.default_rng(1)
+    stack = jnp.eye(d) + 0.1 * jnp.asarray(rng.standard_normal((16, d, d)))
+    assert jnp.allclose(jax.vmap(linalg.det)(stack), jnp.linalg.det(stack))
+
+
+@pytest.mark.parametrize("shape", [(4, 2, 2), (3, 3, 3), (2,)])
+def test_det_rejects_anything_that_is_not_a_single_matrix(shape):
+    with pytest.raises(ValueError, match="single matrix"):
+        linalg.det(jnp.zeros(shape))
+
+
+# --------------------------------------------------------------------------------
 # tensordot
 # --------------------------------------------------------------------------------
 

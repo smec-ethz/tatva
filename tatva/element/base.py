@@ -94,7 +94,7 @@ class Element(ABC):
         J = linalg.contract(
             "in,nj->ij", dNdr, nodal_coords
         )  # (d, n) x (n, d) -> (d, d)
-        return J, jnp.linalg.det(J)
+        return J, linalg.det(J)
 
     def interpolate(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         N = self.shape_function(xi)
