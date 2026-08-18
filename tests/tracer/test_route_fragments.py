@@ -24,6 +24,7 @@ from tatva.tracer.core.routes import (
     resolve_scatter_route,
     resolve_select_n_route,
 )
+from tatva.tracer.program.concrete_resolver import ConcreteEnv
 
 
 def _gather_equation(n_indices: int):
@@ -129,7 +130,7 @@ def test_scatter_route_fragment_matches_intersecting_full_route_relations():
         jax.ShapeDtypeStruct((5,), np.float32),
     )
     eqn = closed.jaxpr.eqns[0]
-    concrete = {eqn.invars[1]: indices}
+    concrete: ConcreteEnv = {eqn.invars[1]: indices}  # ty: ignore[invalid-assignment]
     requested = np.array([3, 7], dtype=np.int64)
 
     full = resolve_scatter_route(eqn, concrete)
@@ -156,7 +157,7 @@ def test_select_n_route_fragment_matches_requested_full_route_rows():
         jax.ShapeDtypeStruct((6,), np.float32),
     )
     eqn = closed.jaxpr.eqns[0]
-    concrete = {eqn.invars[0]: selector}
+    concrete: ConcreteEnv = {eqn.invars[0]: selector}  # ty: ignore[invalid-assignment]
     requested = np.array([5, 1, 3], dtype=np.int64)
 
     full = resolve_select_n_route(eqn, concrete)
@@ -178,7 +179,7 @@ def test_dynamic_slice_route_fragment_matches_requested_full_route_rows():
     eqn = next(
         eqn for eqn in closed.jaxpr.eqns if eqn.primitive.name == "dynamic_slice"
     )
-    concrete = {eqn.invars[1]: np.int32(3)}
+    concrete: ConcreteEnv = {eqn.invars[1]: np.int32(3)}  # ty: ignore[invalid-assignment]
     requested = np.array([3, 0], dtype=np.int64)
 
     full = resolve_dynamic_slice_route(eqn, concrete)
@@ -205,7 +206,7 @@ def test_dynamic_update_fragment_matches_intersecting_full_route_relations():
     eqn = next(
         eqn for eqn in closed.jaxpr.eqns if eqn.primitive.name == "dynamic_update_slice"
     )
-    concrete = {eqn.invars[2]: np.int32(3)}
+    concrete: ConcreteEnv = {eqn.invars[2]: np.int32(3)}  # ty: ignore[invalid-assignment]
     requested = np.array([1, 3, 5, 9], dtype=np.int64)
 
     full = resolve_dynamic_update_slice_route(eqn, concrete)
