@@ -196,7 +196,7 @@ def _frame_outputs(
 ) -> tuple[Any | None, ...]:
     result: list[Any | None] = []
 
-    for atom, layout in zip(plan.instance.plan.jaxpr.outvars, plan.output_layouts):
+    for atom, layout in zip(plan.plan.jaxpr.outvars, plan.output_layouts):
         if layout is None:
             result.append(None)
             continue
@@ -984,7 +984,7 @@ def _execute_frame(
     plan: LocalJaxprPlan,
     local_inputs: tuple[Any, ...],
 ) -> dict[Var, Any]:
-    jaxpr = plan.instance.plan.jaxpr
+    jaxpr = plan.plan.jaxpr
     expected_inputs = sum(layout is not None for layout in plan.input_layouts)
 
     if len(local_inputs) != expected_inputs:
@@ -1010,17 +1010,17 @@ def _execute_frame(
         env[var] = value
 
     # Closed JAXPR constants.
-    for var, layout in zip(jaxpr.constvars, plan.const_layouts):
+    for var, layout, value in zip(
+        jaxpr.constvars, plan.const_layouts, plan.const_values, strict=True
+    ):
         if layout is None:
             continue
 
-        global_value = plan.instance.concrete.get(var)
-        if global_value is None:
+        if value is None:
             raise RuntimeError(
-                f"live constvar {var} is not available in materialization"
+                f"live constvar {var} is not available in the local plan"
             )
-
-        env[var] = extract_local_value(global_value, layout)
+        env[var] = jnp.asarray(value)
 
     # Surviving local equations.
     for eqn_plan in plan.eqns:
@@ -1312,7 +1312,7 @@ def _same_local_jaxpr_plan(
     rhs: LocalJaxprPlan,
 ) -> bool:
     # All map iterations should originate from the same analyzed body.
-    if lhs.instance.plan.jaxpr is not rhs.instance.plan.jaxpr:
+    if lhs.plan.jaxpr is not rhs.plan.jaxpr:
         return False
 
     if not _same_layouts(lhs.input_layouts, rhs.input_layouts):

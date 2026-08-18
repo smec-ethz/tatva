@@ -166,7 +166,7 @@ def route_localization_issues(
             if entry is None:
                 pending_by_eqn[key] = (
                     local_eqn.eqn,
-                    type(route.global_route).__name__,
+                    route.source_kind,
                     {rank},
                 )
             else:

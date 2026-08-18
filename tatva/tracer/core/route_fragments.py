@@ -1,8 +1,9 @@
 """Demand-scoped route geometry for sparse planning traversals.
 
-Full routes remain the source of truth for materialization and localization.
-Fragments expose the same geometry for explicitly requested global rows without
-allocating a mapping proportional to the complete logical output.
+Fragments expose route geometry for explicitly requested global rows without
+allocating a mapping proportional to the complete logical output. They drive
+both sparse planning traversal and rank-local route localization; full routes
+remain available for legacy materialization and unsupported fragment cases.
 """
 
 from __future__ import annotations
