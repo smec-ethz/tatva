@@ -29,12 +29,17 @@ from tatva.tracer.lowering.executor import build_local_executable
 from tatva.tracer.lowering.partition import (
     ContributionPartition,
     OwnedContribution,
-    dof_owner_from_contributions,
-    partition_contributions,
+    PartitionStrategy,
+    dof_owner_from_incidence,
+    partition_contribution_blocks,
 )
 from tatva.tracer.program.analysis import JaxprPlan, analyze
 from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
 from tatva.tracer.program.derivatives import DerivativeTrace, trace_derivatives
+from tatva.tracer.program.incidence import (
+    BlockDofIncidence,
+    tagged_block_dof_incidence,
+)
 from tatva.tracer.program.materialize import JaxprInstance, materialize_plan
 from tatva.tracer.support import require_local_routes, require_registered_operations
 
@@ -44,8 +49,22 @@ class TraceResult[**P, R]:
     captured: CapturedJaxpr[P, R]
     analysis: JaxprPlan
     resolved: JaxprInstance
-    derivatives: DerivativeTrace
     contributions: ContributionTrace
+
+    def incidence(self, block_size: int = 1) -> BlockDofIncidence:
+        """Sparse block↔DOF incidence, built lazily on first planning use."""
+        return tagged_block_dof_incidence(
+            self.resolved,
+            self.contributions,
+            block_size=block_size,
+        )
+
+    @functools.cached_property
+    def derivatives(self) -> DerivativeTrace:
+        return trace_derivatives(
+            self.resolved,
+            n_dofs=_shape_of(self.captured.jaxpr.invars[0])[0],
+        )
 
     @property
     def hessian(self) -> sps.csr_matrix:
@@ -71,7 +90,8 @@ class TraceResult[**P, R]:
         self,
         *,
         n_parts: int,
-        partitioning: NDArray[np.int64] | typing.Literal["metis", "contiguous"],
+        partitioning: NDArray[np.int64]
+        | typing.Literal["metis", "contiguous", "incidence"],
     ) -> tuple[ContributionPartition, NDArray[np.int64]]:
         if n_parts <= 0:
             raise ValueError("n_parts must be positive")
@@ -84,22 +104,47 @@ class TraceResult[**P, R]:
             dof_to_part = None
         elif partitioning == "metis":
             dof_to_part = self._metis_dof_partition(n_parts)
+        elif partitioning == "incidence":
+            dof_to_part = None
         else:
             raise ValueError(f"unsupported partition method {partitioning!r}")
 
-        contribution_partition = partition_contributions(
-            self.contributions,
+        incidence = self.incidence(block_size=10)
+        blocks_per_root = {
+            root.id: sum(block.root_id == root.id for block in incidence.blocks)
+            for root in self.contributions.roots
+        }
+        needs_finer_blocks = any(
+            root.domain.partition_axes
+            and root.domain.shape[root.domain.partition_axes[0]] >= n_parts
+            and blocks_per_root[root.id] < n_parts
+            for root in self.contributions.roots
+        )
+        if needs_finer_blocks:
+            # Preserve the configured coarse default while ensuring every rank
+            # can receive work from each structurally partitionable root.
+            incidence = tagged_block_dof_incidence(
+                self.resolved,
+                self.contributions,
+                block_size=1,
+            )
+
+        strategy = (
+            PartitionStrategy.INCIDENCE
+            if isinstance(partitioning, str) and partitioning == "incidence"
+            else PartitionStrategy.CONTIGUOUS
+        )
+        contribution_partition, block_to_part = partition_contribution_blocks(
+            incidence,
             n_parts=n_parts,
-            derivatives=self.derivatives,
+            strategy=strategy,
             dof_to_part=dof_to_part,
         )
 
         if dof_to_part is None:
-            dof_to_part = dof_owner_from_contributions(
-                owned=contribution_partition.owned,
-                roots=self.contributions.roots,
-                dependencies=self.derivatives.root.dependencies,
-                n_dofs=self.hessian.shape[0],
+            dof_to_part = dof_owner_from_incidence(
+                incidence,
+                block_to_part=block_to_part,
                 n_parts=n_parts,
             )
 
@@ -110,7 +155,7 @@ class TraceResult[**P, R]:
         *,
         n_parts: int,
         partitioning: NDArray[np.int64]
-        | typing.Literal["metis", "contiguous"] = "contiguous",
+        | typing.Literal["metis", "contiguous", "incidence"] = "contiguous",
     ) -> DistributedFunctional[P, R]:
         contribution_partition, dof_to_part = self._partition_metadata(
             n_parts=n_parts,
@@ -153,13 +198,13 @@ class TraceResult[**P, R]:
         rank: int,
         n_parts: int,
         partitioning: NDArray[np.int64]
-        | typing.Literal["metis", "contiguous"] = "contiguous",
+        | typing.Literal["metis", "contiguous", "incidence"] = "contiguous",
     ) -> RankLocalFunctional[P, R]:
         """Build the rank-local view of a distributed functional."""
         if rank < 0 or rank >= n_parts:
             raise ValueError(f"rank {rank} is outside [0, {n_parts})")
 
-        if partitioning == "metis":
+        if isinstance(partitioning, str) and partitioning == "metis":
             # because this runs on every rank, this only works if METIS is DETERMINISTIC!
             # if turns out to be wrong, we must bcast the partitioning instead
             effective_partitioning = self._metis_dof_partition(n_parts)
@@ -356,7 +401,6 @@ def trace[**P, R](captured: CapturedJaxpr[P, R]) -> TraceResult[P, R]:
         raise ValueError(
             f"First input must be a flat DOF vector, got shape {dof_shape}"
         )
-    n_dofs = dof_shape[0]
 
     # fail once with all unsupported operations instead of discovering the first missing registration during analysis
     require_registered_operations(jaxpr)
@@ -371,12 +415,6 @@ def trace[**P, R](captured: CapturedJaxpr[P, R]) -> TraceResult[P, R]:
         analysis,
     )
 
-    # 3. recursive derivative propagation
-    derivatives = trace_derivatives(
-        resolved,
-        n_dofs=n_dofs,
-    )
-
     contributions = detect_contributions(
         resolved,
     )
@@ -385,7 +423,6 @@ def trace[**P, R](captured: CapturedJaxpr[P, R]) -> TraceResult[P, R]:
         captured=captured,
         analysis=analysis,
         resolved=resolved,
-        derivatives=derivatives,
         contributions=contributions,
     )
 

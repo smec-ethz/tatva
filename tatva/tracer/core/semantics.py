@@ -10,6 +10,7 @@ from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
 
 from tatva.tracer.core.nested import CallKind
 from tatva.tracer.core.routes import ConcreteEnv, Route
+from tatva.tracer.core.tagged import Tagged, TaggedDemand, active_blocks
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import Demand, TensorDemand
 
@@ -108,6 +109,19 @@ def conservative_demand(ctx: DemandContext) -> tuple[Demand, ...]:
     return tuple(result)
 
 
+def conservative_tagged_demand(
+    ctx: TaggedDemandContext,
+) -> tuple[Tagged, ...]:
+    """Conservatively attach every active color to every input entry."""
+    blocks = active_blocks(ctx.output_demands)
+    return tuple(
+        None
+        if isinstance(atom, Literal)
+        else TaggedDemand.full(_shape_of(atom), blocks)
+        for atom in ctx.eqn.invars
+    )
+
+
 # --------------------------------
 # Rule context and protocols
 # --------------------------------
@@ -140,9 +154,17 @@ class DemandContext:
     route: Route | None
 
 
+@dataclass(frozen=True)
+class TaggedDemandContext:
+    eqn: JaxprEqn
+    output_demands: tuple[Tagged, ...]
+    route: Route | None
+
+
 type ConcreteInputRule = Callable[[JaxprEqn], tuple[int, ...]]
 type RouteRule = Callable[[JaxprEqn, ConcreteEnv], Route | None]
 type DemandRule = Callable[[DemandContext], tuple[Demand, ...]]
+type TaggedDemandRule = Callable[[TaggedDemandContext], tuple[Tagged, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +206,7 @@ class OperationSemantics[T]:
     concrete_inputs: ConcreteInputRule = no_concrete_inputs
     route: RouteRule = no_route
     demand: DemandRule = conservative_demand
+    tagged_demand: TaggedDemandRule = conservative_tagged_demand
     contribution: ContributionRule = contribution_barrier
     localization: LocalizationSemantics = NO_LOCALIZATION
     lowering: LoweringRule | None = None

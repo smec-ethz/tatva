@@ -32,6 +32,7 @@ from tatva.tracer.local.localize import (
     localize_scatter_route,
 )
 from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.rules import tagged
 
 if TYPE_CHECKING:
     from tatva.tracer.core.semantics import RuleContext
@@ -45,9 +46,7 @@ def prepare_gather(ctx: RuleContext) -> GatherRoute:
         )
 
     if not isinstance(ctx.route, GatherRoute):
-        raise ValueError(  # ruff: ignore[type-check-without-type-error]
-            f"gather route was not resolved for equation {ctx.eqn}"
-        )
+        raise TypeError(f"gather route was not resolved for equation {ctx.eqn}")
 
     return ctx.route
 
@@ -120,9 +119,7 @@ class PreparedScatter:
 
 def prepare_scatter(ctx: RuleContext) -> PreparedScatter:
     if not isinstance(ctx.route, ScatterRoute):
-        raise ValueError(  # ruff: ignore[type-check-without-type-error]
-            f"scatter route was not resolved for equation {ctx.eqn}"
-        )
+        raise TypeError(f"scatter route was not resolved for equation {ctx.eqn}")
 
     base = ctx.input_deps[0]
     updates = ctx.input_deps[2]
@@ -314,6 +311,7 @@ SCATTER_BASIC = OperationSemantics(
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
     demand=scatter_set_demand,
+    tagged_demand=tagged.scatter_set,
     localization=SCATTER_LOCALIZATION,
 )
 
@@ -326,6 +324,7 @@ SCATTER_ACCUMULATE = OperationSemantics(
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
     demand=scatter_accumulate_demand,
+    tagged_demand=tagged.scatter_accumulate,
     localization=SCATTER_LOCALIZATION,
 )
 SCATTER_MUL = OperationSemantics(
@@ -337,5 +336,6 @@ SCATTER_MUL = OperationSemantics(
     concrete_inputs=scatter_concrete_inputs,
     route=resolve_scatter_route,
     demand=scatter_accumulate_demand,
+    tagged_demand=tagged.scatter_accumulate,
     localization=SCATTER_LOCALIZATION,
 )

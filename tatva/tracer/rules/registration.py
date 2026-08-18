@@ -46,6 +46,7 @@ from . import (
     opaque,
     reductions,
     structural,
+    tagged,
 )
 from .zero_dependency import IOTA, NO_OP, ZERO_DEPENDENCY
 
@@ -206,6 +207,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
                 elementwise.elementwise_mul_hessian,
             ),
             demand=elementwise.elementwise_demand,
+            tagged_demand=tagged.elementwise,
             contribution=contribution_rules.scalar_multiply,
         ),
     )
@@ -218,6 +220,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
                 elementwise.elementwise_div_hessian,
             ),
             demand=elementwise.elementwise_demand,
+            tagged_demand=tagged.elementwise,
             contribution=contribution_rules.scalar_divide,
         ),
     )
@@ -230,6 +233,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
                 elementwise.elementwise_pow_hessian,
             ),
             demand=elementwise.elementwise_demand,
+            tagged_demand=tagged.elementwise,
         ),
     )
     reg.register(
@@ -241,6 +245,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
                 elementwise.elementwise_atan2_hessian,
             ),
             demand=elementwise.elementwise_demand,
+            tagged_demand=tagged.elementwise,
         ),
     )
     reg.register(
@@ -252,6 +257,7 @@ def _register_elementwise_binary_rules(reg: PrimitiveRegistry) -> None:
                 no_hessian,
             ),
             demand=elementwise.elementwise_demand,
+            tagged_demand=tagged.elementwise,
         ),
     )
 
@@ -281,6 +287,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_broadcast_in_dim,
+            tagged_demand=tagged.broadcast_in_dim,
             lowering=lowerings.lower_broadcast_in_dim,
         ),
     )
@@ -293,6 +300,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_transpose,
+            tagged_demand=tagged.transpose,
             contribution=contribution_rules.transparent_unary,
         ),
     )
@@ -305,6 +313,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_slice,
+            tagged_demand=tagged.slice_,
             lowering=lowerings.lower_slice,
         ),
     )
@@ -317,6 +326,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_rev,
+            tagged_demand=tagged.rev,
             contribution=contribution_rules.transparent_unary,
         ),
     )
@@ -329,6 +339,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_concatenate,
+            tagged_demand=tagged.concatenate,
             lowering=lowerings.lower_concatenate,
         ),
     )
@@ -341,6 +352,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_stack,
+            tagged_demand=tagged.stack,
         ),
     )
     reg.register(
@@ -352,6 +364,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 hessian=no_hessian,
             ),
             demand=structural.demand_pad,
+            tagged_demand=tagged.pad,
         ),
     )
     reg.register(
@@ -363,6 +376,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
                 no_hessian,
             ),
             demand=structural.demand_split,
+            tagged_demand=tagged.split,
         ),
     )
 
@@ -379,6 +393,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda _eqn: (1,),
             route=resolve_gather_route,
             demand=gather_scatter.gather_demand,
+            tagged_demand=tagged.gather,
             localization=LocalizationSemantics(
                 gather_scatter.localize_gather,
             ),
@@ -414,6 +429,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda _eqn: (0,),
             route=resolve_select_n_route,
             demand=indexing.select_n_demand,
+            tagged_demand=tagged.select_n,
             localization=LocalizationSemantics(
                 localize_route=indexing.localize_select_n,
             ),
@@ -433,6 +449,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda eqn: tuple(range(1, len(eqn.invars))),
             route=resolve_dynamic_slice_route,
             demand=indexing.dynamic_slice_demand,
+            tagged_demand=tagged.dynamic_slice,
             localization=LocalizationSemantics(
                 localize_route=indexing.localize_dynamic_slice,
             ),
@@ -450,6 +467,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             concrete_inputs=lambda eqn: tuple(range(2, len(eqn.invars))),
             route=resolve_dynamic_update_slice_route,
             demand=indexing.dynamic_update_slice_demand,
+            tagged_demand=tagged.dynamic_update_slice,
         ),
     )
 
@@ -484,6 +502,7 @@ def _register_dot_general(reg: PrimitiveRegistry) -> None:
                 dot.dot_general_hessian,
             ),
             demand=dot.dot_general_demand,
+            tagged_demand=tagged.dot_general,
         ),
     )
 
@@ -509,6 +528,7 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
         OperationSemantics(
             derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
             demand=linalg.triangular_solve_demand,
+            tagged_demand=tagged.triangular_solve,
         ),
     )
     reg.register(
@@ -516,6 +536,7 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
         OperationSemantics(
             derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
             demand=linalg.lu_demand,
+            tagged_demand=tagged.lu,
         ),
     )
     reg.register(
@@ -523,6 +544,7 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
         OperationSemantics(
             derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
             demand=opaque.sort_demand,
+            tagged_demand=tagged.sort,
             lowering=lowerings.lower_sort,
         ),
     )

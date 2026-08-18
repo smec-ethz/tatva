@@ -15,6 +15,7 @@ from tatva.tracer.core.semantics import (
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import Demand, TensorDemand, _FullAxis
 from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.rules import tagged
 
 if TYPE_CHECKING:
     from tatva.tracer.core.semantics import RuleContext
@@ -253,6 +254,7 @@ LINEAR_UNARY = OperationSemantics(
         no_hessian,
     ),
     demand=elementwise_demand,
+    tagged_demand=tagged.elementwise,
 )
 NONLINEAR_UNARY = OperationSemantics(
     DerivativeRule(
@@ -261,6 +263,7 @@ NONLINEAR_UNARY = OperationSemantics(
         nonlinear_unary_hessian,
     ),
     demand=elementwise_demand,
+    tagged_demand=tagged.elementwise,
 )
 INTEGER_POW = OperationSemantics(
     DerivativeRule(
@@ -269,6 +272,7 @@ INTEGER_POW = OperationSemantics(
         integer_pow_hessian,
     ),
     demand=elementwise_demand,
+    tagged_demand=tagged.elementwise,
 )
 ELEMENTWISE_BINARY_BASIC = OperationSemantics(
     DerivativeRule(
@@ -277,6 +281,7 @@ ELEMENTWISE_BINARY_BASIC = OperationSemantics(
         hessian=no_hessian,
     ),
     demand=elementwise_demand,
+    tagged_demand=tagged.elementwise,
 )
 
 
@@ -296,7 +301,7 @@ def nary_union_dependencies(
         return (DependencySet.empty(_shape_of(ctx.eqn.outvars[0]), ctx.n_dofs),)
     res = prepared[0]
     for other in prepared[1:]:
-        res = res | other
+        res = res | other  # ty: ignore[unsupported-operator]
     return (res,)
 
 
@@ -307,4 +312,5 @@ ELEMENTWISE_NARY_BASIC = OperationSemantics(
         hessian=no_hessian,
     ),
     demand=elementwise_demand,
+    tagged_demand=tagged.elementwise,
 )
