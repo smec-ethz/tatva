@@ -228,12 +228,18 @@ class ConcreteResolver:
 
         binding = state.bindings.get(atom)
         if binding is not None:
-            value = self.value(binding.frame, binding.atom)
-            if binding.leading_index is not None:
-                array = np.asarray(value)
-                if array.ndim == 0:
-                    raise ValueError("mapped input must have a leading iteration axis")
-                value = array[binding.leading_index]
+            if binding.leading_index is None:
+                value = self.value(binding.frame, binding.atom)
+            else:
+                child_demand = TensorDemand.full(_shape_of(atom))
+                if child_demand is None:
+                    # Empty mapped values need no parent data at all.
+                    value = np.empty(
+                        _shape_of(atom),
+                        dtype=getattr(atom.aval, "dtype", None),
+                    )
+                else:
+                    value = self._regional_binding(binding, child_demand).values
             state.values[atom] = value
             return value
 

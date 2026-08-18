@@ -13,6 +13,7 @@ from tatva.tracer.program.contributions import (
     detect_contributions,
     detect_materialized_contributions,
 )
+from tatva.tracer.program.incidence import generate_contribution_blocks
 from tatva.tracer.program.materialize import materialize_plan
 
 
@@ -161,7 +162,11 @@ def test_trace_and_incidence_do_not_materialize_the_global_plan(monkeypatch):
         jnp.arange(8.0),
         jnp.array([1, 3, 5], dtype=jnp.int32),
     )
-    incidence = traced.incidence()
+    blocks = generate_contribution_blocks(
+        traced.contributions,
+        blocks_per_root=3,
+    )
+    incidence = traced.incidence(blocks)
 
     assert incidence.n_blocks == 3
     np.testing.assert_array_equal(incidence.block_dof_counts, [1, 1, 1])

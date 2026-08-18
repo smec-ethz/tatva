@@ -3,9 +3,11 @@ import numpy as np
 import pytest
 from jax import lax
 
+import tatva.tracer.program.concrete_resolver as concrete_resolver_module
 from tatva.tracer.capture import make_captured_jaxpr
 from tatva.tracer.core.concrete import ConcreteRegion
 from tatva.tracer.core.route_fragments import RouteRequest
+from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import TensorDemand
 from tatva.tracer.program.analysis import EqnPlan, analyze
 from tatva.tracer.program.concrete_resolver import (
@@ -194,3 +196,98 @@ def test_full_fallback_inside_map_is_scoped_to_one_iteration():
     assert resolver.escalations[0].promoted_shape == (8,)
     assert resolver.escalations[0].path
     assert resolver.escalations[0].path[0].iteration == 3
+
+
+def test_full_fallback_inside_map_does_not_materialize_computed_parent_tensor(
+    monkeypatch,
+):
+    def objective(dofs, raw_metrics):
+        metrics = 2.0 * raw_metrics + 1.0
+
+        def element(metric):
+            return jnp.sum(dofs[jnp.argsort(metric)])
+
+        return jnp.sum(lax.map(element, metrics))
+
+    metrics = jnp.arange(4096.0).reshape(512, 8)[:, ::-1]
+    fully_evaluated_shapes = []
+    original_evaluate = concrete_resolver_module.evaluate_concrete_eqn
+
+    def record_full_evaluation(eqn, inputs):
+        fully_evaluated_shapes.extend(_shape_of(outvar) for outvar in eqn.outvars)
+        return original_evaluate(eqn, inputs)
+
+    monkeypatch.setattr(
+        concrete_resolver_module,
+        "evaluate_concrete_eqn",
+        record_full_evaluation,
+    )
+    plan, resolver, frame = _setup(objective, jnp.arange(8.0), metrics)
+    map_eqn = next(eqn for eqn in plan.eqns if eqn.nested is not None)
+    child = resolver.map_frame(frame, map_eqn, 173)
+    try:
+        gather = _eqn(child.plan, "gather")
+        fragment = resolver.route_fragment(
+            child, gather, RouteRequest(np.array([0], dtype=np.int64))
+        )
+    finally:
+        resolver.release(child)
+
+    assert fragment is not None
+    # Full evaluation stays inside the 8-entry child invocation. The parent
+    # multiply/add chain is evaluated regionally for one map slice.
+    assert (512, 8) not in fully_evaluated_shapes
+    assert (8,) in fully_evaluated_shapes
+    assert resolver.stats.regional_evaluated_eqns >= 2
+    assert resolver.stats.regional_entries < 100
+    assert resolver.stats.full_escalations == 1
+    escalation = resolver.escalations[0]
+    assert escalation.promoted_shape == (8,)
+    assert escalation.path[0].iteration == 173
+
+
+def test_full_fallback_inside_scan_does_not_materialize_computed_parent_tensor(
+    monkeypatch,
+):
+    def objective(dofs, raw_metrics):
+        metrics = 2.0 * raw_metrics + 1.0
+
+        def body(carry, metric):
+            term = jnp.sum(dofs[jnp.argsort(metric)])
+            return carry + term, term
+
+        _, terms = lax.scan(body, 0.0, metrics)
+        return jnp.sum(terms)
+
+    metrics = jnp.arange(4096.0).reshape(512, 8)[:, ::-1]
+    fully_evaluated_shapes = []
+    original_evaluate = concrete_resolver_module.evaluate_concrete_eqn
+
+    def record_full_evaluation(eqn, inputs):
+        fully_evaluated_shapes.extend(_shape_of(outvar) for outvar in eqn.outvars)
+        return original_evaluate(eqn, inputs)
+
+    monkeypatch.setattr(
+        concrete_resolver_module,
+        "evaluate_concrete_eqn",
+        record_full_evaluation,
+    )
+    plan, resolver, frame = _setup(objective, jnp.arange(8.0), metrics)
+    scan_eqn = next(eqn for eqn in plan.eqns if eqn.nested is not None)
+    child = resolver.scan_frame(frame, scan_eqn, 173, {})
+    try:
+        gather = _eqn(child.plan, "gather")
+        fragment = resolver.route_fragment(
+            child, gather, RouteRequest(np.array([0], dtype=np.int64))
+        )
+    finally:
+        resolver.release(child)
+
+    assert fragment is not None
+    assert (512, 8) not in fully_evaluated_shapes
+    assert (8,) in fully_evaluated_shapes
+    assert resolver.stats.regional_entries < 100
+    assert resolver.stats.full_escalations == 1
+    escalation = resolver.escalations[0]
+    assert escalation.promoted_shape == (8,)
+    assert escalation.path[0].iteration == 173

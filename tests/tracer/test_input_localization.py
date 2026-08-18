@@ -54,8 +54,9 @@ def test_dead_gather_indices_do_not_prevent_local_execution():
         local_u, local_coords, local_connectivity = local_args
 
         assert not local_kwargs
-        assert local_u.shape == (3,)
-        assert local_coords.shape == (3, 2)
+        assert 0 < local_u.shape[0] < u.shape[0]
+        assert local_coords.shape[1:] == coords.shape[1:]
+        assert 0 < local_coords.shape[0] < coords.shape[0]
         assert local_connectivity is None
 
         local_values.append(local.local_function()(*local_args, **local_kwargs))

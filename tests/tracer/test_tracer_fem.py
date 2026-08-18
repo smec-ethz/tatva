@@ -6,7 +6,7 @@ import numpy as np
 from jax import Array
 from jax_autovmap import autovmap
 
-from tatva import Mesh, Operator
+from tatva import Mesh, Operator, linalg
 from tatva.compound import Compound, field
 from tatva.element.base import Tri3
 from tatva.lifter import Fixed, Lifter, Periodic, RuntimeValue
@@ -43,7 +43,7 @@ def compute_deformation_gradient(grad_u: Array) -> Array:
 def strain_energy_density(grad_u: Array, mat: Material) -> Array:
     F = compute_deformation_gradient(grad_u)
     C = F.T @ F
-    J = jnp.linalg.det(F)
+    J = linalg.det(F)
     return (
         mat.mu / 2 * (jnp.trace(C) - 2)  # 2D case
         - mat.mu * jnp.log(J)
@@ -55,7 +55,7 @@ def strain_energy_density(grad_u: Array, mat: Material) -> Array:
 def get_cauchy_stress(grad_u: Array, mat: Material) -> Array:
     F = compute_deformation_gradient(grad_u)
     C = F.T @ F
-    J = jnp.linalg.det(F)
+    J = linalg.det(F)
 
     C_inv = jnp.linalg.inv(C)
     S = mat.mu * (jnp.eye(2) - C_inv) + mat.lmbda * jnp.log(J) * C_inv  # 2nd PK
@@ -70,7 +70,7 @@ def get_stress(grad_u: Array, mat: Material) -> Array:
     # 2nd Piola-Kirchhoff stress tensor
     F = compute_deformation_gradient(grad_u)
     C = F.T @ F
-    J = jnp.linalg.det(F)
+    J = linalg.det(F)
     C_inv = jnp.linalg.inv(C)
     S = mat.mu * (jnp.eye(2) - C_inv) + mat.lmbda * jnp.log(J) * C_inv  # 2nd PK
     return S
@@ -129,7 +129,7 @@ def test_tracer_fem():
 
     n_parts = 6
     rank = 0
-    distributed = traced.partition(n_parts=n_parts, partitioning="contiguous")
+    distributed = traced.partition(n_parts=n_parts)
     op_slice = next(
         flat_slice
         for name, _tree, flat_slice in cap.call_abi.parameter_trees()
