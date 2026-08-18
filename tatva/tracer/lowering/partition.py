@@ -37,7 +37,7 @@ from jax.extend.core import Var
 from numpy.typing import ArrayLike, NDArray
 
 from tatva.tracer.core.routes import Shape
-from tatva.tracer.local.demand import TensorDemand
+from tatva.tracer.local.demand import TensorDemand, merge_demands
 from tatva.tracer.local.layout import TensorLayout
 from tatva.tracer.program.contributions import (
     ContributionRoot,
@@ -49,11 +49,13 @@ from tatva.tracer.program.derivatives import (
     DerivativeTrace,
     JaxprDerivativeTrace,
 )
+from tatva.tracer.program.incidence import BlockDofIncidence
 
 
 class PartitionStrategy(Enum):
     CONTIGUOUS = auto()
     DEPENDENCY = auto()
+    INCIDENCE = auto()
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,7 @@ class ContributionPartition:
     n_parts: int
     strategy: PartitionStrategy
     owned: tuple[OwnedContribution, ...]
+    block_to_part: NDArray[np.int64] | None = None
 
     def for_part(self, part: int) -> tuple[OwnedContribution, ...]:
         if part < 0 or part >= self.n_parts:
@@ -138,6 +141,229 @@ def _owned_from_axis_owners(
         )
 
     return result
+
+
+def _validate_block_owners(
+    owners: ArrayLike,
+    *,
+    n_blocks: int,
+    n_parts: int,
+) -> NDArray[np.int64]:
+    result = np.asarray(owners, dtype=np.int64).ravel()
+    if result.shape != (n_blocks,):
+        raise ValueError(
+            f"block owners have shape {result.shape}; expected ({n_blocks},)"
+        )
+    if np.any(result < 0) or np.any(result >= n_parts):
+        raise ValueError(f"block owners must be in [0, {n_parts})")
+    return result
+
+
+def _owned_from_block_owners(
+    incidence: BlockDofIncidence,
+    owners: ArrayLike,
+    *,
+    n_parts: int,
+) -> tuple[OwnedContribution, ...]:
+    """Merge blocks with the same root/part into executable root demands."""
+    mapping = _validate_block_owners(
+        owners,
+        n_blocks=incidence.n_blocks,
+        n_parts=n_parts,
+    )
+    merged: dict[tuple[int, int], TensorDemand] = {}
+
+    for block, part in zip(incidence.blocks, mapping, strict=True):
+        key = (block.root_id, int(part))
+        demand = merge_demands(merged.get(key), block.demand)
+        assert demand is not None
+        merged[key] = demand
+
+    return tuple(
+        OwnedContribution(root_id=root_id, part=part, demand=demand)
+        for (root_id, part), demand in sorted(merged.items())
+    )
+
+
+def contiguous_block_owners(
+    incidence: BlockDofIncidence,
+    *,
+    n_parts: int,
+) -> NDArray[np.int64]:
+    """Balanced contiguous block assignment, independently for each root."""
+    if n_parts <= 0:
+        raise ValueError("n_parts must be positive")
+
+    owners = np.empty(incidence.n_blocks, dtype=np.int64)
+    root_ids = sorted({block.root_id for block in incidence.blocks})
+
+    for root_id in root_ids:
+        ids = np.asarray(
+            [block.id for block in incidence.blocks if block.root_id == root_id],
+            dtype=np.int64,
+        )
+        owners[ids] = _contiguous_owners(ids.size, n_parts)
+
+    return owners
+
+
+def dof_partition_block_owners(
+    incidence: BlockDofIncidence,
+    *,
+    dof_to_part: ArrayLike,
+    n_parts: int,
+) -> NDArray[np.int64]:
+    """Place blocks by the plurality of their DOFs' preassigned owners."""
+    mapping = _validate_dof_partition(
+        dof_to_part,
+        n_dofs=incidence.n_dofs,
+        n_parts=n_parts,
+    )
+    defaults = contiguous_block_owners(incidence, n_parts=n_parts)
+    owners = defaults.copy()
+
+    for block_id in range(incidence.n_blocks):
+        dofs = incidence.dofs_for_block(block_id)
+        if dofs.size == 0:
+            continue
+        counts = np.bincount(mapping[dofs], minlength=n_parts)
+        tied = np.flatnonzero(counts == counts.max())
+        preferred = defaults[block_id]
+        owners[block_id] = preferred if preferred in tied else int(tied[0])
+
+    return owners
+
+
+def greedy_incidence_block_owners(
+    incidence: BlockDofIncidence,
+    *,
+    n_parts: int,
+) -> NDArray[np.int64]:
+    """Deterministic local block placer balancing weight and new rank DOFs.
+
+    This is an intentionally small validation partitioner, not a replacement
+    for a distributed hypergraph backend.  Under a soft equal-weight cap it
+    prefers the rank on which a block introduces the fewest new DOFs.
+    """
+    if n_parts <= 0:
+        raise ValueError("n_parts must be positive")
+    if incidence.n_blocks == 0:
+        return np.empty(0, dtype=np.int64)
+
+    weights = np.asarray(
+        [float(block.weight) for block in incidence.blocks], dtype=float
+    )
+    if np.any(~np.isfinite(weights)) or np.any(weights <= 0):
+        raise ValueError("contribution block weights must be finite and positive")
+
+    target = float(weights.sum()) / n_parts
+    largest = float(weights.max())
+    soft_cap = max(target, largest)
+    loads = np.zeros(n_parts, dtype=float)
+    rank_dofs = [set() for _ in range(n_parts)]
+    owners = np.empty(incidence.n_blocks, dtype=np.int64)
+
+    # High-incidence blocks establish shared-DOF affinity first.  Dense block
+    # IDs break ties and make the result reproducible.
+    order = sorted(
+        range(incidence.n_blocks),
+        key=lambda block_id: (
+            -incidence.dofs_for_block(block_id).size,
+            block_id,
+        ),
+    )
+
+    for block_id in order:
+        weight = weights[block_id]
+        dofs = incidence.dofs_for_block(block_id)
+        feasible = [
+            part for part in range(n_parts) if loads[part] + weight <= soft_cap + 1e-12
+        ]
+        candidates = feasible or list(range(n_parts))
+
+        def score(
+            part: int,
+            block_dofs: NDArray[np.int64] = dofs,
+        ) -> tuple[int, float, int]:
+            introduced = sum(int(dof) not in rank_dofs[part] for dof in block_dofs)
+            return introduced, loads[part], part
+
+        owner = min(candidates, key=score)
+        owners[block_id] = owner
+        loads[owner] += weight
+        rank_dofs[owner].update(int(dof) for dof in dofs)
+
+    return owners
+
+
+def partition_contribution_blocks(
+    incidence: BlockDofIncidence,
+    *,
+    n_parts: int,
+    strategy: PartitionStrategy = PartitionStrategy.INCIDENCE,
+    dof_to_part: ArrayLike | None = None,
+) -> tuple[ContributionPartition, NDArray[np.int64]]:
+    """Partition blocks and return both merged root demands and block owners."""
+    if n_parts <= 0:
+        raise ValueError("n_parts must be positive")
+
+    if dof_to_part is not None:
+        owners = dof_partition_block_owners(
+            incidence,
+            dof_to_part=dof_to_part,
+            n_parts=n_parts,
+        )
+        effective_strategy = PartitionStrategy.DEPENDENCY
+    elif strategy is PartitionStrategy.CONTIGUOUS:
+        owners = contiguous_block_owners(incidence, n_parts=n_parts)
+        effective_strategy = strategy
+    elif strategy is PartitionStrategy.INCIDENCE:
+        owners = greedy_incidence_block_owners(incidence, n_parts=n_parts)
+        effective_strategy = strategy
+    else:
+        raise ValueError(f"unsupported block partition strategy {strategy!r}")
+
+    partition = ContributionPartition(
+        n_parts=n_parts,
+        strategy=effective_strategy,
+        owned=_owned_from_block_owners(incidence, owners, n_parts=n_parts),
+        block_to_part=owners.copy(),
+    )
+    return partition, owners
+
+
+def dof_owner_from_incidence(
+    incidence: BlockDofIncidence,
+    *,
+    block_to_part: ArrayLike,
+    n_parts: int,
+) -> NDArray[np.int64]:
+    """Choose a balanced owner among the ranks that compute each DOF."""
+    block_owners = _validate_block_owners(
+        block_to_part,
+        n_blocks=incidence.n_blocks,
+        n_parts=n_parts,
+    )
+    owner = np.zeros(incidence.n_dofs, dtype=np.int64)
+    loads = np.zeros(n_parts, dtype=np.int64)
+    by_dof = incidence.csr.tocsc(copy=False)
+
+    for dof in range(incidence.n_dofs):
+        start = by_dof.indptr[dof]
+        stop = by_dof.indptr[dof + 1]
+        blocks = by_dof.indices[start:stop]
+        if blocks.size == 0:
+            owner[dof] = 0
+            continue
+        else:
+            candidates = np.unique(block_owners[blocks])
+            selected = min(
+                (int(part) for part in candidates), key=lambda p: (loads[p], p)
+            )
+        owner[dof] = selected
+        loads[selected] += 1
+
+    return owner
 
 
 def _partition_root_contiguous(

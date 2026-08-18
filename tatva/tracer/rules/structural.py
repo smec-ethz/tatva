@@ -27,6 +27,7 @@ from tatva.tracer.local.demand import (
     axis_indices,
 )
 from tatva.tracer.program.dependencies import DependencySet
+from tatva.tracer.rules import tagged
 
 if TYPE_CHECKING:
     from tatva.tracer.core.semantics import RuleContext
@@ -634,4 +635,5 @@ RESHAPE_LIKE = OperationSemantics(
         no_hessian,
     ),
     demand=demand_reshape_squeeze,
+    tagged_demand=tagged.reshape,
 )

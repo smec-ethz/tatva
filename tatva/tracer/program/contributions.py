@@ -51,6 +51,7 @@ from tatva.tracer.core.semantics import (
     ContributionMode,
 )
 from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import TensorDemand
 from tatva.tracer.program.materialize import (
     JaxprInstance,
     ResolvedEqn,
@@ -84,6 +85,14 @@ class ContributionRoot:
     value: ValueRef
     domain: ContributionDomain
     coefficient: ContributionCoefficient = 1
+
+
+@dataclass(frozen=True)
+class ContributionBlock:
+    id: int
+    root_id: int
+    demand: TensorDemand
+    weight: float = 1.0
 
 
 @dataclass(frozen=True)

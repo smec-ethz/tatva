@@ -15,6 +15,7 @@ from tatva.tracer.core.semantics import (
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import AxisSubset, Demand, TensorDemand, _FullAxis
 from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.rules import tagged
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,13 +181,15 @@ REDUCE_BASIC = OperationSemantics(
         hessian=no_hessian,
     ),
     demand=reduce_sum_demand,
+    tagged_demand=tagged.reduction,
 )
 REDUCE_PROD = OperationSemantics(
     DerivativeRule(
         prepare=prepare_reduction,
         dependencies=reduction_dependencies,
         hessian=reduce_prod_hessian,
-    )
+    ),
+    tagged_demand=tagged.reduction,
 )
 ZERO_REDUCTION = OperationSemantics(
     DerivativeRule(prepare_reduction, zero_reduction_dependencies, no_hessian)
