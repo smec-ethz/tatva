@@ -5,6 +5,23 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.5](https://github.com/smec-ethz/tatva/compare/v0.11.4...v0.11.5) (2026-08-18)
+
+
+### Bug Fixes
+
+* add `einsum` as drop-in replacement ([f68ab79](https://github.com/smec-ethz/tatva/commit/f68ab79a1203881c858c6fd217b8794f6bf7f6e5))
+* add `tk.contract` as a drop-in replacement of `jnp.einsum` but with performance both on cpu and gpu ([b80c211](https://github.com/smec-ethz/tatva/commit/b80c211afec0ffa08518e68be8bac43105d5d5e7))
+* add test for tensor kernel, replace einsum in operator with broadcast ([36d45a5](https://github.com/smec-ethz/tatva/commit/36d45a5f5fb3a7b08c5c73869161da65423f1f80))
+* **lifter:** use numpy for setup & avoid eager jax compilation (same for compound fields) ([9bda004](https://github.com/smec-ethz/tatva/commit/9bda0040a479a560573505a62fe56b640d3cb647))
+* **linalg:** add `det` with closed form expression of dim &lt;=3 ([39c741b](https://github.com/smec-ethz/tatva/commit/39c741bd78849b3d4241dcf32515fa1f60bd30e1))
+* rename module `tensor_kernels` to `linalg` ([366e47c](https://github.com/smec-ethz/tatva/commit/366e47c2d86610024c4bcff220f74b4ade3c3dc5))
+
+
+### Performance Improvements
+
+* **operator:** replaces einsum matmul and jax.linalg.inv with broadcast for performance gains on cpu and gpu ([521a918](https://github.com/smec-ethz/tatva/commit/521a918da7669e3f1210c3f9667b4fe9a342d20c))
+
 ## [0.11.4](https://github.com/smec-ethz/tatva/compare/v0.11.3...v0.11.4) (2026-08-03)
 
 
