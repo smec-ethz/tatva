@@ -7,6 +7,13 @@ import math
 import numpy as np
 from jax.extend.core import Literal
 
+from tatva.tracer.core.route_fragments import (
+    DynamicSliceRouteFragment,
+    DynamicUpdateSliceRouteFragment,
+    GatherRouteFragment,
+    ScatterRouteFragment,
+    SelectNRouteFragment,
+)
 from tatva.tracer.core.routes import (
     DynamicSliceRoute,
     DynamicUpdateSliceRoute,
@@ -39,6 +46,20 @@ def _output(ctx: TaggedDemandContext) -> Tagged:
     if len(ctx.output_demands) != 1:
         raise ValueError(f"{ctx.eqn.primitive.name} expected one output")
     return ctx.output_demands[0]
+
+
+def _fragment_values(
+    fragment_rows: np.ndarray,
+    values: np.ndarray,
+    demanded_rows: np.ndarray,
+) -> np.ndarray:
+    """Align fragment values with tagged incidences by global output row."""
+    order = np.argsort(fragment_rows, kind="stable")
+    rows = fragment_rows[order]
+    positions = np.searchsorted(rows, demanded_rows)
+    if np.any(positions >= rows.size) or np.any(rows[positions] != demanded_rows):
+        raise ValueError("route fragment does not cover every demanded output row")
+    return values[order[positions]]
 
 
 def _coords(rows: np.ndarray, shape: Shape) -> np.ndarray:
@@ -234,12 +255,16 @@ def gather(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     output = _output(ctx)
     if output is None:
         return tuple(None for _ in ctx.eqn.invars)
-    if not isinstance(ctx.route, GatherRoute):
-        raise TypeError("tagged gather demand requires GatherRoute")
+    if isinstance(ctx.route, GatherRouteFragment):
+        source_rows = _fragment_values(
+            ctx.route.output_rows, ctx.route.source_rows, output.rows
+        )
+    elif isinstance(ctx.route, GatherRoute):
+        source_rows = ctx.route.source_rows[output.rows]
+    else:
+        raise TypeError("tagged gather demand requires a gather route")
     result: list[Tagged] = [None] * len(ctx.eqn.invars)
-    result[0] = output.mapped(
-        _shape_of(ctx.eqn.invars[0]), ctx.route.source_rows[output.rows]
-    )
+    result[0] = output.mapped(_shape_of(ctx.eqn.invars[0]), source_rows)
     return tuple(result)
 
 
@@ -273,9 +298,14 @@ def scatter(
     output = _output(ctx)
     if output is None:
         return tuple(None for _ in ctx.eqn.invars)
-    if not isinstance(ctx.route, ScatterRoute):
-        raise TypeError("tagged scatter demand requires ScatterRoute")
-    targets = ctx.route.target_rows
+    if isinstance(ctx.route, ScatterRouteFragment):
+        targets = ctx.route.target_rows
+        relation_update_rows = ctx.route.update_rows
+    elif isinstance(ctx.route, ScatterRoute):
+        targets = ctx.route.target_rows
+        relation_update_rows = np.arange(targets.size, dtype=np.int64)
+    else:
+        raise TypeError("tagged scatter demand requires a scatter route")
     valid_targets = targets[targets >= 0]
     if needs_operand_at_updates:
         operand = output
@@ -286,7 +316,8 @@ def scatter(
             if not np.any(keep)
             else TaggedDemand(output.shape, output.rows[keep], output.blocks[keep])
         )
-    update_rows, update_blocks = _labels_for_targets(output, targets)
+    relation_rows, update_blocks = _labels_for_targets(output, targets)
+    update_rows = relation_update_rows[relation_rows]
     updates = (
         None
         if update_rows.size == 0
@@ -310,9 +341,14 @@ def select_n(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     output = _output(ctx)
     if output is None:
         return tuple(None for _ in ctx.eqn.invars)
-    if not isinstance(ctx.route, SelectNRoute):
-        raise TypeError("tagged select_n demand requires SelectNRoute")
-    selected = ctx.route.case_indices[output.rows]
+    if isinstance(ctx.route, SelectNRouteFragment):
+        selected = _fragment_values(
+            ctx.route.output_rows, ctx.route.case_indices, output.rows
+        )
+    elif isinstance(ctx.route, SelectNRoute):
+        selected = ctx.route.case_indices[output.rows]
+    else:
+        raise TypeError("tagged select_n demand requires a select_n route")
     result: list[Tagged] = [None] * len(ctx.eqn.invars)
     for case_index, atom in enumerate(ctx.eqn.invars[1:]):
         keep = selected == case_index
@@ -331,12 +367,16 @@ def dynamic_slice(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     output = _output(ctx)
     if output is None:
         return tuple(None for _ in ctx.eqn.invars)
-    if not isinstance(ctx.route, DynamicSliceRoute):
-        raise TypeError("tagged dynamic_slice demand requires DynamicSliceRoute")
+    if isinstance(ctx.route, DynamicSliceRouteFragment):
+        source_rows = _fragment_values(
+            ctx.route.output_rows, ctx.route.source_rows, output.rows
+        )
+    elif isinstance(ctx.route, DynamicSliceRoute):
+        source_rows = ctx.route.source_rows[output.rows]
+    else:
+        raise TypeError("tagged dynamic_slice demand requires a dynamic-slice route")
     result: list[Tagged] = [None] * len(ctx.eqn.invars)
-    result[0] = output.mapped(
-        _shape_of(ctx.eqn.invars[0]), ctx.route.source_rows[output.rows]
-    )
+    result[0] = output.mapped(_shape_of(ctx.eqn.invars[0]), source_rows)
     return tuple(result)
 
 
@@ -344,18 +384,22 @@ def dynamic_update_slice(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     output = _output(ctx)
     if output is None:
         return tuple(None for _ in ctx.eqn.invars)
-    if not isinstance(ctx.route, DynamicUpdateSliceRoute):
-        raise TypeError(
-            "tagged dynamic_update_slice demand requires DynamicUpdateSliceRoute"
-        )
-    targets = ctx.route.target_rows
+    if isinstance(ctx.route, DynamicUpdateSliceRouteFragment):
+        targets = ctx.route.target_rows
+        relation_update_rows = ctx.route.update_rows
+    elif isinstance(ctx.route, DynamicUpdateSliceRoute):
+        targets = ctx.route.target_rows
+        relation_update_rows = np.arange(targets.size, dtype=np.int64)
+    else:
+        raise TypeError("tagged dynamic_update_slice demand requires a dynamic route")
     keep = ~np.isin(output.rows, np.unique(targets[targets >= 0]))
     operand = (
         None
         if not np.any(keep)
         else TaggedDemand(output.shape, output.rows[keep], output.blocks[keep])
     )
-    update_rows, update_blocks = _labels_for_targets(output, targets)
+    relation_rows, update_blocks = _labels_for_targets(output, targets)
+    update_rows = relation_update_rows[relation_rows]
     updates = (
         None
         if update_rows.size == 0

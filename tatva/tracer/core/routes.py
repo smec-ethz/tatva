@@ -190,10 +190,23 @@ def _compute_gather_route(
     eqn: JaxprEqn,
     indices: NDArray,
 ) -> GatherRoute:
+    output_shape = _shape_of(eqn.outvars[0])
+    output_rows = np.arange(int(np.prod(output_shape, dtype=np.int64)), dtype=np.int64)
+    source_rows, index_rows = _compute_gather_route_rows(eqn, indices, output_rows)
+    return GatherRoute(source_rows=source_rows, index_rows=index_rows)
+
+
+def _compute_gather_route_rows(
+    eqn: JaxprEqn,
+    indices: NDArray,
+    output_rows: NDArray[np.int64],
+) -> tuple[NDArray[np.int64], NDArray[np.int64] | None]:
+    """Resolve gather geometry only for the supplied flattened output rows."""
     operand_shape = _shape_of(eqn.invars[0])
     output_shape = _shape_of(eqn.outvars[0])
 
     indices = np.asarray(indices)
+    output_rows = np.asarray(output_rows, dtype=np.int64).ravel()
 
     dnums = eqn.params["dimension_numbers"]
     slice_sizes = tuple(int(x) for x in eqn.params["slice_sizes"])
@@ -227,9 +240,10 @@ def _compute_gather_route(
         raise ValueError("gather operand/index batching dimensions do not match")
 
     # Output coordinates
-    n_output = int(np.prod(output_shape, dtype=np.int64))
-
-    output_rows = np.arange(n_output, dtype=np.int64)
+    n_output = output_rows.size
+    output_size = int(np.prod(output_shape, dtype=np.int64))
+    if np.any(output_rows < 0) or np.any(output_rows >= output_size):
+        raise ValueError("gather fragment output rows are outside the output shape")
 
     if output_shape:
         output_coords = np.stack(
@@ -367,10 +381,7 @@ def _compute_gather_route(
 
         source_rows[valid] = np.ravel_multi_index(tuple(coords.T), operand_shape)
 
-    return GatherRoute(
-        source_rows=source_rows,
-        index_rows=index_rows,
-    )
+    return source_rows, index_rows
 
 
 def _compute_scatter_route(eqn: JaxprEqn, indices: NDArray) -> ScatterRoute | None:
@@ -378,18 +389,36 @@ def _compute_scatter_route(eqn: JaxprEqn, indices: NDArray) -> ScatterRoute | No
     if len(eqn.invars) < 3 or not eqn.outvars:
         return None
 
+    updates_shape = tuple(_shape_of(eqn.invars[2]))
+    n_updates = int(np.prod(updates_shape))
+    update_rows = np.arange(n_updates, dtype=np.int64)
+
+    target_rows = _compute_scatter_target_rows(eqn, np.asarray(indices), update_rows)
+    if target_rows is None:
+        return None
+    return ScatterRoute(target_rows=target_rows)
+
+
+def _compute_scatter_target_rows(
+    eqn: JaxprEqn,
+    indices: NDArray,
+    update_rows: NDArray[np.int64],
+) -> NDArray[np.int64] | None:
+    """Resolve scatter targets only for supplied flattened update rows."""
+    if len(eqn.invars) < 3 or not eqn.outvars:
+        return None
+
     operand_shape = tuple(_shape_of(eqn.invars[0]))
     indices_shape = tuple(_shape_of(eqn.invars[1]))
     updates_shape = tuple(_shape_of(eqn.invars[2]))
-
     indices = np.asarray(indices)
+    update_rows = np.asarray(update_rows, dtype=np.int64).ravel()
 
     if indices.ndim < 1 or tuple(indices.shape) != indices_shape:
         return None
 
     try:
         dnums = eqn.params["dimension_numbers"]
-
         window_dims = tuple(dnums.update_window_dims)
         inserted_dims = tuple(dnums.inserted_window_dims)
         scatter_dims = tuple(dnums.scatter_dims_to_operand_dims)
@@ -399,15 +428,15 @@ def _compute_scatter_route(eqn: JaxprEqn, indices: NDArray) -> ScatterRoute | No
         return None
 
     index_vector_size = indices_shape[-1]
-
     if index_vector_size != len(scatter_dims):
         return None
-
     if len(operand_batch_dims) != len(indices_batch_dims):
         return None
 
-    n_updates = int(np.prod(updates_shape))
-    update_rows = np.arange(n_updates, dtype=np.int64)
+    n_total_updates = int(np.prod(updates_shape))
+    if np.any(update_rows < 0) or np.any(update_rows >= n_total_updates):
+        raise ValueError("scatter fragment update rows are outside the updates shape")
+    n_updates = update_rows.size
 
     try:
         update_coords = np.stack(
@@ -490,9 +519,7 @@ def _compute_scatter_route(eqn: JaxprEqn, indices: NDArray) -> ScatterRoute | No
                 operand_shape,
             )
 
-        return ScatterRoute(
-            target_rows=target_rows,
-        )
+        return target_rows
 
     except (ValueError, IndexError, TypeError):
         return None

@@ -39,8 +39,9 @@ from tatva.tracer.core.nested import (
     dispatch_nested,
 )
 from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.route_fragments import RouteRequest
 from tatva.tracer.core.routes import Shape
-from tatva.tracer.core.semantics import TaggedDemandContext
+from tatva.tracer.core.semantics import TaggedDemandContext, no_route_fragment
 from tatva.tracer.core.tagged import (
     Tagged,
     TaggedDemand,
@@ -127,14 +128,23 @@ def _add_tagged(
 def _backprop_tagged_ordinary(
     resolved: ResolvedEqn,
     output_demands: tuple[Tagged, ...],
+    concrete,
 ) -> tuple[Tagged, ...]:
     eqn = resolved.plan.eqn
     rule = SEMANTICS.get_ordinary(eqn.primitive)
+    fragment = None
+    if rule.route_fragment is not no_route_fragment:
+        active_rows = np.unique(
+            np.concatenate(
+                [demand.rows for demand in output_demands if demand is not None]
+            )
+        )
+        fragment = rule.route_fragment(eqn, concrete, RouteRequest(active_rows))
     result = rule.tagged_demand(
         TaggedDemandContext(
             eqn=eqn,
             output_demands=output_demands,
-            route=resolved.route,
+            route=resolved.route if fragment is None else fragment,
         )
     )
     if len(result) != len(eqn.invars):
@@ -497,7 +507,7 @@ def _backprop_tagged_jaxpr(
         if resolved.nested is None:
             if all(demand is None for demand in outputs):
                 continue
-            inputs = _backprop_tagged_ordinary(resolved, outputs)
+            inputs = _backprop_tagged_ordinary(resolved, outputs, instance.concrete)
         else:
             nested_plan = resolved.plan.nested
             if nested_plan is None:
