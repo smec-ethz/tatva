@@ -12,6 +12,7 @@ from tatva.tracer.helpers import _shape_of
 
 type Shape = tuple[int, ...]
 
+# these 2 are also in program/concrete_resolver.py.... should probably be unified
 type ConcreteValue = NDArray[Any] | np.generic | bool | int | float | complex
 type ConcreteEnv = Mapping[Var, ConcreteValue]
 
