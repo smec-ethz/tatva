@@ -505,12 +505,14 @@ def _materialize_linear_solve(
     for callback, body, consts in zip(
         spec.callbacks(), nested_plan.branches, nested_plan.branch_consts, strict=True
     ):
-        inputs = tuple(
-            None if binding.runtime else outer[binding.outer_input_index]
-            for binding in callback.inputs
-        )
+        inputs: list[ConcreteValue | None] = []
+        for binding in callback.inputs:
+            outer_index = binding.outer_input_index
+            inputs.append(None if outer_index is None else outer[outer_index])
         children.append(
-            _materialize_jaxpr(body, input_values=inputs, const_values=consts)
+            _materialize_jaxpr(
+                body, input_values=tuple(inputs), const_values=consts
+            )
         )
     if eqn_plan.concrete_outputs:
         raise DynamicRoutingError(
