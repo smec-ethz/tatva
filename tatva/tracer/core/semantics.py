@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     from tatva.tracer.local.localize import LocalRoute
     from tatva.tracer.lowering.rules import LoweringRule
     from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
-    from tatva.tracer.program.materialize import JaxprInstance, ResolvedEqn
 
 type ContributionCoefficient = int | float | complex
 
@@ -48,11 +47,11 @@ class ContributionDecision:
 
 @dataclass(frozen=True, slots=True)
 class ContributionContext:
-    instance: JaxprInstance
-    resolved: ResolvedEqn
+    eqn: JaxprEqn
     output_index: int
     coefficient: ContributionCoefficient
     mode: ContributionMode
+    concrete_scalar: Callable[[int], ContributionCoefficient | None]
 
 
 type ContributionRule = Callable[[ContributionContext], ContributionDecision]
@@ -65,7 +64,7 @@ def contribution_barrier(ctx: ContributionContext) -> ContributionDecision:
     return ContributionDecision(
         unsupported_reason=(
             "cannot decompose scalar objective through primitive "
-            f"{ctx.resolved.plan.eqn.primitive.name!r}; expected an additive "
+            f"{ctx.eqn.primitive.name!r}; expected an additive "
             "scalar tail ending, e.g. in reduce_sum"
         )
     )

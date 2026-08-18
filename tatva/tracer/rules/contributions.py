@@ -1,6 +1,3 @@
-import numpy as np
-from jax.extend.core import Literal, Var
-
 from tatva.tracer.core.semantics import (
     ContributionCoefficient,
     ContributionContext,
@@ -18,7 +15,7 @@ def _unsupported(reason: str) -> ContributionDecision:
 def _require_arity(
     ctx: ContributionContext, expected: int
 ) -> ContributionDecision | None:
-    eqn = ctx.resolved.plan.eqn
+    eqn = ctx.eqn
     actual = len(eqn.invars)
     if actual == expected:
         return None
@@ -106,28 +103,6 @@ def reduce_sum(
     )
 
 
-def _concrete_scalar(
-    ctx: ContributionContext,
-    input_index: int,
-) -> ContributionCoefficient | None:
-    atom = ctx.resolved.plan.eqn.invars[input_index]
-
-    if isinstance(atom, Literal):
-        value = atom.val
-    elif isinstance(atom, Var):
-        value = ctx.instance.concrete.get(atom)
-        if value is None:
-            return None
-    else:
-        return None
-
-    array = np.asarray(value)
-    if array.shape != ():
-        return None
-
-    return array.item()
-
-
 def scalar_multiply(ctx: ContributionContext) -> ContributionDecision:
     """Trace ``mul`` only while still in scalar-additive mode."""
 
@@ -138,8 +113,8 @@ def scalar_multiply(ctx: ContributionContext) -> ContributionDecision:
     if invalid is not None:
         return invalid
 
-    lhs_scalar = _concrete_scalar(ctx, 0)
-    rhs_scalar = _concrete_scalar(ctx, 1)
+    lhs_scalar = ctx.concrete_scalar(0)
+    rhs_scalar = ctx.concrete_scalar(1)
 
     if lhs_scalar is not None and rhs_scalar is None:
         return ContributionDecision(
@@ -182,7 +157,7 @@ def scalar_divide(ctx: ContributionContext) -> ContributionDecision:
     if invalid is not None:
         return invalid
 
-    denominator = _concrete_scalar(ctx, 1)
+    denominator = ctx.concrete_scalar(1)
     if denominator is None:
         return _unsupported(
             "contribution scalar division requires a concrete denominator"

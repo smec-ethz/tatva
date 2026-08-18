@@ -49,8 +49,16 @@ from tatva.tracer.support import require_local_routes, require_registered_operat
 class TraceResult[**P, R]:
     captured: CapturedJaxpr[P, R]
     analysis: JaxprPlan
-    resolved: JaxprInstance
     contributions: ContributionTrace
+
+    @functools.cached_property
+    def resolved(self) -> JaxprInstance:
+        """Materialize the invocation tree only for post-partition consumers."""
+        return materialize_plan(
+            self.captured.closed_jaxpr,
+            self.captured.flat_args,
+            self.analysis,
+        )
 
     def incidence(self, block_size: int = 1) -> BlockDofIncidence:
         """Sparse block↔DOF incidence, built lazily on first planning use."""
@@ -423,21 +431,21 @@ def trace[**P, R](captured: CapturedJaxpr[P, R]) -> TraceResult[P, R]:
     # 1. Static structural analysis
     analysis = analyze(jaxpr)
 
-    # 2. recursive concrete evaluation + route materialization
-    resolved = materialize_plan(
+    # 2. Structural contribution detection with lazy concrete scalar lookup.
+    resolver, frame = ConcreteResolver.root(
         captured.closed_jaxpr,
         captured.flat_args,
         analysis,
     )
-
     contributions = detect_contributions(
-        resolved,
+        analysis,
+        frame,
+        resolver,
     )
 
     return TraceResult(
         captured=captured,
         analysis=analysis,
-        resolved=resolved,
         contributions=contributions,
     )
 
