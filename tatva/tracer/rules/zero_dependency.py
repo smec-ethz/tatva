@@ -56,6 +56,19 @@ IOTA = OperationSemantics(
     regional_concrete=concrete.regional_iota,
 )
 
+EMPTY = OperationSemantics(
+    DerivativeRule(
+        no_prepare,
+        zero_output_dependencies,
+        no_hessian,
+    ),
+    demand=no_input_demand,
+    tagged_demand=tagged.no_input,
+    regional_concrete=concrete.unsupported(
+        "empty produces uninitialized values that cannot be used as concrete data"
+    ),
+)
+
 ZERO_DEPENDENCY = OperationSemantics(
     DerivativeRule(
         no_prepare,

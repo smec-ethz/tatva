@@ -157,6 +157,14 @@ def lower_iota(
     )
 
 
+def lower_empty(
+    ctx: LoweringContext,
+) -> tuple[Any, ...]:
+    output = _single_output_layout(ctx)
+    dtype = ctx.plan.eqn.params["dtype"]
+    return (jnp.empty(output.local_shape, dtype=dtype),)
+
+
 def lower_concatenate(
     ctx: LoweringContext,
 ) -> tuple[Any, ...]:
