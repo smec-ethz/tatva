@@ -16,6 +16,12 @@ from math import prod
 import numpy as np
 from numpy.typing import NDArray
 
+from tatva.tracer.core.route_fragments import (
+    DynamicSliceRouteFragment,
+    GatherRouteFragment,
+    ScatterRouteFragment,
+    SelectNRouteFragment,
+)
 from tatva.tracer.core.routes import (
     DynamicSliceRoute,
     GatherRoute,
@@ -117,7 +123,7 @@ def localize_unary_source_rows(
 
 
 def localize_gather_route(
-    route: GatherRoute,
+    route: GatherRoute | GatherRouteFragment,
     *,
     operand_layout: TensorLayout,
     output_layout: TensorLayout,
@@ -135,12 +141,29 @@ def localize_gather_route(
     Valid global source rows must exist in `operand_layout`. If they do not,
     liveness and route localization disagree and localization fails.
     """
-    local_rows = localize_unary_source_rows(
-        route.source_rows,
-        operand_layout=operand_layout,
-        output_layout=output_layout,
-        allow_invalid=True,
-    )
+    if isinstance(route, GatherRouteFragment):
+        global_output_rows = output_layout.local_rows_to_global_rows(
+            np.arange(output_layout.local_size, dtype=np.int64)
+        )
+        positions = np.searchsorted(route.output_rows, global_output_rows)
+
+        if np.any(positions >= route.output_rows.size) or np.any(
+            route.output_rows[positions] != global_output_rows
+        ):
+            raise ValueError("gather fragment does not cover the local output")
+
+        sources = route.source_rows[positions]
+        local_rows = np.full(sources.shape, -1, dtype=np.int64)
+        valid = sources >= 0
+        local_rows[valid] = operand_layout.global_rows_to_local_rows(sources[valid])
+
+    else:
+        local_rows = localize_unary_source_rows(
+            route.source_rows,
+            operand_layout=operand_layout,
+            output_layout=output_layout,
+            allow_invalid=True,
+        )
 
     return LocalGatherRoute(
         source_rows=local_rows,
@@ -251,7 +274,7 @@ class LocalScatterRoute:
 
 
 def localize_scatter_route(
-    route: ScatterRoute,
+    route: ScatterRoute | ScatterRouteFragment,
     *,
     operand_layout: TensorLayout | None,
     update_layout: TensorLayout | None,
@@ -307,19 +330,26 @@ def localize_scatter_route(
         update_shape = None
 
     else:
-        if global_targets.size != update_layout.global_size:
-            raise ValueError(
-                "ScatterRoute/update global shape mismatch: "
-                f"route has {global_targets.size} update rows, "
-                f"update tensor has "
-                f"{update_layout.global_size}"
+        if isinstance(route, ScatterRouteFragment):
+            global_update_rows = np.asarray(route.update_rows, dtype=np.int64)
+            candidate_update_rows = update_layout.global_rows_to_local_rows(
+                global_update_rows
             )
+            selected_global_targets = global_targets
 
-        candidate_update_rows = np.arange(update_layout.local_size, dtype=np.int64)
-        global_update_rows = update_layout.local_rows_to_global_rows(
-            candidate_update_rows
-        )
-        selected_global_targets = global_targets[global_update_rows]
+        else:
+            if global_targets.size != update_layout.global_size:
+                raise ValueError(
+                    "ScatterRoute/update global shape mismatch: "
+                    f"route has {global_targets.size} update rows, "
+                    f"update tensor has {update_layout.global_size}"
+                )
+            candidate_update_rows = np.arange(update_layout.local_size, dtype=np.int64)
+            global_update_rows = update_layout.local_rows_to_global_rows(
+                candidate_update_rows
+            )
+            selected_global_targets = global_targets[global_update_rows]
+
         candidate_target_rows = output_layout.global_rows_to_local_rows(
             selected_global_targets,
             allow_missing=True,
@@ -394,17 +424,33 @@ class LocalDynamicSliceRoute:
 
 
 def localize_dynamic_slice_route(
-    route: DynamicSliceRoute,
+    route: DynamicSliceRoute | DynamicSliceRouteFragment,
     *,
     operand_layout: TensorLayout,
     output_layout: TensorLayout,
 ) -> LocalDynamicSliceRoute:
-    local_rows = localize_unary_source_rows(
-        route.source_rows,
-        operand_layout=operand_layout,
-        output_layout=output_layout,
-        allow_invalid=False,
-    )
+    if isinstance(route, DynamicSliceRouteFragment):
+        global_output_rows = output_layout.local_rows_to_global_rows(
+            np.arange(output_layout.local_size, dtype=np.int64)
+        )
+        positions = np.searchsorted(route.output_rows, global_output_rows)
+
+        if np.any(positions >= route.output_rows.size) or np.any(
+            route.output_rows[positions] != global_output_rows
+        ):
+            raise ValueError("dynamic-slice fragment does not cover local output")
+
+        local_rows = operand_layout.global_rows_to_local_rows(
+            route.source_rows[positions]
+        )
+
+    else:
+        local_rows = localize_unary_source_rows(
+            route.source_rows,
+            operand_layout=operand_layout,
+            output_layout=output_layout,
+            allow_invalid=False,
+        )
 
     return LocalDynamicSliceRoute(
         source_rows=local_rows,
@@ -481,19 +527,30 @@ def _broadcast_output_rows_to_input_rows(
 
 
 def localize_select_n_route(
-    route: SelectNRoute,
+    route: SelectNRoute | SelectNRouteFragment,
     *,
     case_layouts: tuple[TensorLayout | None, ...],
     output_layout: TensorLayout,
 ) -> LocalSelectNRoute:
-    global_case_indices = np.asarray(route.case_indices, dtype=np.int64).ravel()
-
-    if global_case_indices.size != output_layout.global_size:
-        raise ValueError("SelectNRoute/output shape mismatch")
-
     local_output_rows = np.arange(output_layout.local_size, dtype=np.int64)
     global_output_rows = output_layout.local_rows_to_global_rows(local_output_rows)
-    selected_cases = global_case_indices[global_output_rows]
+
+    if isinstance(route, SelectNRouteFragment):
+        positions = np.searchsorted(route.output_rows, global_output_rows)
+        if np.any(positions >= route.output_rows.size) or np.any(
+            route.output_rows[positions] != global_output_rows
+        ):
+            raise ValueError("select_n fragment does not cover local output")
+
+        selected_cases = route.case_indices[positions]
+
+    else:
+        global_case_indices = np.asarray(route.case_indices, dtype=np.int64).ravel()
+        if global_case_indices.size != output_layout.global_size:
+            raise ValueError("SelectNRoute/output shape mismatch")
+
+        selected_cases = global_case_indices[global_output_rows]
+
     n_cases = len(case_layouts)
 
     if np.any((selected_cases < 0) | (selected_cases >= n_cases)):

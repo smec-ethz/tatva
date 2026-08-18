@@ -9,7 +9,11 @@ import scipy.sparse as sps
 from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
-from tatva.tracer.core.route_fragments import resolve_scatter_route_fragment
+from tatva.tracer.core.route_fragments import (
+    GatherRouteFragment,
+    ScatterRouteFragment,
+    resolve_scatter_route_fragment,
+)
 from tatva.tracer.core.routes import (
     GatherRoute,
     ScatterRoute,
@@ -91,11 +95,21 @@ def gather_demand(
 
     route = ctx.route
 
-    if not isinstance(route, GatherRoute):
-        raise TypeError("gather demand requires GatherRoute")
-
     output_rows = output.rows()
-    source_rows = route.source_rows[output_rows]
+    if isinstance(route, GatherRouteFragment):
+        positions = np.searchsorted(route.output_rows, output_rows)
+        if np.any(positions >= route.output_rows.size) or np.any(
+            route.output_rows[positions] != output_rows
+        ):
+            raise ValueError("gather fragment does not cover demanded rows")
+        source_rows = route.source_rows[positions]
+
+    elif isinstance(route, GatherRoute):
+        source_rows = route.source_rows[output_rows]
+
+    else:
+        raise TypeError("gather demand requires a gather route")
+
     source_rows = source_rows[source_rows >= 0]
 
     result: list[Demand] = [None] * len(ctx.eqn.invars)
@@ -181,9 +195,6 @@ def _scatter_demand(
 
     route = ctx.route
 
-    if not isinstance(route, ScatterRoute):
-        raise TypeError("scatter demand requires ScatterRoute")
-
     output_shape = _shape_of(ctx.eqn.outvars[0])
     n_output = int(math.prod(output_shape))
     output_rows = output.rows()
@@ -194,12 +205,23 @@ def _scatter_demand(
     )
     wanted[output_rows] = True
 
-    targets = route.target_rows
+    if isinstance(route, ScatterRouteFragment):
+        targets = route.target_rows
+        relation_update_rows = route.update_rows
+
+    elif isinstance(route, ScatterRoute):
+        targets = route.target_rows
+        relation_update_rows = np.arange(targets.size, dtype=np.int64)
+
+    else:
+        raise TypeError("scatter demand requires a scatter route")
+
     valid = (targets >= 0) & (targets < n_output)
 
-    update_rows = np.flatnonzero(
+    relation_rows = np.flatnonzero(
         valid & wanted[np.clip(targets, 0, max(n_output - 1, 0))]
     )
+    update_rows = relation_update_rows[relation_rows]
 
     if needs_operand_at_updates:
         operand_rows = output_rows
@@ -241,9 +263,9 @@ def localize_gather(
 ) -> LocalGatherRoute:
     route = ctx.route
 
-    if not isinstance(route, GatherRoute):
+    if not isinstance(route, (GatherRoute, GatherRouteFragment)):
         raise TypeError(
-            f"{ctx.eqn.primitive.name} route localization requires GatherRoute"
+            f"{ctx.eqn.primitive.name} route localization requires a gather route"
         )
 
     if not ctx.input_layouts:
@@ -273,9 +295,9 @@ def localize_scatter(
 ) -> LocalScatterRoute:
     route = ctx.route
 
-    if not isinstance(route, ScatterRoute):
+    if not isinstance(route, (ScatterRoute, ScatterRouteFragment)):
         raise TypeError(
-            f"{ctx.eqn.primitive.name} route localization requires ScatterRoute"
+            f"{ctx.eqn.primitive.name} route localization requires a scatter route"
         )
 
     if len(ctx.input_layouts) < 3:

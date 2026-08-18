@@ -23,8 +23,11 @@ from tatva.tracer.local.inputs import (
     localize_inputs,
 )
 from tatva.tracer.local.layout import TensorLayout
-from tatva.tracer.local.liveness import DemandSeed, backpropagate_demand
-from tatva.tracer.local.plan import LocalJaxprPlan, build_local_plan
+from tatva.tracer.local.liveness import (
+    DemandSeed,
+    backpropagate_plan_demand,
+)
+from tatva.tracer.local.plan import LocalJaxprPlan, build_rank_local_plan
 from tatva.tracer.lowering.executor import build_local_executable
 from tatva.tracer.lowering.partition import (
     ContributionPartition,
@@ -186,6 +189,11 @@ class TraceResult[**P, R]:
         )
 
         local_plans = []
+        resolver, frame = ConcreteResolver.root(
+            self.captured.closed_jaxpr,
+            self.captured.flat_args,
+            self.analysis,
+        )
         for rank in range(n_parts):
             owned = contribution_partition.for_part(rank)
             seeds = tuple(
@@ -195,8 +203,10 @@ class TraceResult[**P, R]:
                 )
                 for item in owned
             )
-            demand = backpropagate_demand(self.resolved, seeds)
-            local_plans.append(build_local_plan(self.resolved, demand))
+            demand = backpropagate_plan_demand(self.analysis, frame, resolver, seeds)
+            local_plans.append(
+                build_rank_local_plan(self.analysis, frame, resolver, demand)
+            )
 
         local_plans = tuple(local_plans)
         require_local_routes(local_plans)
@@ -246,8 +256,13 @@ class TraceResult[**P, R]:
             )
             for item in owned
         )
-        demand = backpropagate_demand(self.resolved, seeds)
-        local_plan = build_local_plan(self.resolved, demand)
+        resolver, frame = ConcreteResolver.root(
+            self.captured.closed_jaxpr,
+            self.captured.flat_args,
+            self.analysis,
+        )
+        demand = backpropagate_plan_demand(self.analysis, frame, resolver, seeds)
+        local_plan = build_rank_local_plan(self.analysis, frame, resolver, demand)
 
         compute_layout = local_plan.input_layouts[0]
         if compute_layout is None:

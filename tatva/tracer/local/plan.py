@@ -3,10 +3,10 @@ Construction of rank-local lowering plans.
 
 This phase combines:
 
-    materialized global program
+    structural program + rank-scoped concrete resolution
     + backward structured demand
     + finalized TensorLayouts
-    + localized routes
+    + localized route fragments
 
 into a hierarchical plan suitable for JAX lowering.
 
@@ -27,10 +27,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import cast
+from typing import Any, cast
 
+import numpy as np
 from jax.extend.core import JaxprEqn, Literal, Var
 
+from tatva.tracer.core.concrete import ConcreteRegion
 from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallContext,
@@ -53,27 +55,27 @@ from tatva.tracer.core.nested import (
     dispatch_nested,
 )
 from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.route_fragments import RouteFragment, RouteRequest
 from tatva.tracer.core.routes import (
     Route,
 )
-from tatva.tracer.core.semantics import RouteLocalizationContext
+from tatva.tracer.core.semantics import RouteLocalizationContext, no_route_fragment
+from tatva.tracer.local.demand import TensorDemand
 from tatva.tracer.local.layout import TensorLayout
 from tatva.tracer.local.liveness import JaxprDemandTrace
 from tatva.tracer.local.localize import (
     LocalRoute,
 )
+from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
+from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.materialize import JaxprInstance, ResolvedEqn
 
 
 @dataclass(frozen=True, slots=True)
 class RoutePlan:
-    """Localization status of one globally resolved route.
+    """Rank-local route plus a compact diagnostic for unsupported routes."""
 
-    `local` is None when localization for this route type has not yet
-    been implemented.
-    """
-
-    global_route: Route
+    source_kind: str
     local: LocalRoute | None
 
     @property
@@ -111,9 +113,10 @@ class LocalEqnPlan:
 
 @dataclass(frozen=True)
 class LocalJaxprPlan:
-    """Local lowering plan for one materialized JAXPR invocation."""
+    """Local lowering plan for one rank-required JAXPR invocation."""
 
-    instance: JaxprInstance
+    plan: JaxprPlan
+    const_values: tuple[Any | None, ...]
     layouts: Mapping[Var, TensorLayout]
     const_layouts: tuple[TensorLayout | None, ...]
     input_layouts: tuple[TensorLayout | None, ...]
@@ -122,7 +125,7 @@ class LocalJaxprPlan:
 
     @property
     def global_eqn_count(self) -> int:
-        return len(self.instance.eqns)
+        return len(self.plan.eqns)
 
     @property
     def local_eqn_count(self) -> int:
@@ -179,9 +182,22 @@ def _build_route_plan(
     )
 
     return RoutePlan(
-        global_route=route,
+        source_kind=type(route).__name__,
         local=local,
     )
+
+
+def _extract_numpy_value(value: Any, layout: TensorLayout) -> Any:
+    result = np.asarray(value)
+    if tuple(result.shape) != layout.global_shape:
+        raise ValueError(
+            f"concrete value shape {result.shape} does not match {layout.global_shape}"
+        )
+
+    for axis in range(layout.ndim):
+        result = np.take(result, layout.global_axis_indices(axis), axis=axis)
+
+    return result
 
 
 def _plan_call(
@@ -390,6 +406,10 @@ def _build_local_jaxpr_plan(
     const_layouts = tuple(_atom_layout(var, layouts) for var in jaxpr.constvars)
     input_layouts = tuple(_atom_layout(var, layouts) for var in jaxpr.invars)
     output_layouts = tuple(_atom_layout(atom, layouts) for atom in jaxpr.outvars)
+    const_values = tuple(
+        None if layout is None else _extract_numpy_value(instance.concrete[var], layout)
+        for var, layout in zip(jaxpr.constvars, const_layouts, strict=True)
+    )
     local_eqns: list[LocalEqnPlan] = []
 
     for resolved in instance.eqns:
@@ -433,7 +453,8 @@ def _build_local_jaxpr_plan(
         )
 
     result = LocalJaxprPlan(
-        instance=instance,
+        plan=instance.plan,
+        const_values=const_values,
         layouts=layouts,
         const_layouts=const_layouts,
         input_layouts=input_layouts,
@@ -446,6 +467,343 @@ def _build_local_jaxpr_plan(
     return result
 
 
+def _rank_route_plan(
+    eqn_plan,
+    frame: ConcreteFrame,
+    resolver: ConcreteResolver,
+    *,
+    input_layouts: tuple[TensorLayout | None, ...],
+    output_layouts: tuple[TensorLayout | None, ...],
+) -> RoutePlan | None:
+    semantics = SEMANTICS.get_ordinary(eqn_plan.eqn.primitive)
+    live_outputs = [layout for layout in output_layouts if layout is not None]
+    if not live_outputs:
+        return None
+
+    rows = np.unique(
+        np.concatenate(
+            [
+                layout.local_rows_to_global_rows(
+                    np.arange(layout.local_size, dtype=np.int64)
+                )
+                for layout in live_outputs
+            ]
+        )
+    )
+    fragment = (
+        None
+        if semantics.route_fragment is no_route_fragment
+        else resolver.route_fragment(frame, eqn_plan, RouteRequest(rows))
+    )
+    route: Route | RouteFragment | None = fragment
+
+    if route is None:
+        route = resolver.route(frame, eqn_plan)
+
+    if route is None:
+        return None
+
+    localizer = semantics.localization.localize_route
+    local = (
+        None
+        if localizer is None
+        else localizer(
+            RouteLocalizationContext(
+                eqn=eqn_plan.eqn,
+                route=route,
+                input_layouts=input_layouts,
+                output_layouts=output_layouts,
+            )
+        )
+    )
+    return RoutePlan(type(route).__name__, local)
+
+
+def _rank_const_values(
+    plan: JaxprPlan,
+    frame: ConcreteFrame,
+    resolver: ConcreteResolver,
+    layouts: tuple[TensorLayout | None, ...],
+) -> tuple[Any | None, ...]:
+    result: list[Any | None] = []
+
+    for var, layout in zip(plan.jaxpr.constvars, layouts, strict=True):
+        if layout is None:
+            result.append(None)
+            continue
+
+        demand = TensorDemand.from_axes(layout.global_shape, layout.subset.axes)
+        if demand is None:
+            raise RuntimeError("live constant has an empty demand")
+
+        region = resolver.value(frame, var, demand)
+        if not isinstance(region, ConcreteRegion):
+            raise TypeError("regional constant lookup did not return ConcreteRegion")
+
+        result.append(region.values)
+
+    return tuple(result)
+
+
+def _rank_scan_snapshots(
+    eqn_plan,
+    frame: ConcreteFrame,
+    resolver: ConcreteResolver,
+    spec: ScanSpec,
+    indices: tuple[int, ...],
+) -> dict[int, dict[int, object]]:
+    if not indices:
+        return {}
+    nested = eqn_plan.nested
+    assert nested is not None
+    execution = spec.execution_indices()
+    positions = {index: position for position, index in enumerate(execution)}
+    prefix = execution[: max(positions[index] for index in indices) + 1]
+    required = {
+        index - spec.num_consts
+        for index in nested.body.concrete_inputs
+        if spec.num_consts <= index < spec.num_consts + spec.num_carry
+    }
+
+    if not required:
+        return {}
+
+    carry = {
+        index: resolver.value(frame, eqn_plan.eqn.invars[spec.num_consts + index])
+        for index in required
+    }
+    snapshots: dict[int, dict[int, object]] = {}
+
+    for logical_index in prefix:
+        snapshots[logical_index] = dict(carry)
+        child = resolver.scan_frame(frame, eqn_plan, logical_index, carry)
+
+        try:
+            carry = {
+                index: resolver.value(child, child.plan.jaxpr.outvars[index])
+                for index in required
+            }
+        finally:
+            resolver.release(child)
+
+    return snapshots
+
+
+@dataclass(frozen=True)
+class _LocalRankPlanNestedHandler:
+    eqn_plan: EqnPlan
+    frame: ConcreteFrame
+    resolver: ConcreteResolver
+
+    def call(self, context: CallContext[JaxprDemandTrace]) -> LocalNestedPlan:
+        child_frame = self.resolver.call_frame(self.frame, self.eqn_plan)
+        try:
+            body = _build_rank_local_jaxpr_plan(
+                child_frame.plan, child_frame, self.resolver, context.invocation.body
+            )
+        finally:
+            self.resolver.release(child_frame)
+
+        return LocalNestedPlan(
+            context.spec,
+            CallInvocation(self.eqn_plan.index, body),
+        )
+
+    def cond(self, context: CondContext[JaxprDemandTrace]) -> LocalNestedPlan:
+        branch_index, child_frame = self.resolver.cond_frame(self.frame, self.eqn_plan)
+
+        try:
+            if branch_index != context.invocation.branch_index:
+                raise RuntimeError("conditional branch changed between planning passes")
+
+            body = _build_rank_local_jaxpr_plan(
+                child_frame.plan, child_frame, self.resolver, context.invocation.body
+            )
+        finally:
+            self.resolver.release(child_frame)
+
+        return LocalNestedPlan(
+            context.spec,
+            CondInvocation(self.eqn_plan.index, branch_index, body),
+        )
+
+    def map(self, context: MapContext[JaxprDemandTrace]) -> LocalNestedPlan:
+        children: list[IndexedChild[LocalJaxprPlan]] = []
+
+        for child_trace in context.invocation.children(TraversalOrder.LOGICAL):
+            index = cast(int, child_trace.logical_index)
+            child_frame = self.resolver.map_frame(self.frame, self.eqn_plan, index)
+
+            try:
+                body = _build_rank_local_jaxpr_plan(
+                    child_frame.plan, child_frame, self.resolver, child_trace.payload
+                )
+            finally:
+                self.resolver.release(child_frame)
+
+            children.append(IndexedChild(index, body))
+
+        return LocalNestedPlan(
+            context.spec,
+            RepeatedInvocation.from_spec(
+                self.eqn_plan.index, context.spec, tuple(children)
+            ),
+        )
+
+    def scan(self, context: ScanContext[JaxprDemandTrace]) -> LocalNestedPlan:
+        traces = {
+            cast(int, child.logical_index): child.payload
+            for child in context.invocation.children()
+        }
+        indices = tuple(
+            index for index in context.spec.execution_indices() if index in traces
+        )
+        snapshots = _rank_scan_snapshots(
+            self.eqn_plan, self.frame, self.resolver, context.spec, indices
+        )
+
+        children: list[IndexedChild[LocalJaxprPlan]] = []
+        for index in indices:
+            child_frame = self.resolver.scan_frame(
+                self.frame, self.eqn_plan, index, snapshots.get(index, {})
+            )
+
+            try:
+                body = _build_rank_local_jaxpr_plan(
+                    child_frame.plan, child_frame, self.resolver, traces[index]
+                )
+            finally:
+                self.resolver.release(child_frame)
+
+            children.append(IndexedChild(index, body))
+
+        return LocalNestedPlan(
+            context.spec,
+            RepeatedInvocation.from_spec(
+                self.eqn_plan.index, context.spec, tuple(children)
+            ),
+        )
+
+    def linear_solve(
+        self, context: LinearSolveContext[JaxprDemandTrace]
+    ) -> LocalNestedPlan:
+        frames = self.resolver.linear_solve_frames(self.frame, self.eqn_plan)
+
+        try:
+            children = tuple(
+                _build_rank_local_jaxpr_plan(
+                    child_frame.plan,
+                    child_frame,
+                    self.resolver,
+                    child_trace.payload,
+                )
+                for child_frame, child_trace in zip(
+                    frames, context.invocation.children(), strict=True
+                )
+            )
+        finally:
+            for child_frame in frames:
+                self.resolver.release(child_frame)
+
+        return LocalNestedPlan(
+            context.spec, LinearSolveInvocation(self.eqn_plan.index, *children)
+        )
+
+
+def _build_rank_nested_plan(
+    eqn_plan: EqnPlan,
+    frame: ConcreteFrame,
+    resolver: ConcreteResolver,
+    trace: JaxprDemandTrace,
+) -> LocalNestedPlan:
+    nested = eqn_plan.nested
+    if nested is None:
+        raise TypeError("ordinary equation has no nested local plan")
+
+    nested_trace = trace.nested.get(eqn_plan.index)
+    if nested_trace is None:
+        raise RuntimeError("live nested equation has no demand trace")
+
+    return dispatch_nested(
+        nested.spec,
+        nested_trace,
+        _LocalRankPlanNestedHandler(eqn_plan, frame, resolver),
+    )
+
+
+def _build_rank_local_jaxpr_plan(
+    plan: JaxprPlan,
+    frame: ConcreteFrame,
+    resolver: ConcreteResolver,
+    trace: JaxprDemandTrace,
+) -> LocalJaxprPlan:
+    if frame.plan is not plan:
+        raise ValueError("localization plan does not match concrete frame")
+
+    jaxpr = plan.jaxpr
+    layouts = _finalize_layouts(trace)
+    const_layouts = tuple(_atom_layout(var, layouts) for var in jaxpr.constvars)
+    input_layouts = tuple(_atom_layout(var, layouts) for var in jaxpr.invars)
+    output_layouts = tuple(_atom_layout(atom, layouts) for atom in jaxpr.outvars)
+    local_eqns: list[LocalEqnPlan] = []
+
+    for eqn_plan in plan.eqns:
+        eqn = eqn_plan.eqn
+        inputs = tuple(_atom_layout(atom, layouts) for atom in eqn.invars)
+        outputs = tuple(_atom_layout(atom, layouts) for atom in eqn.outvars)
+        has_nested = eqn_plan.index in trace.nested
+
+        if not any(layout is not None for layout in outputs) and not has_nested:
+            if getattr(eqn, "effects", ()):
+                raise NotImplementedError(
+                    f"effectful dead equation {eqn.primitive.name} is unsupported"
+                )
+            continue
+
+        nested_plan = (
+            _build_rank_nested_plan(eqn_plan, frame, resolver, trace)
+            if has_nested
+            else None
+        )
+        route = (
+            None
+            if eqn_plan.nested is not None
+            else _rank_route_plan(
+                eqn_plan,
+                frame,
+                resolver,
+                input_layouts=inputs,
+                output_layouts=outputs,
+            )
+        )
+        local_eqns.append(
+            LocalEqnPlan(eqn_plan.index, eqn, inputs, outputs, route, nested_plan)
+        )
+
+    result = LocalJaxprPlan(
+        plan=plan,
+        const_values=_rank_const_values(plan, frame, resolver, const_layouts),
+        layouts=layouts,
+        const_layouts=const_layouts,
+        input_layouts=input_layouts,
+        output_layouts=output_layouts,
+        eqns=tuple(local_eqns),
+    )
+    _validate_local_jaxpr_plan(result)
+
+    return result
+
+
+def build_rank_local_plan(
+    plan: JaxprPlan,
+    frame: ConcreteFrame,
+    resolver: ConcreteResolver,
+    demand: JaxprDemandTrace,
+) -> LocalJaxprPlan:
+    """Build one rank's plan without constructing a global invocation tree."""
+    return _build_rank_local_jaxpr_plan(plan, frame, resolver, demand)
+
+
 def _validate_local_jaxpr_plan(
     plan: LocalJaxprPlan,
 ) -> None:
@@ -455,7 +813,7 @@ def _validate_local_jaxpr_plan(
     Inputs with layout=None are deliberately ignored because specialized
     lowering may compile them away, e.g. gather connectivity indices.
     """
-    jaxpr = plan.instance.plan.jaxpr
+    jaxpr = plan.plan.jaxpr
     available: set[Var] = set(jaxpr.invars)
     available.update(jaxpr.constvars)
 
@@ -545,7 +903,7 @@ def summarize_local_plan(
         lines.append(
             f"  eqn {eqn.index}: "
             f"{eqn.primitive_name} "
-            f"({type(eqn.route.global_route).__name__ if eqn.route else 'no route'})"
+            f"({eqn.route.source_kind if eqn.route else 'no route'})"
         )
 
     return "\n".join(lines)

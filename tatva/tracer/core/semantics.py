@@ -197,7 +197,7 @@ class HessianRule[T](Protocol):
 class DemandContext:
     eqn: JaxprEqn
     output_demands: tuple[Demand, ...]
-    route: Route | None
+    route: Route | RouteFragment | None
 
 
 @dataclass(frozen=True)
@@ -222,7 +222,7 @@ class RouteLocalizationContext:
     """Inputs available when converting a global route to rank-local rows."""
 
     eqn: JaxprEqn
-    route: Route
+    route: Route | RouteFragment
     input_layouts: tuple[TensorLayout | None, ...]
     output_layouts: tuple[TensorLayout | None, ...]
 

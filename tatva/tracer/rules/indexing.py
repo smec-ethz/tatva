@@ -4,6 +4,11 @@ import numpy as np
 import scipy.sparse as sps
 from numpy.typing import NDArray
 
+from tatva.tracer.core.route_fragments import (
+    DynamicSliceRouteFragment,
+    DynamicUpdateSliceRouteFragment,
+    SelectNRouteFragment,
+)
 from tatva.tracer.core.routes import (
     DynamicSliceRoute,
     DynamicUpdateSliceRoute,
@@ -28,7 +33,7 @@ from tatva.tracer.rules.elementwise import inverse_elementwise_broadcast
 
 def prepare_select_n(ctx: RuleContext) -> SelectNRoute:
     if not isinstance(ctx.route, SelectNRoute):
-        raise ValueError(f"select_n route was not resolved for equation {ctx.eqn}")  # ruff: ignore[type-check-without-type-error]
+        raise TypeError(f"select_n route was not resolved for equation {ctx.eqn}")
 
     return ctx.route
 
@@ -74,7 +79,7 @@ def select_n_dependencies(
 
 def prepare_dynamic_slice(ctx: RuleContext) -> DynamicSliceRoute:
     if not isinstance(ctx.route, DynamicSliceRoute):
-        raise ValueError(f"dynamic_slice route was not resolved for equation {ctx.eqn}")  # ruff: ignore[type-check-without-type-error]
+        raise TypeError(f"dynamic_slice route was not resolved for equation {ctx.eqn}")
 
     return ctx.route
 
@@ -92,7 +97,7 @@ def dynamic_slice_dependencies(
 
 def prepare_dynamic_update_slice(ctx: RuleContext) -> DynamicUpdateSliceRoute:
     if not isinstance(ctx.route, DynamicUpdateSliceRoute):
-        raise ValueError(  # ruff: ignore[type-check-without-type-error]
+        raise TypeError(
             f"dynamic_update_slice route was not resolved for equation {ctx.eqn}"
         )
 
@@ -129,16 +134,26 @@ def select_n_demand(
 
     route = ctx.route
 
-    if not isinstance(route, SelectNRoute):
-        raise TypeError("select_n demand requires SelectNRoute")
-
     output_shape = _shape_of(ctx.eqn.outvars[0])
     demanded_rows = output.rows()
     result: list[Demand] = [None] * len(ctx.eqn.invars)
 
     # selector is compiled into route.case_indices.
     result[0] = None
-    selected_cases = route.case_indices[demanded_rows]
+
+    if isinstance(route, SelectNRouteFragment):
+        positions = np.searchsorted(route.output_rows, demanded_rows)
+        if np.any(positions >= route.output_rows.size) or np.any(
+            route.output_rows[positions] != demanded_rows
+        ):
+            raise ValueError("select_n fragment does not cover demanded rows")
+        selected_cases = route.case_indices[positions]
+
+    elif isinstance(route, SelectNRoute):
+        selected_cases = route.case_indices[demanded_rows]
+
+    else:
+        raise TypeError("select_n demand requires a select_n route")
 
     for case_index, atom in enumerate(ctx.eqn.invars[1:]):
         mask = selected_cases == case_index
@@ -166,11 +181,22 @@ def dynamic_slice_demand(
 
     route = ctx.route
 
-    if not isinstance(route, DynamicSliceRoute):
-        raise TypeError("dynamic_slice demand requires DynamicSliceRoute")
-
     rows = output.rows()
-    source_rows = route.source_rows[rows]
+
+    if isinstance(route, DynamicSliceRouteFragment):
+        positions = np.searchsorted(route.output_rows, rows)
+        if np.any(positions >= route.output_rows.size) or np.any(
+            route.output_rows[positions] != rows
+        ):
+            raise ValueError("dynamic_slice fragment does not cover demanded rows")
+        source_rows = route.source_rows[positions]
+
+    elif isinstance(route, DynamicSliceRoute):
+        source_rows = route.source_rows[rows]
+
+    else:
+        raise TypeError("dynamic_slice demand requires a dynamic-slice route")
+
     result: list[Demand] = [None] * len(ctx.eqn.invars)
     result[0] = TensorDemand.from_rows_hull(
         _shape_of(ctx.eqn.invars[0]),
@@ -190,9 +216,6 @@ def dynamic_update_slice_demand(
 
     route = ctx.route
 
-    if not isinstance(route, DynamicUpdateSliceRoute):
-        raise TypeError("dynamic_update_slice demand requires DynamicUpdateSliceRoute")
-
     output_shape = _shape_of(ctx.eqn.outvars[0])
     output_rows = output.rows()
     n_output = int(math.prod(output_shape))
@@ -203,11 +226,22 @@ def dynamic_update_slice_demand(
     )
     wanted[output_rows] = True
 
-    target_rows = route.target_rows
+    if isinstance(route, DynamicUpdateSliceRouteFragment):
+        target_rows = route.target_rows
+        relation_update_rows = route.update_rows
+
+    elif isinstance(route, DynamicUpdateSliceRoute):
+        target_rows = route.target_rows
+        relation_update_rows = np.arange(target_rows.size, dtype=np.int64)
+
+    else:
+        raise TypeError("dynamic_update_slice demand requires a dynamic route")
+
     valid_update = (target_rows >= 0) & (target_rows < n_output)
-    update_rows = np.flatnonzero(
+    relation_rows = np.flatnonzero(
         valid_update & wanted[np.clip(target_rows, 0, max(n_output - 1, 0))]
     )
+    update_rows = relation_update_rows[relation_rows]
 
     overwritten = np.unique(target_rows[valid_update])
     operand_rows = output_rows[~np.isin(output_rows, overwritten, assume_unique=False)]
@@ -224,7 +258,7 @@ def localize_select_n(
 ) -> LocalSelectNRoute:
     route = ctx.route
 
-    if not isinstance(route, SelectNRoute):
+    if not isinstance(route, (SelectNRoute, SelectNRouteFragment)):
         raise TypeError(
             f"{ctx.eqn.primitive.name} route localization requires SelectNRoute"
         )
@@ -250,7 +284,7 @@ def localize_dynamic_slice(
 ) -> LocalDynamicSliceRoute:
     route = ctx.route
 
-    if not isinstance(route, DynamicSliceRoute):
+    if not isinstance(route, (DynamicSliceRoute, DynamicSliceRouteFragment)):
         raise TypeError(
             f"{ctx.eqn.primitive.name} route localization requires DynamicSliceRoute"
         )
