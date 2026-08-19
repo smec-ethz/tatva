@@ -290,6 +290,17 @@ def direct_call_target(eqn: JaxprEqn) -> CallTarget:
     return CallTarget(body=value)
 
 
+def custom_derivative_call_target(eqn: JaxprEqn) -> CallTarget:
+    value = eqn.params.get("call_jaxpr")
+
+    if not isinstance(value, (Jaxpr, ClosedJaxpr)):
+        raise TypeError(
+            f"call-like primitive {eqn.primitive.name} does not contain a Jaxpr-valued 'call_jaxpr' parameter"
+        )
+
+    return CallTarget(body=value)
+
+
 @dataclass(frozen=True, slots=True)
 class CallAnalysisSemantics:
     call_kind: CallKind

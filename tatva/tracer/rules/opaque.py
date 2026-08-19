@@ -27,23 +27,13 @@ def prepare_opaque(ctx: RuleContext) -> OpaqueData:
     warnings.warn(
         f"Using conservative opaque derivative rule for {ctx.eqn.primitive.name}"
     )
-    active = np.zeros(ctx.n_dofs, dtype=bool)
-    for dep in ctx.input_deps:
-        if dep.csr.nnz:
-            active[dep.csr.indices] = True
+    nonempty = [dep.total_union().csr for dep in ctx.input_deps if dep.csr.nnz]
+    if not nonempty:
+        total_csr = sps.csr_matrix((1, ctx.n_dofs), dtype=bool)
+    else:
+        total_csr = sps.vstack(nonempty, format="csr").max(axis=0)
+        total_csr = sps.csr_matrix(total_csr, dtype=bool)
 
-    cols = np.flatnonzero(active)
-    total_csr = sps.csr_matrix(
-        (
-            np.ones(cols.size, dtype=bool),
-            (
-                np.zeros(cols.size, dtype=np.int64),
-                cols,
-            ),
-        ),
-        shape=(1, ctx.n_dofs),
-        dtype=bool,
-    )
     return OpaqueData(DependencySet(total_csr, (1,)))
 
 

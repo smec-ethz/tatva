@@ -37,6 +37,7 @@ from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallContext,
     CallInvocation,
+    CallSpec,
     CondContext,
     CondInvocation,
     IndexedChild,
@@ -397,6 +398,7 @@ def _build_rank_nested_plan(
     frame: ConcreteFrame,
     resolver: ConcreteResolver,
     trace: JaxprDemandTrace,
+    outer_input_layouts: tuple[TensorLayout | None, ...],
 ) -> LocalNestedPlan:
     nested = eqn_plan.nested
     if nested is None:
@@ -406,11 +408,36 @@ def _build_rank_nested_plan(
     if nested_trace is None:
         raise RuntimeError("live nested equation has no demand trace")
 
-    return dispatch_nested(
+    local_nested_plan = dispatch_nested(
         nested.spec,
         nested_trace,
-        _LocalRankPlanNestedHandler(eqn_plan, frame, resolver),
+        _LocalRankPlanNestedHandler(
+            eqn_plan,
+            frame,
+            resolver,
+        ),
     )
+    # Custom derivative rules may use operands which the primal child does
+    # not. Validate the parent boundary, not ``body.input_layouts``: the
+    # latter intentionally marks primal-dead operands as absent.
+    if isinstance(nested.spec, CallSpec) and nested.spec.call_kind.is_custom_derivative:
+        for index in nested.spec.resolved_input_indices(len(outer_input_layouts)):
+            atom = eqn_plan.eqn.invars[index]
+            if isinstance(atom, Literal):
+                continue
+
+            layout = outer_input_layouts[index]
+            if layout is None:
+                raise RuntimeError(
+                    f"{eqn_plan.eqn.primitive.name}: custom derivative input {index} was removed by liveness"
+                )
+            if not layout.is_full:
+                raise RuntimeError(
+                    f"{eqn_plan.eqn.primitive.name}: custom derivative input {index} must currently be invocation-local FULL; "
+                    f"got {layout.local_shape} from global {layout.global_shape}"
+                )
+
+    return local_nested_plan
 
 
 def _build_rank_local_jaxpr_plan(
@@ -443,7 +470,7 @@ def _build_rank_local_jaxpr_plan(
             continue
 
         nested_plan = (
-            _build_rank_nested_plan(eqn_plan, frame, resolver, trace)
+            _build_rank_nested_plan(eqn_plan, frame, resolver, trace, inputs)
             if has_nested
             else None
         )

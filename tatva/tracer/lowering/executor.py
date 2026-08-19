@@ -281,6 +281,127 @@ def _lower_call(
     return tuple(result)
 
 
+def _bind_custom_derivative_primitive(
+    eqn,
+    args: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    """Re-bind a custom_jvp/custom_vjp call preserving its AD semantics."""
+    primitive = eqn.primitive
+    bind_params = primitive.get_bind_params(eqn.params)
+
+    result = primitive.bind(
+        *args,
+        **bind_params,
+    )
+
+    if primitive.multiple_results:
+        return tuple(result)
+
+    return (result,)
+
+
+def _lower_custom_derivative_call(
+    plan: LocalEqnPlan,
+    context: CallContext[LocalJaxprPlan],
+    inputs: tuple[Any | None, ...],
+) -> tuple[Any | None, ...]:
+    """Lower custom_jvp/custom_vjp while preserving the custom AD boundary.
+
+    Unlike ordinary calls, we must not execute the localized primal child
+    directly. Doing so would erase the custom derivative rule and cause JAX
+    to differentiate the primal implementation.
+
+    For now all dynamic call operands are required to have full
+    invocation-local layouts. We therefore re-bind the original primitive
+    and project its complete invocation-local outputs to the requested
+    local layouts.
+    """
+
+    eqn = plan.eqn
+    spec = context.spec
+
+    if not spec.call_kind.is_custom_derivative:
+        raise ValueError(
+            "_lower_custom_derivative_call called for "
+            f"non-custom call kind {spec.call_kind}"
+        )
+
+    input_indices = spec.resolved_input_indices(len(inputs))
+
+    # The primitive bind expects exactly the outer operands selected by the
+    # call boundary, in primitive/JAXPR order.
+    args: list[Any] = []
+
+    for outer_index in input_indices:
+        atom = eqn.invars[outer_index]
+        value = inputs[outer_index]
+        layout = plan.input_layouts[outer_index]
+
+        if isinstance(atom, Literal):
+            # Usually literals are already returned by _read_atom(), so this
+            # branch is mostly defensive.
+            args.append(atom.val if value is None else value)
+            continue
+
+        if value is None:
+            raise RuntimeError(
+                f"{plan.primitive_name}: custom derivative operand "
+                f"{outer_index} is unavailable"
+            )
+
+        if layout is None:
+            raise RuntimeError(
+                f"{plan.primitive_name}: custom derivative operand "
+                f"{outer_index} has no runtime layout"
+            )
+
+        if not layout.is_full:
+            raise RuntimeError(
+                f"{plan.primitive_name}: custom derivative operand "
+                f"{outer_index} must currently be FULL within its "
+                "invocation; got "
+                f"global_shape={layout.global_shape}, "
+                f"local_shape={layout.local_shape}"
+            )
+
+        args.append(value)
+
+    raw_outputs = _bind_custom_derivative_primitive(eqn, tuple(args))
+
+    if not isinstance(raw_outputs, (tuple, list)):
+        raw_outputs = (raw_outputs,)
+    else:
+        raw_outputs = tuple(raw_outputs)
+
+    if len(raw_outputs) != len(eqn.outvars):
+        raise RuntimeError(
+            f"{plan.primitive_name}: primitive returned "
+            f"{len(raw_outputs)} outputs but equation has "
+            f"{len(eqn.outvars)} outvars"
+        )
+
+    result: list[Any | None] = []
+
+    for value, target_layout in zip(raw_outputs, plan.output_layouts, strict=True):
+        if target_layout is None:
+            result.append(None)
+            continue
+
+        full_demand = TensorDemand.full(target_layout.global_shape)
+        assert full_demand is not None, (
+            "unexpected. full demand should always be non-None"
+        )
+        source_layout = TensorLayout.from_demand(full_demand)
+
+        result.append(
+            _project_local_value(
+                value, source_layout=source_layout, target_layout=target_layout
+            )
+        )
+
+    return tuple(result)
+
+
 def _lower_cond(
     plan: LocalEqnPlan,
     context: CondContext[LocalJaxprPlan],
@@ -947,6 +1068,9 @@ class _LowerNestedHandler:
     inputs: tuple[Any | None, ...]
 
     def call(self, context: CallContext[LocalJaxprPlan]):
+        if context.spec.call_kind.is_custom_derivative:
+            return _lower_custom_derivative_call(self.plan, context, self.inputs)
+
         return _lower_call(self.plan, context, self.inputs)
 
     def map(self, context: MapContext[LocalJaxprPlan]):

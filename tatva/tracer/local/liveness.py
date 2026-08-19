@@ -259,6 +259,25 @@ class _DemandPlanNestedHandler:
         for index, demand in zip(indices, child.input_demands, strict=True):
             outer[index] = merge_demands(outer[index], demand)
 
+        # a custom derivative can use an input that is absent from the primal call_jaxpr
+        # dependency slice. Until the derivative jaxpr itself is localized, conservatively we
+        # keep every invocation input
+        if spec.call_kind.is_custom_derivative:
+            active = any(demand is not None for demand in self.outputs) or bool(
+                self.seed_node.children.get(step)
+            )
+            if active:
+                for index in indices:
+                    atom = self.eqn_plan.eqn.invars[index]
+
+                    if isinstance(atom, Literal):
+                        continue
+
+                    outer[index] = merge_demands(
+                        outer[index],
+                        TensorDemand.full(_shape_of(atom)),
+                    )
+
         return tuple(outer), CallInvocation(self.eqn_plan.index, child)
 
     def map(self, spec: MapSpec) -> tuple[tuple[Demand, ...], NestedDemandTrace]:

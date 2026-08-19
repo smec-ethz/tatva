@@ -348,6 +348,29 @@ def _trace_plan_nested(
     spec = nested.spec
     eqn = eqn_plan.eqn
 
+    # A custom JVP/VJP body is visible for planning, but the executable must retain the
+    # outer primitive to preserve its derivative rule. Keeping a contribution root inside
+    # its primal child would require reconstructing values from a nested call frame, which
+    # the local executable deliberately does not do. Treat the custom boundary itself as
+    # the partitionable contribution-domain value instead.
+    if isinstance(spec, CallSpec) and spec.call_kind.is_custom_derivative:
+        if seed.mode is ContributionMode.DOMAIN:
+            return (
+                [
+                    _root_candidate(
+                        frame.path,
+                        cast(Var, seed.atom),
+                        seed.coefficient,
+                        partition_axes=partition_axes,
+                    )
+                ],
+                [],
+            )
+        raise UnsupportedContributionError(
+            f"custom derivative primitive {eqn.primitive.name!r} produces "
+            "the scalar objective without an additive reduction"
+        )
+
     if not isinstance(spec, (CallSpec, CondSpec)):
         if seed.mode is ContributionMode.DOMAIN:
             return (
