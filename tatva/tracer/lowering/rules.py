@@ -317,7 +317,22 @@ def lower_select_n(
 ) -> tuple[Any, ...]:
     route_plan = ctx.plan.route
     if route_plan is None or not isinstance(route_plan.local, LocalSelectNRoute):
-        raise RuntimeError("select_n requires LocalSelectNRoute")
+        # No concrete selector was available while planning.  All operands
+        # were kept by the dynamic demand rule, so bind the rank-local JAX
+        # primitive directly.  Broadcasting must be entirely local: silently
+        # relying on global layouts here would produce incorrect rank values.
+        output_layout = _single_output_layout(ctx)
+        output_shape = output_layout.local_shape
+        values = [_input(ctx, index) for index in range(len(ctx.inputs))]
+        for index, value in enumerate(values):
+            try:
+                np.broadcast_shapes(tuple(value.shape), output_shape)
+            except ValueError as exc:
+                raise NotImplementedError(
+                    f"select_n dynamic selector operand {index} is not locally "
+                    f"broadcast-compatible with output {output_shape}; got {value.shape}"
+                ) from exc
+        return (lax.select_n(values[0], *values[1:]),)
 
     route = route_plan.local
 

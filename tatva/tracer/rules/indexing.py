@@ -31,21 +31,29 @@ from tatva.tracer.program.dependencies import DependencySet
 from tatva.tracer.rules.elementwise import inverse_elementwise_broadcast
 
 
-def prepare_select_n(ctx: RuleContext) -> SelectNRoute:
-    if not isinstance(ctx.route, SelectNRoute):
-        raise TypeError(f"select_n route was not resolved for equation {ctx.eqn}")
-
+def prepare_select_n(ctx: RuleContext) -> SelectNRoute | None:
+    """A missing route denotes a runtime (DOF-dependent) selector."""
+    if ctx.route is not None and not isinstance(ctx.route, SelectNRoute):
+        raise TypeError(f"invalid select_n route for equation {ctx.eqn}")
     return ctx.route
 
 
 def select_n_dependencies(
     ctx: RuleContext,
-    prepared: SelectNRoute,
+    prepared: SelectNRoute | None,
 ) -> tuple[DependencySet, ...]:
     output_shape = _shape_of(ctx.eqn.outvars[0])
     n_output = int(np.prod(output_shape))
 
     cases = tuple(dep.broadcast_to(output_shape) for dep in ctx.input_deps[1:])
+
+    # lax.select_n is non-differentiable in its selector.  Without a static
+    # selector every case can contribute at runtime, so retain their union.
+    if prepared is None:
+        output = cases[0].csr.copy()
+        for case in cases[1:]:
+            output = output.maximum(case.csr)
+        return (DependencySet(output.tocsr(), output_shape),)
 
     selected_rows: list[NDArray[np.int64]] = []
     selected_blocks: list[sps.csr_matrix] = []
@@ -137,6 +145,18 @@ def select_n_demand(
     output_shape = _shape_of(ctx.eqn.outvars[0])
     demanded_rows = output.rows()
     result: list[Demand] = [None] * len(ctx.eqn.invars)
+
+    if route is None:
+        # Keep the selector live as a runtime value, although its derivatives
+        # deliberately remain excluded above. Every case is runtime-live.
+        result[0] = inverse_elementwise_broadcast(
+            output, input_shape=_shape_of(ctx.eqn.invars[0]), output_shape=output_shape
+        )
+        for case_index, atom in enumerate(ctx.eqn.invars[1:]):
+            result[case_index + 1] = inverse_elementwise_broadcast(
+                output, input_shape=_shape_of(atom), output_shape=output_shape
+            )
+        return tuple(result)
 
     # selector is compiled into route.case_indices.
     result[0] = None

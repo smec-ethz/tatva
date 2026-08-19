@@ -341,6 +341,13 @@ def select_n(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     output = _output(ctx)
     if output is None:
         return tuple(None for _ in ctx.eqn.invars)
+    if ctx.route is None:
+        result: list[Tagged] = [None] * len(ctx.eqn.invars)
+        for index, atom in enumerate(ctx.eqn.invars):
+            result[index] = _inverse_broadcast(
+                output, input_shape=_shape_of(atom), output_shape=output.shape
+            )
+        return tuple(result)
     if isinstance(ctx.route, SelectNRouteFragment):
         selected = _fragment_values(
             ctx.route.output_rows, ctx.route.case_indices, output.rows

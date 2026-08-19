@@ -689,6 +689,7 @@ class ConcreteResolver:
         semantics = SEMANTICS.get_ordinary(eqn.primitive)
         concrete: ConcreteEnv = {}
         concrete_indices = semantics.concrete_inputs(eqn)
+        optional_indices = semantics.optional_route_inputs(eqn)
         demands = None
 
         if request is not None and semantics.route_concrete_demands is not None:
@@ -742,6 +743,38 @@ class ConcreteResolver:
                     f"while resolving route for {eqn.primitive.name} at equation {eqn_plan.index} "
                     f"concrete input {input_index}, frame={frame.path}"
                 ) from exc
+
+        # Optional route inputs are intentionally best-effort.  In particular
+        # a selector derived from DOFs must leave a dynamic route unresolved,
+        # rather than turning into a planning-time concrete requirement.
+        for input_index in optional_indices:
+            if input_index in concrete_indices:
+                continue
+            if input_index < 0 or input_index >= len(eqn.invars):
+                raise ValueError(
+                    f"{eqn.primitive.name}.optional_route_inputs returned invalid "
+                    f"input index {input_index}"
+                )
+            atom = eqn.invars[input_index]
+            try:
+                if isinstance(atom, Var):
+                    concrete[atom] = (
+                        self._full_value(frame, atom)
+                        if request is None
+                        else self.value(
+                            frame,
+                            atom,
+                            None
+                            if demands is None
+                            else demands[input_index],
+                        )
+                    )
+                elif not isinstance(atom, Literal):
+                    raise TypeError(f"unsupported JAXPR atom {type(atom)!r}")
+            except DynamicRoutingError:
+                # Absence is the signal to the route rule to use its dynamic
+                # fallback. Do not retain a partial/concrete value.
+                continue
 
         return semantics, concrete
 
