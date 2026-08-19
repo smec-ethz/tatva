@@ -173,22 +173,50 @@ def _backprop_plan_call(
 ) -> tuple[tuple[Tagged, ...], TaggedTraversalSummary]:
     child_frame = resolver.call_frame(frame, eqn_plan)
     step = child_frame.path[-1]
+
+    child_seed = _seed_child(seed_node, step)
+
     try:
         child = _backprop_tagged_plan(
             child_frame.plan,
             child_frame,
             resolver,
-            _seed_child(seed_node, step) or _TaggedSeedNode(),
+            child_seed or _TaggedSeedNode(),
             output_demands=output_demands,
         )
     finally:
         resolver.release(child_frame)
+
     outer: list[Tagged] = [None] * len(eqn_plan.eqn.invars)
     indices = spec.resolved_input_indices(len(outer))
+
     if len(indices) != len(child.input_demands):
         raise RuntimeError("call child tagged-demand/input boundary mismatch")
+
     for outer_index, demand in zip(indices, child.input_demands, strict=True):
         outer[outer_index] = merge_tagged(outer[outer_index], demand)
+
+    # a custom derivative can use an input that is absent from the primal call_jaxpr
+    # dependency slice. Until the derivative jaxpr itself is localized, conservatively we
+    # keep every invocation input
+    if spec.call_kind.is_custom_derivative:
+        # blocks for which this call is active, either because one of its outputs is demanded
+        # or because there is an explicit contribution seed inside the child
+        block_ids = active_blocks(output_demands)
+        if child_seed is not None:
+            block_ids = np.union1d(block_ids, child_seed.block_ids())
+
+        if block_ids.size:
+            for outer_index in indices:
+                atom = eqn_plan.eqn.invars[outer_index]
+
+                if isinstance(atom, Literal):
+                    continue
+
+                outer[outer_index] = merge_tagged(
+                    outer[outer_index], TaggedDemand.full(_shape_of(atom), block_ids)
+                )
+
     return tuple(outer), TaggedTraversalSummary(NestedKind.CALL)
 
 

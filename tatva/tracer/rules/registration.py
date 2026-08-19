@@ -31,6 +31,7 @@ from tatva.tracer.core.semantics import (
     NestedOperationSemantics,
     OperationSemantics,
     ScanAnalysisSemantics,
+    custom_derivative_call_target,
     no_hessian,
 )
 from tatva.tracer.lowering import rules as lowerings
@@ -584,8 +585,6 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
         lax.linalg.cholesky_p,
         lax.linalg.eig_p,
         lax.linalg.eigh_p,
-        custom_derivatives.custom_jvp_call_p,
-        custom_derivatives.custom_vjp_call_p,
     ):
         reg.register(
             primitive,
@@ -661,6 +660,26 @@ def _register_nested_rules(
         lax.cond_p,
         NestedOperationSemantics(
             analysis=CondAnalysisSemantics(),
+        ),
+    )
+
+    reg.register(
+        custom_derivatives.custom_jvp_call_p,
+        NestedOperationSemantics(
+            analysis=CallAnalysisSemantics(
+                call_kind=CallKind.CUSTOM_JVP,
+                target=custom_derivative_call_target,
+            )
+        ),
+    )
+
+    reg.register(
+        custom_derivatives.custom_vjp_call_p,
+        NestedOperationSemantics(
+            analysis=CallAnalysisSemantics(
+                call_kind=CallKind.CUSTOM_VJP,
+                target=custom_derivative_call_target,
+            )
         ),
     )
 

@@ -684,11 +684,13 @@ class ConcreteResolver:
             raise ValueError("equation plan does not belong to the concrete frame")
         if eqn_plan.nested is not None:
             raise TypeError("nested primitives do not have ordinary routes")
+
         eqn = eqn_plan.eqn
         semantics = SEMANTICS.get_ordinary(eqn.primitive)
         concrete: ConcreteEnv = {}
         concrete_indices = semantics.concrete_inputs(eqn)
         demands = None
+
         if request is not None and semantics.route_concrete_demands is not None:
             demands = semantics.route_concrete_demands(eqn, request)
             if len(demands) != len(eqn.invars):
@@ -696,37 +698,51 @@ class ConcreteResolver:
                     f"{eqn.primitive.name}.route_concrete_demands returned "
                     "the wrong arity"
                 )
+
         for input_index in concrete_indices:
             if input_index < 0 or input_index >= len(eqn.invars):
                 raise ValueError(
                     f"{eqn.primitive.name}.concrete_inputs returned invalid "
                     f"index {input_index}"
                 )
+
             atom = eqn.invars[input_index]
-            if isinstance(atom, Var):
-                if request is None:
-                    concrete[atom] = self._full_value(frame, atom)
-                else:
-                    demand = None if demands is None else demands[input_index]
-                    if demand is None:
-                        demand = TensorDemand.full(_shape_of(atom))
-                    if demand is None:
-                        raise RuntimeError("concrete route input has an empty shape")
-                    if demands is None and demand.is_full and demand.size > 1:
-                        requested = TensorDemand.from_rows_hull(
-                            _shape_of(eqn.outvars[0]), request.output_rows
-                        )
-                        if requested is not None and not requested.is_full:
-                            self._record_route_escalation(
-                                frame,
-                                eqn_plan,
-                                requested,
-                                demand,
-                                input_index,
+
+            try:
+                if isinstance(atom, Var):
+                    if request is None:
+                        concrete[atom] = self._full_value(frame, atom)
+                    else:
+                        demand = None if demands is None else demands[input_index]
+                        if demand is None:
+                            demand = TensorDemand.full(_shape_of(atom))
+                        if demand is None:
+                            raise RuntimeError(
+                                "concrete route input has an empty shape"
                             )
-                    concrete[atom] = self.value(frame, atom, demand)
-            elif not isinstance(atom, Literal):
-                raise TypeError(f"unsupported JAXPR atom {type(atom)!r}")
+                        if demands is None and demand.is_full and demand.size > 1:
+                            requested = TensorDemand.from_rows_hull(
+                                _shape_of(eqn.outvars[0]), request.output_rows
+                            )
+                            if requested is not None and not requested.is_full:
+                                self._record_route_escalation(
+                                    frame,
+                                    eqn_plan,
+                                    requested,
+                                    demand,
+                                    input_index,
+                                )
+                        concrete[atom] = self.value(frame, atom, demand)
+                elif not isinstance(atom, Literal):
+                    raise TypeError(f"unsupported JAXPR atom {type(atom)!r}")
+
+            except DynamicRoutingError as exc:
+                raise DynamicRoutingError(
+                    f"{exc}\n"
+                    f"while resolving route for {eqn.primitive.name} at equation {eqn_plan.index} "
+                    f"concrete input {input_index}, frame={frame.path}"
+                ) from exc
+
         return semantics, concrete
 
     def _record_route_escalation(
@@ -1048,3 +1064,34 @@ def eval_select_n(inputs, _params):
 def eval_clamp(inputs, _params):
     min_val, x_val, max_val = inputs
     return (np.clip(np.asarray(x_val), np.asarray(min_val), np.asarray(max_val)),)
+
+
+@register(lax.stack_p)
+def eval_stack(inputs, params):
+    axis = params.get("axis", 0)
+    return (np.stack(tuple(np.asarray(x) for x in inputs), axis=axis),)
+
+
+@register(lax.squeeze_p)
+def eval_squeeze(inputs, params):
+    (x,) = inputs
+    return (np.squeeze(np.asarray(x), axis=params.get("dimensions")),)
+
+
+@register(lax.slice_p)
+def eval_slice(inputs, params):
+    (x,) = inputs
+    start_indices = params.get("start_indices")
+    limit_indices = params.get("limit_indices")
+    strides = params.get("strides", None)
+    if strides is None:
+        strides = (1,) * len(start_indices)
+
+    return (
+        np.asarray(x)[
+            tuple(
+                slice(start, limit, stride)
+                for start, limit, stride in zip(start_indices, limit_indices, strides)
+            )
+        ],
+    )

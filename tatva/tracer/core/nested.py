@@ -19,6 +19,12 @@ class NestedKind(Enum):
 class CallKind(Enum):
     JIT = auto()
     REMAT = auto()
+    CUSTOM_JVP = auto()
+    CUSTOM_VJP = auto()
+
+    @property
+    def is_custom_derivative(self) -> bool:
+        return self in (CallKind.CUSTOM_JVP, CallKind.CUSTOM_VJP)
 
 
 class TraversalOrder(Enum):
