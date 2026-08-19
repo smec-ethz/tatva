@@ -254,6 +254,9 @@ class OperationSemantics[T]:
     derivatives: DerivativeRule[T]
 
     concrete_inputs: ConcreteInputRule = no_concrete_inputs
+    # Inputs which may improve route specialization when concrete, but must
+    # never make planning depend on a runtime DOF value.
+    optional_route_inputs: ConcreteInputRule = no_concrete_inputs
     route: RouteRule = no_route
     route_fragment: RouteFragmentRule = no_route_fragment
     route_concrete_demands: RouteConcreteDemandRule | None = None

@@ -314,6 +314,28 @@ def test_compiled_custom_derivative_preserves_custom_gradient(energy, kind):
     )
 
 
+@pytest.mark.parametrize("energy, kind", CASES)
+def test_partitioned_custom_derivative_preserves_first_order_ad(energy, kind):
+    del kind
+    u = _example_u()
+    distributed = analyze(energy, u).distribute(parts=2)
+    values = []
+    gradient_sum = np.zeros_like(np.asarray(u))
+
+    for rank in range(distributed.parts):
+        local = distributed.rank(rank)
+        inputs = local.localize(u)
+        compiled = local.compile()
+        values.append(compiled(*inputs.args, **inputs.kwargs))
+        gradient = np.asarray(jax.grad(compiled)(*inputs.args, **inputs.kwargs))
+        gradient_sum[local.dofs.storage.global_dofs] += gradient
+
+    np.testing.assert_allclose(sum(values), energy(u), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        gradient_sum, _expected_gradient(u), rtol=1e-6, atol=1e-6
+    )
+
+
 # -----------------------------------------------------------------------------
 # Diagnostic global structural derivative analysis
 # -----------------------------------------------------------------------------

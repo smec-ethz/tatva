@@ -220,7 +220,8 @@ def _materialize_ordinary(
             context=f"routing for {eqn.primitive.name}",
         )
 
-    # Route is resolved from the current invocation's concrete env.
+    # Best-effort route specialization: optional inputs never become concrete
+    # requirements for materialization.
     route = rule.route(eqn, env)
 
     # Execute this equation only if something downstream requires

@@ -480,7 +480,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 indexing.select_n_dependencies,
                 no_hessian,
             ),
-            concrete_inputs=lambda _eqn: (0,),
+            optional_route_inputs=lambda _eqn: (0,),
             route=resolve_select_n_route,
             route_fragment=resolve_select_n_route_fragment,
             route_concrete_demands=select_route_concrete_demands,
