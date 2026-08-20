@@ -10,6 +10,7 @@ from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     CondAnalysisSemantics,
+    CustomJvpAnalysisSemantics,
     LinearSolveAnalysisSemantics,
     NestedOperationSemantics,
     ScanAnalysisSemantics,
@@ -18,6 +19,7 @@ from tatva.tracer.local.plan import (
     LocalJaxprPlan,
     pending_routes,
 )
+from tatva.tracer.program.custom_jvp import extract_custom_jvp_parameters
 
 
 class SupportCapability(Enum):
@@ -62,9 +64,12 @@ def _nested_jaxprs(
 ) -> tuple[Jaxpr, ...]:
     analysis = semantics.analysis
 
+    if isinstance(analysis, CustomJvpAnalysisSemantics):
+        extracted = extract_custom_jvp_parameters(eqn)
+        return (extracted.primal_jaxpr, extracted.jvp_jaxpr)
+
     if isinstance(analysis, CallAnalysisSemantics):
         target = analysis.target(eqn)
-
         return (normalize_nested_jaxpr(target.body).jaxpr,)
 
     if isinstance(analysis, ScanAnalysisSemantics):
@@ -103,6 +108,7 @@ def registration_issues(
     jaxpr: Jaxpr,
 ) -> tuple[SupportIssue, ...]:
     issues: list[SupportIssue] = []
+    active_custom_jvp_callbacks: set[tuple[int, int]] = set()
 
     def visit(
         frame: Jaxpr,
@@ -129,6 +135,27 @@ def registration_issues(
                 continue
 
             if not isinstance(semantics, NestedOperationSemantics):
+                continue
+
+            analysis = semantics.analysis
+            if isinstance(analysis, CustomJvpAnalysisSemantics):
+                # JAX derivative programs may recursively contain the same
+                # custom-JVP call (LU's JVP in JAX 0.11 does this). Each
+                # extraction can expose that callback again, so JAXPR object
+                # identity alone cannot make this traversal finite. The
+                # callback metadata is stable across the recursive occurrence.
+                callback_key = (
+                    id(eqn.params.get("call_jaxpr")),
+                    id(eqn.params.get("jvp_jaxpr_fun")),
+                )
+                if callback_key in active_custom_jvp_callbacks:
+                    continue
+                active_custom_jvp_callbacks.add(callback_key)
+                try:
+                    for child in _nested_jaxprs(eqn, semantics):
+                        visit(child, eqn_path)
+                finally:
+                    active_custom_jvp_callbacks.remove(callback_key)
                 continue
 
             for child in _nested_jaxprs(eqn, semantics):

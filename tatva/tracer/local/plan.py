@@ -37,9 +37,10 @@ from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallContext,
     CallInvocation,
-    CallSpec,
     CondContext,
     CondInvocation,
+    CustomJvpContext,
+    CustomJvpInvocation,
     IndexedChild,
     LinearSolveContext,
     LinearSolveInvocation,
@@ -292,6 +293,33 @@ class _LocalRankPlanNestedHandler:
             CallInvocation(self.eqn_plan.index, body),
         )
 
+    def custom_jvp(
+        self, context: CustomJvpContext[JaxprDemandTrace]
+    ) -> LocalNestedPlan:
+        primal_frame, jvp_frame = self.resolver.custom_jvp_frames(
+            self.frame, self.eqn_plan
+        )
+        try:
+            primal = _build_rank_local_jaxpr_plan(
+                primal_frame.plan,
+                primal_frame,
+                self.resolver,
+                context.invocation.primal,
+            )
+            jvp = _build_rank_local_jaxpr_plan(
+                jvp_frame.plan,
+                jvp_frame,
+                self.resolver,
+                context.invocation.jvp,
+            )
+        finally:
+            self.resolver.release(primal_frame)
+            self.resolver.release(jvp_frame)
+        return LocalNestedPlan(
+            context.spec,
+            CustomJvpInvocation(self.eqn_plan.index, primal, jvp),
+        )
+
     def cond(self, context: CondContext[JaxprDemandTrace]) -> LocalNestedPlan:
         branch_index, child_frame = self.resolver.cond_frame(self.frame, self.eqn_plan)
 
@@ -417,25 +445,6 @@ def _build_rank_nested_plan(
             resolver,
         ),
     )
-    # Custom derivative rules may use operands which the primal child does
-    # not. Validate the parent boundary, not ``body.input_layouts``: the
-    # latter intentionally marks primal-dead operands as absent.
-    if isinstance(nested.spec, CallSpec) and nested.spec.call_kind.is_custom_derivative:
-        for index in nested.spec.resolved_input_indices(len(outer_input_layouts)):
-            atom = eqn_plan.eqn.invars[index]
-            if isinstance(atom, Literal):
-                continue
-
-            layout = outer_input_layouts[index]
-            if layout is None:
-                raise RuntimeError(
-                    f"{eqn_plan.eqn.primitive.name}: custom derivative input {index} was removed by liveness"
-                )
-            if not layout.is_full:
-                raise RuntimeError(
-                    f"{eqn_plan.eqn.primitive.name}: custom derivative input {index} must currently be invocation-local FULL; "
-                    f"got {layout.local_shape} from global {layout.global_shape}"
-                )
 
     return local_nested_plan
 

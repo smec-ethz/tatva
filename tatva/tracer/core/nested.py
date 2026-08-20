@@ -10,6 +10,7 @@ from jax.extend.core import ClosedJaxpr, Jaxpr
 
 class NestedKind(Enum):
     CALL = auto()
+    CUSTOM_JVP = auto()
     MAP = auto()
     SCAN = auto()
     COND = auto()
@@ -19,12 +20,6 @@ class NestedKind(Enum):
 class CallKind(Enum):
     JIT = auto()
     REMAT = auto()
-    CUSTOM_JVP = auto()
-    CUSTOM_VJP = auto()
-
-    @property
-    def is_custom_derivative(self) -> bool:
-        return self in (CallKind.CUSTOM_JVP, CallKind.CUSTOM_VJP)
 
 
 class TraversalOrder(Enum):
@@ -158,11 +153,39 @@ class LinearSolveSpec:
         return (self.matvec, self.solve, self.transpose_solve)
 
 
-type NestedSpec = CallSpec | MapSpec | ScanSpec | CondSpec | LinearSolveSpec
+@dataclass(frozen=True)
+class CustomJvpBinding:
+    """One JVP-program input sourced from an outer primal or its tangent."""
+
+    outer_input_index: int
+    tangent: bool = False
+
+
+@dataclass(frozen=True)
+class CustomJvpSpec:
+    """Runtime mapping for the staged JVP callback.
+
+    jvp_bindings covers only explicit JVP jaxpr inputs: dynamic primals followed by their
+    tangents. lifted primal constants stay on the outer custom-jvp equation, while
+    jvp-only captures are child jaxpr constvars.
+    """
+
+    jvp_bindings: tuple[CustomJvpBinding, ...]
+    output_zeros: tuple[bool, ...]
+
+    @property
+    def kind(self) -> NestedKind:
+        return NestedKind.CUSTOM_JVP
+
+
+type NestedSpec = (
+    CallSpec | CustomJvpSpec | MapSpec | ScanSpec | CondSpec | LinearSolveSpec
+)
 
 
 class NestedSpecHandler[R](Protocol):
     def call(self, spec: CallSpec) -> R: ...
+    def custom_jvp(self, spec: CustomJvpSpec) -> R: ...
     def map(self, spec: MapSpec) -> R: ...
     def scan(self, spec: ScanSpec) -> R: ...
     def cond(self, spec: CondSpec) -> R: ...
@@ -172,6 +195,8 @@ class NestedSpecHandler[R](Protocol):
 def dispatch_nested_spec[R](spec: NestedSpec, handler: NestedSpecHandler[R]) -> R:
     if isinstance(spec, CallSpec):
         return handler.call(spec)
+    if isinstance(spec, CustomJvpSpec):
+        return handler.custom_jvp(spec)
     if isinstance(spec, MapSpec):
         return handler.map(spec)
     if isinstance(spec, ScanSpec):
@@ -253,6 +278,48 @@ class CallInvocation[T]:
 
     def map_children[U](self, fn: Callable[[NestedChild[T]], U]) -> CallInvocation[U]:
         return CallInvocation(self.eqn_index, fn(self.children()[0]))
+
+
+@dataclass(frozen=True)
+class CustomJvpInvocation[T]:
+    eqn_index: int
+    primal: T
+    jvp: T
+
+    @property
+    def kind(self) -> NestedKind:
+        return NestedKind.CUSTOM_JVP
+
+    def children(
+        self, order: TraversalOrder = TraversalOrder.EXECUTION
+    ) -> tuple[NestedChild[T], ...]:
+        del order
+        return (
+            NestedChild(
+                self.primal,
+                FrameStep(self.eqn_index, NestedKind.CUSTOM_JVP, 0),
+                0,
+            ),
+            NestedChild(
+                self.jvp,
+                FrameStep(self.eqn_index, NestedKind.CUSTOM_JVP, 1),
+                1,
+            ),
+        )
+
+    def child_at(self, step: FrameStep) -> T:
+        _validate_step(self.eqn_index, self.kind, step)
+        if step.iteration == 0:
+            return self.primal
+        if step.iteration == 1:
+            return self.jvp
+        raise KeyError("custom_jvp callback index must be 0 or 1")
+
+    def map_children[U](
+        self, fn: Callable[[NestedChild[T]], U]
+    ) -> CustomJvpInvocation[U]:
+        primal, jvp = self.children()
+        return CustomJvpInvocation(self.eqn_index, fn(primal), fn(jvp))
 
 
 @dataclass(frozen=True)
@@ -405,6 +472,7 @@ class LinearSolveInvocation[T]:
 
 type AnyNestedInvocation[T] = (
     CallInvocation[T]
+    | CustomJvpInvocation[T]
     | RepeatedInvocation[T]
     | CondInvocation[T]
     | LinearSolveInvocation[T]
@@ -415,6 +483,12 @@ type AnyNestedInvocation[T] = (
 class CallContext[T]:
     spec: CallSpec
     invocation: CallInvocation[T]
+
+
+@dataclass(frozen=True)
+class CustomJvpContext[T]:
+    spec: CustomJvpSpec
+    invocation: CustomJvpInvocation[T]
 
 
 @dataclass(frozen=True)
@@ -443,6 +517,7 @@ class LinearSolveContext[T]:
 
 type NestedContext[T] = (
     CallContext[T]
+    | CustomJvpContext[T]
     | MapContext[T]
     | ScanContext[T]
     | CondContext[T]
@@ -460,6 +535,7 @@ def _validate_step(eqn_index: int, kind: NestedKind, step: FrameStep) -> None:
 
 class NestedHandler[T, R](Protocol):
     def call(self, context: CallContext[T]) -> R: ...
+    def custom_jvp(self, context: CustomJvpContext[T]) -> R: ...
     def map(self, context: MapContext[T]) -> R: ...
     def scan(self, context: ScanContext[T]) -> R: ...
     def cond(self, context: CondContext[T]) -> R: ...
@@ -474,6 +550,10 @@ def dispatch_nested[T, R](
     """Validate a spec/invocation pair once, then dispatch a typed context."""
     if isinstance(spec, CallSpec) and isinstance(node, CallInvocation):
         return handler.call(CallContext(spec, cast(CallInvocation[T], node)))
+    if isinstance(spec, CustomJvpSpec) and isinstance(node, CustomJvpInvocation):
+        return handler.custom_jvp(
+            CustomJvpContext(spec, cast(CustomJvpInvocation[T], node))
+        )
     if (
         isinstance(spec, MapSpec)
         and isinstance(node, RepeatedInvocation)

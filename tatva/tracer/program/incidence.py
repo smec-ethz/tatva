@@ -26,6 +26,7 @@ from numpy.typing import ArrayLike, NDArray
 from tatva.tracer.core.nested import (
     CallSpec,
     CondSpec,
+    CustomJvpSpec,
     FrameStep,
     LinearSolveSpec,
     MapSpec,
@@ -196,28 +197,42 @@ def _backprop_plan_call(
     for outer_index, demand in zip(indices, child.input_demands, strict=True):
         outer[outer_index] = merge_tagged(outer[outer_index], demand)
 
-    # a custom derivative can use an input that is absent from the primal call_jaxpr
-    # dependency slice. Until the derivative jaxpr itself is localized, conservatively we
-    # keep every invocation input
-    if spec.call_kind.is_custom_derivative:
-        # blocks for which this call is active, either because one of its outputs is demanded
-        # or because there is an explicit contribution seed inside the child
-        block_ids = active_blocks(output_demands)
-        if child_seed is not None:
-            block_ids = np.union1d(block_ids, child_seed.block_ids())
-
-        if block_ids.size:
-            for outer_index in indices:
-                atom = eqn_plan.eqn.invars[outer_index]
-
-                if isinstance(atom, Literal):
-                    continue
-
-                outer[outer_index] = merge_tagged(
-                    outer[outer_index], TaggedDemand.full(_shape_of(atom), block_ids)
-                )
-
     return tuple(outer), TaggedTraversalSummary(NestedKind.CALL)
+
+
+def _backprop_plan_custom_jvp(
+    eqn_plan: EqnPlan,
+    frame: ConcreteFrame,
+    resolver: ConcreteResolver,
+    spec: CustomJvpSpec,
+    output_demands: tuple[Tagged, ...],
+    seed_node: _TaggedSeedNode,
+) -> tuple[tuple[Tagged, ...], TaggedTraversalSummary]:
+    primal_frame, jvp_frame = resolver.custom_jvp_frames(frame, eqn_plan)
+    jvp_step = jvp_frame.path[-1]
+    # Incidence follows the custom tangent program. Its primal-valued outputs
+    # are not derivative outputs; nonzero tangent outputs inherit outer tags.
+    jvp_outputs: list[Tagged] = [None] * len(output_demands)
+    for is_zero, demand in zip(spec.output_zeros, output_demands, strict=True):
+        if not is_zero:
+            jvp_outputs.append(demand)
+    try:
+        child = _backprop_tagged_plan(
+            jvp_frame.plan,
+            jvp_frame,
+            resolver,
+            _seed_child(seed_node, jvp_step) or _TaggedSeedNode(),
+            output_demands=tuple(jvp_outputs),
+        )
+    finally:
+        resolver.release(primal_frame)
+        resolver.release(jvp_frame)
+
+    outer: list[Tagged] = [None] * len(eqn_plan.eqn.invars)
+    for binding, demand in zip(spec.jvp_bindings, child.input_demands, strict=True):
+        index = binding.outer_input_index
+        outer[index] = merge_tagged(outer[index], demand)
+    return tuple(outer), TaggedTraversalSummary(NestedKind.CUSTOM_JVP)
 
 
 def _backprop_plan_cond(
@@ -607,6 +622,10 @@ def _backprop_tagged_plan(
             spec = nested.spec
             if isinstance(spec, CallSpec):
                 inputs, summary = _backprop_plan_call(
+                    eqn_plan, frame, resolver, spec, outputs, seed_node
+                )
+            elif isinstance(spec, CustomJvpSpec):
+                inputs, summary = _backprop_plan_custom_jvp(
                     eqn_plan, frame, resolver, spec, outputs, seed_node
                 )
             elif isinstance(spec, CondSpec):

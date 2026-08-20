@@ -3,6 +3,7 @@ from jax.extend.core import Primitive
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     CondAnalysisSemantics,
+    CustomJvpAnalysisSemantics,
     LinearSolveAnalysisSemantics,
     NestedOperationSemantics,
     OperationSemantics,
@@ -70,6 +71,7 @@ class PrimitiveRegistry:
                         ScanAnalysisSemantics,
                         CondAnalysisSemantics,
                         LinearSolveAnalysisSemantics,
+                        CustomJvpAnalysisSemantics,
                     ),
                 ):
                     errors.append(

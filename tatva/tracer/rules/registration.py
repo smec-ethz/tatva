@@ -25,13 +25,13 @@ from tatva.tracer.core.routes import (
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     CondAnalysisSemantics,
+    CustomJvpAnalysisSemantics,
     DerivativeRule,
     LinearSolveAnalysisSemantics,
     LocalizationSemantics,
     NestedOperationSemantics,
     OperationSemantics,
     ScanAnalysisSemantics,
-    custom_derivative_call_target,
     no_hessian,
 )
 from tatva.tracer.lowering import rules as lowerings
@@ -691,20 +691,7 @@ def _register_nested_rules(
     reg.register(
         custom_derivatives.custom_jvp_call_p,
         NestedOperationSemantics(
-            analysis=CallAnalysisSemantics(
-                call_kind=CallKind.CUSTOM_JVP,
-                target=custom_derivative_call_target,
-            )
-        ),
-    )
-
-    reg.register(
-        custom_derivatives.custom_vjp_call_p,
-        NestedOperationSemantics(
-            analysis=CallAnalysisSemantics(
-                call_kind=CallKind.CUSTOM_VJP,
-                target=custom_derivative_call_target,
-            )
+            analysis=CustomJvpAnalysisSemantics(),
         ),
     )
 
