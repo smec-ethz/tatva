@@ -21,6 +21,7 @@ from numpy.typing import NDArray
 from tatva.tracer.core.nested import (
     CallContext,
     CondContext,
+    CustomJvpContext,
     LinearSolveContext,
     MapContext,
     RepeatedInvocation,
@@ -281,125 +282,134 @@ def _lower_call(
     return tuple(result)
 
 
-def _bind_custom_derivative_primitive(
-    eqn,
-    args: tuple[Any, ...],
-) -> tuple[Any, ...]:
-    """Re-bind a custom_jvp/custom_vjp call preserving its AD semantics."""
-    primitive = eqn.primitive
-    bind_params = primitive.get_bind_params(eqn.params)
-
-    result = primitive.bind(
-        *args,
-        **bind_params,
-    )
-
-    if primitive.multiple_results:
-        return tuple(result)
-
-    return (result,)
-
-
-def _lower_custom_derivative_call(
-    plan: LocalEqnPlan,
-    context: CallContext[LocalJaxprPlan],
-    inputs: tuple[Any | None, ...],
+def _callback_outputs(
+    body: LocalJaxprPlan,
+    values: tuple[Any | None, ...],
+    source_layouts: tuple[TensorLayout | None, ...],
 ) -> tuple[Any | None, ...]:
-    """Lower custom_jvp/custom_vjp while preserving the custom AD boundary.
+    if len(values) != len(body.input_layouts) or len(values) != len(source_layouts):
+        raise RuntimeError("localized callback input ABI mismatch")
 
-    Unlike ordinary calls, we must not execute the localized primal child
-    directly. Doing so would erase the custom derivative rule and cause JAX
-    to differentiate the primal implementation.
+    local_inputs: list[Any] = []
 
-    For now all dynamic call operands are required to have full
-    invocation-local layouts. We therefore re-bind the original primitive
-    and project its complete invocation-local outputs to the requested
-    local layouts.
-    """
-
-    eqn = plan.eqn
-    spec = context.spec
-
-    if not spec.call_kind.is_custom_derivative:
-        raise ValueError(
-            "_lower_custom_derivative_call called for "
-            f"non-custom call kind {spec.call_kind}"
-        )
-
-    input_indices = spec.resolved_input_indices(len(inputs))
-
-    # The primitive bind expects exactly the outer operands selected by the
-    # call boundary, in primitive/JAXPR order.
-    args: list[Any] = []
-
-    for outer_index in input_indices:
-        atom = eqn.invars[outer_index]
-        value = inputs[outer_index]
-        layout = plan.input_layouts[outer_index]
-
-        if isinstance(atom, Literal):
-            # Usually literals are already returned by _read_atom(), so this
-            # branch is mostly defensive.
-            args.append(atom.val if value is None else value)
+    for value, source, target in zip(
+        values, source_layouts, body.input_layouts, strict=True
+    ):
+        if target is None:
             continue
 
         if value is None:
-            raise RuntimeError(
-                f"{plan.primitive_name}: custom derivative operand "
-                f"{outer_index} is unavailable"
+            raise RuntimeError("live localized callback input is unavailable")
+
+        if source is None:
+            if tuple(value.shape) != target.local_shape:
+                raise RuntimeError("live localized callback input has no source layout")
+            local_inputs.append(value)
+        else:
+            local_inputs.append(
+                _project_local_value(value, source_layout=source, target_layout=target)
             )
 
+    return _frame_outputs(body, _execute_frame(body, tuple(local_inputs)))
+
+
+def _lower_custom_jvp(
+    plan: LocalEqnPlan,
+    context: CustomJvpContext[LocalJaxprPlan],
+    inputs: tuple[Any | None, ...],
+) -> tuple[Any | None, ...]:
+    spec = context.spec
+    outer_layouts = plan.input_layouts
+    live_outer_indices: list[int] = []
+    live_outer_values: list[Any] = []
+
+    for index, (value, layout) in enumerate(
+        zip(inputs, plan.input_layouts, strict=True)
+    ):
         if layout is None:
-            raise RuntimeError(
-                f"{plan.primitive_name}: custom derivative operand "
-                f"{outer_index} has no runtime layout"
-            )
-
-        if not layout.is_full:
-            raise RuntimeError(
-                f"{plan.primitive_name}: custom derivative operand "
-                f"{outer_index} must currently be FULL within its "
-                "invocation; got "
-                f"global_shape={layout.global_shape}, "
-                f"local_shape={layout.local_shape}"
-            )
-
-        args.append(value)
-
-    raw_outputs = _bind_custom_derivative_primitive(eqn, tuple(args))
-
-    if not isinstance(raw_outputs, (tuple, list)):
-        raw_outputs = (raw_outputs,)
-    else:
-        raw_outputs = tuple(raw_outputs)
-
-    if len(raw_outputs) != len(eqn.outvars):
-        raise RuntimeError(
-            f"{plan.primitive_name}: primitive returned "
-            f"{len(raw_outputs)} outputs but equation has "
-            f"{len(eqn.outvars)} outvars"
-        )
-
-    result: list[Any | None] = []
-
-    for value, target_layout in zip(raw_outputs, plan.output_layouts, strict=True):
-        if target_layout is None:
-            result.append(None)
             continue
 
-        full_demand = TensorDemand.full(target_layout.global_shape)
-        assert full_demand is not None, (
-            "unexpected. full demand should always be non-None"
-        )
-        source_layout = TensorLayout.from_demand(full_demand)
+        if value is None:
+            raise RuntimeError(f"live custom_jvp input {index} is unavailable")
 
-        result.append(
-            _project_local_value(
-                value, source_layout=source_layout, target_layout=target_layout
+        live_outer_indices.append(index)
+        live_outer_values.append(value)
+
+    live_position = {
+        outer_index: position for position, outer_index in enumerate(live_outer_indices)
+    }
+
+    def primal(*primals):
+        values: list[Any | None] = [None] * len(inputs)
+        for outer_index, value in zip(live_outer_indices, primals, strict=True):
+            values[outer_index] = value
+
+        outputs = _callback_outputs(
+            context.invocation.primal,
+            tuple(values),
+            outer_layouts,
+        )
+        return tuple(outputs)
+
+    local = jax.custom_jvp(primal)
+
+    @local.defjvp
+    def jvp(primals, tangents):
+        # JAX 0.11 uses these forward-mode tracers when an AD transformation
+        # is already active at this custom boundary. DynamicJaxprTracer from
+        # jit is deliberately allowed.
+        if any(
+            type(value).__name__ in {"JVPTracer", "LinearizeTracer"}
+            for value in primals
+        ):
+            raise NotImplementedError(
+                "higher-order AD through localized custom_jvp is not supported"
             )
-        )
 
-    return tuple(result)
+        values: list[Any | None] = []
+        layouts: list[TensorLayout | None] = []
+
+        for child_index, binding in enumerate(spec.jvp_bindings):
+            outer_index = binding.outer_input_index
+            position = live_position.get(outer_index)
+            if position is None:
+                if context.invocation.jvp.input_layouts[child_index] is not None:
+                    raise RuntimeError(
+                        f"custom_jvp live callback input {child_index} maps to dead outer operand {outer_index}"
+                    )
+
+                values.append(None)
+                layouts.append(None)
+                continue
+
+            layouts.append(outer_layouts[outer_index])
+            values.append(tangents[position] if binding.tangent else primals[position])
+
+        outputs = _callback_outputs(
+            context.invocation.jvp,
+            tuple(values),
+            tuple(layouts),
+        )
+        nout = len(plan.eqn.outvars)
+        primal_outputs = tuple(outputs[:nout])
+        tangent_values = iter(outputs[nout:])
+        tangent_outputs_list: list[Any | None] = []
+
+        for index, is_zero in enumerate(spec.output_zeros):
+            tangent_value = None if is_zero else next(tangent_values)
+            primal_value = primal_outputs[index]
+            if primal_value is None:
+                tangent_outputs_list.append(None)
+            elif is_zero:
+                tangent_outputs_list.append(jnp.zeros_like(primal_value))
+            else:
+                tangent_outputs_list.append(tangent_value)
+
+        tangent_outputs = tuple(tangent_outputs_list)
+
+        return primal_outputs, tangent_outputs
+
+    return tuple(local(*live_outer_values))
 
 
 def _lower_cond(
@@ -1006,9 +1016,11 @@ def _lower_linear_solve(
         def fn(*runtime_args):
             rhs = runtime_args[-1]
             values = []
+            source_layouts = []
             for index, binding in enumerate(bindings):
                 if binding.runtime:
                     values.append(rhs)
+                    source_layouts.append(None)
                 else:
                     value = inputs[binding.outer_input_index]
                     if value is None:
@@ -1016,22 +1028,9 @@ def _lower_linear_solve(
                             "live custom_linear_solve capture is unavailable"
                         )
                     source = plan.input_layouts[binding.outer_input_index]
-                    target = body.input_layouts[index]
-                    values.append(
-                        value
-                        if source is None or target is None
-                        else _project_local_value(
-                            value, source_layout=source, target_layout=target
-                        )
-                    )
-            # Child local plans may omit dead captured values, so pass precisely
-            # the live inputs in JAXPR order.
-            local = tuple(
-                v
-                for v, layout in zip(values, body.input_layouts, strict=True)
-                if layout is not None
-            )
-            return _frame_outputs(body, _execute_frame(body, local))[0]
+                    values.append(value)
+                    source_layouts.append(source)
+            return _callback_outputs(body, tuple(values), tuple(source_layouts))[0]
 
         return fn
 
@@ -1068,10 +1067,10 @@ class _LowerNestedHandler:
     inputs: tuple[Any | None, ...]
 
     def call(self, context: CallContext[LocalJaxprPlan]):
-        if context.spec.call_kind.is_custom_derivative:
-            return _lower_custom_derivative_call(self.plan, context, self.inputs)
-
         return _lower_call(self.plan, context, self.inputs)
+
+    def custom_jvp(self, context: CustomJvpContext[LocalJaxprPlan]):
+        return _lower_custom_jvp(self.plan, context, self.inputs)
 
     def map(self, context: MapContext[LocalJaxprPlan]):
         return _lower_map(self.plan, context, self.inputs)

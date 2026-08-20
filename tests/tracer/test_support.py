@@ -52,6 +52,34 @@ def test_registration_preflight_descends_into_nested_jaxprs():
     assert issues[0].primitive == "test_nested_unsupported"
 
 
+def test_registration_preflight_checks_custom_jvp_derivative_jaxpr():
+    unsupported_p = _identity_primitive("test_custom_jvp_unsupported")
+
+    @jax.custom_jvp
+    def value(x):
+        return x
+
+    @value.defjvp
+    def value_jvp(primals, tangents):
+        (x,) = primals
+        (x_dot,) = tangents
+        return x, unsupported_p.bind(x_dot)
+
+    closed = jax.make_jaxpr(value)(jnp.ones(4))
+
+    issues = registration_issues(closed.jaxpr)
+
+    assert len(issues) == 1
+    assert issues[0].primitive == "test_custom_jvp_unsupported"
+
+
+def test_registration_preflight_terminates_on_recursive_custom_jvp_derivative():
+    matrix = jnp.eye(4, dtype=jnp.float32)
+    closed = jax.make_jaxpr(jnp.linalg.det)(matrix)
+
+    assert registration_issues(closed.jaxpr) == ()
+
+
 def test_describe_gather():
     description = SEMANTICS.describe(lax.gather_p)
 

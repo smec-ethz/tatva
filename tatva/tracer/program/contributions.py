@@ -42,6 +42,7 @@ from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 from tatva.tracer.core.nested import (
     CallSpec,
     CondSpec,
+    CustomJvpSpec,
     FramePath,
 )
 from tatva.tracer.core.registry import SEMANTICS
@@ -317,6 +318,8 @@ def _depends_on_opaque_nested(plan: JaxprPlan, atom: Atom) -> bool:
                 child_opaque or any(opaque for opaque, _indices in outer_children),
                 frozenset().union(*(indices for _opaque, indices in outer_children)),
             )
+        elif isinstance(nested.spec, CustomJvpSpec):
+            result = True, frozenset()
         else:
             # Repeated operations and callbacks are contribution-domain barriers.
             # A conditional would require selecting a branch before this preflight,
@@ -348,12 +351,10 @@ def _trace_plan_nested(
     spec = nested.spec
     eqn = eqn_plan.eqn
 
-    # A custom JVP/VJP body is visible for planning, but the executable must retain the
-    # outer primitive to preserve its derivative rule. Keeping a contribution root inside
-    # its primal child would require reconstructing values from a nested call frame, which
-    # the local executable deliberately does not do. Treat the custom boundary itself as
-    # the partitionable contribution-domain value instead.
-    if isinstance(spec, CallSpec) and spec.call_kind.is_custom_derivative:
+    # a custom jvp body is visible for planning, but contribution decomposition still
+    # stops at the custom-jvp boundary. The localized executable reconstructs that
+    # boundary explicitly from its primal and jvp callbacks.
+    if isinstance(spec, CustomJvpSpec):
         if seed.mode is ContributionMode.DOMAIN:
             return (
                 [
@@ -367,7 +368,7 @@ def _trace_plan_nested(
                 [],
             )
         raise UnsupportedContributionError(
-            f"custom derivative primitive {eqn.primitive.name!r} produces "
+            f"custom_jvp primitive {eqn.primitive.name!r} produces "
             "the scalar objective without an additive reduction"
         )
 

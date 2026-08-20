@@ -63,6 +63,8 @@ from tatva.tracer.core.nested import (
     CallInvocation,
     CondContext,
     CondInvocation,
+    CustomJvpContext,
+    CustomJvpInvocation,
     IndexedChild,
     LinearSolveContext,
     LinearSolveInvocation,
@@ -251,16 +253,16 @@ class _DerivativeNestedHandler:
     n_dofs: int
 
     def call(self, context: CallContext[JaxprInstance]):
-        if context.spec.call_kind.is_custom_derivative:
-            return _trace_custom_derivative_call_opaque(
-                resolved=self.resolved,
-                context=context,
-                input_deps=self.input_deps,
-                acc=self.acc,
-                n_dofs=self.n_dofs,
-            )
-
         return _trace_call(
+            context=context,
+            input_deps=self.input_deps,
+            acc=self.acc,
+            n_dofs=self.n_dofs,
+        )
+
+    def custom_jvp(self, context: CustomJvpContext[JaxprInstance]):
+        return _trace_custom_jvp_opaque(
+            resolved=self.resolved,
             context=context,
             input_deps=self.input_deps,
             acc=self.acc,
@@ -403,65 +405,45 @@ def _stack_leading_axis_dependencies(
     )
 
 
-def _trace_custom_derivative_call_opaque(
+def _trace_custom_jvp_opaque(
     *,
     resolved: ResolvedEqn,
-    context: CallContext[JaxprInstance],
+    context: CustomJvpContext[JaxprInstance],
     input_deps: tuple[DependencySet, ...],
     acc: HessianAccumulator,
     n_dofs: int,
-) -> tuple[
-    tuple[DependencySet, ...],
-    NestedDerivativeTrace,
-]:
-    """Conservatively trace a custom_jvp/custom_vjp boundary.
-
-    The nested call_jaxpr describes the primal computation only. Its
-    derivative structure is therefore not authoritative for custom_jvp
-    or custom_vjp.
-
-    We still trace the primal child into a scratch accumulator so that
-    the returned NestedDerivativeTrace remains useful for diagnostics.
-
-    The actual outer dependency/Hessian structure is treated as an
-    opaque nonlinear operation of all custom-call operands.
-    """
+) -> tuple[tuple[DependencySet, ...], NestedDerivativeTrace]:
+    """Trace callbacks diagnostically but keep the outer Hessian conservative."""
     from tatva.tracer.rules.opaque import DERIVATIVES_OPAQUE_NONLINEAR
 
-    # 1. Trace the primal body for diagnostics only.
-    #
-    # IMPORTANT:
-    # Do not use `acc` here. The primal Hessian is not necessarily the
-    # Hessian defined by the custom derivative rule.
-    scratch_acc = HessianAccumulator(n_dofs)
-    _, nested_trace = _trace_call(
-        context=context, input_deps=input_deps, acc=scratch_acc, n_dofs=n_dofs
+    scratch = HessianAccumulator(n_dofs)
+    primal_trace = _trace_jaxpr(
+        instance=context.invocation.primal,
+        input_deps=input_deps,
+        acc=scratch,
+        n_dofs=n_dofs,
     )
-
-    # We deliberately discard:
-    #
-    #   scratch_acc.finalize()
-    #
-    # because it describes derivatives of call_jaxpr's primal body,
-    # not necessarily the custom derivative semantics.
-
-    # 2. Treat the outer custom derivative boundary conservatively.
+    jvp_deps = tuple(
+        input_deps[binding.outer_input_index] for binding in context.spec.jvp_bindings
+    )
+    jvp_trace = _trace_jaxpr(
+        instance=context.invocation.jvp,
+        input_deps=jvp_deps,
+        acc=scratch,
+        n_dofs=n_dofs,
+    )
     eqn = resolved.plan.eqn
     ctx = RuleContext(eqn=eqn, input_deps=input_deps, route=None, n_dofs=n_dofs)
-
     rule = DERIVATIVES_OPAQUE_NONLINEAR
     prepared = rule.prepare(ctx)
-
-    # Conservative second-order structure:
-    # every DOF appearing in any custom-call operand may interact with
-    # every other such DOF.
     rule.hessian(ctx, prepared, acc)
-
-    # Conservative first-order structure:
-    # every output may depend on the union of all operand dependencies.
-    output_deps = rule.dependencies(ctx, prepared)
-
-    return output_deps, nested_trace
+    outputs = rule.dependencies(ctx, prepared)
+    nested_trace = CustomJvpInvocation(
+        eqn_index=resolved.plan.index,
+        primal=primal_trace,
+        jvp=jvp_trace,
+    )
+    return outputs, nested_trace
 
 
 def _trace_call(

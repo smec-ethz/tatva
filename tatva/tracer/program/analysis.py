@@ -42,6 +42,8 @@ from tatva.tracer.core.nested import (
     CallbackBinding,
     CallSpec,
     CondSpec,
+    CustomJvpBinding,
+    CustomJvpSpec,
     LinearSolveCallbackSpec,
     LinearSolveSpec,
     MapSpec,
@@ -54,11 +56,13 @@ from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     CondAnalysisSemantics,
+    CustomJvpAnalysisSemantics,
     LinearSolveAnalysisSemantics,
     NestedAnalysisSemantics,
     NestedOperationSemantics,
     ScanAnalysisSemantics,
 )
+from tatva.tracer.program.custom_jvp import extract_custom_jvp_parameters
 
 
 @dataclass(frozen=True)
@@ -254,6 +258,9 @@ def _analyze_nested(
     semantics: NestedAnalysisSemantics,
     concrete_outputs: frozenset[int],
 ) -> NestedPlan:
+    if isinstance(semantics, CustomJvpAnalysisSemantics):
+        return _analyze_custom_jvp(eqn, concrete_outputs=concrete_outputs)
+
     if isinstance(semantics, CallAnalysisSemantics):
         return _analyze_call(
             eqn,
@@ -276,6 +283,50 @@ def _analyze_nested(
         return _analyze_linear_solve(eqn, concrete_outputs=concrete_outputs)
 
     raise TypeError(f"unsupported nested analysis semantics {type(semantics).__name__}")
+
+
+def _analyze_custom_jvp(
+    eqn: JaxprEqn, *, concrete_outputs: frozenset[int]
+) -> NestedPlan:
+    extracted = extract_custom_jvp_parameters(eqn)
+    if len(extracted.primal_jaxpr.invars) != len(eqn.invars):
+        raise NotImplementedError("custom_jvp primal input ABI does not match its call")
+    if len(extracted.primal_jaxpr.outvars) != len(eqn.outvars):
+        raise NotImplementedError(
+            "custom_jvp primal output ABI does not match its call"
+        )
+
+    primal = analyze(extracted.primal_jaxpr, concrete_outputs=concrete_outputs)
+    # Derivative callback values are runtime-only. Concrete output propagation
+    # belongs to the primal callback, while JVP routing requirements are still
+    # discovered by analyzing its complete program.
+    jvp = analyze(extracted.jvp_jaxpr)
+    dynamic_arity = len(eqn.invars) - extracted.num_consts
+    bindings = tuple(
+        CustomJvpBinding(extracted.num_consts + index) for index in range(dynamic_arity)
+    ) + tuple(
+        CustomJvpBinding(extracted.num_consts + index, tangent=True)
+        for index in range(dynamic_arity)
+    )
+
+    concrete: set[int] = set(primal.concrete_inputs)
+    for child_index in jvp.concrete_inputs:
+        binding = bindings[child_index]
+        if binding.tangent:
+            raise NotImplementedError(
+                "custom_jvp routing may not require a runtime tangent concretely"
+            )
+        concrete.add(binding.outer_input_index)
+
+    return NestedPlan(
+        spec=CustomJvpSpec(
+            jvp_bindings=bindings,
+            output_zeros=extracted.output_zeros,
+        ),
+        branches=(primal, jvp),
+        branch_consts=((), extracted.jvp_consts),
+        concrete_inputs=frozenset(concrete),
+    )
 
 
 def _analyze_linear_solve(

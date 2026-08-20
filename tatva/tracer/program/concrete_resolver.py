@@ -13,6 +13,7 @@ from tatva.tracer.core.concrete import ConcreteRegion
 from tatva.tracer.core.nested import (
     CallSpec,
     CondSpec,
+    CustomJvpSpec,
     FramePath,
     FrameStep,
     LinearSolveSpec,
@@ -417,6 +418,17 @@ class ConcreteResolver:
                 return ConcreteRegion(result.values, demand)
             finally:
                 self.release(child)
+        if isinstance(spec, CustomJvpSpec):
+            primal, jvp = self.custom_jvp_frames(frame, eqn_plan)
+            try:
+                result = self.value(
+                    primal, primal.plan.jaxpr.outvars[output_index], demand
+                )
+                assert isinstance(result, ConcreteRegion)
+                return ConcreteRegion(result.values, demand)
+            finally:
+                self.release(primal)
+                self.release(jvp)
         if isinstance(spec, CondSpec):
             _branch, child = self.cond_frame(frame, eqn_plan)
             try:
@@ -531,6 +543,42 @@ class ConcreteResolver:
             nested.consts,
             bindings,
         )
+
+    def custom_jvp_frames(
+        self, parent: ConcreteFrame, eqn_plan: EqnPlan
+    ) -> tuple[ConcreteFrame, ConcreteFrame]:
+        nested = self._nested(eqn_plan, CustomJvpSpec)
+        spec = nested.spec
+        assert isinstance(spec, CustomJvpSpec)
+        primal_bindings = tuple(
+            _ParentBinding(parent, atom) for atom in eqn_plan.eqn.invars
+        )
+        primal = self._register_frame(
+            nested.branches[0],
+            parent.path + (FrameStep(eqn_plan.index, NestedKind.CUSTOM_JVP, 0),),
+            nested.branch_consts[0],
+            primal_bindings,
+        )
+        jvp_bindings: list[_ParentBinding | None] = []
+        unavailable: dict[int, str] = {}
+        for index, binding in enumerate(spec.jvp_bindings):
+            if binding.tangent:
+                jvp_bindings.append(None)
+                unavailable[index] = f"custom_jvp runtime tangent input {index}"
+            else:
+                jvp_bindings.append(
+                    _ParentBinding(
+                        parent, eqn_plan.eqn.invars[binding.outer_input_index]
+                    )
+                )
+        jvp = self._register_frame(
+            nested.branches[1],
+            parent.path + (FrameStep(eqn_plan.index, NestedKind.CUSTOM_JVP, 1),),
+            nested.branch_consts[1],
+            tuple(jvp_bindings),
+            unavailable=unavailable,
+        )
+        return primal, jvp
 
     def map_frame(
         self, parent: ConcreteFrame, eqn_plan: EqnPlan, logical_index: int
@@ -764,9 +812,7 @@ class ConcreteResolver:
                         else self.value(
                             frame,
                             atom,
-                            None
-                            if demands is None
-                            else demands[input_index],
+                            None if demands is None else demands[input_index],
                         )
                     )
                 elif not isinstance(atom, Literal):
@@ -877,6 +923,13 @@ class ConcreteResolver:
                 value = self.value(child, child.plan.jaxpr.outvars[output_index])
             finally:
                 self.release(child)
+        elif isinstance(spec, CustomJvpSpec):
+            primal, jvp = self.custom_jvp_frames(parent, eqn_plan)
+            try:
+                value = self.value(primal, primal.plan.jaxpr.outvars[output_index])
+            finally:
+                self.release(primal)
+                self.release(jvp)
         elif isinstance(spec, CondSpec):
             _branch, child = self.cond_frame(parent, eqn_plan)
             try:

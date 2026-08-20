@@ -30,6 +30,8 @@ from tatva.tracer.core.nested import (
     CallSpec,
     CondInvocation,
     CondSpec,
+    CustomJvpInvocation,
+    CustomJvpSpec,
     FrameStep,
     IndexedChild,
     LinearSolveContext,
@@ -259,26 +261,47 @@ class _DemandPlanNestedHandler:
         for index, demand in zip(indices, child.input_demands, strict=True):
             outer[index] = merge_demands(outer[index], demand)
 
-        # a custom derivative can use an input that is absent from the primal call_jaxpr
-        # dependency slice. Until the derivative jaxpr itself is localized, conservatively we
-        # keep every invocation input
-        if spec.call_kind.is_custom_derivative:
-            active = any(demand is not None for demand in self.outputs) or bool(
-                self.seed_node.children.get(step)
-            )
-            if active:
-                for index in indices:
-                    atom = self.eqn_plan.eqn.invars[index]
-
-                    if isinstance(atom, Literal):
-                        continue
-
-                    outer[index] = merge_demands(
-                        outer[index],
-                        TensorDemand.full(_shape_of(atom)),
-                    )
-
         return tuple(outer), CallInvocation(self.eqn_plan.index, child)
+
+    def custom_jvp(
+        self, spec: CustomJvpSpec
+    ) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
+        outer = self._empty_outer()
+        primal_frame, jvp_frame = self.resolver.custom_jvp_frames(
+            self.frame, self.eqn_plan
+        )
+        primal_step, jvp_step = primal_frame.path[-1], jvp_frame.path[-1]
+        jvp_outputs: list[Demand] = list(self.outputs)
+        for is_zero, demand in zip(spec.output_zeros, self.outputs, strict=True):
+            if not is_zero:
+                jvp_outputs.append(demand)
+        try:
+            primal = _backprop_plan_jaxpr(
+                primal_frame.plan,
+                primal_frame,
+                self.resolver,
+                self.seed_node.children.get(primal_step, _SeedNode()),
+                output_demands=self.outputs,
+            )
+            jvp = _backprop_plan_jaxpr(
+                jvp_frame.plan,
+                jvp_frame,
+                self.resolver,
+                self.seed_node.children.get(jvp_step, _SeedNode()),
+                output_demands=tuple(jvp_outputs),
+            )
+        finally:
+            self.resolver.release(primal_frame)
+            self.resolver.release(jvp_frame)
+
+        for index, demand in enumerate(primal.input_demands):
+            outer[index] = merge_demands(outer[index], demand)
+
+        for binding, demand in zip(spec.jvp_bindings, jvp.input_demands, strict=True):
+            index = binding.outer_input_index
+            outer[index] = merge_demands(outer[index], demand)
+
+        return tuple(outer), CustomJvpInvocation(self.eqn_plan.index, primal, jvp)
 
     def map(self, spec: MapSpec) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
         outer = self._empty_outer()

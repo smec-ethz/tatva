@@ -59,6 +59,8 @@ from tatva.tracer.core.nested import (
     CallSpec,
     CondInvocation,
     CondSpec,
+    CustomJvpInvocation,
+    CustomJvpSpec,
     IndexedChild,
     LinearSolveInvocation,
     LinearSolveSpec,
@@ -275,6 +277,41 @@ def _materialize_call(
         plan=eqn_plan,
         route=None,
         nested=CallInvocation(eqn_index=eqn_plan.index, body=child),
+    )
+
+
+def _materialize_custom_jvp(
+    eqn_plan: EqnPlan,
+    nested_plan: NestedPlan,
+    spec: CustomJvpSpec,
+    parent_env: ConcreteEnv,
+) -> ResolvedEqn:
+    outer = tuple(_read(parent_env, atom) for atom in eqn_plan.eqn.invars)
+    primal = _materialize_jaxpr(
+        nested_plan.branches[0],
+        input_values=outer,
+        const_values=nested_plan.branch_consts[0],
+    )
+    jvp_inputs = tuple(
+        None if binding.tangent else outer[binding.outer_input_index]
+        for binding in spec.jvp_bindings
+    )
+    jvp = _materialize_jaxpr(
+        nested_plan.branches[1],
+        input_values=jvp_inputs,
+        const_values=nested_plan.branch_consts[1],
+    )
+    for output_index in eqn_plan.concrete_outputs:
+        value = primal.output_values[output_index]
+        if value is None:
+            raise DynamicRoutingError(
+                f"custom_jvp output {output_index} is unavailable concretely"
+            )
+        _write(parent_env, eqn_plan.eqn.outvars[output_index], value)
+    return ResolvedEqn(
+        eqn_plan,
+        route=None,
+        nested=CustomJvpInvocation(eqn_plan.index, primal, jvp),
     )
 
 
@@ -544,6 +581,9 @@ class _MaterializeNestedHandler:
 
     def call(self, spec: CallSpec) -> ResolvedEqn:
         return _materialize_call(self.eqn_plan, self.nested_plan, spec, self.env)
+
+    def custom_jvp(self, spec: CustomJvpSpec) -> ResolvedEqn:
+        return _materialize_custom_jvp(self.eqn_plan, self.nested_plan, spec, self.env)
 
     def map(self, spec: MapSpec) -> ResolvedEqn:
         return _materialize_map(self.eqn_plan, self.nested_plan, spec, self.env)
