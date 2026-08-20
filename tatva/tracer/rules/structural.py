@@ -185,6 +185,39 @@ def prepare_slice(ctx: RuleContext) -> UnaryRowMap:
     return slice_row_map(eqn)
 
 
+def tile_row_map(
+    eqn: JaxprEqn,
+) -> UnaryRowMap:
+    input_shape = _shape_of(eqn.invars[0])
+    output_shape = _shape_of(eqn.outvars[0])
+    reps = tuple(int(rep) for rep in eqn.params["reps"])
+
+    if len(reps) != len(input_shape):
+        raise ValueError(
+            f"tile reps rank {len(reps)} does not match operand rank "
+            f"{len(input_shape)}"
+        )
+    if any(rep < 0 for rep in reps):
+        raise ValueError(f"tile reps must be non-negative, got {reps}")
+
+    expected_shape = tuple(extent * rep for extent, rep in zip(input_shape, reps))
+    if output_shape != expected_shape:
+        raise ValueError(
+            f"tile output shape {output_shape} does not match operand shape "
+            f"{input_shape} repeated by {reps}"
+        )
+
+    rows = np.arange(int(np.prod(input_shape)), dtype=np.int64).reshape(input_shape)
+    return UnaryRowMap(
+        source_rows=np.tile(rows, reps).ravel(),
+        output_shape=output_shape,
+    )
+
+
+def prepare_tile(ctx: RuleContext) -> UnaryRowMap:
+    return tile_row_map(ctx.eqn)
+
+
 def prepare_rev(ctx: RuleContext) -> UnaryRowMap:
     eqn = ctx.eqn
 
@@ -482,6 +515,19 @@ def demand_slice(
             tuple(input_axes),
         ),
     )
+
+
+def demand_tile(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None,)
+
+    input_shape = _shape_of(ctx.eqn.invars[0])
+    row_map = tile_row_map(ctx.eqn)
+    source_rows = row_map.source_rows[output.rows()]
+    return (TensorDemand.from_rows_hull(input_shape, source_rows),)
 
 
 def demand_rev(

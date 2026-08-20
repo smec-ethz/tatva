@@ -167,6 +167,17 @@ def slice_(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     return (TaggedDemand(shape, _rows(input_coords, shape), output.blocks),)
 
 
+def tile(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
+    from tatva.tracer.rules.structural import tile_row_map
+
+    output = _output(ctx)
+    if output is None:
+        return (None,)
+    shape = _shape_of(ctx.eqn.invars[0])
+    source_rows = tile_row_map(ctx.eqn).source_rows[output.rows]
+    return (TaggedDemand(shape, source_rows, output.blocks),)
+
+
 def rev(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     output = _output(ctx)
     if output is None:

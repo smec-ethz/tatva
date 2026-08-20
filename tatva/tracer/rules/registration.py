@@ -366,6 +366,19 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
         ),
     )
     reg.register(
+        lax.tile_p,
+        OperationSemantics(
+            DerivativeRule(
+                prepare=structural.prepare_tile,
+                dependencies=structural.unary_routed_dependencies,
+                hessian=no_hessian,
+            ),
+            demand=structural.demand_tile,
+            tagged_demand=tagged.tile,
+            lowering=lowerings.lower_tile,
+        ),
+    )
+    reg.register(
         lax.rev_p,
         OperationSemantics(
             DerivativeRule(
@@ -580,6 +593,18 @@ def _register_dot_general(reg: PrimitiveRegistry) -> None:
 
 
 def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
+    # Cumprod is intentionally supported only as an invocation-local opaque
+    # expression. Requiring its full operand makes direct local binding and
+    # JAX's own AD rule correct, while its structural dependency and Hessian
+    # patterns remain conservative.
+    reg.register(
+        lax.cumprod_p,
+        OperationSemantics(
+            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
+            demand=opaque.full_operand_demand,
+        ),
+    )
+
     # Register rules for opaque primitives if needed
     for primitive in (
         lax.linalg.cholesky_p,

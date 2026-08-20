@@ -16,7 +16,7 @@ from tatva.tracer.local.localize import (
     LocalSelectNRoute,
     localize_unary_source_rows,
 )
-from tatva.tracer.rules.structural import slice_row_map
+from tatva.tracer.rules.structural import slice_row_map, tile_row_map
 
 if TYPE_CHECKING:
     from tatva.tracer.local.plan import LocalEqnPlan
@@ -308,6 +308,29 @@ def lower_slice(
         allow_invalid=False,
     )
 
+    result = jnp.ravel(operand)[jnp.asarray(source_rows)]
+    return (jnp.reshape(result, output_layout.local_shape),)
+
+
+def lower_tile(
+    ctx: LoweringContext,
+) -> tuple[Any, ...]:
+    operand = _input(ctx, 0)
+    input_layout = ctx.plan.input_layouts[0]
+    output_layout = ctx.plan.output_layouts[0]
+
+    if input_layout is None:
+        raise RuntimeError("live tile has no operand layout")
+    if output_layout is None:
+        raise RuntimeError("live tile has no output layout")
+
+    global_map = tile_row_map(ctx.plan.eqn)
+    source_rows = localize_unary_source_rows(
+        global_map.source_rows,
+        operand_layout=input_layout,
+        output_layout=output_layout,
+        allow_invalid=False,
+    )
     result = jnp.ravel(operand)[jnp.asarray(source_rows)]
     return (jnp.reshape(result, output_layout.local_shape),)
 

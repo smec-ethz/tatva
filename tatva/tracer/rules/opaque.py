@@ -76,8 +76,8 @@ def opaque_nonlinear_hessian(
     acc.add_self(prepared.total)
 
 
-def sort_demand(ctx: DemandContext) -> tuple[Demand, ...]:
-    """Require every non-literal operand whenever any sort result is live."""
+def full_operand_demand(ctx: DemandContext) -> tuple[Demand, ...]:
+    """Require every non-literal operand whenever any result is live."""
     if not any(demand is not None for demand in ctx.output_demands):
         return tuple(None for _ in ctx.eqn.invars)
 
@@ -85,6 +85,9 @@ def sort_demand(ctx: DemandContext) -> tuple[Demand, ...]:
         None if isinstance(atom, Literal) else TensorDemand.full(_shape_of(atom))
         for atom in ctx.eqn.invars
     )
+
+
+sort_demand = full_operand_demand
 
 
 DERIVATIVES_OPAQUE_NONLINEAR = DerivativeRule(
