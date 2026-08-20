@@ -194,8 +194,7 @@ def tile_row_map(
 
     if len(reps) != len(input_shape):
         raise ValueError(
-            f"tile reps rank {len(reps)} does not match operand rank "
-            f"{len(input_shape)}"
+            f"tile reps rank {len(reps)} does not match operand rank {len(input_shape)}"
         )
     if any(rep < 0 for rep in reps):
         raise ValueError(f"tile reps must be non-negative, got {reps}")

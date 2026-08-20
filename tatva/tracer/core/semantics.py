@@ -247,19 +247,80 @@ class DerivativeRule[T]:
     hessian: HessianRule[T]
 
 
+class RoutingScope(Enum):
+    STRUCTURAL = auto()
+    INVOCATION_INTERNAL = auto()
+
+
+class RouteRequirement(Enum):
+    REQUIRED = auto()
+    OPTIONAL = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class InternalRoutingBatching:
+    """Axes that may be compacted without changing runtime routing semantics.
+
+    output_axes[k] is logical batch dimension k on the routed output.
+
+    input_axes[i][k] is the corresponding axis on input i, or None when
+    input i does not carry that batch dimension.
+
+    All non-batch axes are invocation-local payload and must remain complete.
+    """
+
+    output_axes: tuple[int, ...]
+    input_axes: tuple[tuple[int | None, ...], ...]
+
+
+type InternalRoutingBatchingRule = Callable[
+    [JaxprEqn],
+    InternalRoutingBatching,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class InternalRoutingSemantics:
+    batching: InternalRoutingBatchingRule
+    lowering: LoweringRule | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingSemantics:
+    """Structural routing semantics for an ordinary primitive.
+
+    These semantics are meaningful only in RoutingScope.STRUCTURAL.
+
+    inputs:
+        Inputs needed to specialize the primitive into global scalar-row
+        routing geometry.
+
+    requirement:
+        REQUIRED:
+            failure to specialize is a planning error.
+
+        OPTIONAL:
+            specialization improves precision but is not required for
+            correctness. The primitive's ordinary demand/lowering rules must
+            support route=None.
+    """
+
+    inputs: ConcreteInputRule
+    resolve: RouteRule
+    fragment: RouteFragmentRule = no_route_fragment
+    concrete_demands: RouteConcreteDemandRule | None = None
+    requirement: RouteRequirement = RouteRequirement.REQUIRED
+    internal: InternalRoutingSemantics | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class OperationSemantics[T]:
     """Global structural semantics of one JAX primitive."""
 
     derivatives: DerivativeRule[T]
 
-    concrete_inputs: ConcreteInputRule = no_concrete_inputs
-    # Inputs which may improve route specialization when concrete, but must
-    # never make planning depend on a runtime DOF value.
-    optional_route_inputs: ConcreteInputRule = no_concrete_inputs
-    route: RouteRule = no_route
-    route_fragment: RouteFragmentRule = no_route_fragment
-    route_concrete_demands: RouteConcreteDemandRule | None = None
+    routing: RoutingSemantics | None = None
+
     demand: DemandRule = conservative_demand
     tagged_demand: TaggedDemandRule = conservative_tagged_demand
     regional_concrete: RegionalConcreteRule = full_concrete_evaluation

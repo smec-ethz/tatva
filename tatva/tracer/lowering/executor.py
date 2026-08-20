@@ -7,7 +7,7 @@ emitted by that walk become the compiled JAX computation.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +31,7 @@ from tatva.tracer.core.nested import (
     dispatch_nested,
 )
 from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.semantics import RoutingScope
 from tatva.tracer.local.demand import (
     TensorDemand,
     _FullAxis,
@@ -50,7 +51,10 @@ from tatva.tracer.local.plan import (
     LocalNestedPlan,
 )
 from tatva.tracer.lowering.partition import OwnedContribution
-from tatva.tracer.lowering.rules import LoweringContext, lower_bind
+from tatva.tracer.lowering.rules import (
+    LoweringContext,
+    lower_bind,
+)
 from tatva.tracer.program.contributions import ContributionTrace
 
 
@@ -143,7 +147,8 @@ def _project_local_value(
 
 def _read_atom(
     atom,
-    layout: TensorLayout | None,
+    target_layout: TensorLayout | None,
+    storage_layouts: Mapping[Var, TensorLayout],
     env: dict[Var, Any],
 ):
     if isinstance(atom, Literal):
@@ -152,13 +157,23 @@ def _read_atom(
     if not isinstance(atom, Var):
         raise TypeError(f"unsupported atom {type(atom)!r}")
 
-    if layout is None:
+    if target_layout is None:
         return None
 
     try:
-        return env[atom]
+        value = env[atom]
     except KeyError as exc:
         raise RuntimeError(f"live variable {atom} is unavailable") from exc
+
+    source_layout = storage_layouts.get(atom)
+    if source_layout is None:
+        raise RuntimeError(f"live variable {atom} has no storage layout")
+
+    return _project_local_value(
+        value,
+        source_layout=source_layout,
+        target_layout=target_layout,
+    )
 
 
 def _validate_outputs(
@@ -1094,7 +1109,23 @@ def _lower_eqn(
 
     else:
         semantics = SEMANTICS.get_ordinary(plan.eqn.primitive)
-        rule = semantics.lowering or lower_bind
+        routing = semantics.routing
+
+        if (
+            plan.routing_scope is RoutingScope.INVOCATION_INTERNAL
+            and routing is not None
+        ):
+            internal = routing.internal
+            if internal is None:
+                raise RuntimeError(
+                    f"{plan.primitive_name} has no invocation-internal "
+                    "routing lowering semantics"
+                )
+
+            rule = internal.lowering or lower_bind
+
+        else:
+            rule = semantics.lowering or lower_bind
 
         result = rule(LoweringContext(plan=plan, inputs=inputs))
 
@@ -1148,8 +1179,10 @@ def _execute_frame(
     # Surviving local equations.
     for eqn_plan in plan.eqns:
         inputs = tuple(
-            _read_atom(atom, layout, env)
-            for atom, layout in zip(eqn_plan.eqn.invars, eqn_plan.input_layouts)
+            _read_atom(atom, edge_layout, plan.layouts, env)
+            for atom, edge_layout in zip(
+                eqn_plan.eqn.invars, eqn_plan.input_layouts, strict=True
+            )
         )
         outputs = _lower_eqn(eqn_plan, inputs)
 

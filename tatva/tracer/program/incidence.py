@@ -36,7 +36,12 @@ from tatva.tracer.core.nested import (
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import RouteRequest
 from tatva.tracer.core.routes import Shape
-from tatva.tracer.core.semantics import TaggedDemandContext, no_route_fragment
+from tatva.tracer.core.semantics import (
+    RoutingScope,
+    TaggedDemandContext,
+    conservative_tagged_demand,
+    no_route_fragment,
+)
 from tatva.tracer.core.tagged import (
     Tagged,
     TaggedDemand,
@@ -52,6 +57,7 @@ from tatva.tracer.program.contributions import (
     ContributionTrace,
     ValueRef,
 )
+from tatva.tracer.rules import internal_routing
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,28 +141,62 @@ def _backprop_plan_ordinary(
     output_demands: tuple[Tagged, ...],
 ) -> tuple[Tagged, ...]:
     eqn = eqn_plan.eqn
-    rule = SEMANTICS.get_ordinary(eqn.primitive)
-    fragment = None
-    if rule.route_fragment is not no_route_fragment:
-        active_rows = np.unique(
-            np.concatenate(
-                [demand.rows for demand in output_demands if demand is not None]
+    semantics = SEMANTICS.get_ordinary(eqn.primitive)
+    routing = semantics.routing
+
+    if routing is None:
+        if (
+            frame.plan.routing_scope is RoutingScope.INVOCATION_INTERNAL
+            and semantics.tagged_demand is conservative_tagged_demand
+        ):
+            raise NotImplementedError(
+                f"{eqn.primitive.name} uses conservative full-tensor tagged demand "
+                "inside an invocation-internal scope; add an explicit "
+                "batch-preserving tagged demand rule"
+            )
+
+        # Ordinary non-routing primitive.
+        result = semantics.tagged_demand(
+            TaggedDemandContext(
+                eqn=eqn,
+                output_demands=output_demands,
+                route=None,
             )
         )
-        fragment = resolver.route_fragment(frame, eqn_plan, RouteRequest(active_rows))
-    route = resolver.route(frame, eqn_plan) if fragment is None else fragment
-    result = rule.tagged_demand(
-        TaggedDemandContext(
-            eqn=eqn,
-            output_demands=output_demands,
-            route=route,
+
+    elif frame.plan.routing_scope is RoutingScope.INVOCATION_INTERNAL:
+        # Routed primitive, but routing is internal to this invocation.
+        result = internal_routing.tagged_demand(eqn, output_demands, routing)
+
+    else:
+        # Routed primitive in structural/global index space.
+        fragment = None
+        active_demands = [
+            demand.rows for demand in output_demands if demand is not None
+        ]
+
+        if active_demands and routing.fragment is not no_route_fragment:
+            active_rows = np.unique(np.concatenate(active_demands))
+            fragment = resolver.route_fragment(
+                frame, eqn_plan, RouteRequest(active_rows)
+            )
+
+        route = resolver.route(frame, eqn_plan) if fragment is None else fragment
+
+        result = semantics.tagged_demand(
+            TaggedDemandContext(
+                eqn=eqn,
+                output_demands=output_demands,
+                route=route,
+            )
         )
-    )
+
     if len(result) != len(eqn.invars):
         raise RuntimeError(
             f"tagged demand rule for {eqn.primitive.name!r} returned "
             f"{len(result)} inputs; expected {len(eqn.invars)}"
         )
+
     return result
 
 

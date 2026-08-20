@@ -29,6 +29,9 @@ from tatva.tracer.core.semantics import (
     FullConcrete,
     RegionalConcrete,
     RegionalConcreteContext,
+    RouteRequirement,
+    RoutingScope,
+    RoutingSemantics,
     UnsupportedConcrete,
     no_route_fragment,
 )
@@ -39,6 +42,10 @@ from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 
 class DynamicRoutingError(RuntimeError):
     """Planning-time routing depends on a value unavailable without the DOFs."""
+
+
+class RouteResolutionError(RuntimeError):
+    pass
 
 
 class ConcreteFallback(Enum):
@@ -516,18 +523,54 @@ class ConcreteResolver:
         state.regions.setdefault(atom, []).append(region)
         self.stats.regional_entries += region.values.size
 
+    def _routing_semantics(
+        self, frame: ConcreteFrame, eqn_plan: EqnPlan
+    ) -> RoutingSemantics | None:
+        if frame.plan.routing_scope is not RoutingScope.STRUCTURAL:
+            raise RuntimeError(
+                "structural route resolution requested inside "
+                f"{frame.plan.routing_scope.name} frame: {eqn_plan.eqn.primitive.name}, frame={frame.path}"
+            )
+
+        semantics = SEMANTICS.get_ordinary(eqn_plan.eqn.primitive)
+        return semantics.routing
+
     def route(self, frame: ConcreteFrame, eqn_plan: EqnPlan) -> Route | None:
         """Resolve an ordinary equation's complete structural route lazily."""
-        semantics, concrete = self._route_inputs(frame, eqn_plan)
-        return semantics.route(eqn_plan.eqn, concrete)
+        routing = self._routing_semantics(frame, eqn_plan)
+        if routing is None:
+            return None
+
+        concrete = self._route_inputs(frame, eqn_plan, routing)
+        route = routing.resolve(eqn_plan.eqn, concrete)
+
+        if route is None and routing.requirement is RouteRequirement.REQUIRED:
+            raise RouteResolutionError(
+                f"{eqn_plan.eqn.primitive.name} requires a structural route, "
+                "but its route resolver could not represent the routing geometry "
+                f"at equation {eqn_plan.index}, frame={frame.path}"
+            )
+
+        return route
 
     def route_fragment(
-        self, frame: ConcreteFrame, eqn_plan: EqnPlan, request: RouteRequest
+        self,
+        frame: ConcreteFrame,
+        eqn_plan: EqnPlan,
+        request: RouteRequest,
     ) -> RouteFragment | None:
-        semantics, concrete = self._route_inputs(frame, eqn_plan, request=request)
-        if semantics.route_fragment is no_route_fragment:
+        routing = self._routing_semantics(frame, eqn_plan)
+        if routing is None or routing.fragment is no_route_fragment:
             return None
-        return semantics.route_fragment(eqn_plan.eqn, concrete, request)
+
+        concrete = self._route_inputs(
+            frame,
+            eqn_plan,
+            routing,
+            request=request,
+        )
+
+        return routing.fragment(eqn_plan.eqn, concrete, request)
 
     def call_frame(self, parent: ConcreteFrame, eqn_plan: EqnPlan) -> ConcreteFrame:
         nested = self._nested(eqn_plan, CallSpec)
@@ -561,6 +604,7 @@ class ConcreteResolver:
         )
         jvp_bindings: list[_ParentBinding | None] = []
         unavailable: dict[int, str] = {}
+
         for index, binding in enumerate(spec.jvp_bindings):
             if binding.tangent:
                 jvp_bindings.append(None)
@@ -571,6 +615,7 @@ class ConcreteResolver:
                         parent, eqn_plan.eqn.invars[binding.outer_input_index]
                     )
                 )
+
         jvp = self._register_frame(
             nested.branches[1],
             parent.path + (FrameStep(eqn_plan.index, NestedKind.CUSTOM_JVP, 1),),
@@ -724,35 +769,27 @@ class ConcreteResolver:
         self,
         frame: ConcreteFrame,
         eqn_plan: EqnPlan,
+        routing: RoutingSemantics,
         *,
         request: RouteRequest | None = None,
-    ):
-        self._state(frame)
-        if not any(candidate is eqn_plan for candidate in frame.plan.eqns):
-            raise ValueError("equation plan does not belong to the concrete frame")
-        if eqn_plan.nested is not None:
-            raise TypeError("nested primitives do not have ordinary routes")
-
+    ) -> ConcreteEnv:
         eqn = eqn_plan.eqn
-        semantics = SEMANTICS.get_ordinary(eqn.primitive)
         concrete: ConcreteEnv = {}
-        concrete_indices = semantics.concrete_inputs(eqn)
-        optional_indices = semantics.optional_route_inputs(eqn)
-        demands = None
 
-        if request is not None and semantics.route_concrete_demands is not None:
-            demands = semantics.route_concrete_demands(eqn, request)
+        indices = routing.inputs(eqn)
+
+        demands = None
+        if request is not None and routing.concrete_demands is not None:
+            demands = routing.concrete_demands(eqn, request)
             if len(demands) != len(eqn.invars):
                 raise ValueError(
-                    f"{eqn.primitive.name}.route_concrete_demands returned "
-                    "the wrong arity"
+                    f"{eqn.primitive.name}.routing.concrete_demands returned the wrong arity"
                 )
 
-        for input_index in concrete_indices:
+        for input_index in indices:
             if input_index < 0 or input_index >= len(eqn.invars):
                 raise ValueError(
-                    f"{eqn.primitive.name}.concrete_inputs returned invalid "
-                    f"index {input_index}"
+                    f"{eqn.primitive.name}.routing.inputs returned invalid input index {input_index}"
                 )
 
             atom = eqn.invars[input_index]
@@ -763,66 +800,26 @@ class ConcreteResolver:
                         concrete[atom] = self._full_value(frame, atom)
                     else:
                         demand = None if demands is None else demands[input_index]
+
                         if demand is None:
                             demand = TensorDemand.full(_shape_of(atom))
-                        if demand is None:
-                            raise RuntimeError(
-                                "concrete route input has an empty shape"
-                            )
-                        if demands is None and demand.is_full and demand.size > 1:
-                            requested = TensorDemand.from_rows_hull(
-                                _shape_of(eqn.outvars[0]), request.output_rows
-                            )
-                            if requested is not None and not requested.is_full:
-                                self._record_route_escalation(
-                                    frame,
-                                    eqn_plan,
-                                    requested,
-                                    demand,
-                                    input_index,
-                                )
+
                         concrete[atom] = self.value(frame, atom, demand)
+
                 elif not isinstance(atom, Literal):
                     raise TypeError(f"unsupported JAXPR atom {type(atom)!r}")
 
             except DynamicRoutingError as exc:
+                if routing.requirement is RouteRequirement.OPTIONAL:
+                    continue
+
                 raise DynamicRoutingError(
                     f"{exc}\n"
-                    f"while resolving route for {eqn.primitive.name} at equation {eqn_plan.index} "
-                    f"concrete input {input_index}, frame={frame.path}"
+                    f"while resolving structural route for "
+                    f"{eqn.primitive.name} at equation {eqn_plan.index}, frame={frame.path}"
                 ) from exc
 
-        # Optional route inputs are intentionally best-effort.  In particular
-        # a selector derived from DOFs must leave a dynamic route unresolved,
-        # rather than turning into a planning-time concrete requirement.
-        for input_index in optional_indices:
-            if input_index in concrete_indices:
-                continue
-            if input_index < 0 or input_index >= len(eqn.invars):
-                raise ValueError(
-                    f"{eqn.primitive.name}.optional_route_inputs returned invalid "
-                    f"input index {input_index}"
-                )
-            atom = eqn.invars[input_index]
-            try:
-                if isinstance(atom, Var):
-                    concrete[atom] = (
-                        self._full_value(frame, atom)
-                        if request is None
-                        else self.value(
-                            frame,
-                            atom,
-                            None if demands is None else demands[input_index],
-                        )
-                    )
-                elif not isinstance(atom, Literal):
-                    raise TypeError(f"unsupported JAXPR atom {type(atom)!r}")
-            except DynamicRoutingError:
-                # Absence is the signal to the route rule to use its dynamic
-                # fallback. Do not retain a partial/concrete value.
-                continue
-
-        return semantics, concrete
+        return concrete
 
     def _record_route_escalation(
         self,
@@ -878,11 +875,13 @@ class ConcreteResolver:
             raise ValueError("nested constants do not match child JAXPR")
         if len(bindings) != len(plan.jaxpr.invars):
             raise ValueError("nested input bindings do not match child JAXPR")
+
         concrete = dict(values or {})
         concrete.update(zip(plan.jaxpr.constvars, consts, strict=True))
         binding_map: dict[Var, _ParentBinding] = {}
         unavailable_map: dict[Var, str] = {}
         unavailable = unavailable or {}
+
         for index, (var, binding) in enumerate(
             zip(plan.jaxpr.invars, bindings, strict=True)
         ):
@@ -892,6 +891,7 @@ class ConcreteResolver:
                 binding_map[var] = binding
             else:
                 unavailable_map[var] = unavailable.get(index, f"input {index}")
+
         frame = ConcreteFrame(plan, path)
         self._frames[path] = _FrameState(
             plan=plan,
