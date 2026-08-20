@@ -47,8 +47,6 @@ from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import RouteRequest
 from tatva.tracer.core.semantics import (
     DemandContext,
-    RoutingScope,
-    conservative_demand,
     no_route_fragment,
 )
 from tatva.tracer.helpers import _shape_of
@@ -67,7 +65,6 @@ from tatva.tracer.program.contributions import ValueRef
 from tatva.tracer.program.materialize import (
     JaxprInstance,
 )
-from tatva.tracer.rules import internal_routing
 
 
 def _expand_batch_demand(
@@ -217,30 +214,19 @@ def _backprop_plan_ordinary(
     routing = semantics.routing
 
     if routing is None:
-        # ordinary non-routing primitive
-        if (
-            frame.plan.routing_scope is RoutingScope.INVOCATION_INTERNAL
-            and semantics.demand is conservative_demand
-        ):
-            raise NotImplementedError(
-                f"{eqn.primitive.name} uses conservative full-tensor demand "
-                "inside an invocation-internal scope; add an explicit "
-                "batch-preserving demand rule"
-            )
-
         result = semantics.demand(
             DemandContext(eqn=eqn, output_demands=output_demands, route=None)
         )
-
-    elif frame.plan.routing_scope is RoutingScope.INVOCATION_INTERNAL:
-        result = internal_routing.demand(eqn, output_demands, routing)
 
     else:
         fragment = None
         demanded_rows = [
             demand.rows() for demand in output_demands if demand is not None
         ]
-        if demanded_rows and routing.fragment is not no_route_fragment:
+        if demanded_rows and (
+            routing.fragment is not no_route_fragment
+            or routing.partial_fragment is not None
+        ):
             fragment = resolver.route_fragment(
                 frame,
                 eqn_plan,
@@ -666,8 +652,8 @@ def _backprop_plan_jaxpr(
         raise ValueError("demand traversal plan does not match concrete frame")
 
     jaxpr = plan.jaxpr
-    eqn_input_demands: dict[int, tuple[Demand, ...]] = {}
     demands: dict[Var, TensorDemand] = {}
+    eqn_input_demands: dict[int, tuple[Demand, ...]] = {}
     nested_traces: dict[int, NestedDemandTrace] = {}
 
     for var, demand in seed_node.values.items():
@@ -711,8 +697,7 @@ def _backprop_plan_jaxpr(
             )
             nested_traces[eqn_plan.index] = nested_trace
 
-        eqn_input_demands[eqn_plan.index] = inputs
-
+        eqn_input_demands[eqn_plan.index] = tuple(inputs)
         for atom, demand in zip(eqn.invars, inputs, strict=True):
             _add_demand(demands, atom, demand)
 

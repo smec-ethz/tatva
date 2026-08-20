@@ -126,3 +126,35 @@ def regional_iota(_ctx: RegionalConcreteContext) -> RegionalConcretePlan:
         return ()
 
     return RegionalConcrete(no_inputs, _iota_requested)
+
+
+def _concatenate_requested(
+    ctx: RegionalConcreteContext, inputs: tuple[Any, ...]
+) -> Any:
+    values = tuple(np.asarray(value) for value in inputs if value is not None)
+    if not values:
+        raise RuntimeError("regional concatenate has no demanded operands")
+    result = (
+        values[0]
+        if len(values) == 1
+        else np.concatenate(values, axis=int(ctx.eqn.params["dimension"]))
+    )
+    expected = TensorLayout.from_demand(ctx.demand).local_shape
+    if tuple(result.shape) != expected:
+        raise RuntimeError(
+            f"regional concatenate produced {result.shape}, expected {expected}"
+        )
+    return result
+
+
+def regional_concatenate(
+    demand_rule: Callable[[DemandContext], tuple[Demand, ...]],
+):
+    def plan(_ctx: RegionalConcreteContext) -> RegionalConcretePlan:
+        return RegionalConcrete(
+            demand_rule,
+            _concatenate_requested,
+            allow_dead_inputs=True,
+        )
+
+    return plan

@@ -320,48 +320,6 @@ class TensorDemand:
 
         return cls.from_axes(shape, tuple(axes))
 
-    @classmethod
-    def from_mapped_axes(
-        cls,
-        shape: Shape,
-        source: TensorDemand,
-        mappings: tuple[tuple[int, int], ...],
-    ) -> Self | None:
-        """Demand full target payload while preserving selected source axes.
-
-        Each mapping is:
-
-            (source_axis, target_axis)
-
-        Unmapped target axes become FullAxis.
-        """
-        _validate_shape(shape)
-        if _shape_size(shape) == 0:
-            return None
-
-        axes: list[AxisSubset] = [_FullAxis() for _ in shape]
-        used_targets: set[int] = set()
-
-        for source_axis, target_axis in mappings:
-            _validate_axis(source.shape, source_axis)
-            _validate_axis(shape, target_axis)
-
-            if target_axis in used_targets:
-                raise ValueError(f"target axis {target_axis} is mapped more than once")
-            used_targets.add(target_axis)
-
-            if source.shape[source_axis] != shape[target_axis]:
-                raise ValueError(
-                    "mapped demand axes have different extents: "
-                    f"source axis {source_axis} has "
-                    f"{source.shape[source_axis]}, target axis "
-                    f"{target_axis} has {shape[target_axis]}"
-                )
-
-            axes[target_axis] = source.axis_subset(source_axis)
-
-        return cls.from_axes(shape, tuple(axes))
-
     def merge(
         self,
         other: Self,

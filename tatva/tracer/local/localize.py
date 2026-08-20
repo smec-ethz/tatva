@@ -18,6 +18,7 @@ from numpy.typing import NDArray
 
 from tatva.tracer.core.route_fragments import (
     DynamicSliceRouteFragment,
+    GatherEnvelopeFragment,
     GatherRouteFragment,
     ScatterRouteFragment,
     SelectNRouteFragment,
@@ -28,6 +29,7 @@ from tatva.tracer.core.routes import (
     ScatterRoute,
     SelectNRoute,
 )
+from tatva.tracer.local.demand import _FullAxis
 from tatva.tracer.local.layout import TensorLayout
 
 
@@ -73,6 +75,96 @@ class LocalGatherRoute:
 
         object.__setattr__(self, "source_rows", rows)
         object.__setattr__(self, "output_shape", output_shape)
+
+
+@dataclass(frozen=True, slots=True)
+class LocalGatherIndexRebase:
+    component: int
+    operand_axis: int
+    global_indices: NDArray[np.int64]
+
+    def __post_init__(self) -> None:
+        values = np.asarray(self.global_indices, dtype=np.int64).ravel().copy()
+        if values.size == 0:
+            raise ValueError("gather index rebase cannot use an empty axis")
+        if values.size > 1 and np.any(values[1:] <= values[:-1]):
+            raise ValueError("gather rebase coordinates must be strictly increasing")
+        values.flags.writeable = False
+        object.__setattr__(self, "global_indices", values)
+
+
+@dataclass(frozen=True, slots=True)
+class LocalDynamicGatherRoute:
+    """Localized gather retaining runtime-dependent payload indices."""
+
+    output_shape: tuple[int, ...]
+    slice_sizes: tuple[int, ...]
+    rebases: tuple[LocalGatherIndexRebase, ...]
+
+    @classmethod
+    def from_fragment(
+        cls,
+        eqn,
+        route: GatherEnvelopeFragment,
+        *,
+        operand_layout: TensorLayout,
+        index_layout: TensorLayout,
+        output_layout: TensorLayout,
+    ) -> "LocalDynamicGatherRoute":
+        global_output_rows = output_layout.local_rows_to_global_rows(
+            np.arange(output_layout.local_size, dtype=np.int64)
+        )
+        positions = np.searchsorted(route.output_rows, global_output_rows)
+        if np.any(positions >= route.output_rows.size) or np.any(
+            route.output_rows[positions] != global_output_rows
+        ):
+            raise ValueError("gather envelope does not cover the local output")
+
+        start_index_map = tuple(
+            int(x) for x in eqn.params["dimension_numbers"].start_index_map
+        )
+        dynamic = frozenset(route.dynamic_components)
+        rebases: list[LocalGatherIndexRebase] = []
+        for component, operand_axis in enumerate(start_index_map):
+            subset = operand_layout.axis_subset(operand_axis)
+            if isinstance(subset, _FullAxis):
+                continue
+            if component in dynamic:
+                raise RuntimeError(
+                    "runtime gather component would index a localized structural "
+                    f"axis: component {component}, operand axis {operand_axis}"
+                )
+            rebases.append(
+                LocalGatherIndexRebase(
+                    component=component,
+                    operand_axis=operand_axis,
+                    global_indices=operand_layout.global_axis_indices(operand_axis),
+                )
+            )
+
+        slice_sizes = list(int(x) for x in eqn.params["slice_sizes"])
+        for axis, (global_extent, local_extent) in enumerate(
+            zip(operand_layout.global_shape, operand_layout.local_shape, strict=True)
+        ):
+            if global_extent == local_extent:
+                continue
+            if slice_sizes[axis] == global_extent:
+                slice_sizes[axis] = local_extent
+            elif slice_sizes[axis] != 1:
+                raise NotImplementedError(
+                    "localized runtime gather cannot rewrite a partial window on "
+                    f"operand axis {axis}: slice size {slice_sizes[axis]}, "
+                    f"global extent {global_extent}, local extent {local_extent}"
+                )
+
+        if index_layout.local_shape[-1] != index_layout.global_shape[-1]:
+            raise RuntimeError("localized gather dropped index-vector components")
+
+        return cls(
+            output_shape=output_layout.local_shape,
+            slice_sizes=tuple(slice_sizes),
+            rebases=tuple(rebases),
+        )
 
 
 def localize_unary_source_rows(
@@ -610,5 +702,9 @@ def localize_select_n_route(
 
 
 type LocalRoute = (
-    LocalGatherRoute | LocalScatterRoute | LocalDynamicSliceRoute | LocalSelectNRoute
+    LocalGatherRoute
+    | LocalDynamicGatherRoute
+    | LocalScatterRoute
+    | LocalDynamicSliceRoute
+    | LocalSelectNRoute
 )

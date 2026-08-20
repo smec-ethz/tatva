@@ -13,6 +13,7 @@ from tatva.tracer.core.route_fragments import (
     resolve_dynamic_slice_route_fragment,
     resolve_dynamic_update_slice_route_fragment,
     resolve_gather_route_fragment,
+    resolve_partial_gather_route_fragment,
     resolve_select_n_route_fragment,
     select_route_concrete_demands,
 )
@@ -27,7 +28,6 @@ from tatva.tracer.core.semantics import (
     CondAnalysisSemantics,
     CustomJvpAnalysisSemantics,
     DerivativeRule,
-    InternalRoutingSemantics,
     LinearSolveAnalysisSemantics,
     LocalizationSemantics,
     NestedOperationSemantics,
@@ -38,7 +38,6 @@ from tatva.tracer.core.semantics import (
     no_hessian,
 )
 from tatva.tracer.lowering import rules as lowerings
-from tatva.tracer.rules import internal_routing
 from tatva.tracer.rules.elementwise import (
     ELEMENTWISE_BINARY_BASIC,
     ELEMENTWISE_NARY_BASIC,
@@ -407,7 +406,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             demand=structural.demand_concatenate,
             tagged_demand=tagged.concatenate,
             lowering=lowerings.lower_concatenate,
-            regional_concrete=concrete_rules.regional_bind(
+            regional_concrete=concrete_rules.regional_concatenate(
                 structural.demand_concatenate
             ),
         ),
@@ -464,9 +463,8 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 resolve=resolve_gather_route,
                 fragment=resolve_gather_route_fragment,
                 concrete_demands=gather_route_concrete_demands,
-                internal=InternalRoutingSemantics(
-                    batching=internal_routing.gather_batching,
-                ),
+                partial_fragment=resolve_partial_gather_route_fragment,
+                requirement=RouteRequirement.OPTIONAL,
             ),
             demand=gather_scatter.gather_demand,
             tagged_demand=tagged.gather,
@@ -508,10 +506,6 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 fragment=resolve_select_n_route_fragment,
                 concrete_demands=select_route_concrete_demands,
                 requirement=RouteRequirement.OPTIONAL,
-                internal=InternalRoutingSemantics(
-                    batching=internal_routing.select_n_batching,
-                    lowering=lowerings.lower_select_n,
-                ),
             ),
             demand=indexing.select_n_demand,
             tagged_demand=tagged.select_n,
@@ -538,10 +532,6 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 inputs=lambda eqn: tuple(range(1, len(eqn.invars))),
                 resolve=resolve_dynamic_slice_route,
                 fragment=resolve_dynamic_slice_route_fragment,
-                internal=InternalRoutingSemantics(
-                    batching=internal_routing.dynamic_slice_batching,
-                    lowering=lowerings.lower_internal_dynamic_slice,
-                ),
             ),
             demand=indexing.dynamic_slice_demand,
             tagged_demand=tagged.dynamic_slice,
@@ -563,9 +553,6 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 inputs=lambda eqn: tuple(range(2, len(eqn.invars))),
                 resolve=resolve_dynamic_update_slice_route,
                 fragment=resolve_dynamic_update_slice_route_fragment,
-                internal=InternalRoutingSemantics(
-                    batching=internal_routing.dynamic_update_slice_batching,
-                ),
             ),
             demand=indexing.dynamic_update_slice_demand,
             tagged_demand=tagged.dynamic_update_slice,
@@ -603,15 +590,6 @@ def _register_reduction_rules(reg: PrimitiveRegistry) -> None:
     reg.register(lax.reduce_and_p, reductions.ZERO_REDUCTION)
     reg.register(lax.reduce_or_p, reductions.ZERO_REDUCTION)
 
-    reg.register(
-        lax.cumprod_p,
-        OperationSemantics(
-            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
-            demand=reductions.cumulative_demand,
-            tagged_demand=tagged.cumulative,
-        ),
-    )
-
 
 def _register_dot_general(reg: PrimitiveRegistry) -> None:
     reg.register(
@@ -629,6 +607,15 @@ def _register_dot_general(reg: PrimitiveRegistry) -> None:
 
 
 def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
+    reg.register(
+        lax.cumprod_p,
+        OperationSemantics(
+            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
+            demand=reductions.cumulative_demand,
+            tagged_demand=tagged.cumulative,
+        ),
+    )
+
     # Register rules for opaque primitives if needed
     for primitive in (
         lax.linalg.cholesky_p,

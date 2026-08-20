@@ -8,8 +8,10 @@ from typing import TYPE_CHECKING, Any
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax.extend.core import Literal
 
 from tatva.tracer.local.localize import (
+    LocalDynamicGatherRoute,
     LocalDynamicSliceRoute,
     LocalGatherRoute,
     LocalScatterRoute,
@@ -190,42 +192,71 @@ def lower_concatenate(
     return (result,)
 
 
-def lower_gather(
-    ctx: LoweringContext,
-) -> tuple[Any, ...]:
+def lower_gather(ctx: LoweringContext) -> tuple[Any, ...]:
     operand = _input(ctx, 0)
     route_plan = ctx.plan.route
+    if route_plan is None:
+        raise RuntimeError("gather has no localized route decision")
 
-    if route_plan is None or not isinstance(route_plan.local, LocalGatherRoute):
-        raise RuntimeError("gather requires LocalGatherRoute")
+    if isinstance(route_plan.local, LocalDynamicGatherRoute):
+        indices = _input(ctx, 1)
+        route = route_plan.local
+        for rebase in route.rebases:
+            values = indices[..., rebase.component]
+            global_indices = jnp.asarray(
+                rebase.global_indices,
+                dtype=values.dtype,
+            )
+            positions = jnp.searchsorted(global_indices, values)
+            safe = jnp.minimum(positions, global_indices.size - 1)
+            matched = (positions < global_indices.size) & (
+                global_indices[safe] == values
+            )
+            # An unmatched global coordinate is outside the compact operand.
+            # Keep it out of bounds rather than accidentally aliasing a local row.
+            local = jnp.where(matched, positions, global_indices.size).astype(
+                values.dtype
+            )
 
+            component = rebase.component
+            indices = jnp.concatenate(
+                (
+                    indices[..., :component],
+                    local[..., None],
+                    indices[..., component + 1 :],
+                ),
+                axis=-1,
+            )
+
+        params = dict(ctx.plan.eqn.params)
+        params["slice_sizes"] = route.slice_sizes
+        result = ctx.plan.eqn.primitive.bind(operand, indices, **params)
+        if tuple(result.shape) != route.output_shape:
+            raise RuntimeError(
+                "localized runtime gather produced shape "
+                f"{tuple(result.shape)}, expected {route.output_shape}"
+            )
+        return (result,)
+
+    if not isinstance(route_plan.local, LocalGatherRoute):
+        raise RuntimeError("gather requires a localized gather route")
     route = route_plan.local
     flat_operand = jnp.ravel(operand)
     rows = route.source_rows
     invalid = rows < 0
-
     if not invalid.any():
         result = flat_operand[jnp.asarray(rows)]
-
     else:
-        safe_rows = jnp.asarray(rows.copy())
-        safe_rows = jnp.maximum(safe_rows, 0)
-
+        safe_rows = jnp.maximum(jnp.asarray(rows.copy()), 0)
         result = flat_operand[safe_rows]
         fill_value = ctx.plan.eqn.params.get("fill_value")
-
         if fill_value is None:
             raise NotImplementedError(
-                "localized gather with invalid rows "
-                "and implicit fill_value is not yet supported"
+                "localized gather with invalid rows and implicit fill_value is not yet supported"
             )
-
         result = jnp.where(
-            jnp.asarray(~invalid),
-            result,
-            jnp.asarray(fill_value, dtype=operand.dtype),
+            jnp.asarray(~invalid), result, jnp.asarray(fill_value, dtype=operand.dtype)
         )
-
     return (jnp.reshape(result, route.output_shape),)
 
 
@@ -251,8 +282,13 @@ def lower_scatter_set(
     if operand is not None:
         flat_operand = jnp.ravel(operand)
 
+        if np.unique(route.operand_output_rows).size != route.operand_output_rows.size:
+            raise RuntimeError(
+                "localized scatter operand projection contains duplicate output rows"
+            )
+
         output = output.at[jnp.asarray(route.operand_output_rows)].set(
-            flat_operand[jnp.asarray(route.operand_rows)]
+            flat_operand[jnp.asarray(route.operand_rows)], unique_indices=True
         )
 
     # Apply surviving updates.
@@ -265,7 +301,7 @@ def lower_scatter_set(
             )
 
         output = output.at[jnp.asarray(route.target_rows)].set(
-            flat_updates[jnp.asarray(route.update_rows)]
+            flat_updates[jnp.asarray(route.update_rows)], unique_indices=True
         )
 
     return (jnp.reshape(output, route.output_shape),)
@@ -285,29 +321,6 @@ def lower_dynamic_slice(
     result = flat_operand[jnp.asarray(route.source_rows)]
 
     return (jnp.reshape(result, route.output_shape),)
-
-
-def lower_internal_dynamic_slice(
-    ctx: LoweringContext,
-) -> tuple[Any | None, ...]:
-    eqn = ctx.plan.eqn
-
-    if any(value is None for value in ctx.inputs):
-        raise RuntimeError(
-            "invocation-internal dynamic_slice requires all runtime inputs"
-        )
-
-    output_layout = _single_output_layout(ctx)
-
-    params = dict(eqn.params)
-    params["slice_sizes"] = tuple(output_layout.local_shape)
-
-    result = eqn.primitive.bind(
-        *ctx.inputs,
-        **params,
-    )
-
-    return (result,)
 
 
 def lower_slice(
@@ -408,7 +421,17 @@ def lower_select_n(
         value = ctx.inputs[case_index + 1]
         assert value is not None
         source = jnp.ravel(value)[jnp.asarray(case_route.source_rows)]
-        output = output.at[jnp.asarray(case_route.output_rows)].set(source)
+
+        rows = np.asarray(case_route.output_rows, dtype=np.int64)
+
+        if np.unique(rows).size != rows.size:
+            raise RuntimeError(
+                "localized select_n route contains duplicate output rows"
+            )
+
+        output = output.at[jnp.asarray(case_route.output_rows)].set(
+            source, unique_indices=True
+        )
 
     return (jnp.reshape(output, route.output_shape),)
 

@@ -61,7 +61,6 @@ from tatva.tracer.core.semantics import (
     NestedAnalysisSemantics,
     NestedOperationSemantics,
     RouteRequirement,
-    RoutingScope,
     ScanAnalysisSemantics,
 )
 from tatva.tracer.program.custom_jvp import extract_custom_jvp_parameters
@@ -104,7 +103,6 @@ class JaxprPlan:
     concrete_inputs: frozenset[int]
     # outputs that the parent requires concretely
     concrete_outputs: frozenset[int]
-    routing_scope: RoutingScope
 
 
 def backward_output_slice(
@@ -140,7 +138,6 @@ def analyze(
     jaxpr: Jaxpr,
     *,
     concrete_outputs: frozenset[int] = frozenset(),
-    routing_scope: RoutingScope = RoutingScope.STRUCTURAL,
 ) -> JaxprPlan:
     # validate output indices before doing any work
     for index in concrete_outputs:
@@ -184,7 +181,6 @@ def analyze(
                 eqn,
                 semantics=semantics.analysis,
                 concrete_outputs=required_outputs,
-                routing_scope=routing_scope,
             )
             nested_plans[index] = nested
 
@@ -206,21 +202,7 @@ def analyze(
 
         routing = semantics.routing
 
-        if (
-            routing_scope is RoutingScope.INVOCATION_INTERNAL
-            and routing is not None
-            and routing.internal is None
-        ):
-            raise NotImplementedError(
-                f"{eqn.primitive.name} appears inside an invocation-internal "
-                "routing scope but has no internal routing semantics"
-            )
-
-        if (
-            routing_scope is RoutingScope.STRUCTURAL
-            and routing is not None
-            and routing.requirement is RouteRequirement.REQUIRED
-        ):
+        if routing is not None and routing.requirement is RouteRequirement.REQUIRED:
             for input_index in routing.inputs(eqn):
                 if input_index < 0 or input_index >= len(eqn.invars):
                     raise ValueError(
@@ -270,7 +252,6 @@ def analyze(
         eqns=eqn_plans,
         concrete_inputs=concrete_inputs,
         concrete_outputs=concrete_outputs,
-        routing_scope=routing_scope,
     )
 
 
@@ -279,13 +260,11 @@ def _analyze_nested(
     *,
     semantics: NestedAnalysisSemantics,
     concrete_outputs: frozenset[int],
-    routing_scope: RoutingScope,
 ) -> NestedPlan:
     if isinstance(semantics, CustomJvpAnalysisSemantics):
         return _analyze_custom_jvp(
             eqn,
             concrete_outputs=concrete_outputs,
-            routing_scope=routing_scope,
         )
 
     if isinstance(semantics, CallAnalysisSemantics):
@@ -293,27 +272,23 @@ def _analyze_nested(
             eqn,
             semantics=semantics,
             concrete_outputs=concrete_outputs,
-            routing_scope=routing_scope,
         )
 
     if isinstance(semantics, ScanAnalysisSemantics):
         return _analyze_scan(
             eqn,
             concrete_outputs=concrete_outputs,
-            routing_scope=routing_scope,
         )
 
     if isinstance(semantics, CondAnalysisSemantics):
         return _analyze_cond(
             eqn,
             concrete_outputs=concrete_outputs,
-            routing_scope=routing_scope,
         )
     if isinstance(semantics, LinearSolveAnalysisSemantics):
         return _analyze_linear_solve(
             eqn,
             concrete_outputs=concrete_outputs,
-            routing_scope=routing_scope,
         )
 
     raise TypeError(f"unsupported nested analysis semantics {type(semantics).__name__}")
@@ -323,7 +298,6 @@ def _analyze_custom_jvp(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
-    routing_scope: RoutingScope,
 ) -> NestedPlan:
     extracted = extract_custom_jvp_parameters(eqn)
     if len(extracted.primal_jaxpr.invars) != len(eqn.invars):
@@ -336,14 +310,12 @@ def _analyze_custom_jvp(
     primal = analyze(
         extracted.primal_jaxpr,
         concrete_outputs=concrete_outputs,
-        routing_scope=routing_scope,
     )
     # Derivative callback values are runtime-only. Concrete output propagation
     # belongs to the primal callback, while JVP routing requirements are still
     # discovered by analyzing its complete program.
     jvp = analyze(
         extracted.jvp_jaxpr,
-        routing_scope=RoutingScope.INVOCATION_INTERNAL,
     )
     dynamic_arity = len(eqn.invars) - extracted.num_consts
     bindings = tuple(
@@ -353,10 +325,10 @@ def _analyze_custom_jvp(
         for index in range(dynamic_arity)
     )
 
-    # Only route requirements explicitly deferred by runtime-route semantics are absent
-    # from jvp.concrete_inputs. Genuine planning requirements (for example a dynamic cond
-    # predicate) still cross this boundary and remain errors if they depend on a runtime
-    # tangent.
+    # Optional structural routing (for example a partially resolved gather) does
+    # not create a concrete-input requirement. Genuine planning requirements
+    # (for example a dynamic cond predicate) still cross this boundary and remain
+    # errors if they depend on a runtime tangent.
     concrete: set[int] = set(primal.concrete_inputs)
     for child_index in jvp.concrete_inputs:
         binding = bindings[child_index]
@@ -381,7 +353,6 @@ def _analyze_linear_solve(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
-    routing_scope: RoutingScope,
 ) -> NestedPlan:
     """Analyze all executable custom-linear-solve callbacks.
 
@@ -423,7 +394,7 @@ def _analyze_linear_solve(
         # still traversed so captured concrete requirements are propagated.
         # The runtime vector is unavailable during planning, so solution demand
         # must not be converted into a concrete callback-output requirement.
-        body = analyze(child.jaxpr, routing_scope=routing_scope)
+        body = analyze(child.jaxpr)
         for i in body.concrete_inputs:
             binding = bindings[i]
             if binding.outer_input_index is not None:
@@ -444,7 +415,6 @@ def _analyze_call(
     *,
     semantics: CallAnalysisSemantics,
     concrete_outputs: frozenset[int],
-    routing_scope: RoutingScope,
 ) -> NestedPlan:
     target = semantics.target(eqn)
     nested = normalize_nested_jaxpr(target.body)
@@ -470,7 +440,6 @@ def _analyze_call(
     body = analyze(
         nested.jaxpr,
         concrete_outputs=concrete_outputs,
-        routing_scope=routing_scope,
     )
     concrete_inputs = frozenset(
         spec.outer_input_index(child_index, outer_arity=len(eqn.invars))
@@ -489,7 +458,6 @@ def _analyze_cond(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
-    routing_scope: RoutingScope,
 ) -> NestedPlan:
     branches_raw = eqn.params.get("branches")
     if branches_raw is None:
@@ -518,7 +486,6 @@ def _analyze_cond(
         analyze(
             b.jaxpr,
             concrete_outputs=concrete_outputs,
-            routing_scope=routing_scope,
         )
         for b in branches
     )
@@ -542,7 +509,6 @@ def _analyze_scan(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
-    routing_scope: RoutingScope,
 ) -> NestedPlan:
     nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
 
@@ -566,7 +532,6 @@ def _analyze_scan(
             num_consts,
             length,
             reverse,
-            routing_scope=routing_scope,
         )
 
     body = nested.jaxpr
@@ -612,7 +577,6 @@ def _analyze_scan(
     if length == 0:
         body_plan = analyze(
             body,
-            routing_scope=routing_scope,
         )
 
         required_outer_inputs = {
@@ -649,7 +613,6 @@ def _analyze_scan(
         body_plan = analyze(
             body,
             concrete_outputs=required_body_outputs,
-            routing_scope=routing_scope,
         )
 
         required_carry_inputs = {
@@ -693,7 +656,6 @@ def _analyze_carry_free_scan(
     num_consts: int,
     length: int,
     reverse: bool,
-    routing_scope: RoutingScope,
 ) -> NestedPlan:
     body = nested.jaxpr
 
@@ -711,7 +673,6 @@ def _analyze_carry_free_scan(
     body_plan = analyze(
         body,
         concrete_outputs=concrete_outputs,
-        routing_scope=routing_scope,
     )
 
     # Body and outer input ordering coincide:

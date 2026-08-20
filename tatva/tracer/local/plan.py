@@ -57,10 +57,9 @@ from tatva.tracer.core.route_fragments import RouteFragment, RouteRequest
 from tatva.tracer.core.routes import Route
 from tatva.tracer.core.semantics import (
     RouteLocalizationContext,
-    RoutingScope,
     no_route_fragment,
 )
-from tatva.tracer.local.demand import Demand, TensorDemand
+from tatva.tracer.local.demand import TensorDemand
 from tatva.tracer.local.layout import TensorLayout
 from tatva.tracer.local.liveness import JaxprDemandTrace
 from tatva.tracer.local.localize import (
@@ -102,7 +101,6 @@ class LocalEqnPlan:
     eqn: JaxprEqn
     input_layouts: tuple[TensorLayout | None, ...]
     output_layouts: tuple[TensorLayout | None, ...]
-    routing_scope: RoutingScope
     route: RoutePlan | None
     nested: LocalNestedPlan | None
 
@@ -154,10 +152,8 @@ def _atom_layout(
     return layouts.get(atom)
 
 
-def _demand_layout(demand: Demand) -> TensorLayout | None:
-    if demand is None:
-        return None
-    return TensorLayout.from_demand(demand)
+def _demand_layout(demand) -> TensorLayout | None:
+    return None if demand is None else TensorLayout.from_demand(demand)
 
 
 def _rank_route_plan(
@@ -168,15 +164,6 @@ def _rank_route_plan(
     input_layouts: tuple[TensorLayout | None, ...],
     output_layouts: tuple[TensorLayout | None, ...],
 ) -> RoutePlan | None:
-    if frame.plan.routing_scope is RoutingScope.INVOCATION_INTERNAL:
-        semantics = SEMANTICS.get_ordinary(eqn_plan.eqn.primitive)
-        if semantics.routing is not None and semantics.routing.internal is None:
-            raise RuntimeError(
-                f"{eqn_plan.eqn.primitive.name} has no internal routing semantics"
-            )
-
-        return None
-
     semantics = SEMANTICS.get_ordinary(eqn_plan.eqn.primitive)
     routing = semantics.routing
     if routing is None:
@@ -198,7 +185,7 @@ def _rank_route_plan(
     )
     fragment = (
         None
-        if routing.fragment is no_route_fragment
+        if routing.fragment is no_route_fragment and routing.partial_fragment is None
         else resolver.route_fragment(frame, eqn_plan, RouteRequest(rows))
     )
     route: Route | RouteFragment | None = fragment
@@ -489,12 +476,15 @@ def _build_rank_local_jaxpr_plan(
 
     for eqn_plan in plan.eqns:
         eqn = eqn_plan.eqn
-        input_demands = trace.eqn_input_demands.get(eqn_plan.index)
-        if input_demands is None:
+        edge_demands = trace.eqn_input_demands.get(eqn_plan.index)
+        if edge_demands is None:
             inputs = tuple(None for _ in eqn.invars)
         else:
-            inputs = tuple(_demand_layout(demand) for demand in input_demands)
-
+            if len(edge_demands) != len(eqn.invars):
+                raise RuntimeError(
+                    f"equation {eqn_plan.index} input-demand arity mismatch"
+                )
+            inputs = tuple(_demand_layout(demand) for demand in edge_demands)
         outputs = tuple(_atom_layout(atom, layouts) for atom in eqn.outvars)
         has_nested = eqn_plan.index in trace.nested
 
@@ -527,7 +517,6 @@ def _build_rank_local_jaxpr_plan(
                 eqn,
                 inputs,
                 outputs,
-                routing_scope=frame.plan.routing_scope,
                 route=route,
                 nested=nested_plan,
             )
@@ -613,8 +602,6 @@ def pending_routes(
         frame: LocalJaxprPlan,
     ) -> None:
         for eqn in frame.eqns:
-            if eqn.route is not None and not eqn.route.is_localized:
-                result.append(eqn)
             if eqn.route is not None and not eqn.route.is_localized:
                 result.append(eqn)
             nested = eqn.nested

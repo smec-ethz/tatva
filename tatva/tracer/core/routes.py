@@ -484,20 +484,31 @@ def _compute_scatter_target_rows(
         index_batch_coords = update_coords[:, batch_update_dims]
 
         if index_vector_size:
-            key = tuple(
-                index_batch_coords[:, i] for i in range(index_batch_coords.shape[1])
-            )
+            if len(indices_shape) == 1:
+                # One index vector shared by every update-window element.
+                #
+                # This is produced by expressions such as
+                #
+                #     x.at[..., i, j].set(values)
+                #
+                # where leading dimensions of `values` are update-window
+                # dimensions, not scatter-index batch dimensions.
+                index_vectors = np.broadcast_to(
+                    np.asarray(indices, dtype=np.int64).reshape(1, index_vector_size),
+                    (n_updates, index_vector_size),
+                )
+            else:
+                key = tuple(
+                    index_batch_coords[:, i] for i in range(index_batch_coords.shape[1])
+                )
 
-            index_vectors = np.asarray(indices[key], dtype=np.int64)
-            index_vectors = index_vectors.reshape(
-                n_updates,
-                index_vector_size,
-            )
+                index_vectors = np.asarray(indices[key], dtype=np.int64)
+                index_vectors = index_vectors.reshape(
+                    n_updates,
+                    index_vector_size,
+                )
         else:
-            index_vectors = np.empty(
-                (n_updates, 0),
-                dtype=np.int64,
-            )
+            index_vectors = np.empty((n_updates, 0), dtype=np.int64)
 
         # Construct operand coordinate for each update scalar.
         target_coords = np.zeros(
@@ -550,4 +561,5 @@ def _compute_scatter_target_rows(
         return target_rows
 
     except (ValueError, IndexError, TypeError):
+        # TODO: looks fishy, necessary?
         return None
