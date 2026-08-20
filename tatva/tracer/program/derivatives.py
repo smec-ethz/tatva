@@ -76,13 +76,14 @@ from tatva.tracer.core.nested import (
     dispatch_nested,
 )
 from tatva.tracer.core.registry import SEMANTICS
-from tatva.tracer.core.semantics import RuleContext
+from tatva.tracer.core.semantics import RoutingScope, RuleContext
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.program.materialize import (
     JaxprInstance,
     ResolvedEqn,
 )
+from tatva.tracer.rules import internal_routing
 
 
 @dataclass(frozen=True)
@@ -212,6 +213,7 @@ def _trace_jaxpr(
                 input_deps=input_eqn_deps,
                 acc=acc,
                 n_dofs=n_dofs,
+                routing_scope=instance.plan.routing_scope,
             )
 
         else:
@@ -341,9 +343,18 @@ def _trace_ordinary_eqn(
     input_deps: tuple[DependencySet, ...],
     acc: HessianAccumulator,
     n_dofs: int,
+    routing_scope: RoutingScope,
 ) -> tuple[DependencySet, ...]:
     eqn = resolved.plan.eqn
-    rule = SEMANTICS.get_ordinary(eqn.primitive)
+    semantics = SEMANTICS.get_ordinary(eqn.primitive)
+
+    if (
+        routing_scope is RoutingScope.INVOCATION_INTERNAL
+        and semantics.routing is not None
+    ):
+        return internal_routing.dependencies(
+            eqn, input_deps, semantics.routing, n_dofs=n_dofs, acc=acc
+        )
 
     ctx = RuleContext(
         eqn=eqn,
@@ -352,13 +363,10 @@ def _trace_ordinary_eqn(
         n_dofs=n_dofs,
     )
 
-    prepared = rule.derivatives.prepare(ctx)
+    prepared = semantics.derivatives.prepare(ctx)
+    semantics.derivatives.hessian(ctx, prepared, acc)
 
-    # Primitive-local second-order structure.
-    rule.derivatives.hessian(ctx, prepared, acc)
-
-    # Structural Jacobian propagation.
-    return rule.derivatives.dependencies(ctx, prepared)
+    return semantics.derivatives.dependencies(ctx, prepared)
 
 
 def _leading_axis_dependency(

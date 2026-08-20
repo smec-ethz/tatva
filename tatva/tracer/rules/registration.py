@@ -27,14 +27,18 @@ from tatva.tracer.core.semantics import (
     CondAnalysisSemantics,
     CustomJvpAnalysisSemantics,
     DerivativeRule,
+    InternalRoutingSemantics,
     LinearSolveAnalysisSemantics,
     LocalizationSemantics,
     NestedOperationSemantics,
     OperationSemantics,
+    RouteRequirement,
+    RoutingSemantics,
     ScanAnalysisSemantics,
     no_hessian,
 )
 from tatva.tracer.lowering import rules as lowerings
+from tatva.tracer.rules import internal_routing
 from tatva.tracer.rules.elementwise import (
     ELEMENTWISE_BINARY_BASIC,
     ELEMENTWISE_NARY_BASIC,
@@ -455,10 +459,15 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 dependencies=gather_scatter.gather_dependencies,
                 hessian=no_hessian,
             ),
-            concrete_inputs=lambda _eqn: (1,),
-            route=resolve_gather_route,
-            route_fragment=resolve_gather_route_fragment,
-            route_concrete_demands=gather_route_concrete_demands,
+            routing=RoutingSemantics(
+                inputs=lambda _eqn: (1,),
+                resolve=resolve_gather_route,
+                fragment=resolve_gather_route_fragment,
+                concrete_demands=gather_route_concrete_demands,
+                internal=InternalRoutingSemantics(
+                    batching=internal_routing.gather_batching,
+                ),
+            ),
             demand=gather_scatter.gather_demand,
             tagged_demand=tagged.gather,
             localization=LocalizationSemantics(
@@ -493,10 +502,17 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 indexing.select_n_dependencies,
                 no_hessian,
             ),
-            optional_route_inputs=lambda _eqn: (0,),
-            route=resolve_select_n_route,
-            route_fragment=resolve_select_n_route_fragment,
-            route_concrete_demands=select_route_concrete_demands,
+            routing=RoutingSemantics(
+                inputs=lambda _eqn: (0,),
+                resolve=resolve_select_n_route,
+                fragment=resolve_select_n_route_fragment,
+                concrete_demands=select_route_concrete_demands,
+                requirement=RouteRequirement.OPTIONAL,
+                internal=InternalRoutingSemantics(
+                    batching=internal_routing.select_n_batching,
+                    lowering=lowerings.lower_select_n,
+                ),
+            ),
             demand=indexing.select_n_demand,
             tagged_demand=tagged.select_n,
             regional_concrete=concrete_rules.regional_bind(
@@ -518,9 +534,15 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 dependencies=indexing.dynamic_slice_dependencies,
                 hessian=no_hessian,
             ),
-            concrete_inputs=lambda eqn: tuple(range(1, len(eqn.invars))),
-            route=resolve_dynamic_slice_route,
-            route_fragment=resolve_dynamic_slice_route_fragment,
+            routing=RoutingSemantics(
+                inputs=lambda eqn: tuple(range(1, len(eqn.invars))),
+                resolve=resolve_dynamic_slice_route,
+                fragment=resolve_dynamic_slice_route_fragment,
+                internal=InternalRoutingSemantics(
+                    batching=internal_routing.dynamic_slice_batching,
+                    lowering=lowerings.lower_internal_dynamic_slice,
+                ),
+            ),
             demand=indexing.dynamic_slice_demand,
             tagged_demand=tagged.dynamic_slice,
             localization=LocalizationSemantics(
@@ -537,9 +559,14 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
                 indexing.dynamic_update_slice_dependencies,
                 no_hessian,
             ),
-            concrete_inputs=lambda eqn: tuple(range(2, len(eqn.invars))),
-            route=resolve_dynamic_update_slice_route,
-            route_fragment=resolve_dynamic_update_slice_route_fragment,
+            routing=RoutingSemantics(
+                inputs=lambda eqn: tuple(range(2, len(eqn.invars))),
+                resolve=resolve_dynamic_update_slice_route,
+                fragment=resolve_dynamic_update_slice_route_fragment,
+                internal=InternalRoutingSemantics(
+                    batching=internal_routing.dynamic_update_slice_batching,
+                ),
+            ),
             demand=indexing.dynamic_update_slice_demand,
             tagged_demand=tagged.dynamic_update_slice,
         ),
@@ -576,6 +603,15 @@ def _register_reduction_rules(reg: PrimitiveRegistry) -> None:
     reg.register(lax.reduce_and_p, reductions.ZERO_REDUCTION)
     reg.register(lax.reduce_or_p, reductions.ZERO_REDUCTION)
 
+    reg.register(
+        lax.cumprod_p,
+        OperationSemantics(
+            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
+            demand=reductions.cumulative_demand,
+            tagged_demand=tagged.cumulative,
+        ),
+    )
+
 
 def _register_dot_general(reg: PrimitiveRegistry) -> None:
     reg.register(
@@ -593,18 +629,6 @@ def _register_dot_general(reg: PrimitiveRegistry) -> None:
 
 
 def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
-    # Cumprod is intentionally supported only as an invocation-local opaque
-    # expression. Requiring its full operand makes direct local binding and
-    # JAX's own AD rule correct, while its structural dependency and Hessian
-    # patterns remain conservative.
-    reg.register(
-        lax.cumprod_p,
-        OperationSemantics(
-            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
-            demand=opaque.full_operand_demand,
-        ),
-    )
-
     # Register rules for opaque primitives if needed
     for primitive in (
         lax.linalg.cholesky_p,

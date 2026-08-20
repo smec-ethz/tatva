@@ -23,9 +23,11 @@ from tatva.tracer.core.routes import (
 from tatva.tracer.core.semantics import (
     DemandContext,
     DerivativeRule,
+    InternalRoutingSemantics,
     LocalizationSemantics,
     OperationSemantics,
     RouteLocalizationContext,
+    RoutingSemantics,
     no_hessian,
 )
 from tatva.tracer.helpers import _shape_of
@@ -37,7 +39,7 @@ from tatva.tracer.local.localize import (
     localize_scatter_route,
 )
 from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
-from tatva.tracer.rules import tagged
+from tatva.tracer.rules import internal_routing, tagged
 
 if TYPE_CHECKING:
     from tatva.tracer.core.semantics import RuleContext
@@ -323,6 +325,14 @@ def localize_scatter(
 SCATTER_LOCALIZATION = LocalizationSemantics(
     localize_route=localize_scatter,
 )
+_SCATTER_ROUTING = RoutingSemantics(
+    inputs=scatter_concrete_inputs,
+    resolve=resolve_scatter_route,
+    fragment=resolve_scatter_route_fragment,
+    internal=InternalRoutingSemantics(
+        batching=internal_routing.scatter_batching,
+    ),
+)
 
 
 SCATTER_BASIC = OperationSemantics(
@@ -331,9 +341,7 @@ SCATTER_BASIC = OperationSemantics(
         dependencies=scatter_accumulate_dependencies,
         hessian=no_hessian,
     ),
-    concrete_inputs=scatter_concrete_inputs,
-    route=resolve_scatter_route,
-    route_fragment=resolve_scatter_route_fragment,
+    routing=_SCATTER_ROUTING,
     demand=scatter_set_demand,
     tagged_demand=tagged.scatter_set,
     localization=SCATTER_LOCALIZATION,
@@ -345,9 +353,7 @@ SCATTER_ACCUMULATE = OperationSemantics(
         dependencies=scatter_accumulate_dependencies,
         hessian=no_hessian,
     ),
-    concrete_inputs=scatter_concrete_inputs,
-    route=resolve_scatter_route,
-    route_fragment=resolve_scatter_route_fragment,
+    routing=_SCATTER_ROUTING,
     demand=scatter_accumulate_demand,
     tagged_demand=tagged.scatter_accumulate,
     localization=SCATTER_LOCALIZATION,
@@ -358,9 +364,7 @@ SCATTER_MUL = OperationSemantics(
         dependencies=scatter_accumulate_dependencies,
         hessian=scatter_mul_hessian,
     ),
-    concrete_inputs=scatter_concrete_inputs,
-    route=resolve_scatter_route,
-    route_fragment=resolve_scatter_route_fragment,
+    routing=_SCATTER_ROUTING,
     demand=scatter_accumulate_demand,
     tagged_demand=tagged.scatter_accumulate,
     localization=SCATTER_LOCALIZATION,

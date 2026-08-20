@@ -287,6 +287,29 @@ def lower_dynamic_slice(
     return (jnp.reshape(result, route.output_shape),)
 
 
+def lower_internal_dynamic_slice(
+    ctx: LoweringContext,
+) -> tuple[Any | None, ...]:
+    eqn = ctx.plan.eqn
+
+    if any(value is None for value in ctx.inputs):
+        raise RuntimeError(
+            "invocation-internal dynamic_slice requires all runtime inputs"
+        )
+
+    output_layout = _single_output_layout(ctx)
+
+    params = dict(eqn.params)
+    params["slice_sizes"] = tuple(output_layout.local_shape)
+
+    result = eqn.primitive.bind(
+        *ctx.inputs,
+        **params,
+    )
+
+    return (result,)
+
+
 def lower_slice(
     ctx: LoweringContext,
 ) -> tuple[Any, ...]:

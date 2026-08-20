@@ -72,6 +72,7 @@ from tatva.tracer.core.nested import (
 )
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.routes import Route
+from tatva.tracer.core.semantics import RouteRequirement, RoutingScope
 from tatva.tracer.program.analysis import (
     EqnPlan,
     JaxprPlan,
@@ -81,6 +82,7 @@ from tatva.tracer.program.concrete_resolver import (
     ConcreteEnv,
     ConcreteValue,
     DynamicRoutingError,
+    RouteResolutionError,
     evaluate_concrete_eqn,
 )
 
@@ -203,31 +205,30 @@ def _seed_env(
 def _materialize_ordinary(
     eqn_plan: EqnPlan,
     env: ConcreteEnv,
+    *,
+    routing_scope: RoutingScope,
 ) -> ResolvedEqn:
     eqn = eqn_plan.eqn
+    semantics = SEMANTICS.get_ordinary(eqn.primitive)
+    route = None
 
-    rule = SEMANTICS.get_ordinary(eqn.primitive)
+    if routing_scope is RoutingScope.STRUCTURAL and semantics.routing is not None:
+        routing = semantics.routing
+        for input_index in routing.inputs(eqn):
+            if routing.requirement is RouteRequirement.REQUIRED:
+                _required_value(
+                    env,
+                    eqn.invars[input_index],
+                    context=f"routing for {eqn.primitive.name}",
+                )
 
-    # First ensure all values explicitly needed for routing exist.
-    for input_index in rule.concrete_inputs(eqn):
-        if input_index < 0 or input_index >= len(eqn.invars):
-            raise ValueError(
-                f"{eqn.primitive.name}.concrete_inputs returned "
-                f"invalid index {input_index}"
+        route = routing.resolve(eqn, env)
+
+        if route is None and routing.requirement is RouteRequirement.REQUIRED:
+            raise RouteResolutionError(
+                f"{eqn.primitive.name} requires a structural route"
             )
 
-        _required_value(
-            env,
-            eqn.invars[input_index],
-            context=f"routing for {eqn.primitive.name}",
-        )
-
-    # Best-effort route specialization: optional inputs never become concrete
-    # requirements for materialization.
-    route = rule.route(eqn, env)
-
-    # Execute this equation only if something downstream requires
-    # one of its outputs concretely.
     if eqn_plan.concrete_outputs:
         _execute_primitive(eqn, env)
 
@@ -446,7 +447,9 @@ def _materialize_map(
         )
         body_inputs = tuple(const_values) + step_values
         body = _materialize_jaxpr(
-            map_plan.body, input_values=body_inputs, const_values=map_plan.consts
+            map_plan.body,
+            input_values=body_inputs,
+            const_values=map_plan.consts,
         )
         iterations.append(IndexedChild(index=logical_index, body=body))
 
@@ -548,7 +551,11 @@ def _materialize_linear_solve(
             outer_index = binding.outer_input_index
             inputs.append(None if outer_index is None else outer[outer_index])
         children.append(
-            _materialize_jaxpr(body, input_values=tuple(inputs), const_values=consts)
+            _materialize_jaxpr(
+                body,
+                input_values=tuple(inputs),
+                const_values=consts,
+            )
         )
     if eqn_plan.concrete_outputs:
         raise DynamicRoutingError(
@@ -562,11 +569,13 @@ def _materialize_linear_solve(
 def _materialize_eqn(
     eqn_plan: EqnPlan,
     env: ConcreteEnv,
+    *,
+    routing_scope: RoutingScope,
 ) -> ResolvedEqn:
     nested = eqn_plan.nested
 
     if nested is None:
-        return _materialize_ordinary(eqn_plan, env)
+        return _materialize_ordinary(eqn_plan, env, routing_scope=routing_scope)
 
     return dispatch_nested_spec(
         nested.spec, _MaterializeNestedHandler(eqn_plan, nested, env)
@@ -580,23 +589,51 @@ class _MaterializeNestedHandler:
     env: ConcreteEnv
 
     def call(self, spec: CallSpec) -> ResolvedEqn:
-        return _materialize_call(self.eqn_plan, self.nested_plan, spec, self.env)
+        return _materialize_call(
+            self.eqn_plan,
+            self.nested_plan,
+            spec,
+            self.env,
+        )
 
     def custom_jvp(self, spec: CustomJvpSpec) -> ResolvedEqn:
-        return _materialize_custom_jvp(self.eqn_plan, self.nested_plan, spec, self.env)
+        return _materialize_custom_jvp(
+            self.eqn_plan,
+            self.nested_plan,
+            spec,
+            self.env,
+        )
 
     def map(self, spec: MapSpec) -> ResolvedEqn:
-        return _materialize_map(self.eqn_plan, self.nested_plan, spec, self.env)
+        return _materialize_map(
+            self.eqn_plan,
+            self.nested_plan,
+            spec,
+            self.env,
+        )
 
     def scan(self, spec: ScanSpec) -> ResolvedEqn:
-        return _materialize_scan(self.eqn_plan, self.nested_plan, spec, self.env)
+        return _materialize_scan(
+            self.eqn_plan,
+            self.nested_plan,
+            spec,
+            self.env,
+        )
 
     def cond(self, spec: CondSpec) -> ResolvedEqn:
-        return _materialize_cond(self.eqn_plan, self.nested_plan, spec, self.env)
+        return _materialize_cond(
+            self.eqn_plan,
+            self.nested_plan,
+            spec,
+            self.env,
+        )
 
     def linear_solve(self, spec: LinearSolveSpec) -> ResolvedEqn:
         return _materialize_linear_solve(
-            self.eqn_plan, self.nested_plan, spec, self.env
+            self.eqn_plan,
+            self.nested_plan,
+            spec,
+            self.env,
         )
 
 
@@ -615,7 +652,7 @@ def _materialize_jaxpr(
     resolved_eqns: list[ResolvedEqn] = []
 
     for eqn_plan in plan.eqns:
-        resolved = _materialize_eqn(eqn_plan, env)
+        resolved = _materialize_eqn(eqn_plan, env, routing_scope=plan.routing_scope)
         resolved_eqns.append(resolved)
 
     output_values = tuple(

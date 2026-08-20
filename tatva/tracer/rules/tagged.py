@@ -266,6 +266,7 @@ def gather(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     output = _output(ctx)
     if output is None:
         return tuple(None for _ in ctx.eqn.invars)
+
     if isinstance(ctx.route, GatherRouteFragment):
         source_rows = _fragment_values(
             ctx.route.output_rows, ctx.route.source_rows, output.rows
@@ -274,6 +275,7 @@ def gather(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
         source_rows = ctx.route.source_rows[output.rows]
     else:
         raise TypeError("tagged gather demand requires a gather route")
+
     result: list[Tagged] = [None] * len(ctx.eqn.invars)
     result[0] = output.mapped(_shape_of(ctx.eqn.invars[0]), source_rows)
     return tuple(result)
@@ -453,6 +455,79 @@ def reduction(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
             input_shape,
             _rows(coords, input_shape),
             np.repeat(output.blocks, expansion),
+        ),
+    )
+
+
+def cumulative(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
+    """Tagged demand for cumulative operations such as cumprod.
+
+    Each demanded output entry depends only on entries with identical
+    coordinates on all non-cumulative axes, and on a prefix/suffix along the
+    cumulative axis.
+    """
+
+    output = _output(ctx)
+    if output is None:
+        return (None,)
+
+    input_shape = _shape_of(ctx.eqn.invars[0])
+
+    if input_shape != output.shape:
+        raise ValueError(
+            f"{ctx.eqn.primitive.name}: cumulative input/output shape mismatch: "
+            f"{input_shape} != {output.shape}"
+        )
+
+    ndim = len(input_shape)
+    axis = int(ctx.eqn.params["axis"])
+    if axis < 0:
+        axis += ndim
+
+    if axis < 0 or axis >= ndim:
+        raise ValueError(
+            f"{ctx.eqn.primitive.name}: invalid cumulative axis "
+            f"{ctx.eqn.params['axis']} for shape {input_shape}"
+        )
+
+    reverse = bool(ctx.eqn.params.get("reverse", False))
+
+    # One coordinate tuple per tagged output pair.  Distinct blocks for the
+    # same output row remain distinct throughout the expansion.
+    output_coords = _coords(output.rows, output.shape)
+    axis_coords = output_coords[:, axis]
+
+    if reverse:
+        # y[..., i, ...] depends on x[..., i:, ...].
+        counts = input_shape[axis] - axis_coords
+    else:
+        # y[..., i, ...] depends on x[..., :i+1, ...].
+        counts = axis_coords + 1
+
+    counts = np.asarray(counts, dtype=np.int64)
+
+    total = int(counts.sum())
+    if total == 0:
+        return (None,)
+
+    # Repeat the non-cumulative coordinates once for every contributing input
+    # position.
+    input_coords = np.repeat(output_coords, counts, axis=0)
+
+    # Position within each expanded prefix/suffix.
+    group_starts = np.repeat(np.cumsum(counts, dtype=np.int64) - counts, counts)
+    offsets = np.arange(total, dtype=np.int64) - group_starts
+
+    if reverse:
+        input_coords[:, axis] = np.repeat(axis_coords, counts) + offsets
+    else:
+        input_coords[:, axis] = offsets
+
+    return (
+        TaggedDemand(
+            input_shape,
+            _rows(input_coords, input_shape),
+            np.repeat(output.blocks, counts),
         ),
     )
 

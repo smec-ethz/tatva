@@ -47,6 +47,8 @@ from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import RouteRequest
 from tatva.tracer.core.semantics import (
     DemandContext,
+    RoutingScope,
+    conservative_demand,
     no_route_fragment,
 )
 from tatva.tracer.helpers import _shape_of
@@ -65,6 +67,7 @@ from tatva.tracer.program.contributions import ValueRef
 from tatva.tracer.program.materialize import (
     JaxprInstance,
 )
+from tatva.tracer.rules import internal_routing
 
 
 def _expand_batch_demand(
@@ -146,6 +149,7 @@ type NestedDemandTrace = AnyNestedInvocation[JaxprDemandTrace]
 @dataclass(frozen=True)
 class JaxprDemandTrace:
     demands: dict[Var, TensorDemand]
+    eqn_input_demands: dict[int, tuple[Demand, ...]]
     input_demands: tuple[Demand, ...]
     nested: dict[int, NestedDemandTrace]
 
@@ -210,18 +214,43 @@ def _backprop_plan_ordinary(
 ) -> tuple[Demand, ...]:
     eqn = eqn_plan.eqn
     semantics = SEMANTICS.get_ordinary(eqn.primitive)
-    fragment = None
-    demanded_rows = [demand.rows() for demand in output_demands if demand is not None]
-    if demanded_rows and semantics.route_fragment is not no_route_fragment:
-        fragment = resolver.route_fragment(
-            frame,
-            eqn_plan,
-            RouteRequest(np.unique(np.concatenate(demanded_rows))),
+    routing = semantics.routing
+
+    if routing is None:
+        # ordinary non-routing primitive
+        if (
+            frame.plan.routing_scope is RoutingScope.INVOCATION_INTERNAL
+            and semantics.demand is conservative_demand
+        ):
+            raise NotImplementedError(
+                f"{eqn.primitive.name} uses conservative full-tensor demand "
+                "inside an invocation-internal scope; add an explicit "
+                "batch-preserving demand rule"
+            )
+
+        result = semantics.demand(
+            DemandContext(eqn=eqn, output_demands=output_demands, route=None)
         )
-    route = resolver.route(frame, eqn_plan) if fragment is None else fragment
-    result = semantics.demand(
-        DemandContext(eqn=eqn, output_demands=output_demands, route=route)
-    )
+
+    elif frame.plan.routing_scope is RoutingScope.INVOCATION_INTERNAL:
+        result = internal_routing.demand(eqn, output_demands, routing)
+
+    else:
+        fragment = None
+        demanded_rows = [
+            demand.rows() for demand in output_demands if demand is not None
+        ]
+        if demanded_rows and routing.fragment is not no_route_fragment:
+            fragment = resolver.route_fragment(
+                frame,
+                eqn_plan,
+                RouteRequest(np.unique(np.concatenate(demanded_rows))),
+            )
+        route = resolver.route(frame, eqn_plan) if fragment is None else fragment
+        result = semantics.demand(
+            DemandContext(eqn=eqn, output_demands=output_demands, route=route)
+        )
+
     if len(result) != len(eqn.invars):
         raise RuntimeError(
             f"demand rule for {eqn.primitive.name!r} returned {len(result)} "
@@ -637,6 +666,7 @@ def _backprop_plan_jaxpr(
         raise ValueError("demand traversal plan does not match concrete frame")
 
     jaxpr = plan.jaxpr
+    eqn_input_demands: dict[int, tuple[Demand, ...]] = {}
     demands: dict[Var, TensorDemand] = {}
     nested_traces: dict[int, NestedDemandTrace] = {}
 
@@ -681,11 +711,14 @@ def _backprop_plan_jaxpr(
             )
             nested_traces[eqn_plan.index] = nested_trace
 
+        eqn_input_demands[eqn_plan.index] = inputs
+
         for atom, demand in zip(eqn.invars, inputs, strict=True):
             _add_demand(demands, atom, demand)
 
     return JaxprDemandTrace(
         demands=demands,
+        eqn_input_demands=eqn_input_demands,
         input_demands=tuple(demands.get(var) for var in jaxpr.invars),
         nested=nested_traces,
     )

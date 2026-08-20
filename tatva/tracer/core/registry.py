@@ -82,7 +82,11 @@ class PrimitiveRegistry:
                 continue
 
             localizer = rule.localization.localize_route
-            if localizer is not None and rule.route is no_route:
+            if (
+                localizer is not None
+                and rule.routing is not None
+                and rule.routing.resolve is no_route
+            ):
                 errors.append(
                     f"{primitive.name}: route localizer is registered "
                     "but the operation has no route resolver"
@@ -105,7 +109,7 @@ class PrimitiveRegistry:
                 )
             )
 
-        has_route = rule.route is not no_route
+        has_route = rule.routing and rule.routing.resolve is not no_route
 
         if not has_route:
             route_localization = "n/a"
@@ -165,7 +169,7 @@ class PrimitiveRegistry:
                 )
                 continue
 
-            has_route = rule.route is not no_route
+            has_route = rule.routing and rule.routing.resolve is not no_route
             has_localizer = rule.localization.localize_route is not None
 
             rows.append(
