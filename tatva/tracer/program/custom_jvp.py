@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from jax.extend.core import Jaxpr, JaxprEqn
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,7 +19,10 @@ class CustomJvpParameters:
 def extract_custom_jvp_parameters(eqn: JaxprEqn) -> CustomJvpParameters:
     """Materialize the supported all-tangents-present JVP program."""
     params = eqn.params
-    primal = params.get("call_jaxpr")
+    primal_param = params.get("call_jaxpr")
+    primal = (
+        primal_param.jaxpr if isinstance(primal_param, ClosedJaxpr) else primal_param
+    )
     jvp_fun = params.get("jvp_jaxpr_fun")
     num_consts = params.get("num_consts")
     symbolic_zeros = params.get("symbolic_zeros")
@@ -52,25 +55,40 @@ def extract_custom_jvp_parameters(eqn: JaxprEqn) -> CustomJvpParameters:
     if not isinstance(jvp, Jaxpr):
         raise NotImplementedError("custom_jvp callback did not produce a Jaxpr")
 
+    jvp_consts = tuple(jvp_consts)
+    # JAX 0.11 trace_to_jaxpr_dynamic returns callback constants
+    # separately. Until their values are attached, their variables are
+    # exposed as leading jvp.invars rather than jvp.constvars.
+    if jvp_consts:
+        if jvp.consts:
+            if len(jvp.consts) != len(jvp_consts):
+                raise NotImplementedError(
+                    "custom_jvp JVP callback returned inconsistent constants"
+                )
+        else:
+            if len(jvp_consts) > len(jvp.invars):
+                raise NotImplementedError(
+                    "custom_jvp JVP callback returned more constants than leading Jaxpr inputs"
+                )
+
+            jvp = jvp.with_consts(jvp_consts)
+
     if jvp.effects:
         raise NotImplementedError("effectful custom_jvp JVP callbacks are unsupported")
 
-    # jax's staged custom-jvp ABI deliberately excludes the lifted primal constants from
-    # the jvp callback. The callback receives its own captures as leading inputs,
-    # followed by dynamic primals and their nonzero tangents. Normalize those leading
-    # inputs into constvars for Tatva's nested-program representation.
-    num_jvp_consts = len(jvp_consts)
-    expected_inputs = num_jvp_consts + 2 * dynamic_arity
+    # JAX keeps JVP captures in jvp.constvars and returns their values
+    # separately as jvp_consts. They are not leading explicit JVP inputs.
+    expected_inputs = 2 * dynamic_arity
     if len(jvp.invars) != expected_inputs:
         raise NotImplementedError(
             "custom_jvp JVP input ABI is unsupported: expected "
             f"{expected_inputs} inputs, got {len(jvp.invars)}"
         )
-    jvp = jvp.replace(
-        constvars=(*jvp.constvars, *jvp.invars[:num_jvp_consts]),
-        invars=jvp.invars[num_jvp_consts:],
-        consts=jvp_consts,
-    )
+    if len(jvp.constvars) != len(jvp_consts):
+        raise NotImplementedError(
+            "custom_jvp JVP capture ABI is unsupported: expected "
+            f"{len(jvp.constvars)} constants, got {len(jvp_consts)}"
+        )
 
     zeros = tuple(bool(value) for value in output_zeros)
     if len(zeros) != len(eqn.outvars):

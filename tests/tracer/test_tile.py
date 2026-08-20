@@ -42,14 +42,10 @@ def test_partitioned_tile_uses_local_shapes_and_preserves_value_and_gradient():
         compiled = local.compile()
 
         value += float(compiled(*inputs.args, **inputs.kwargs))
-        local_gradient = np.asarray(
-            jax.grad(compiled)(*inputs.args, **inputs.kwargs)
-        )
+        local_gradient = np.asarray(jax.grad(compiled)(*inputs.args, **inputs.kwargs))
         gradient[local.dofs.storage.global_dofs] += local_gradient
 
-        tile = next(
-            eqn for eqn in local._plan.eqns if eqn.primitive_name == "tile"
-        )
+        tile = next(eqn for eqn in local._plan.eqns if eqn.primitive_name == "tile")
         assert tile.input_layouts[0] is not None
         assert tile.output_layouts[0] is not None
         assert tile.input_layouts[0].local_shape == (2, 2)

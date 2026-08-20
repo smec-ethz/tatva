@@ -72,7 +72,7 @@ from tatva.tracer.core.nested import (
 )
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.routes import Route
-from tatva.tracer.core.semantics import RouteRequirement, RoutingScope
+from tatva.tracer.core.semantics import RouteRequirement
 from tatva.tracer.program.analysis import (
     EqnPlan,
     JaxprPlan,
@@ -205,14 +205,12 @@ def _seed_env(
 def _materialize_ordinary(
     eqn_plan: EqnPlan,
     env: ConcreteEnv,
-    *,
-    routing_scope: RoutingScope,
 ) -> ResolvedEqn:
     eqn = eqn_plan.eqn
     semantics = SEMANTICS.get_ordinary(eqn.primitive)
     route = None
 
-    if routing_scope is RoutingScope.STRUCTURAL and semantics.routing is not None:
+    if semantics.routing is not None:
         routing = semantics.routing
         for input_index in routing.inputs(eqn):
             if routing.requirement is RouteRequirement.REQUIRED:
@@ -569,13 +567,11 @@ def _materialize_linear_solve(
 def _materialize_eqn(
     eqn_plan: EqnPlan,
     env: ConcreteEnv,
-    *,
-    routing_scope: RoutingScope,
 ) -> ResolvedEqn:
     nested = eqn_plan.nested
 
     if nested is None:
-        return _materialize_ordinary(eqn_plan, env, routing_scope=routing_scope)
+        return _materialize_ordinary(eqn_plan, env)
 
     return dispatch_nested_spec(
         nested.spec, _MaterializeNestedHandler(eqn_plan, nested, env)
@@ -652,7 +648,7 @@ def _materialize_jaxpr(
     resolved_eqns: list[ResolvedEqn] = []
 
     for eqn_plan in plan.eqns:
-        resolved = _materialize_eqn(eqn_plan, env, routing_scope=plan.routing_scope)
+        resolved = _materialize_eqn(eqn_plan, env)
         resolved_eqns.append(resolved)
 
     output_values = tuple(

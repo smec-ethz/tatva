@@ -10,6 +10,7 @@ from jax.extend.core import JaxprEqn
 from numpy.typing import NDArray
 
 from tatva.tracer.core.route_fragments import (
+    GatherEnvelopeFragment,
     GatherRouteFragment,
     ScatterRouteFragment,
     resolve_scatter_route_fragment,
@@ -23,7 +24,6 @@ from tatva.tracer.core.routes import (
 from tatva.tracer.core.semantics import (
     DemandContext,
     DerivativeRule,
-    InternalRoutingSemantics,
     LocalizationSemantics,
     OperationSemantics,
     RouteLocalizationContext,
@@ -31,49 +31,56 @@ from tatva.tracer.core.semantics import (
     no_hessian,
 )
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.local.demand import Demand, TensorDemand
+from tatva.tracer.local.demand import Demand, TensorDemand, merge_demands
 from tatva.tracer.local.localize import (
+    LocalDynamicGatherRoute,
     LocalGatherRoute,
     LocalScatterRoute,
     localize_gather_route,
     localize_scatter_route,
 )
 from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
-from tatva.tracer.rules import internal_routing, tagged
+from tatva.tracer.rules import tagged
 
 if TYPE_CHECKING:
     from tatva.tracer.core.semantics import RuleContext
 
 
-def prepare_gather(ctx: RuleContext) -> GatherRoute:
+def prepare_gather(ctx: RuleContext) -> GatherRoute | None:
     if len(ctx.input_deps) != 2 or len(ctx.eqn.outvars) != 1:
         raise ValueError(
             f"{ctx.eqn.primitive.name} must have two inputs and one output; got "
             f"{len(ctx.input_deps)} inputs and {len(ctx.eqn.outvars)} outputs"
         )
 
-    if not isinstance(ctx.route, GatherRoute):
-        raise TypeError(f"gather route was not resolved for equation {ctx.eqn}")
+    if ctx.route is not None and not isinstance(ctx.route, GatherRoute):
+        raise TypeError(f"invalid gather route for equation {ctx.eqn}")
 
     return ctx.route
 
 
 def gather_dependencies(
     ctx: RuleContext,
-    prepared: GatherRoute,
+    prepared: GatherRoute | None,
 ) -> tuple[DependencySet, ...]:
     source = ctx.input_deps[0]
     output_shape = _shape_of(ctx.eqn.outvars[0])
-
     n_output = int(np.prod(output_shape))
+
+    if prepared is None:
+        union = source.total_union().csr
+        output_csr = (
+            sps.csr_matrix((0, ctx.n_dofs), dtype=bool)
+            if n_output == 0
+            else sps.vstack([union] * n_output, format="csr")
+        )
+        return (DependencySet(output_csr, output_shape),)
 
     if prepared.source_rows.shape != (n_output,):
         raise ValueError(
             f"gather route has {prepared.source_rows.size} rows, expected {n_output}"
         )
-
     valid = prepared.source_rows >= 0
-
     selection = sps.csr_matrix(
         (
             np.ones(np.count_nonzero(valid), dtype=bool),
@@ -82,22 +89,40 @@ def gather_dependencies(
         shape=(n_output, source.csr.shape[0]),
         dtype=bool,
     )
-
-    output_csr = (selection @ source.csr).astype(bool).tocsr()
-
-    return (DependencySet(output_csr, output_shape),)
+    return (DependencySet((selection @ source.csr).astype(bool).tocsr(), output_shape),)
 
 
-def gather_demand(
-    ctx: DemandContext,
-) -> tuple[Demand, ...]:
+def _envelope_positions(
+    route: GatherEnvelopeFragment, output_rows: NDArray[np.int64]
+) -> NDArray[np.int64]:
+    positions = np.searchsorted(route.output_rows, output_rows)
+    if np.any(positions >= route.output_rows.size) or np.any(
+        route.output_rows[positions] != output_rows
+    ):
+        raise ValueError("gather envelope does not cover demanded rows")
+    return positions
+
+
+def gather_demand(ctx: DemandContext) -> tuple[Demand, ...]:
     output = ctx.output_demands[0]
     if output is None:
         return tuple(None for _ in ctx.eqn.invars)
-
     route = ctx.route
-
     output_rows = output.rows()
+    result: list[Demand] = [None] * len(ctx.eqn.invars)
+
+    if isinstance(route, GatherEnvelopeFragment):
+        positions = _envelope_positions(route, output_rows)
+        operand: Demand = None
+        for position in positions:
+            operand = merge_demands(operand, route.source_demands[position])
+        result[0] = operand
+        index_rows = route.index_rows[positions].ravel()
+        result[1] = TensorDemand.from_rows_hull(
+            _shape_of(ctx.eqn.invars[1]), index_rows
+        )
+        return tuple(result)
+
     if isinstance(route, GatherRouteFragment):
         positions = np.searchsorted(route.output_rows, output_rows)
         if np.any(positions >= route.output_rows.size) or np.any(
@@ -105,24 +130,15 @@ def gather_demand(
         ):
             raise ValueError("gather fragment does not cover demanded rows")
         source_rows = route.source_rows[positions]
-
     elif isinstance(route, GatherRoute):
         source_rows = route.source_rows[output_rows]
-
     else:
         raise TypeError("gather demand requires a gather route")
 
-    source_rows = source_rows[source_rows >= 0]
-
-    result: list[Demand] = [None] * len(ctx.eqn.invars)
     result[0] = TensorDemand.from_rows_hull(
-        _shape_of(ctx.eqn.invars[0]),
-        source_rows,
+        _shape_of(ctx.eqn.invars[0]), source_rows[source_rows >= 0]
     )
-
-    # indices are compiled into the route
     result[1] = None
-
     return tuple(result)
 
 
@@ -262,33 +278,37 @@ def scatter_accumulate_demand(
 
 def localize_gather(
     ctx: RouteLocalizationContext,
-) -> LocalGatherRoute:
+) -> LocalGatherRoute | LocalDynamicGatherRoute:
     route = ctx.route
-
-    if not isinstance(route, (GatherRoute, GatherRouteFragment)):
+    if not isinstance(
+        route, (GatherRoute, GatherRouteFragment, GatherEnvelopeFragment)
+    ):
         raise TypeError(
             f"{ctx.eqn.primitive.name} route localization requires a gather route"
         )
-
-    if not ctx.input_layouts:
-        raise RuntimeError("gather has no operand")
-
+    if len(ctx.input_layouts) < 2:
+        raise RuntimeError("gather expected operand and indices")
     operand_layout = ctx.input_layouts[0]
-
     if operand_layout is None:
         raise RuntimeError("live gather output has no live operand layout")
-
-    if len(ctx.output_layouts) != 1:
-        raise RuntimeError("gather expected one output")
-
-    output_layout = ctx.output_layouts[0]
-    if output_layout is None:
+    if len(ctx.output_layouts) != 1 or ctx.output_layouts[0] is None:
         raise RuntimeError("attempted to localize dead gather")
+    output_layout = ctx.output_layouts[0]
+    assert output_layout is not None
 
+    if isinstance(route, GatherEnvelopeFragment):
+        index_layout = ctx.input_layouts[1]
+        if index_layout is None:
+            raise RuntimeError("runtime-local gather has no live index layout")
+        return LocalDynamicGatherRoute.from_fragment(
+            ctx.eqn,
+            route,
+            operand_layout=operand_layout,
+            index_layout=index_layout,
+            output_layout=output_layout,
+        )
     return localize_gather_route(
-        route,
-        operand_layout=operand_layout,
-        output_layout=output_layout,
+        route, operand_layout=operand_layout, output_layout=output_layout
     )
 
 
@@ -325,14 +345,6 @@ def localize_scatter(
 SCATTER_LOCALIZATION = LocalizationSemantics(
     localize_route=localize_scatter,
 )
-_SCATTER_ROUTING = RoutingSemantics(
-    inputs=scatter_concrete_inputs,
-    resolve=resolve_scatter_route,
-    fragment=resolve_scatter_route_fragment,
-    internal=InternalRoutingSemantics(
-        batching=internal_routing.scatter_batching,
-    ),
-)
 
 
 SCATTER_BASIC = OperationSemantics(
@@ -341,7 +353,11 @@ SCATTER_BASIC = OperationSemantics(
         dependencies=scatter_accumulate_dependencies,
         hessian=no_hessian,
     ),
-    routing=_SCATTER_ROUTING,
+    routing=RoutingSemantics(
+        inputs=scatter_concrete_inputs,
+        resolve=resolve_scatter_route,
+        fragment=resolve_scatter_route_fragment,
+    ),
     demand=scatter_set_demand,
     tagged_demand=tagged.scatter_set,
     localization=SCATTER_LOCALIZATION,
@@ -353,7 +369,11 @@ SCATTER_ACCUMULATE = OperationSemantics(
         dependencies=scatter_accumulate_dependencies,
         hessian=no_hessian,
     ),
-    routing=_SCATTER_ROUTING,
+    routing=RoutingSemantics(
+        inputs=scatter_concrete_inputs,
+        resolve=resolve_scatter_route,
+        fragment=resolve_scatter_route_fragment,
+    ),
     demand=scatter_accumulate_demand,
     tagged_demand=tagged.scatter_accumulate,
     localization=SCATTER_LOCALIZATION,
@@ -364,7 +384,11 @@ SCATTER_MUL = OperationSemantics(
         dependencies=scatter_accumulate_dependencies,
         hessian=scatter_mul_hessian,
     ),
-    routing=_SCATTER_ROUTING,
+    routing=RoutingSemantics(
+        inputs=scatter_concrete_inputs,
+        resolve=resolve_scatter_route,
+        fragment=resolve_scatter_route_fragment,
+    ),
     demand=scatter_accumulate_demand,
     tagged_demand=tagged.scatter_accumulate,
     localization=SCATTER_LOCALIZATION,

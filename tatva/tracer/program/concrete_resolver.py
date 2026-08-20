@@ -28,15 +28,15 @@ from tatva.tracer.core.semantics import (
     DemandContext,
     FullConcrete,
     RegionalConcrete,
+    PartialRouteContext,
     RegionalConcreteContext,
     RouteRequirement,
-    RoutingScope,
     RoutingSemantics,
     UnsupportedConcrete,
     no_route_fragment,
 )
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.local.demand import TensorDemand, axis_indices
+from tatva.tracer.local.demand import Demand, TensorDemand, axis_indices
 from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 
 
@@ -389,9 +389,11 @@ class ConcreteResolver:
             if isinstance(input_atom, Literal):
                 inputs.append(input_atom.val)
             elif input_demand is None:
-                raise ConcreteEvaluationError(
-                    f"{eqn.primitive.name} omitted demand for non-literal input"
-                )
+                if not decision.allow_dead_inputs:
+                    raise ConcreteEvaluationError(
+                        f"{eqn.primitive.name} omitted demand for non-literal input"
+                    )
+                inputs.append(None)
             else:
                 input_region = self.value(frame, input_atom, input_demand)
                 assert isinstance(input_region, ConcreteRegion)
@@ -526,12 +528,6 @@ class ConcreteResolver:
     def _routing_semantics(
         self, frame: ConcreteFrame, eqn_plan: EqnPlan
     ) -> RoutingSemantics | None:
-        if frame.plan.routing_scope is not RoutingScope.STRUCTURAL:
-            raise RuntimeError(
-                "structural route resolution requested inside "
-                f"{frame.plan.routing_scope.name} frame: {eqn_plan.eqn.primitive.name}, frame={frame.path}"
-            )
-
         semantics = SEMANTICS.get_ordinary(eqn_plan.eqn.primitive)
         return semantics.routing
 
@@ -560,7 +556,41 @@ class ConcreteResolver:
         request: RouteRequest,
     ) -> RouteFragment | None:
         routing = self._routing_semantics(frame, eqn_plan)
-        if routing is None or routing.fragment is no_route_fragment:
+        if routing is None:
+            return None
+
+        if routing.partial_fragment is not None:
+            eqn = eqn_plan.eqn
+
+            def read_input(input_index: int, demand: Demand):
+                if input_index < 0 or input_index >= len(eqn.invars):
+                    raise ValueError(
+                        f"{eqn.primitive.name}: invalid partial-route input "
+                        f"index {input_index}"
+                    )
+                atom = eqn.invars[input_index]
+                if isinstance(atom, Literal):
+                    return atom.val
+                if not isinstance(atom, Var):
+                    raise TypeError(f"unsupported JAXPR atom {type(atom)!r}")
+                try:
+                    if demand is None:
+                        return self._full_value(frame, atom)
+                    return self.value(frame, atom, demand)
+                except DynamicRoutingError:
+                    return None
+
+            fragment = routing.partial_fragment(
+                PartialRouteContext(
+                    eqn=eqn,
+                    request=request,
+                    read_input=read_input,
+                )
+            )
+            if fragment is not None:
+                return fragment
+
+        if routing.fragment is no_route_fragment:
             return None
 
         concrete = self._route_inputs(

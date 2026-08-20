@@ -19,6 +19,7 @@ from tatva.tracer.local.demand import (
     TensorDemand,
     _FullAxis,
     _RangeAxis,
+    axis_indices,
 )
 from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
 from tatva.tracer.rules import tagged
@@ -180,39 +181,31 @@ def reduce_sum_demand(
     )
 
 
-def cumulative_demand(
-    ctx: DemandContext,
-) -> tuple[Demand, ...]:
+def cumulative_demand(ctx: DemandContext) -> tuple[Demand, ...]:
     output = ctx.output_demands[0]
     if output is None:
         return (None,)
-
     input_shape = _shape_of(ctx.eqn.invars[0])
     if input_shape != output.shape:
         raise ValueError(
             f"{ctx.eqn.primitive.name}: cumulative input/output shape mismatch"
         )
-
     axis = int(ctx.eqn.params["axis"])
     if axis < 0:
         axis += len(input_shape)
-
+    selected = axis_indices(output.axes[axis], extent=input_shape[axis])
     reverse = bool(ctx.eqn.params.get("reverse", False))
-    selected = output.selected_indices(axis)
-
-    if reverse:
-        start = int(selected.min())
-        stop = input_shape[axis]
-    else:
-        start = 0
-        stop = int(selected.max()) + 1
-
+    start, stop = (
+        (int(selected.min()), input_shape[axis])
+        if reverse
+        else (0, int(selected.max()) + 1)
+    )
     axes = list(output.axes)
-    if start == 0 and stop == input_shape[axis]:
-        axes[axis] = _FullAxis()
-    else:
-        axes[axis] = _RangeAxis(start, stop)
-
+    axes[axis] = (
+        _FullAxis()
+        if start == 0 and stop == input_shape[axis]
+        else _RangeAxis(start, stop)
+    )
     return (TensorDemand.from_axes(input_shape, tuple(axes)),)
 
 
@@ -233,13 +226,8 @@ REDUCE_PROD = OperationSemantics(
     ),
     tagged_demand=tagged.reduction,
 )
-
 ZERO_REDUCTION = OperationSemantics(
-    DerivativeRule(
-        prepare_reduction,
-        zero_reduction_dependencies,
-        no_hessian,
-    ),
+    DerivativeRule(prepare_reduction, zero_reduction_dependencies, no_hessian),
     demand=reduce_sum_demand,
     tagged_demand=tagged.reduction,
 )

@@ -40,6 +40,7 @@ type RegionalConcreteEvaluator = Callable[
 class RegionalConcrete:
     backpropagate: DemandRule
     evaluate: RegionalConcreteEvaluator
+    allow_dead_inputs: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +214,22 @@ type RouteFragmentRule = Callable[
     [JaxprEqn, ConcreteEnv, RouteRequest], RouteFragment | None
 ]
 type RouteConcreteDemandRule = Callable[[JaxprEqn, RouteRequest], tuple[Demand, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class PartialRouteContext:
+    """Demand-scoped access used by partially resolvable route rules.
+
+    ``read_input`` returns the requested concrete region when planning can
+    prove it without evaluating unavailable runtime values, otherwise ``None``.
+    """
+
+    eqn: JaxprEqn
+    request: RouteRequest
+    read_input: Callable[[int, Demand], object | None]
+
+
+type PartialRouteFragmentRule = Callable[[PartialRouteContext], RouteFragment | None]
 type DemandRule = Callable[[DemandContext], tuple[Demand, ...]]
 type TaggedDemandRule = Callable[[TaggedDemandContext], tuple[Tagged, ...]]
 
@@ -247,49 +264,14 @@ class DerivativeRule[T]:
     hessian: HessianRule[T]
 
 
-class RoutingScope(Enum):
-    STRUCTURAL = auto()
-    INVOCATION_INTERNAL = auto()
-
-
 class RouteRequirement(Enum):
     REQUIRED = auto()
     OPTIONAL = auto()
 
 
 @dataclass(frozen=True, slots=True)
-class InternalRoutingBatching:
-    """Axes that may be compacted without changing runtime routing semantics.
-
-    output_axes[k] is logical batch dimension k on the routed output.
-
-    input_axes[i][k] is the corresponding axis on input i, or None when
-    input i does not carry that batch dimension.
-
-    All non-batch axes are invocation-local payload and must remain complete.
-    """
-
-    output_axes: tuple[int, ...]
-    input_axes: tuple[tuple[int | None, ...], ...]
-
-
-type InternalRoutingBatchingRule = Callable[
-    [JaxprEqn],
-    InternalRoutingBatching,
-]
-
-
-@dataclass(frozen=True, slots=True)
-class InternalRoutingSemantics:
-    batching: InternalRoutingBatchingRule
-    lowering: LoweringRule | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class RoutingSemantics:
     """Structural routing semantics for an ordinary primitive.
-
-    These semantics are meaningful only in RoutingScope.STRUCTURAL.
 
     inputs:
         Inputs needed to specialize the primitive into global scalar-row
@@ -309,8 +291,8 @@ class RoutingSemantics:
     resolve: RouteRule
     fragment: RouteFragmentRule = no_route_fragment
     concrete_demands: RouteConcreteDemandRule | None = None
+    partial_fragment: PartialRouteFragmentRule | None = None
     requirement: RouteRequirement = RouteRequirement.REQUIRED
-    internal: InternalRoutingSemantics | None = None
 
 
 @dataclass(frozen=True, slots=True)

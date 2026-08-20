@@ -310,9 +310,7 @@ def test_partitioned_custom_jvp_preserves_first_order_ad():
         gradient = np.asarray(jax.grad(compiled)(*inputs.args, **inputs.kwargs))
         gradient_sum[local.dofs.storage.global_dofs] += gradient
 
-    np.testing.assert_allclose(
-        sum(values), energy_custom_jvp(u), rtol=1e-6, atol=1e-6
-    )
+    np.testing.assert_allclose(sum(values), energy_custom_jvp(u), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(
         gradient_sum, _expected_gradient(u), rtol=1e-6, atol=1e-6
     )
