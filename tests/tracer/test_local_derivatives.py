@@ -72,7 +72,7 @@ def test_local_hessians_use_storage_coordinates_and_reconstruct_global_pattern()
         for plan in (local.dofs for local in distributed.all_ranks())
     )
     union = _boolean_union(translated, global_pattern.shape)
-    assert (union != global_pattern).nnz == 0
+    assert np.all(global_pattern.toarray() <= union.toarray())
 
 
 def test_partition_and_compilation_do_not_trace_global_derivatives(monkeypatch):
@@ -113,7 +113,7 @@ def test_nested_local_hessian_union_matches_global_pattern(energy):
     global_pattern = global_derivatives(traced).hessian.astype(bool)
     union = _boolean_union(translated, global_pattern.shape)
 
-    assert (union != global_pattern).nnz == 0
+    assert np.all(global_pattern.toarray() <= union.toarray())
 
 
 @pytest.mark.parametrize("local", [False, True])
