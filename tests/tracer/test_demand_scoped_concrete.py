@@ -149,7 +149,7 @@ def test_strict_fallback_rejects_a_global_concrete_operation():
         )
 
 
-def test_arbitrary_scatter_reports_its_full_index_requirement():
+def test_arbitrary_scatter_reads_only_the_requested_index_region():
     def objective(dofs, indices):
         scattered = jnp.zeros_like(dofs).at[indices].add(dofs[: indices.size])
         return jnp.sum(scattered)
@@ -166,11 +166,8 @@ def test_arbitrary_scatter_reports_its_full_index_requirement():
     )
 
     assert fragment is not None
-    assert resolver.stats.full_escalations == 1
-    escalation = resolver.escalations[0]
-    assert escalation.primitive == "scatter-add"
-    assert escalation.promoted_entries == 4
-    assert "complete concrete input" in escalation.reason
+    assert resolver.stats.full_escalations == 0
+    assert resolver.escalations == []
 
 
 def test_full_fallback_inside_map_is_scoped_to_one_iteration():

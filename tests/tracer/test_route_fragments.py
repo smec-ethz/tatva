@@ -88,7 +88,9 @@ def test_registered_gather_fragment_scales_with_requested_rows(monkeypatch):
     monkeypatch.setattr(routes.np, "arange", reject_full_output_arange)
 
     semantics = SEMANTICS.get_ordinary(eqn.primitive)
-    fragment = semantics.route_fragment(
+    routing = semantics.routing
+    assert routing is not None
+    fragment = routing.fragment(
         eqn,
         concrete,
         RouteRequest(requested),

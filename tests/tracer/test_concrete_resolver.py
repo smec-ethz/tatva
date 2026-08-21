@@ -15,7 +15,6 @@ from tatva.tracer.program.concrete_resolver import (
     ConcreteResolver,
     DynamicRoutingError,
 )
-from tatva.tracer.program.materialize import materialize_plan
 
 
 def _setup(fn, *args):
@@ -49,7 +48,7 @@ def _assert_fragment_equal(actual, expected):
             assert lhs == rhs
 
 
-def test_recursive_value_matches_legacy_materialization_and_is_memoized():
+def test_recursive_value_evaluates_computed_concrete_data_and_is_memoized():
     def objective(dofs, raw_indices):
         indices = (2 * raw_indices + 1).astype(jnp.int32)
         return jnp.sum(dofs[indices])
@@ -65,9 +64,8 @@ def test_recursive_value_matches_legacy_materialization_and_is_memoized():
 
     value = resolver.value(frame, index_atom)
     evaluated = resolver.stats.evaluated_eqns
-    legacy = materialize_plan(captured.closed_jaxpr, captured.flat_args, plan)
-
-    np.testing.assert_array_equal(value, legacy.concrete[index_atom])
+    expected = (2 * np.asarray(args[1]) + 1).reshape(-1, 1)
+    np.testing.assert_array_equal(value, expected)
     assert evaluated > 0
     assert resolver.value(frame, index_atom) is value
     assert resolver.stats.evaluated_eqns == evaluated
@@ -149,31 +147,38 @@ def test_route_fragments_resolve_without_a_jaxpr_instance(
     # This is the new Phase-4 path: no JaxprInstance is involved.
     actual = resolver.route_fragment(frame, eqn_plan, request)
 
-    # The legacy materialized environment remains the correctness oracle.
-    legacy = materialize_plan(captured.closed_jaxpr, captured.flat_args, plan)
+    # Evaluate exactly the concrete inputs required by the complete route rule.
     semantics = SEMANTICS.get_ordinary(eqn_plan.eqn.primitive)
-    expected = semantics.route_fragment(eqn_plan.eqn, legacy.concrete, request)
+    routing = semantics.routing
+    assert routing is not None, (
+        f"Missing routing semantics for {eqn_plan.eqn.primitive}"
+    )
+    concrete = {
+        eqn_plan.eqn.invars[index]: resolver.value(frame, eqn_plan.eqn.invars[index])
+        for index in routing.inputs(eqn_plan.eqn)
+        if isinstance(eqn_plan.eqn.invars[index], Var)
+    }
+    expected = routing.fragment(eqn_plan.eqn, concrete, request)
     _assert_fragment_equal(actual, expected)
 
 
-def test_transitive_dof_dependent_routing_is_rejected():
+def test_transitive_dof_dependent_gather_returns_dynamic_envelope():
     def objective(dofs):
         index = jnp.asarray(dofs[0], dtype=jnp.int32).reshape(1)
         return jnp.sum(dofs[index])
 
-    captured, plan, resolver, frame = _setup(objective, jnp.arange(8.0))
+    _captured, plan, resolver, frame = _setup(objective, jnp.arange(8.0))
     gather = _eqn(plan, "gather")
 
     with pytest.raises(DynamicRoutingError, match="DOF input"):
         resolver.value(frame, plan.jaxpr.invars[0])
-    with pytest.raises(DynamicRoutingError, match="DOF input"):
-        resolver.route_fragment(
-            frame,
-            gather,
-            RouteRequest(np.array([0], dtype=np.int64)),
-        )
-    with pytest.raises(DynamicRoutingError, match="input 0"):
-        materialize_plan(captured.closed_jaxpr, captured.flat_args, plan)
+    fragment = resolver.route_fragment(
+        frame,
+        gather,
+        RouteRequest(np.array([0], dtype=np.int64)),
+    )
+    assert fragment is not None
+    assert fragment.dynamic_components == (0,)
 
 
 def test_fallback_multi_output_equation_is_evaluated_once():
@@ -247,7 +252,7 @@ def test_nested_concrete_producer_is_resolved_lazily():
     assert resolver.stats.frames_released == 1
 
 
-def test_frame_and_equation_ownership_are_validated():
+def test_structurally_equivalent_equation_plan_is_accepted():
     captured, _plan, resolver, frame = _setup(
         _gather_program,
         jnp.arange(8.0),
@@ -256,9 +261,9 @@ def test_frame_and_equation_ownership_are_validated():
     other_plan = analyze(captured.jaxpr)
     foreign_eqn = _eqn(other_plan, "gather")
 
-    with pytest.raises(ValueError, match="does not belong"):
-        resolver.route_fragment(
-            frame,
-            foreign_eqn,
-            RouteRequest(np.array([0], dtype=np.int64)),
-        )
+    fragment = resolver.route_fragment(
+        frame,
+        foreign_eqn,
+        RouteRequest(np.array([0], dtype=np.int64)),
+    )
+    assert fragment is not None
