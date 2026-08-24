@@ -336,6 +336,42 @@ def resolve_partial_gather_route_fragment(ctx) -> RouteFragment | None:
     ):
         fixed_starts[:, operand_axis] = batch_coords[:, index_axis]
 
+    if not dynamic_components:
+        valid_mask = np.ones(n_output, dtype=bool)
+        target_coords = np.empty((n_output, len(operand_shape)), dtype=np.int64)
+
+        for axis, extent in enumerate(operand_shape):
+            offset = offsets[:, axis]
+            start = fixed_starts[:, axis]
+            upper = upper_starts[axis]
+
+            if mode_name in {"CLIP", "PROMISE_IN_BOUNDS"}:
+                start = np.clip(start, 0, upper)
+            elif axis in start_index_map:
+                valid_mask &= (start >= 0) & (start <= upper)
+
+            coord = start + offset
+            valid_mask &= (coord >= 0) & (coord < extent)
+            target_coords[:, axis] = coord
+
+        source_rows = np.full(n_output, -1, dtype=np.int64)
+        if np.any(valid_mask):
+            if operand_shape:
+                source_rows[valid_mask] = np.ravel_multi_index(
+                    tuple(
+                        target_coords[valid_mask, a] for a in range(len(operand_shape))
+                    ),
+                    operand_shape,
+                )
+            else:
+                source_rows[valid_mask] = 0
+
+        return GatherRouteFragment(
+            output_rows=output_rows,
+            source_rows=source_rows,
+            index_rows=index_rows,
+        )
+
     dynamic_axes = frozenset(start_index_map[c] for c in dynamic_components)
     source_demands: list[TensorDemand | None] = []
 
@@ -367,21 +403,6 @@ def resolve_partial_gather_route_fragment(ctx) -> RouteFragment | None:
 
         source_demands.append(
             TensorDemand.from_axes(operand_shape, tuple(axes)) if valid else None
-        )
-
-    if not dynamic_components:
-        source_rows = np.full(n_output, -1, dtype=np.int64)
-        for row, demand in enumerate(source_demands):
-            if demand is None:
-                continue
-            rows = demand.rows()
-            if rows.size != 1:
-                raise RuntimeError("exact gather source envelope is not scalar")
-            source_rows[row] = rows[0]
-        return GatherRouteFragment(
-            output_rows=output_rows,
-            source_rows=source_rows,
-            index_rows=index_rows,
         )
 
     return GatherEnvelopeFragment(
