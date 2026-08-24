@@ -67,8 +67,10 @@ from tatva.tracer.core.nested import (
     CustomJvpInvocation,
     CustomJvpSpec,
     IndexedChild,
+    IterationSelection,
     LinearSolveInvocation,
     LinearSolveSpec,
+    MapInvocation,
     MapSpec,
     RepeatedInvocation,
     ScanSpec,
@@ -958,11 +960,15 @@ def _trace_map(
     outputs = tuple(
         _stack_leading_axis_dependencies(steps) for steps in steps_by_output
     )
-    invocation = RepeatedInvocation.from_spec(eqn_plan.index, spec, ())
+    invocation = MapInvocation(
+        eqn_index=eqn_plan.index,
+        indices=IterationSelection(length=spec.length),
+        body=template.trace,
+    )
 
     return (
         outputs,
-        NestedDerivativeTrace(invocation=invocation, template=template.trace),
+        NestedDerivativeTrace(invocation=invocation, template=None),
     )
 
 

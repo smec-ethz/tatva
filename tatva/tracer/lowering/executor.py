@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +24,7 @@ from tatva.tracer.core.nested import (
     CustomJvpContext,
     LinearSolveContext,
     MapContext,
+    MapInvocation,
     RepeatedInvocation,
     ScanContext,
     ScanSpec,
@@ -487,23 +488,35 @@ def _lower_map(
     context: MapContext[LocalJaxprPlan],
     inputs: tuple[Any | None, ...],
 ) -> tuple[Any | None, ...]:
-    template = _common_repeated_template(context.invocation)
-    if template is None:
-        raise NotImplementedError(
-            "localized map iterations have different body layouts/routes; "
-            "a single lax.map template cannot represent them"
+    invocation = context.invocation
+
+    if isinstance(invocation, MapInvocation):
+        template = cast(LocalJaxprPlan, invocation.body)
+        logical_indices = np.fromiter(
+            invocation.indices,
+            dtype=np.int64,
+            count=invocation.indices.count,
         )
 
-    logical_indices = np.asarray(
-        [
-            child.logical_index
-            for child in context.invocation.children()
-            if child.logical_index is not None
-        ],
-        dtype=np.int64,
-    )
-    n_iterations = logical_indices.size
+    else:
+        # Existing exact fallback.
+        template = _common_repeated_template(invocation)
+        if template is None:
+            raise NotImplementedError(
+                "localized map iterations have different body layouts/routes; "
+                "heterogeneous map lowering is not yet implemented"
+            )
 
+        logical_indices = np.asarray(
+            [
+                child.logical_index
+                for child in invocation.children()
+                if child.logical_index is not None
+            ],
+            dtype=np.int64,
+        )
+
+    n_iterations = logical_indices.size
     if n_iterations == 0:
         raise RuntimeError("live local map has no surviving iterations")
 
@@ -1421,14 +1434,27 @@ def _same_nested_local_plan(
         return False
     if lhs.spec != rhs.spec:
         return False
+
     left = lhs.invocation
     right = rhs.invocation
+
     if left.kind is not right.kind or left.eqn_index != right.eqn_index:
         return False
+
+    if isinstance(left, MapInvocation) or isinstance(right, MapInvocation):
+        if not isinstance(left, MapInvocation) or not isinstance(right, MapInvocation):
+            return False
+        return left.indices == right.indices and _same_local_jaxpr_plan(
+            left.body,  # ty: ignore[invalid-argument-type]
+            right.body,  # ty: ignore[invalid-argument-type]
+        )
+
     left_children = left.children()
     right_children = right.children()
+
     if len(left_children) != len(right_children):
         return False
+
     return all(
         a.logical_index == b.logical_index
         and _same_local_jaxpr_plan(a.payload, b.payload)

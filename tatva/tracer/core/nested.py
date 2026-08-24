@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Protocol, cast
@@ -327,9 +327,118 @@ class CustomJvpInvocation[T]:
         return CustomJvpInvocation(self.eqn_index, fn(primal), fn(jvp))
 
 
+@dataclass(frozen=True, slots=True)
+class IterationSelection:
+    length: int
+    selected: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.length < 0:
+            raise ValueError("iteration selection length must be non-negative")
+        if self.selected is None:
+            return
+
+        indices = tuple(int(index) for index in self.selected)
+        if indices != tuple(sorted(set(indices))):
+            raise ValueError(
+                "iteration selection indices must be unique and sorted logically"
+            )
+        if indices and (indices[0] < 0 or indices[-1] >= self.length):
+            raise IndexError("iteration selection outside map extent")
+
+        if len(indices) == self.length and all(
+            index == position for position, index in enumerate(indices)
+        ):
+            object.__setattr__(self, "selected", None)
+        else:
+            object.__setattr__(self, "selected", indices)
+
+    @classmethod
+    def from_indices(
+        cls,
+        length: int,
+        indices: Iterable[int],
+    ) -> IterationSelection:
+        return cls(length, tuple(sorted(int(i) for i in indices)))
+
+    @property
+    def count(self) -> int:
+        return self.length if self.selected is None else len(self.selected)
+
+    @property
+    def is_all(self) -> bool:
+        return self.selected is None
+
+    def __iter__(self) -> Iterator[int]:
+        if self.selected is None:
+            return iter(range(self.length))
+        return iter(self.selected)
+
+    def first(self) -> int:
+        if self.count == 0:
+            raise ValueError("empty iteration selection has no representative")
+        return 0 if self.selected is None else self.selected[0]
+
+    def contains(self, index: int) -> bool:
+        index = int(index)
+        if index < 0 or index >= self.length:
+            return False
+        if self.selected is None:
+            return True
+
+        return index in self.selected
+
+
+@dataclass(frozen=True)
+class MapInvocation[T]:
+    """One map body template applied to a compact logical-index selection."""
+
+    eqn_index: int
+    indices: IterationSelection
+    body: T
+
+    @property
+    def kind(self) -> NestedKind:
+        return NestedKind.MAP
+
+    def children(
+        self, order: TraversalOrder = TraversalOrder.EXECUTION
+    ) -> tuple[NestedChild[T], ...]:
+        del order
+        if self.indices.count == 0:
+            return ()
+        representative = self.indices.first()
+        return (
+            NestedChild(
+                payload=self.body,
+                frame_step=FrameStep(
+                    eqn_index=self.eqn_index,
+                    kind=NestedKind.MAP,
+                    iteration=representative,
+                ),
+                logical_index=representative,
+            ),
+        )
+
+    def child_at(self, step: FrameStep) -> T:
+        _validate_step(self.eqn_index, self.kind, step)
+        if step.iteration is None:
+            raise ValueError("map frame step requires an iteration")
+        if not self.indices.contains(step.iteration):
+            raise KeyError(f"map template does not cover iteration {step.iteration}")
+        return self.body
+
+    def map_children[U](self, fn: Callable[[NestedChild[T]], U]) -> MapInvocation[U]:
+        children = self.children()
+        if not children:
+            raise ValueError("cannot map an empty map invocation template")
+        return MapInvocation(self.eqn_index, self.indices, fn(children[0]))
+
+
 @dataclass(frozen=True)
 class RepeatedInvocation[T]:
-    """Map or scan children, stored once in actual execution order."""
+    """Repeated children stored once in actual execution order. Scan uses this
+    representation."""
 
     eqn_index: int
     kind: NestedKind
@@ -478,6 +587,7 @@ class LinearSolveInvocation[T]:
 type AnyNestedInvocation[T] = (
     CallInvocation[T]
     | CustomJvpInvocation[T]
+    | MapInvocation[T]
     | RepeatedInvocation[T]
     | CondInvocation[T]
     | LinearSolveInvocation[T]
@@ -499,7 +609,7 @@ class CustomJvpContext[T]:
 @dataclass(frozen=True)
 class MapContext[T]:
     spec: MapSpec
-    invocation: RepeatedInvocation[T]
+    invocation: MapInvocation[T] | RepeatedInvocation[T]
 
 
 @dataclass(frozen=True)
@@ -559,11 +669,16 @@ def dispatch_nested[T, R](
         return handler.custom_jvp(
             CustomJvpContext(spec, cast(CustomJvpInvocation[T], node))
         )
+    if isinstance(spec, MapSpec) and isinstance(node, MapInvocation):
+        return handler.map(MapContext(spec, cast(MapInvocation[T], node)))
     if (
         isinstance(spec, MapSpec)
         and isinstance(node, RepeatedInvocation)
         and node.kind is NestedKind.MAP
     ):
+        # Transitional path: liveness/incidence/derivative tracing may still
+        # materialize map iterations. Rank-local planning compresses these to
+        # MapInvocation before lowering.
         return handler.map(MapContext(spec, cast(RepeatedInvocation[T], node)))
     if (
         isinstance(spec, ScanSpec)
