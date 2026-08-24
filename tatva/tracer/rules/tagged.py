@@ -556,6 +556,31 @@ def _expand_batch(demand: TaggedDemand, shape: Shape) -> TaggedDemand:
     return TaggedDemand(shape, rows, np.repeat(demand.blocks, local_size))
 
 
+def _broadcast_batch_to_operand(
+    output: TaggedDemand,
+    *,
+    source_shape: Shape,
+    target_batch_shape: Shape,
+) -> TaggedDemand:
+    """Map output tags through right-aligned batch broadcasting."""
+    from tatva.tracer.rules.linalg import broadcast_batch_coordinates
+
+    source_batch_shape = source_shape[:-2]
+    output_item_size = int(math.prod(output.shape[len(target_batch_shape) :]))
+    source_item_size = int(math.prod(source_shape[len(source_batch_shape) :]))
+    output_batch_rows = output.rows // output_item_size
+    source_batch_rows = broadcast_batch_coordinates(
+        source_batch_shape, target_batch_shape
+    )[output_batch_rows]
+    offsets = np.arange(source_item_size, dtype=np.int64)
+    return TaggedDemand(
+        source_shape,
+        np.repeat(source_batch_rows * source_item_size, source_item_size)
+        + np.tile(offsets, output.nnz),
+        np.repeat(output.blocks, source_item_size),
+    )
+
+
 def triangular_solve(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     output = _output(ctx)
     if output is None:
@@ -563,16 +588,21 @@ def triangular_solve(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     a_shape = _shape_of(ctx.eqn.invars[0])
     b_shape = _shape_of(ctx.eqn.invars[1])
     out_shape = _shape_of(ctx.eqn.outvars[0])
-    if (
-        len(a_shape) < 2
-        or len(b_shape) < 2
-        or a_shape[:-2] != b_shape[:-2]
-        or b_shape[:-2] != out_shape[:-2]
-    ):
+    if len(a_shape) < 2 or len(b_shape) < 2 or len(out_shape) < 2:
         blocks = output.block_ids
         return TaggedDemand.full(a_shape, blocks), TaggedDemand.full(b_shape, blocks)
-    batch = _batch_projection(output, out_shape[:-2])
-    return _expand_batch(batch, a_shape), _expand_batch(batch, b_shape)
+    try:
+        return (
+            _broadcast_batch_to_operand(
+                output, source_shape=a_shape, target_batch_shape=out_shape[:-2]
+            ),
+            _broadcast_batch_to_operand(
+                output, source_shape=b_shape, target_batch_shape=out_shape[:-2]
+            ),
+        )
+    except ValueError:
+        blocks = output.block_ids
+        return TaggedDemand.full(a_shape, blocks), TaggedDemand.full(b_shape, blocks)
 
 
 def lu(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
