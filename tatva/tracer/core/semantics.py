@@ -176,7 +176,7 @@ def conservative_tagged_demand(
 class RuleContext:
     eqn: JaxprEqn
     input_deps: tuple[DependencySet, ...]
-    route: Route | None
+    route: Route | RouteFragment | None
     n_symbols: int
 
     @property

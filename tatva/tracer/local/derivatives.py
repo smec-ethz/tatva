@@ -21,6 +21,7 @@ from tatva.tracer.local.dof_plan import LocalDofPlan
 from tatva.tracer.local.layout import TensorLayout
 from tatva.tracer.lowering.executor import LocalExecutable
 from tatva.tracer.program.analysis import analyze
+from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.dependencies import DependencySet
 from tatva.tracer.program.derivatives import (
     DerivativeTrace,
@@ -28,7 +29,6 @@ from tatva.tracer.program.derivatives import (
     trace_seeded_derivatives,
 )
 from tatva.tracer.program.forms import FormSpec, SymbolicLayout
-from tatva.tracer.program.materialize import materialize_plan
 from tatva.tracer.support import require_registered_operations
 
 
@@ -292,7 +292,6 @@ def trace_local_derivatives(
     closed_jaxpr = jax.make_jaxpr(executable)(*examples)
     require_registered_operations(closed_jaxpr.jaxpr)
     plan = analyze(closed_jaxpr.jaxpr)
-    instance = materialize_plan(closed_jaxpr, examples, plan)
 
     symbolic_layout, input_deps, block_global_ids = _build_local_symbolic_seeds(
         form=form,
@@ -301,10 +300,14 @@ def trace_local_derivatives(
         global_inputs=global_inputs,
         jaxpr_input_shapes=tuple(_shape_of(var) for var in closed_jaxpr.jaxpr.invars),
     )
+
+    resolver, frame = ConcreteResolver.root(plan.jaxpr, examples, plan)
     derivative_trace = trace_seeded_derivatives(
-        instance,
-        symbolic_layout,
-        input_deps,
+        plan=plan,
+        frame=frame,
+        resolver=resolver,
+        symbolic_layout=symbolic_layout,
+        input_deps=input_deps,
     )
 
     return LocalDerivativeTrace(

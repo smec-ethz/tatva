@@ -546,6 +546,26 @@ class ConcreteResolver:
         semantics = SEMANTICS.get_ordinary(eqn_plan.eqn.primitive)
         return semantics.routing
 
+    def routed(
+        self,
+        frame: ConcreteFrame,
+        eqn_plan: EqnPlan,
+        request: RouteRequest | None = None,
+    ) -> Route | RouteFragment | None:
+        routing = self._routing_semantics(frame, eqn_plan)
+        if routing is None:
+            return None
+
+        if request is not None and (
+            routing.fragment is not no_route_fragment
+            or routing.partial_fragment is not None
+        ):
+            fragment = self.route_fragment(frame, eqn_plan, request)
+            if fragment is not None:
+                return fragment
+
+        return self.route(frame, eqn_plan)
+
     def route(self, frame: ConcreteFrame, eqn_plan: EqnPlan) -> Route | None:
         """Resolve an ordinary equation's complete structural route lazily."""
         routing = self._routing_semantics(frame, eqn_plan)

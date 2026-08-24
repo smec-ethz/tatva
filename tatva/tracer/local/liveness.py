@@ -34,7 +34,6 @@ from tatva.tracer.core.nested import (
     CustomJvpSpec,
     FrameStep,
     IndexedChild,
-    LinearSolveContext,
     LinearSolveInvocation,
     LinearSolveSpec,
     MapSpec,
@@ -47,7 +46,6 @@ from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import RouteRequest
 from tatva.tracer.core.semantics import (
     DemandContext,
-    no_route_fragment,
 )
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import (
@@ -62,9 +60,6 @@ from tatva.tracer.local.demand import (
 from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.contributions import ValueRef
-from tatva.tracer.program.materialize import (
-    JaxprInstance,
-)
 
 
 def _expand_batch_demand(
@@ -81,57 +76,6 @@ def _expand_batch_demand(
         shape,
         batch_demand.axes + tuple(_FullAxis() for _ in shape[batch_rank:]),
     )
-
-
-def _linear_solve_batch_demand(
-    context: LinearSolveContext[JaxprInstance],
-    output_demands: tuple[Demand, ...],
-) -> tuple[tuple[int, ...], TensorDemand] | None:
-    """Return the supported non-broadcasted matrix-solve batch demand.
-
-    We deliberately support the same layout as the LU and triangular-solve
-    rules: a non-empty leading batch prefix followed by two solve axes.
-    """
-    # The outer equation is obtained by the caller; callback validation lives
-    # here because it needs the materialized callback bodies.
-    if len(output_demands) != 1 or output_demands[0] is None:
-        return None
-
-    demand = output_demands[0]
-    assert demand is not None
-    if len(demand.shape) < 3:
-        return None
-
-    batch_shape = demand.shape[:-2]
-    if not batch_shape:
-        return None
-
-    for callback, child in zip(
-        context.spec.callbacks(), context.invocation.children(), strict=True
-    ):
-        if len(child.payload.plan.jaxpr.outvars) != 1:
-            return None
-
-        if (
-            _shape_of(child.payload.plan.jaxpr.outvars[0])[: len(batch_shape)]
-            != batch_shape
-        ):
-            return None
-
-        runtime_index = next(
-            (index for index, binding in enumerate(callback.inputs) if binding.runtime),
-            None,
-        )
-        if runtime_index is None:
-            return None
-
-        runtime_shape = _shape_of(child.payload.plan.jaxpr.invars[runtime_index])
-        if runtime_shape != demand.shape:
-            return None
-
-    return batch_shape, TensorDemand.from_axes(
-        batch_shape, demand.axes[: len(batch_shape)]
-    )  # ty: ignore[invalid-return-type]
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,20 +163,15 @@ def _backprop_plan_ordinary(
         )
 
     else:
-        fragment = None
         demanded_rows = [
             demand.rows() for demand in output_demands if demand is not None
         ]
-        if demanded_rows and (
-            routing.fragment is not no_route_fragment
-            or routing.partial_fragment is not None
-        ):
-            fragment = resolver.route_fragment(
-                frame,
-                eqn_plan,
-                RouteRequest(np.unique(np.concatenate(demanded_rows))),
-            )
-        route = resolver.route(frame, eqn_plan) if fragment is None else fragment
+        request = (
+            None
+            if not demanded_rows
+            else RouteRequest(np.unique(np.concatenate(demanded_rows)))
+        )
+        route = resolver.routed(frame, eqn_plan, request)
         result = semantics.demand(
             DemandContext(eqn=eqn, output_demands=output_demands, route=route)
         )

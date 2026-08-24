@@ -60,8 +60,16 @@ def materialize(functional: FunctionalAnalysis) -> JaxprInstance:
 
 @functools.cache
 def global_derivatives(functional: FunctionalAnalysis) -> DerivativeTrace:
-    """Materialize and analyze global derivative sparsity."""
+    """Analyze global derivative sparsity without materializing an instance tree."""
+    resolver, frame = ConcreteResolver.root(
+        functional._captured.closed_jaxpr,
+        functional._captured.flat_args,
+        functional._plan,
+        unavailable_inputs=functional._form.coordinate_input_indices,
+    )
     return trace_form_derivatives(
-        materialize(functional),
+        functional._plan,
+        frame,
+        resolver,
         functional._form,
     )
