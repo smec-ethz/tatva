@@ -115,10 +115,10 @@ def reduce_prod_hessian(
     prepared: PreparedReduction,
     acc: InteractionGraph,
 ) -> None:
-    deps = prepared.deps.csr
+    deps = prepared.deps
     groups = prepared.input_to_output
 
-    if deps.shape[0] <= 1:
+    if deps.csr.shape[0] <= 1:
         return
 
     order = np.argsort(groups, kind="stable")
@@ -139,17 +139,17 @@ def reduce_prod_hessian(
         # scalar operands in the same reduction bucket.
         for i_pos in range(len(rows)):
             lhs_row = rows[i_pos]
-            lhs = deps[lhs_row : lhs_row + 1]
 
-            if lhs.nnz == 0:
+            if deps.csr[lhs_row : lhs_row + 1].nnz == 0:
                 continue
 
-            for rhs_row in rows[i_pos + 1 :]:
-                rhs = deps[rhs_row : rhs_row + 1]
-
-                if rhs.nnz:
-                    # TODO: this fails, because add_cross expects two depsets, not sparse matrices. Fix this.
-                    acc.add_cross(lhs, rhs)
+            rhs_rows = rows[i_pos + 1 :]
+            acc.add_paired_cross(
+                deps,
+                np.full(rhs_rows.size, lhs_row, dtype=np.int64),
+                deps,
+                rhs_rows,
+            )
 
         start = stop
 

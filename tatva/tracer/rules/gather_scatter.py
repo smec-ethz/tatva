@@ -266,10 +266,12 @@ def scatter_mul_hessian(
     valid = prepared.target_rows >= 0
 
     targets = prepared.target_rows[valid]
-    base_deps = prepared.base.csr[targets]
-    update_deps = prepared.updates.csr[valid]
-
-    acc.add_cross(base_deps, update_deps)
+    acc.add_paired_cross(
+        prepared.base,
+        targets,
+        prepared.updates,
+        np.flatnonzero(valid),
+    )
 
 
 def _scatter_demand(
