@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.extend import core
+from jax.extend.core import Var
 
 if not hasattr(lax, "stack_p"):
     lax.stack_p = core.Primitive("stack_compat")
@@ -34,11 +35,14 @@ def test_scalar_dynamic_gather_is_compactly_conservative():
     plan = analyze(closed.jaxpr)
     resolver, frame = ConcreteResolver.root(closed, (x,), plan)
     demand = TensorDemand.full(())
+    assert demand is not None
+    output = plan.jaxpr.outvars[0]
+    assert isinstance(output, Var)
     trace = backpropagate_plan_demand(
         plan,
         frame,
         resolver,
-        [DemandSeed(ValueRef((), plan.jaxpr.outvars[0]), demand)],
+        [DemandSeed(ValueRef((), output), demand)],
     )
     input_demand = trace.input_demands[0]
     assert input_demand is not None

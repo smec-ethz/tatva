@@ -119,9 +119,19 @@ def test_dispatch_validates_spec_and_invocation_before_handler():
             raise AssertionError
 
         def map(self, context: MapContext[str]):
+            assert isinstance(context.invocation, RepeatedInvocation)
             return context.spec.length, context.invocation.child_at_index(0)
 
         def scan(self, context):
+            raise AssertionError
+
+        def custom_jvp(self, context):
+            raise AssertionError
+
+        def cond(self, context):
+            raise AssertionError
+
+        def linear_solve(self, context):
             raise AssertionError
 
     assert dispatch_nested(
