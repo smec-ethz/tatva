@@ -1,5 +1,5 @@
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sized
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Self
@@ -37,7 +37,8 @@ from tatva.tracer.core.semantics import (
 )
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import Demand, TensorDemand, axis_indices
-from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
+from tatva.tracer.program.analysis import EqnPlan, JaxprPlan, NestedPlan
+from tatva.tracer.program.map_batch import BatchedMapProgram, build_batched_map_program
 
 
 class DynamicRoutingError(RuntimeError):
@@ -139,6 +140,7 @@ class ConcreteResolverStats:
     frames_released: int = 0
     peak_live_frames: int = 0
     map_iterations: int = 0
+    map_template_frames: int = 0
     scan_iterations: int = 0
     regional_value_requests: int = 0
     regional_cache_hits: int = 0
@@ -153,6 +155,7 @@ class ConcreteResolver:
         self.fallback = fallback
         self.escalations: list[ConcreteEscalation] = []
         self.stats = ConcreteResolverStats()
+        self._batched_maps: dict[tuple[int, tuple[int, ...]], BatchedMapProgram] = {}
 
     @classmethod
     def root(
@@ -180,7 +183,7 @@ class ConcreteResolver:
         for var, value in zip(plan.jaxpr.constvars, closed_jaxpr.consts, strict=True):
             values[var] = value
 
-        unavailable_indices = tuple(sorted(set(int(i) for i in unavailable_inputs)))
+        unavailable_indices = tuple(sorted(int(i) for i in unavailable_inputs))
         if any(i < 0 or i >= len(plan.jaxpr.invars) for i in unavailable_indices):
             raise ValueError("unavailable root input index is out of range")
 
@@ -714,6 +717,63 @@ class ConcreteResolver:
             bindings,
         )
 
+    def batched_map_frame(
+        self,
+        parent: ConcreteFrame,
+        eqn_plan: EqnPlan,
+        program: BatchedMapProgram,
+        *,
+        analysis: bool,
+    ) -> ConcreteFrame:
+        nested = self._nested(eqn_plan, MapSpec)
+        spec = nested.spec
+        assert isinstance(spec, MapSpec)
+
+        if analysis:
+            plan = program.analysis_plan
+            closed = program.analysis_closed_jaxpr
+        else:
+            plan = program.execution_plan
+            closed = program.execution_closed_jaxpr
+
+        if len(plan.jaxpr.invars) != len(eqn_plan.eqn.invars):
+            raise RuntimeError("batched map input ABI mismatch")
+
+        bindings = tuple(_ParentBinding(parent, atom) for atom in eqn_plan.eqn.invars)
+
+        return self._register_frame(
+            plan,
+            parent.path + (FrameStep(eqn_plan.index, NestedKind.MAP, None),),
+            closed.consts,
+            bindings,
+        )
+
+    def batched_map_program(
+        self, eqn_plan: EqnPlan, *, expose: tuple[Var, ...] = ()
+    ) -> BatchedMapProgram:
+        nested = self._nested(eqn_plan, MapSpec)
+        key = (id(nested.body.jaxpr), tuple(id(var) for var in expose))
+        program = self._batched_maps.get(key)
+        spec = nested.spec
+
+        if not isinstance(spec, MapSpec):
+            raise TypeError(
+                f"batched_map_program only supports MapSpec, got {type(spec).__name__}"
+            )
+
+        if program is None:
+            program = build_batched_map_program(
+                nested.body,
+                nested.consts,
+                num_consts=spec.num_consts,
+                length=spec.length,
+                outer_inputs=eqn_plan.eqn.invars,
+                expose=expose,
+            )
+            self._batched_maps[key] = program
+
+        return program
+
     def cond_frame(
         self, parent: ConcreteFrame, eqn_plan: EqnPlan
     ) -> tuple[int, ConcreteFrame]:
@@ -916,7 +976,7 @@ class ConcreteResolver:
         )
         self.stats.full_escalations += 1
 
-    def _nested(self, eqn_plan: EqnPlan, spec_type):
+    def _nested(self, eqn_plan: EqnPlan, spec_type) -> NestedPlan:
         nested = eqn_plan.nested
         if nested is None or not isinstance(nested.spec, spec_type):
             raise TypeError(
@@ -928,7 +988,7 @@ class ConcreteResolver:
         self,
         plan: JaxprPlan,
         path: FramePath,
-        consts: tuple[object, ...],
+        consts: Sized[object],
         bindings: tuple[_ParentBinding | None, ...],
         *,
         values: dict[Var, ConcreteValue] | None = None,

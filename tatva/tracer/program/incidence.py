@@ -53,7 +53,7 @@ from tatva.tracer.program.contributions import (
     ValueRef,
 )
 from tatva.tracer.program.forms import FormSpec
-from tatva.tracer.program.repeated import map_template_requires_mapped_concrete
+from tatva.tracer.program.map_batch import BatchedMapProgram
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,71 +132,6 @@ class TaggedTraversalSummary:
     def __post_init__(self) -> None:
         if self.visited_count < 0:
             raise ValueError("visited_count must be nonnegative")
-
-
-@dataclass(frozen=True, slots=True)
-class _MapTagSpace:
-    """Dense temporary tags for distinct ``(iteration, original block)`` pairs."""
-
-    iterations: NDArray[np.int64]
-    blocks: NDArray[np.int64]
-
-    def __post_init__(self) -> None:
-        iterations = np.array(self.iterations, dtype=np.int64, copy=True).ravel()
-        blocks = np.array(self.blocks, dtype=np.int64, copy=True).ravel()
-
-        if iterations.shape != blocks.shape:
-            raise ValueError("map tag-space arrays must have equal length")
-        if np.any(iterations < 0) or np.any(blocks < 0):
-            raise ValueError("map tag-space values must be nonnegative")
-
-        iterations.setflags(write=False)
-        blocks.setflags(write=False)
-        object.__setattr__(self, "iterations", iterations)
-        object.__setattr__(self, "blocks", blocks)
-
-    @classmethod
-    def encode(
-        cls,
-        iterations: NDArray[np.int64],
-        blocks: NDArray[np.int64],
-    ) -> tuple[_MapTagSpace, NDArray[np.int64]]:
-        iterations = np.asarray(iterations, dtype=np.int64).ravel()
-        blocks = np.asarray(blocks, dtype=np.int64).ravel()
-
-        if iterations.shape != blocks.shape:
-            raise ValueError("one iteration is required per map block tag")
-        if iterations.size == 0:
-            empty = np.empty(0, dtype=np.int64)
-            return cls(empty, empty), empty
-
-        order = np.lexsort((blocks, iterations))
-        sorted_iterations = iterations[order]
-        sorted_blocks = blocks[order]
-        starts = np.ones(iterations.size, dtype=bool)
-        starts[1:] = (sorted_iterations[1:] != sorted_iterations[:-1]) | (
-            sorted_blocks[1:] != sorted_blocks[:-1]
-        )
-        sorted_ids = np.cumsum(starts, dtype=np.int64) - 1
-        temp_ids = np.empty(iterations.size, dtype=np.int64)
-        temp_ids[order] = sorted_ids
-        return cls(sorted_iterations[starts], sorted_blocks[starts]), temp_ids
-
-    @property
-    def size(self) -> int:
-        return int(self.iterations.size)
-
-    @property
-    def visited_count(self) -> int:
-        return int(np.unique(self.iterations).size)
-
-    def decode(
-        self, temp_ids: NDArray[np.int64]
-    ) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-        temp_ids = np.asarray(temp_ids, dtype=np.int64).ravel()
-        if np.any(temp_ids < 0) or np.any(temp_ids >= self.size):
-            raise RuntimeError("map body produced an unknown temporary block tag")
-        return self.iterations[temp_ids], self.blocks[temp_ids]
 
 
 def _backprop_plan_ordinary(
@@ -437,99 +372,38 @@ def _map_has_explicit_child_seed(
     )
 
 
-def _map_template_outputs(
-    output_demands: tuple[Tagged, ...],
+def _batched_map_tagged_outputs(
     *,
+    eqn_plan: EqnPlan,
     spec: MapSpec,
-) -> tuple[tuple[Tagged, ...], _MapTagSpace]:
-    projections: list[
-        tuple[Shape, NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]] | None
-    ] = []
-    iteration_parts: list[NDArray[np.int64]] = []
-    block_parts: list[NDArray[np.int64]] = []
-
-    for demand in output_demands:
-        if demand is None:
-            projections.append(None)
-            continue
-        if not demand.shape or demand.shape[0] != spec.length:
-            raise ValueError(
-                f"mapped output tagged shape {demand.shape} does not have "
-                f"leading extent {spec.length}"
-            )
-        child_shape = demand.shape[1:]
-        child_size = int(math.prod(child_shape))
-        if child_size <= 0:
-            raise ValueError("non-empty mapped output demand has an empty child shape")
-
-        iterations = demand.rows // child_size
-        child_rows = demand.rows % child_size
-
-        projections.append((child_shape, child_rows, iterations, demand.blocks))
-        iteration_parts.append(iterations)
-        block_parts.append(demand.blocks)
-
-    if not iteration_parts:
-        empty = np.empty(0, dtype=np.int64)
-        return tuple(None for _ in output_demands), _MapTagSpace(empty, empty)
-
-    tag_space, all_temp_ids = _MapTagSpace.encode(
-        np.concatenate(iteration_parts),
-        np.concatenate(block_parts),
+    program: BatchedMapProgram,
+    outer_outputs: tuple[Tagged, ...],
+    seed_node: _TaggedSeedNode,
+) -> tuple[Tagged, ...] | None:
+    demands: list[Tagged] = list(outer_outputs) + [None] * (
+        len(program.analysis_plan.jaxpr.outvars) - program.num_outputs
     )
-    child_outputs: list[Tagged] = []
-    cursor = 0
 
-    for projection in projections:
-        if projection is None:
-            child_outputs.append(None)
+    for step, node in seed_node.children.items():
+        if step.eqn_index != eqn_plan.index or step.kind is not NestedKind.MAP:
             continue
 
-        child_shape, child_rows, _iterations, blocks = projection
-        stop = cursor + blocks.size
-        child_outputs.append(
-            TaggedDemand(child_shape, child_rows, all_temp_ids[cursor:stop])
-        )
-        cursor = stop
+        if step.iteration is None:
+            raise RuntimeError("tagged map seed requires iteration")
 
-    if cursor != all_temp_ids.size:
-        raise RuntimeError("map output temporary-tag accounting mismatch")
+        # Same safe boundary as liveness.
+        if node.children:
+            return None
 
-    return tuple(child_outputs), tag_space
+        iteration = int(step.iteration)
 
+        for var, demand in node.values.items():
+            output_index = program.exposed[var]
+            outer_shape = _shape_of(program.analysis_plan.jaxpr.outvars[output_index])
+            lifted = demand.lift_leading_axis(outer_shape=outer_shape, index=iteration)
+            demands[output_index] = merge_tagged(demands[output_index], lifted)
 
-def _decode_map_template_input(
-    demand: TaggedDemand,
-    *,
-    input_index: int,
-    spec: MapSpec,
-    outer_shape: Shape,
-    tag_space: _MapTagSpace,
-) -> TaggedDemand:
-    iterations, blocks = tag_space.decode(demand.blocks)
-
-    if input_index < spec.num_consts:
-        if demand.shape != outer_shape:
-            raise RuntimeError(
-                f"map constant input shape {demand.shape} does not match "
-                f"outer shape {outer_shape}"
-            )
-        outer_rows = demand.rows
-    else:
-        if not outer_shape or outer_shape[0] != spec.length:
-            raise RuntimeError(
-                f"mapped input shape {outer_shape} does not have leading "
-                f"extent {spec.length}"
-            )
-        if demand.shape != outer_shape[1:]:
-            raise RuntimeError(
-                f"map body input shape {demand.shape} does not match "
-                f"mapped outer shape {outer_shape}"
-            )
-        child_size = int(math.prod(demand.shape))
-        outer_rows = iterations * child_size + demand.rows
-
-    return TaggedDemand(outer_shape, outer_rows, blocks)
+    return tuple(demands)
 
 
 def _backprop_plan_map_template(
@@ -539,45 +413,37 @@ def _backprop_plan_map_template(
     spec: MapSpec,
     output_demands: tuple[Tagged, ...],
 ) -> tuple[tuple[Tagged, ...], TaggedTraversalSummary]:
-    eqn = eqn_plan.eqn
-    child_outputs, tag_space = _map_template_outputs(output_demands, spec=spec)
-    outer: list[Tagged] = [None] * len(eqn.invars)
+    program = resolver.batched_map_program(eqn_plan)
 
-    if tag_space.size == 0:
-        return tuple(outer), TaggedTraversalSummary(NestedKind.MAP)
+    outputs = _batched_map_tagged_outputs(
+        eqn_plan=eqn_plan,
+        spec=spec,
+        program=program,
+        outer_outputs=output_demands,
+        seed_node=_TaggedSeedNode(),
+    )
 
-    representative = int(tag_space.iterations[0])
-    child_frame = resolver.map_frame(frame, eqn_plan, representative)
+    if outputs is None:
+        return _backprop_plan_map_unrolled(
+            eqn_plan, frame, resolver, spec, output_demands, _TaggedSeedNode()
+        )
+
+    child = resolver.batched_map_frame(frame, eqn_plan, program, analysis=True)
 
     try:
-        child = _backprop_tagged_plan(
-            child_frame.plan,
-            child_frame,
+        trace = _backprop_tagged_plan(
+            program.analysis_plan,
+            child,
             resolver,
             _TaggedSeedNode(),
-            output_demands=child_outputs,
+            output_demands=outputs,
         )
     finally:
-        resolver.release(child_frame)
+        resolver.release(child)
 
-    if len(child.input_demands) != len(eqn.invars):
-        raise RuntimeError("mapped body/input tagged-demand ABI mismatch")
-
-    for input_index, demand in enumerate(child.input_demands):
-        if demand is None:
-            continue
-        lifted = _decode_map_template_input(
-            demand,
-            input_index=input_index,
-            spec=spec,
-            outer_shape=_shape_of(eqn.invars[input_index]),
-            tag_space=tag_space,
-        )
-        outer[input_index] = merge_tagged(outer[input_index], lifted)
-
-    return tuple(outer), TaggedTraversalSummary(
-        NestedKind.MAP,
-        visited_count=tag_space.visited_count,
+    return (
+        trace.input_demands,
+        TaggedTraversalSummary(NestedKind.MAP, visited_count=spec.length),
     )
 
 
@@ -589,9 +455,7 @@ def _backprop_plan_map(
     output_demands: tuple[Tagged, ...],
     seed_node: _TaggedSeedNode,
 ) -> tuple[tuple[Tagged, ...], TaggedTraversalSummary]:
-    if map_template_requires_mapped_concrete(
-        eqn_plan, spec
-    ) or _map_has_explicit_child_seed(eqn_plan, seed_node):
+    if _map_has_explicit_child_seed(eqn_plan, seed_node):
         return _backprop_plan_map_unrolled(
             eqn_plan, frame, resolver, spec, output_demands, seed_node
         )

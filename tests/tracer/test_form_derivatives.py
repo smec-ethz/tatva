@@ -102,6 +102,69 @@ def test_reduce_prod_records_distinct_pairs_within_each_reduction_bucket():
     np.testing.assert_array_equal(trace.hessian.toarray().astype(bool), expected)
 
 
+def test_cumprod_records_distinct_pairs_within_each_axis_fiber():
+    x = jnp.arange(6, dtype=jnp.float32) + 1
+
+    def energy(values):
+        return jnp.sum(jnp.cumprod(values.reshape(2, 3), axis=1))
+
+    trace = _trace_form(energy, x, form=FormSpec.energy(input_index=0))
+
+    expected = np.zeros((6, 6), dtype=bool)
+    expected[:3, :3] = ~np.eye(3, dtype=bool)
+    expected[3:, 3:] = ~np.eye(3, dtype=bool)
+    np.testing.assert_array_equal(trace.hessian.toarray().astype(bool), expected)
+
+
+def test_reverse_cumprod_records_distinct_pairs_within_each_axis_fiber():
+    x = jnp.arange(6, dtype=jnp.float32) + 1
+
+    def energy(values):
+        return jnp.sum(lax.cumprod(values.reshape(2, 3), axis=1, reverse=True))
+
+    trace = _trace_form(energy, x, form=FormSpec.energy(input_index=0))
+
+    expected = np.zeros((6, 6), dtype=bool)
+    expected[:3, :3] = ~np.eye(3, dtype=bool)
+    expected[3:, 3:] = ~np.eye(3, dtype=bool)
+    np.testing.assert_array_equal(trace.hessian.toarray().astype(bool), expected)
+
+
+def test_triangular_solve_hessian_is_batch_local_and_linear_in_rhs():
+    x = jnp.arange(12, dtype=jnp.float32) + 1
+
+    def energy(values):
+        a = values[:8].reshape(2, 2, 2)
+        b = values[8:].reshape(2, 2, 1)
+        return jnp.sum(lax.linalg.triangular_solve(a, b, left_side=True))
+
+    trace = _trace_form(energy, x, form=FormSpec.energy(input_index=0))
+
+    expected = np.zeros((12, 12), dtype=bool)
+    for batch in range(2):
+        a_rows = np.arange(batch * 4, batch * 4 + 4)
+        b_rows = np.arange(8 + batch * 2, 8 + batch * 2 + 2)
+        expected[np.ix_(a_rows, a_rows)] = True
+        expected[np.ix_(a_rows, b_rows)] = True
+        expected[np.ix_(b_rows, a_rows)] = True
+    np.testing.assert_array_equal(trace.hessian.toarray().astype(bool), expected)
+
+
+def test_lu_hessian_is_batch_local():
+    x = jnp.arange(8, dtype=jnp.float32) + 1
+
+    def energy(values):
+        lu, _, _ = lax.linalg.lu(values.reshape(2, 2, 2))
+        return jnp.sum(lu)
+
+    trace = _trace_form(energy, x, form=FormSpec.energy(input_index=0))
+
+    expected = np.zeros((8, 8), dtype=bool)
+    expected[:4, :4] = True
+    expected[4:, 4:] = True
+    np.testing.assert_array_equal(trace.hessian.toarray().astype(bool), expected)
+
+
 def test_mixed_form_extracts_row_by_column_block_tangent():
     n = 4
     values = tuple(jnp.arange(n, dtype=jnp.float32) + shift for shift in range(4))

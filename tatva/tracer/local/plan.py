@@ -351,30 +351,23 @@ class _LocalRankPlanNestedHandler:
             CondInvocation(self.eqn_plan.index, branch_index, body),
         )
 
-    def map(
-        self,
-        context: MapContext[JaxprDemandTrace],
-    ) -> LocalNestedPlan:
+    def map(self, context: MapContext[JaxprDemandTrace]) -> LocalNestedPlan:
         invocation = context.invocation
 
         if isinstance(invocation, MapInvocation):
-            if invocation.indices.count == 0:
-                raise RuntimeError("live template map has no surviving iterations")
+            program = self.resolver.batched_map_program(self.eqn_plan)
 
-            representative = invocation.indices.first()
-            child_frame = self.resolver.map_frame(
-                self.frame, self.eqn_plan, representative
+            child = self.resolver.batched_map_frame(
+                self.frame, self.eqn_plan, program, analysis=False
             )
 
             try:
+                trace = cast(JaxprDemandTrace, invocation.body)
                 body = _build_rank_local_jaxpr_plan(
-                    child_frame.plan,
-                    child_frame,
-                    self.resolver,
-                    invocation.body,  # ty: ignore[invalid-argument-type]
+                    program.execution_plan, child, self.resolver, trace
                 )
             finally:
-                self.resolver.release(child_frame)
+                self.resolver.release(child)
 
             return LocalNestedPlan(
                 context.spec,
@@ -385,7 +378,7 @@ class _LocalRankPlanNestedHandler:
                 ),
             )
 
-        # Exact/unrolled fallback.
+        # Keep exact fallback for now.
         children: list[IndexedChild[LocalJaxprPlan]] = []
 
         for child_trace in invocation.children(TraversalOrder.LOGICAL):

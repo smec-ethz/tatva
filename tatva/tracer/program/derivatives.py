@@ -84,18 +84,6 @@ from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
 from tatva.tracer.program.forms import FormSpec, SymbolicLayout
-from tatva.tracer.program.repeated import map_template_requires_mapped_concrete
-
-
-@dataclass(frozen=True)
-class MapDerivativeTemplate:
-    """Handle map by tracing a single iteration and broadcasting the result to all iterations."""
-
-    input_shapes: tuple[tuple[int, ...], ...]
-    output_deps: tuple[DependencySet, ...]
-    interactions: sps.csr_matrix
-    n_local_symbols: int
-    trace: JaxprDerivativeTrace
 
 
 @dataclass(frozen=True)
@@ -887,215 +875,56 @@ def _trace_map(
     tuple[DependencySet, ...],
     AnyNestedInvocation[JaxprDerivativeTrace],
 ]:
-    if map_template_requires_mapped_concrete(eqn_plan, spec):
-        return _trace_map_unrolled(
-            spec=spec,
-            eqn_plan=eqn_plan,
-            frame=frame,
+    """Trace an independent map through its synthetic batched JAXPR.
+
+    JAX batching converts the repeated body into one ordinary batched
+    program.  The batched program has the same input ABI as the outer map
+    equation, so the enclosing dependency sets can be traced directly.
+
+    Any additional analysis-only outputs expose body intermediates for
+    liveness/incidence; they are ignored as logical map outputs here.
+    """
+    program = resolver.batched_map_program(eqn_plan)
+
+    child_frame = resolver.batched_map_frame(
+        frame,
+        eqn_plan,
+        program,
+        analysis=True,
+    )
+
+    try:
+        trace = _trace_jaxpr(
+            plan=program.analysis_plan,
+            frame=child_frame,
             resolver=resolver,
             input_deps=input_deps,
             acc=acc,
             n_symbols=n_symbols,
         )
-
-    template = _build_map_derivative_template(
-        eqn_plan=eqn_plan,
-        frame=frame,
-        resolver=resolver,
-        spec=spec,
-    )
-    if len(template.output_deps) != len(eqn_plan.eqn.outvars):
-        raise RuntimeError(
-            f"mapped body returned {len(template.output_deps)} outputs; "
-            f"expected {len(eqn_plan.eqn.outvars)}"
-        )
-    steps_by_output = [[] for _ in eqn_plan.eqn.outvars]
-
-    for logical_index in range(spec.length):
-        lifting = _map_iteration_lifting(
-            template,
-            spec=spec,
-            input_deps=input_deps,
-            logical_index=logical_index,
-            n_symbols=n_symbols,
-        )
-        for output_index, local_dep in enumerate(template.output_deps):
-            lifted = (local_dep.csr @ lifting).astype(bool).tocsr()
-            lifted.eliminate_zeros()
-            steps_by_output[output_index].append(DependencySet(lifted, local_dep.shape))
-
-        if template.interactions.nnz and lifting.nnz:
-            interaction = (
-                (lifting.T @ template.interactions @ lifting).astype(bool).tocsr()
-            )
-            interaction.eliminate_zeros()
-            acc.add_pattern(interaction)
-
-    outputs = tuple(
-        _stack_leading_axis_dependencies(steps) for steps in steps_by_output
-    )
-    invocation = MapInvocation(
-        eqn_index=eqn_plan.index,
-        indices=IterationSelection(length=spec.length),
-        body=template.trace,
-    )
-
-    return (outputs, invocation)
-
-
-def _trace_map_unrolled(
-    *,
-    spec: MapSpec,
-    eqn_plan: EqnPlan,
-    frame: ConcreteFrame,
-    resolver: ConcreteResolver,
-    input_deps: tuple[DependencySet, ...],
-    acc: InteractionGraph,
-    n_symbols: int,
-) -> tuple[
-    tuple[DependencySet, ...],
-    AnyNestedInvocation[JaxprDerivativeTrace],
-]:
-    const_deps = input_deps[: spec.num_consts]
-    mapped_deps = input_deps[spec.num_consts :]
-    children: list[IndexedChild[JaxprDerivativeTrace]] = []
-
-    for logical_index in spec.execution_range():
-        step_deps = tuple(
-            _leading_axis_dependency(dep, logical_index) for dep in mapped_deps
-        )
-        child_frame = resolver.map_frame(frame, eqn_plan, logical_index)
-        try:
-            body_trace = _trace_jaxpr(
-                plan=child_frame.plan,
-                frame=child_frame,
-                resolver=resolver,
-                input_deps=const_deps + step_deps,
-                acc=acc,
-                n_symbols=n_symbols,
-            )
-        finally:
-            resolver.release(child_frame)
-
-        if len(body_trace.output_deps) != len(eqn_plan.eqn.outvars):
-            raise RuntimeError("mapped body/output ABI mismatch")
-
-        children.append(IndexedChild(logical_index, body_trace))
-
-    outputs: list[DependencySet] = []
-
-    for output_index, outvar in enumerate(eqn_plan.eqn.outvars):
-        if spec.length == 0:
-            shape = _shape_of(outvar)
-            outputs.append(DependencySet.empty(shape, n_symbols))
-            continue
-        steps = collect_logical_output(
-            ((item.index, item.body.output_deps) for item in children),
-            output_index=output_index,
-            length=spec.length,
-            label="map derivative",
-        )
-        outputs.append(_stack_leading_axis_dependencies(list(steps)))
-
-    return (
-        tuple(outputs),
-        RepeatedInvocation.from_spec(eqn_plan.index, spec, tuple(children)),
-    )
-
-
-def _build_map_derivative_template(
-    *,
-    eqn_plan: EqnPlan,
-    frame: ConcreteFrame,
-    resolver: ConcreteResolver,
-    spec: MapSpec,
-) -> MapDerivativeTemplate:
-    if spec.length <= 0:
-        raise ValueError("zero-length map has no body template")
-
-    representative = 0
-    child_frame = resolver.map_frame(frame, eqn_plan, representative)
-
-    try:
-        shapes = tuple(_shape_of(var) for var in child_frame.plan.jaxpr.invars)
-
-        sizes = tuple(int(np.prod(shape, dtype=np.int64)) for shape in shapes)
-
-        offsets = np.cumsum((0, *sizes[:-1]))
-        n_local = sum(sizes)
-
-        local_inputs = []
-
-        for shape, size, offset in zip(shapes, sizes, offsets, strict=True):
-            rows = np.arange(size, dtype=np.int64)
-            cols = offset + rows
-
-            local_inputs.append(
-                DependencySet(
-                    sps.csr_matrix(
-                        (np.ones(size, dtype=bool), (rows, cols)),
-                        shape=(size, n_local),
-                    ),
-                    shape,
-                )
-            )
-
-        local_acc = InteractionGraph(n_local)
-
-        trace = _trace_jaxpr(
-            plan=child_frame.plan,
-            frame=child_frame,
-            resolver=resolver,
-            input_deps=tuple(local_inputs),
-            acc=local_acc,
-            n_symbols=n_local,
-        )
-
-        return MapDerivativeTemplate(
-            input_shapes=shapes,
-            output_deps=trace.output_deps,
-            interactions=local_acc.finalize(),
-            n_local_symbols=n_local,
-            trace=trace,
-        )
-
     finally:
         resolver.release(child_frame)
 
-
-def _map_iteration_lifting(
-    template: MapDerivativeTemplate,
-    *,
-    spec: MapSpec,
-    input_deps: tuple[DependencySet, ...],
-    logical_index: int,
-    n_symbols: int,
-) -> sps.csr_matrix:
-    if len(input_deps) != len(template.input_shapes):
+    if len(trace.output_deps) < program.num_outputs:
         raise RuntimeError(
-            "map template/input count mismatch"
-            f" {len(template.input_shapes)} != {len(input_deps)}"
+            "batched map derivative output ABI mismatch: "
+            f"analysis program produced {len(trace.output_deps)} outputs, "
+            f"expected at least {program.num_outputs}"
         )
 
-    rows = []
-
-    for input_index, dep in enumerate(input_deps):
-        if input_index < spec.num_consts:
-            child_dep = dep
-        else:
-            child_dep = _leading_axis_dependency(dep, logical_index)
-
-        if child_dep.shape != template.input_shapes[input_index]:
-            raise RuntimeError("map template/input shape mismatch")
-
-        rows.append(child_dep.csr)
-
-    lifting = sps.vstack(rows, format="csr").astype(bool)
-
-    expected_shape = (template.n_local_symbols, n_symbols)
-    if lifting.shape != expected_shape:
+    outputs = tuple(trace.output_deps[: program.num_outputs])
+    if len(outputs) != len(eqn_plan.eqn.outvars):
         raise RuntimeError(
-            f"invalid map lifting shape {lifting.shape}; expected {expected_shape}"
+            "batched map logical output ABI mismatch: "
+            f"{len(outputs)} derivative outputs for "
+            f"{len(eqn_plan.eqn.outvars)} map outputs"
         )
 
-    return lifting
+    return (
+        outputs,
+        MapInvocation(
+            eqn_index=eqn_plan.index,
+            indices=IterationSelection(length=spec.length),
+            body=trace,
+        ),
+    )

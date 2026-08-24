@@ -483,6 +483,61 @@ def _lower_cond(
     return tuple(result)
 
 
+def _lower_batched_map(
+    plan: LocalEqnPlan,
+    body: LocalJaxprPlan,
+    inputs: tuple[Any | None, ...],
+) -> tuple[Any | None, ...]:
+    if len(inputs) != len(body.input_layouts):
+        raise RuntimeError("batched map outer/body input arity mismatch")
+
+    child_inputs: list[Any] = []
+
+    for input_index, target_layout in enumerate(body.input_layouts):
+        if target_layout is None:
+            continue
+
+        value = inputs[input_index]
+        source_layout = plan.input_layouts[input_index]
+
+        if value is None or source_layout is None:
+            raise RuntimeError(f"live batched map input {input_index} is unavailable")
+
+        child_inputs.append(
+            _project_local_value(
+                value,
+                source_layout=source_layout,
+                target_layout=target_layout,
+            )
+        )
+
+    env = _execute_frame(body, tuple(child_inputs))
+    child_outputs = _frame_outputs(body, env)
+
+    if len(child_outputs) != len(plan.output_layouts):
+        raise RuntimeError("batched map output ABI mismatch")
+
+    result: list[Any | None] = []
+
+    for output_index, (value, source_layout, target_layout) in enumerate(
+        zip(child_outputs, body.output_layouts, plan.output_layouts, strict=True)
+    ):
+        if target_layout is None:
+            result.append(None)
+            continue
+
+        if value is None or source_layout is None:
+            raise RuntimeError(f"live batched map output {output_index} is unavailable")
+
+        result.append(
+            _project_local_value(
+                value, source_layout=source_layout, target_layout=target_layout
+            )
+        )
+
+    return tuple(result)
+
+
 def _lower_map(
     plan: LocalEqnPlan,
     context: MapContext[LocalJaxprPlan],
@@ -491,30 +546,25 @@ def _lower_map(
     invocation = context.invocation
 
     if isinstance(invocation, MapInvocation):
-        template = cast(LocalJaxprPlan, invocation.body)
-        logical_indices = np.fromiter(
-            invocation.indices,
-            dtype=np.int64,
-            count=invocation.indices.count,
+        body = cast(LocalJaxprPlan, invocation.body)
+        return _lower_batched_map(plan, body, inputs)
+
+    # Existing exact fallback.
+    template = _common_repeated_template(invocation)
+    if template is None:
+        raise NotImplementedError(
+            "localized map iterations have different body layouts/routes; "
+            "heterogeneous map lowering is not yet implemented"
         )
 
-    else:
-        # Existing exact fallback.
-        template = _common_repeated_template(invocation)
-        if template is None:
-            raise NotImplementedError(
-                "localized map iterations have different body layouts/routes; "
-                "heterogeneous map lowering is not yet implemented"
-            )
-
-        logical_indices = np.asarray(
-            [
-                child.logical_index
-                for child in invocation.children()
-                if child.logical_index is not None
-            ],
-            dtype=np.int64,
-        )
+    logical_indices = np.asarray(
+        [
+            child.logical_index
+            for child in invocation.children()
+            if child.logical_index is not None
+        ],
+        dtype=np.int64,
+    )
 
     n_iterations = logical_indices.size
     if n_iterations == 0:
@@ -646,8 +696,7 @@ def _lower_map(
 
         if tuple(value.shape) != layout.local_shape:
             raise RuntimeError(
-                f"localized map output {output_index} "
-                f"has shape {value.shape}; "
+                f"localized map output {output_index} has shape {value.shape}; "
                 f"expected {layout.local_shape}"
             )
 
