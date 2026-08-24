@@ -44,6 +44,7 @@ from tatva.tracer.core.nested import (
 )
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import RouteRequest
+from tatva.tracer.core.routes import Shape
 from tatva.tracer.core.semantics import (
     DemandContext,
 )
@@ -60,6 +61,7 @@ from tatva.tracer.local.demand import (
 from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.contributions import ValueRef
+from tatva.tracer.program.repeated import map_template_requires_mapped_concrete
 
 
 def _expand_batch_demand(
@@ -258,6 +260,79 @@ class _DemandPlanNestedHandler:
         return tuple(outer), CustomJvpInvocation(self.eqn_plan.index, primal, jvp)
 
     def map(self, spec: MapSpec) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
+        if map_template_requires_mapped_concrete(self.eqn_plan, spec):
+            return self._map_unrolled(spec)
+
+        # Explicit child seeds can differ by iteration.
+        has_map_seeds = any(
+            step.eqn_index == self.eqn_plan.index and step.kind is NestedKind.MAP
+            for step in self.seed_node.children
+        )
+        if has_map_seeds:
+            return self._map_unrolled(spec)
+
+        indices = _plan_map_indices(self.eqn_plan, spec, self.outputs, self.seed_node)
+        if indices.size == 0:
+            return (
+                tuple(self._empty_outer()),
+                RepeatedInvocation.from_spec(self.eqn_plan.index, spec, ()),
+            )
+
+        representative = int(indices[0])
+        child_outputs = tuple(
+            take_leading_axis_demand(demand, representative) for demand in self.outputs
+        )
+
+        # The first implementation only templates a single common pattern.
+        for index_ in indices[1:]:
+            pattern = tuple(
+                take_leading_axis_demand(demand, int(index_)) for demand in self.outputs
+            )
+            if pattern != child_outputs:
+                return self._map_unrolled(spec)
+
+        child_frame = self.resolver.map_frame(self.frame, self.eqn_plan, representative)
+        step = child_frame.path[-1]
+
+        try:
+            child = _backprop_plan_jaxpr(
+                child_frame.plan,
+                child_frame,
+                self.resolver,
+                self.seed_node.children.get(step, _SeedNode()),
+                output_demands=child_outputs,
+            )
+        finally:
+            self.resolver.release(child_frame)
+
+        outer = self._empty_outer()
+
+        for input_index, demand in enumerate(child.input_demands):
+            if demand is None:
+                continue
+
+            lifted = (
+                demand
+                if input_index < spec.num_consts
+                else lift_leading_axis_demand_many(
+                    demand,
+                    outer_shape=_shape_of(self.eqn_plan.eqn.invars[input_index]),
+                    indices=indices,
+                )
+            )
+            outer[input_index] = merge_demands(outer[input_index], lifted)
+
+        # Preserve every selected index while sharing one demand trace.
+        children = tuple(IndexedChild(int(index), child) for index in indices)
+
+        return (
+            tuple(outer),
+            RepeatedInvocation.from_spec(self.eqn_plan.index, spec, children),
+        )
+
+    def _map_unrolled(
+        self, spec: MapSpec
+    ) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
         outer = self._empty_outer()
         children: list[IndexedChild[JaxprDemandTrace]] = []
 
@@ -513,6 +588,24 @@ def _plan_map_indices(
     if np.any(indices < 0) or np.any(indices >= spec.length):
         raise IndexError("map demand contains an out-of-range iteration")
     return indices
+
+
+def lift_leading_axis_demand_many(
+    demand: Demand,
+    *,
+    outer_shape: Shape,
+    indices: NDArray[np.int64],
+) -> Demand:
+    if demand is None or indices.size == 0:
+        return None
+
+    leading = TensorDemand.axis_selection(outer_shape, axis=0, indices=indices)
+    assert leading is not None
+
+    return TensorDemand.from_axes(
+        outer_shape,
+        (leading.axes[0], *demand.axes),
+    )
 
 
 def _plan_scan_prefix(

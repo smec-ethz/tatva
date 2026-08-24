@@ -5,8 +5,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.sparse as sps
+from jax.extend.core import Var
 
 from tatva.tracer.api import analyze
+from tatva.tracer.core.nested import FrameStep, MapSpec, NestedKind
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import GatherRouteFragment
 from tatva.tracer.diagnostics import incidence as inspect_incidence
@@ -16,11 +18,15 @@ from tatva.tracer.lowering.partition import (
     dof_owner_from_incidence,
     partition_contribution_blocks,
 )
+from tatva.tracer.program import incidence as incidence_program
 from tatva.tracer.program.concrete_resolver import ConcreteResolver
-from tatva.tracer.program.contributions import ContributionBlock
+from tatva.tracer.program.contributions import ContributionBlock, ValueRef
 from tatva.tracer.program.incidence import (
     BlockDofIncidence,
     TaggedDemand,
+    TaggedDemandSeed,
+    _backprop_tagged_plan,
+    _build_tagged_seed_tree,
     generate_contribution_blocks,
     merge_tagged,
     plan_tagged_block_dof_incidence,
@@ -200,10 +206,156 @@ def test_plan_tagged_map_visits_only_demanded_iterations():
         blocks=blocks,
     )
     np.testing.assert_array_equal(planned.csr.toarray(), np.eye(3, 100, dtype=bool))
-    assert resolver.stats.map_iterations == 3
-    assert resolver.stats.frames_created == 4
-    assert resolver.stats.frames_released == 3
+    assert resolver.stats.map_iterations == 1
+    assert resolver.stats.frames_created == 2
+    assert resolver.stats.frames_released == 1
     assert resolver.stats.peak_live_frames == 2
+
+
+def test_plan_tagged_map_template_matches_unrolled_with_shared_constants(
+    monkeypatch,
+):
+    weights = jnp.array([1.0, 2.0, 3.0])
+    values = jnp.arange(12.0).reshape(4, 3)
+
+    def objective(weights, values):
+        terms = jax.lax.map(lambda row: jnp.sum((weights * row) ** 2), values)
+        return jnp.sum(terms)
+
+    traced = analyze(objective, weights, values)
+    blocks = generate_contribution_blocks(
+        traced._contributions,
+        blocks_per_root=2,
+    )
+
+    template_resolver, template_frame = ConcreteResolver.root(
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
+    )
+    template = plan_tagged_block_dof_incidence(
+        traced._plan,
+        template_frame,
+        template_resolver,
+        traced._contributions,
+        blocks=blocks,
+    )
+
+    monkeypatch.setattr(
+        incidence_program,
+        "map_template_requires_mapped_concrete",
+        lambda _eqn_plan, _spec: True,
+    )
+    unrolled_resolver, unrolled_frame = ConcreteResolver.root(
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
+    )
+    unrolled = plan_tagged_block_dof_incidence(
+        traced._plan,
+        unrolled_frame,
+        unrolled_resolver,
+        traced._contributions,
+        blocks=blocks,
+    )
+
+    np.testing.assert_array_equal(template.csr.toarray(), unrolled.csr.toarray())
+    assert template_resolver.stats.map_iterations == 1
+    assert unrolled_resolver.stats.map_iterations == values.shape[0]
+
+
+def test_nested_multi_output_map_templates_match_unrolled(monkeypatch):
+    values = jnp.arange(12.0)
+
+    def objective(values):
+        squares, doubled = jax.lax.map(
+            lambda row: (jax.lax.map(lambda value: value**2, row), 2 * row),
+            values.reshape(4, 3),
+        )
+        return jnp.sum(squares + doubled)
+
+    traced = analyze(objective, values)
+    blocks = generate_contribution_blocks(
+        traced._contributions,
+        blocks_per_root=2,
+    )
+
+    template_resolver, template_frame = ConcreteResolver.root(
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
+    )
+    template = plan_tagged_block_dof_incidence(
+        traced._plan,
+        template_frame,
+        template_resolver,
+        traced._contributions,
+        blocks=blocks,
+    )
+
+    monkeypatch.setattr(
+        incidence_program,
+        "map_template_requires_mapped_concrete",
+        lambda _eqn_plan, _spec: True,
+    )
+    unrolled_resolver, unrolled_frame = ConcreteResolver.root(
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
+    )
+    unrolled = plan_tagged_block_dof_incidence(
+        traced._plan,
+        unrolled_frame,
+        unrolled_resolver,
+        traced._contributions,
+        blocks=blocks,
+    )
+
+    np.testing.assert_array_equal(template.csr.toarray(), unrolled.csr.toarray())
+    assert template_resolver.stats.map_iterations == 2
+    assert unrolled_resolver.stats.map_iterations == 16
+
+
+def test_map_with_explicit_child_seed_uses_unrolled_path():
+    values = jnp.arange(5.0)
+
+    def objective(values):
+        return jnp.sum(jax.lax.map(lambda value: value**2, values))
+
+    traced = analyze(objective, values)
+    map_eqn = next(
+        eqn
+        for eqn in traced._plan.eqns
+        if eqn.nested is not None and isinstance(eqn.nested.spec, MapSpec)
+    )
+    assert map_eqn.nested is not None
+    child_output = map_eqn.nested.body.jaxpr.outvars[0]
+    assert isinstance(child_output, Var)
+    seed = TaggedDemandSeed(
+        ValueRef(
+            path=(FrameStep(map_eqn.index, NestedKind.MAP, iteration=3),),
+            var=child_output,
+        ),
+        TaggedDemand((), np.array([0]), np.array([7])),
+    )
+    resolver, frame = ConcreteResolver.root(
+        traced._captured.closed_jaxpr,
+        traced._captured.flat_args,
+        traced._plan,
+    )
+
+    trace = _backprop_tagged_plan(
+        traced._plan,
+        frame,
+        resolver,
+        _build_tagged_seed_tree((seed,)),
+    )
+
+    demand = trace.input_demands[0]
+    assert demand is not None
+    np.testing.assert_array_equal(demand.rows, [3])
+    np.testing.assert_array_equal(demand.blocks, [7])
+    assert resolver.stats.map_iterations == 1
 
 
 @pytest.mark.parametrize(("reverse", "expected_visits"), [(False, 3), (True, 100)])

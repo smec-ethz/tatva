@@ -363,7 +363,7 @@ def _materialize_scan(
 
     iterations: list[IndexedChild[JaxprInstance]] = []
 
-    for logical_index in spec.execution_indices():
+    for logical_index in spec.execution_range():
         x_step_values = tuple(
             _leading_axis_value(value, logical_index) for value in xs_values
         )
@@ -439,7 +439,7 @@ def _materialize_map(
 
     iterations: list[IndexedChild[JaxprInstance]] = []
 
-    for logical_index in spec.execution_indices():
+    for logical_index in spec.execution_range():
         step_values = tuple(
             _leading_axis_value(value, logical_index) for value in mapped_values
         )

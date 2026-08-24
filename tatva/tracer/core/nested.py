@@ -92,6 +92,11 @@ class RepeatedSpec:
     length: int
     reverse: bool
 
+    def execution_range(self) -> range:
+        if self.reverse:
+            return range(self.length - 1, -1, -1)
+        return range(self.length)
+
     def execution_indices(self) -> tuple[int, ...]:
         indices = range(self.length - 1, -1, -1) if self.reverse else range(self.length)
         return tuple(indices)
