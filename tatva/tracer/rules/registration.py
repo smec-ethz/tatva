@@ -609,11 +609,7 @@ def _register_dot_general(reg: PrimitiveRegistry) -> None:
 def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
     reg.register(
         lax.cumprod_p,
-        OperationSemantics(
-            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
-            demand=reductions.cumulative_demand,
-            tagged_demand=tagged.cumulative,
-        ),
+        reductions.CUMPROD,
     )
 
     # Register rules for opaque primitives if needed
@@ -632,7 +628,7 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
     reg.register(
         lax.linalg.triangular_solve_p,
         OperationSemantics(
-            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
+            derivatives=linalg.DERIVATIVES_TRIANGULAR_SOLVE,
             demand=linalg.triangular_solve_demand,
             tagged_demand=tagged.triangular_solve,
         ),
@@ -640,7 +636,7 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
     reg.register(
         primitives.lu_p,
         OperationSemantics(
-            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
+            derivatives=linalg.DERIVATIVES_LU,
             demand=linalg.lu_demand,
             tagged_demand=tagged.lu,
         ),
