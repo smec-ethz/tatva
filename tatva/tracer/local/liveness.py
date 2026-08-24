@@ -34,8 +34,10 @@ from tatva.tracer.core.nested import (
     CustomJvpSpec,
     FrameStep,
     IndexedChild,
+    IterationSelection,
     LinearSolveInvocation,
     LinearSolveSpec,
+    MapInvocation,
     MapSpec,
     NestedKind,
     RepeatedInvocation,
@@ -322,12 +324,11 @@ class _DemandPlanNestedHandler:
             )
             outer[input_index] = merge_demands(outer[input_index], lifted)
 
-        # Preserve every selected index while sharing one demand trace.
-        children = tuple(IndexedChild(int(index), child) for index in indices)
+        selection = IterationSelection.from_indices(spec.length, indices)
 
         return (
             tuple(outer),
-            RepeatedInvocation.from_spec(self.eqn_plan.index, spec, children),
+            MapInvocation(eqn_index=self.eqn_plan.index, indices=selection, body=child),
         )
 
     def _map_unrolled(

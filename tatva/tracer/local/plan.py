@@ -42,9 +42,11 @@ from tatva.tracer.core.nested import (
     CustomJvpContext,
     CustomJvpInvocation,
     IndexedChild,
+    IterationSelection,
     LinearSolveContext,
     LinearSolveInvocation,
     MapContext,
+    MapInvocation,
     NestedSpec,
     RepeatedInvocation,
     ScanContext,
@@ -88,6 +90,9 @@ class LocalNestedPlan:
 
     @property
     def indices(self) -> tuple[int, ...]:
+        if isinstance(self.invocation, MapInvocation):
+            return tuple(self.invocation.indices)
+
         return tuple(
             child.logical_index
             for child in self.invocation.children(TraversalOrder.LOGICAL)
@@ -347,16 +352,53 @@ class _LocalRankPlanNestedHandler:
             CondInvocation(self.eqn_plan.index, branch_index, body),
         )
 
-    def map(self, context: MapContext[JaxprDemandTrace]) -> LocalNestedPlan:
+    def map(
+        self,
+        context: MapContext[JaxprDemandTrace],
+    ) -> LocalNestedPlan:
+        invocation = context.invocation
+
+        if isinstance(invocation, MapInvocation):
+            if invocation.indices.count == 0:
+                raise RuntimeError("live template map has no surviving iterations")
+
+            representative = invocation.indices.first()
+            child_frame = self.resolver.map_frame(
+                self.frame, self.eqn_plan, representative
+            )
+
+            try:
+                body = _build_rank_local_jaxpr_plan(
+                    child_frame.plan,
+                    child_frame,
+                    self.resolver,
+                    invocation.body,  # ty: ignore[invalid-argument-type]
+                )
+            finally:
+                self.resolver.release(child_frame)
+
+            return LocalNestedPlan(
+                context.spec,
+                MapInvocation(
+                    eqn_index=self.eqn_plan.index,
+                    indices=invocation.indices,
+                    body=body,
+                ),
+            )
+
+        # Exact/unrolled fallback.
         children: list[IndexedChild[LocalJaxprPlan]] = []
 
-        for child_trace in context.invocation.children(TraversalOrder.LOGICAL):
+        for child_trace in invocation.children(TraversalOrder.LOGICAL):
             index = cast(int, child_trace.logical_index)
             child_frame = self.resolver.map_frame(self.frame, self.eqn_plan, index)
 
             try:
                 body = _build_rank_local_jaxpr_plan(
-                    child_frame.plan, child_frame, self.resolver, child_trace.payload
+                    child_frame.plan,
+                    child_frame,
+                    self.resolver,
+                    child_trace.payload,
                 )
             finally:
                 self.resolver.release(child_frame)
@@ -366,7 +408,9 @@ class _LocalRankPlanNestedHandler:
         return LocalNestedPlan(
             context.spec,
             RepeatedInvocation.from_spec(
-                self.eqn_plan.index, context.spec, tuple(children)
+                self.eqn_plan.index,
+                context.spec,
+                tuple(children),
             ),
         )
 
