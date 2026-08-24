@@ -2,12 +2,12 @@
 Recursive structural Jacobian and Hessian sparsity propagation.
 
 This module consumes a materialized `JaxprInstance` tree and propagates
-structural derivative dependencies with respect to the global DOF vector.
+structural derivative dependencies with respect to the declared coordinate blocks.
 
 A `DependencySet` represents structural Jacobian support: each tensor entry maps
-to the set of global DOFs that may influence it. Primitive-local derivative
+to the set of symbolic coordinates that may influence it. Primitive-local derivative
 rules propagate these dependency sets and contribute structural second-order
-interactions to a shared `HessianAccumulator`.
+interactions to a shared `InteractionGraph`.
 
 Ordinary primitives are handled through `SEMANTICS`. Higher-order constructs are
 handled recursively rather than through ordinary primitive rules:
@@ -18,28 +18,29 @@ handled recursively rather than through ordinary primitive rules:
   between iterations.
 
 Map tracing has two modes. When every materialized iteration has the same
-resolved structural program, the body is traced once using symbolic local input
-DOFs. Its local Jacobian and Hessian support are then lifted to each iteration
-through that iteration's actual global input-dependency matrix. If routes or
+resolved structural program, the body is traced once in a compact local symbolic
+coordinate system. Its dependency and interaction support are then lifted to each
+iteration through that iteration's actual input-dependency matrix. If routes or
 nested structure differ between iterations, tracing falls back to exact
 iteration-by-iteration recursion.
 
 Stateful scans are not eligible for this map optimization because their carry
 creates genuine cross-iteration dependency propagation.
 
-The root JAXPR is seeded specially: its first input is the global flat DOF
-vector and receives singleton dependencies; all other root inputs and constants
-start with empty derivative dependencies. Nested JAXPR inputs instead receive
-dependency sets supplied by their parent invocation.
+Root JAXPR inputs are seeded from a `FormSpec`: every declared coordinate
+block receives independent symbolic columns, while non-coordinate inputs start
+with empty derivative dependencies. Nested JAXPR inputs receive dependency sets
+supplied by their parent invocation.
 
-The Hessian accumulator is shared across the full recursive trace, so
-second-order interactions originating inside nested calls, maps, or scans are
-recorded directly in the global sparsity pattern.
+The interaction graph is shared across the full recursive trace, so second-order
+interactions originating inside nested calls, maps, scans, or custom-JVP rules
+are recorded in one symbolic coordinate system. Operator sparsity is obtained by
+extracting the declared row-by-column block from this graph.
 
 Key invariants:
 
-- dependency coordinates always refer to global DOFs;
-- nested wrappers introduce no Hessian interactions by themselves;
+- dependency coordinates always refer to symbolic coordinates;
+- nested wrappers introduce no second-order interactions by themselves;
 - independent map iterations may be template-lifted only when their resolved
   structural programs are identical;
 - recurrent scan carry dependencies are propagated iteration by iteration;
@@ -78,7 +79,8 @@ from tatva.tracer.core.nested import (
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.semantics import RuleContext
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
+from tatva.tracer.program.forms import FormSpec, SymbolicLayout
 from tatva.tracer.program.materialize import (
     JaxprInstance,
     ResolvedEqn,
@@ -97,8 +99,8 @@ class MapDerivativeTemplate:
 
     input_shapes: tuple[tuple[int, ...], ...]
     output_deps: tuple[DependencySet, ...]
-    hessian: sps.csr_matrix
-    n_local_dofs: int
+    interactions: sps.csr_matrix
+    n_local_symbols: int
     trace: JaxprDerivativeTrace
 
 
@@ -112,58 +114,94 @@ class JaxprDerivativeTrace:
 @dataclass(frozen=True)
 class DerivativeTrace:
     root: JaxprDerivativeTrace
-    hessian: sps.csr_matrix
+    symbolic_layout: SymbolicLayout
+    interactions: sps.csr_matrix
+
+    @property
+    def tangent(self) -> sps.csr_matrix:
+        """Row-coordinate × column-coordinate structural tangent pattern."""
+        return self.symbolic_layout.tangent_block(self.interactions)
+
+    @property
+    def hessian(self) -> sps.csr_matrix:
+        """Backward-compatible energy Hessian view.
+
+        A Hessian is defined only when the exact same symbolic coordinates are
+        declared as rows and columns.  Weak/mixed forms should use ``tangent``.
+        """
+        if not self.symbolic_layout.has_identical_rows_and_columns:
+            raise AttributeError(
+                "hessian is only defined when row and column coordinates coincide; "
+                "use tangent for weak or mixed forms"
+            )
+        return self.tangent
+
+
+def trace_form_derivatives(
+    instance: JaxprInstance,
+    form: FormSpec,
+) -> DerivativeTrace:
+    """Trace one scalar form in a unified symbolic coordinate system."""
+    layout = SymbolicLayout.from_form(form, instance.plan.jaxpr)
+    input_deps = layout.seed_inputs(form, instance.plan.jaxpr)
+    return trace_seeded_derivatives(instance, layout, input_deps)
+
+
+def trace_seeded_derivatives(
+    instance: JaxprInstance,
+    symbolic_layout: SymbolicLayout,
+    input_deps: tuple[DependencySet, ...],
+) -> DerivativeTrace:
+    """Trace with an explicit root relation into an existing symbolic layout.
+
+    This is used by localized execution, where executable inputs can be compact
+    projections of a larger storage coordinate block.
+    """
+    if len(input_deps) != len(instance.plan.jaxpr.invars):
+        raise ValueError(
+            f"JAXPR has {len(instance.plan.jaxpr.invars)} inputs but received "
+            f"{len(input_deps)} dependency seeds"
+        )
+    for dep in input_deps:
+        if dep.csr.shape[1] != symbolic_layout.size:
+            raise ValueError(
+                "root dependency seed width does not match symbolic layout"
+            )
+
+    acc = InteractionGraph(symbolic_layout.size)
+    root = _trace_jaxpr(
+        instance=instance,
+        input_deps=input_deps,
+        acc=acc,
+        n_symbols=symbolic_layout.size,
+    )
+    return DerivativeTrace(
+        root=root,
+        symbolic_layout=symbolic_layout,
+        interactions=acc.finalize(),
+    )
 
 
 def trace_derivatives(
     instance: JaxprInstance,
     n_dofs: int,
 ) -> DerivativeTrace:
-    acc = HessianAccumulator(n_dofs)
-
-    input_deps = _seed_root_input_dependencies(instance, n_dofs)
-
-    root = _trace_jaxpr(
-        instance=instance, input_deps=input_deps, acc=acc, n_dofs=n_dofs
-    )
-
-    return DerivativeTrace(root=root, hessian=acc.finalize())
-
-
-def _seed_root_input_dependencies(
-    instance: JaxprInstance,
-    n_dofs: int,
-) -> tuple[DependencySet, ...]:
-    jaxpr = instance.plan.jaxpr
-
-    if not jaxpr.invars:
-        raise ValueError("Expected the first Jaxpr input to be the DOF vector")
-
-    dof_var = jaxpr.invars[0]
-    dof_shape = _shape_of(dof_var)
-
-    if dof_shape != (n_dofs,):
-        raise ValueError(f"DOF input must have shape ({n_dofs},), got {dof_shape}")
-
-    result: list[DependencySet] = [DependencySet.singletons(n_dofs)]
-
-    result.extend(
-        DependencySet.empty(
-            _shape_of(var),
-            n_dofs,
+    """Backward-compatible energy entry point using the generic form tracer."""
+    trace = trace_form_derivatives(instance, FormSpec.energy(input_index=0))
+    if trace.symbolic_layout.size != n_dofs:
+        raise ValueError(
+            f"energy coordinate size {trace.symbolic_layout.size} does not match "
+            f"n_dofs={n_dofs}"
         )
-        for var in jaxpr.invars[1:]
-    )
-
-    return tuple(result)
+    return trace
 
 
 def _trace_jaxpr(
     *,
     instance: JaxprInstance,
     input_deps: tuple[DependencySet, ...],
-    acc: HessianAccumulator,
-    n_dofs: int,
+    acc: InteractionGraph,
+    n_symbols: int,
 ) -> JaxprDerivativeTrace:
     jaxpr = instance.plan.jaxpr
 
@@ -179,11 +217,11 @@ def _trace_jaxpr(
     for var, dep in zip(jaxpr.invars, input_deps):
         dependencies[var] = dep
 
-    # Closed-over constants never depend on the global DOFs.
+    # Closed-over constants never depend on the symbolic coordinates.
     for var in jaxpr.constvars:
         dependencies[var] = DependencySet.empty(
             _shape_of(var),
-            n_dofs,
+            n_symbols,
         )
 
     nested_traces: dict[int, NestedDerivativeTrace] = {}
@@ -192,7 +230,7 @@ def _trace_jaxpr(
         if isinstance(atom, Literal):
             return DependencySet.empty(
                 _shape_of(atom),
-                n_dofs,
+                n_symbols,
             )
         if isinstance(atom, Var):
             try:
@@ -211,7 +249,7 @@ def _trace_jaxpr(
                 resolved=resolved,
                 input_deps=input_eqn_deps,
                 acc=acc,
-                n_dofs=n_dofs,
+                n_symbols=n_symbols,
             )
 
         else:
@@ -221,7 +259,7 @@ def _trace_jaxpr(
             output_deps, nested_trace = dispatch_nested(
                 nested_plan.spec,
                 resolved.nested,
-                _DerivativeNestedHandler(resolved, input_eqn_deps, acc, n_dofs),
+                _DerivativeNestedHandler(resolved, input_eqn_deps, acc, n_symbols),
             )
             nested_traces[resolved.plan.index] = nested_trace
 
@@ -249,24 +287,24 @@ def _trace_jaxpr(
 class _DerivativeNestedHandler:
     resolved: ResolvedEqn
     input_deps: tuple[DependencySet, ...]
-    acc: HessianAccumulator
-    n_dofs: int
+    acc: InteractionGraph
+    n_symbols: int
 
     def call(self, context: CallContext[JaxprInstance]):
         return _trace_call(
             context=context,
             input_deps=self.input_deps,
             acc=self.acc,
-            n_dofs=self.n_dofs,
+            n_symbols=self.n_symbols,
         )
 
     def custom_jvp(self, context: CustomJvpContext[JaxprInstance]):
-        return _trace_custom_jvp_opaque(
+        return _trace_custom_jvp(
             resolved=self.resolved,
             context=context,
             input_deps=self.input_deps,
             acc=self.acc,
-            n_dofs=self.n_dofs,
+            n_symbols=self.n_symbols,
         )
 
     def map(self, context: MapContext[JaxprInstance]):
@@ -275,7 +313,7 @@ class _DerivativeNestedHandler:
             context=context,
             input_deps=self.input_deps,
             acc=self.acc,
-            n_dofs=self.n_dofs,
+            n_symbols=self.n_symbols,
         )
 
     def scan(self, context: ScanContext[JaxprInstance]):
@@ -284,7 +322,7 @@ class _DerivativeNestedHandler:
             context=context,
             input_deps=self.input_deps,
             acc=self.acc,
-            n_dofs=self.n_dofs,
+            n_symbols=self.n_symbols,
         )
 
     def cond(self, context: CondContext[JaxprInstance]):
@@ -292,7 +330,7 @@ class _DerivativeNestedHandler:
             context=context,
             input_deps=self.input_deps,
             acc=self.acc,
-            n_dofs=self.n_dofs,
+            n_symbols=self.n_symbols,
         )
 
     def linear_solve(self, context: LinearSolveContext[JaxprInstance]):
@@ -313,7 +351,7 @@ class _DerivativeNestedHandler:
                     instance=child.payload,
                     input_deps=deps,
                     acc=self.acc,
-                    n_dofs=self.n_dofs,
+                    n_symbols=self.n_symbols,
                 )
             )
         union = (
@@ -339,8 +377,8 @@ def _trace_ordinary_eqn(
     *,
     resolved: ResolvedEqn,
     input_deps: tuple[DependencySet, ...],
-    acc: HessianAccumulator,
-    n_dofs: int,
+    acc: InteractionGraph,
+    n_symbols: int,
 ) -> tuple[DependencySet, ...]:
     eqn = resolved.plan.eqn
     semantics = SEMANTICS.get_ordinary(eqn.primitive)
@@ -349,11 +387,11 @@ def _trace_ordinary_eqn(
         eqn=eqn,
         input_deps=input_deps,
         route=resolved.route,
-        n_dofs=n_dofs,
+        n_symbols=n_symbols,
     )
 
     prepared = semantics.derivatives.prepare(ctx)
-    semantics.derivatives.hessian(ctx, prepared, acc)
+    semantics.derivatives.interactions(ctx, prepared, acc)
 
     return semantics.derivatives.dependencies(ctx, prepared)
 
@@ -402,53 +440,247 @@ def _stack_leading_axis_dependencies(
     )
 
 
-def _trace_custom_jvp_opaque(
+def _augment_dependency_width(
+    dep: DependencySet,
+    extra_columns: int,
+) -> DependencySet:
+    if extra_columns < 0:
+        raise ValueError("extra_columns must be nonnegative")
+    if extra_columns == 0:
+        return dep
+    zeros = sps.csr_matrix((dep.csr.shape[0], extra_columns), dtype=bool)
+    return DependencySet(
+        sps.hstack((dep.csr, zeros), format="csr"),
+        dep.shape,
+    )
+
+
+def _independent_tangent_dependency(
+    shape: tuple[int, ...],
+    *,
+    parent_symbols: int,
+    tangent_symbols: int,
+    tangent_offset: int,
+) -> DependencySet:
+    size = int(np.prod(shape, dtype=np.int64))
+    rows = np.arange(size, dtype=np.int64)
+    cols = parent_symbols + tangent_offset + rows
+    csr = sps.csr_matrix(
+        (
+            np.ones(size, dtype=bool),
+            (rows, cols),
+        ),
+        shape=(size, parent_symbols + tangent_symbols),
+        dtype=bool,
+    )
+    return DependencySet(csr, shape)
+
+
+def _project_dependency(
+    dep: DependencySet,
+    projection: sps.csr_matrix,
+) -> DependencySet:
+    csr = (dep.csr @ projection).astype(bool).tocsr()
+    csr.eliminate_zeros()
+    return DependencySet(csr, dep.shape)
+
+
+def _project_jaxpr_derivative_trace(
+    trace: JaxprDerivativeTrace,
+    projection: sps.csr_matrix,
+) -> JaxprDerivativeTrace:
+    nested: dict[int, NestedDerivativeTrace] = {}
+    for index, item in trace.nested.items():
+        invocation = item.invocation.map_children(
+            lambda child: _project_jaxpr_derivative_trace(
+                child.payload,
+                projection,
+            )
+        )
+        template = (
+            None
+            if item.template is None
+            else _project_jaxpr_derivative_trace(item.template, projection)
+        )
+        nested[index] = NestedDerivativeTrace(invocation=invocation, template=template)
+
+    return JaxprDerivativeTrace(
+        dependencies={
+            var: _project_dependency(dep, projection)
+            for var, dep in trace.dependencies.items()
+        },
+        output_deps=tuple(
+            _project_dependency(dep, projection) for dep in trace.output_deps
+        ),
+        nested=nested,
+    )
+
+
+def _trace_custom_jvp(
     *,
     resolved: ResolvedEqn,
     context: CustomJvpContext[JaxprInstance],
     input_deps: tuple[DependencySet, ...],
-    acc: HessianAccumulator,
-    n_dofs: int,
+    acc: InteractionGraph,
+    n_symbols: int,
 ) -> tuple[tuple[DependencySet, ...], NestedDerivativeTrace]:
-    """Trace callbacks diagnostically but keep the outer Hessian conservative."""
-    from tatva.tracer.rules.opaque import DERIVATIVES_OPAQUE_NONLINEAR
+    """Use the staged custom-JVP program as the authoritative derivative rule.
 
-    scratch = HessianAccumulator(n_dofs)
+    The enclosing symbolic coordinate system is extended temporarily with one
+    independent tangent symbol per scalar tangent input.  The JVP is traced in
+    ``[parent symbols | tangent symbols]``.  First-order output dependencies
+    come from tangent-output -> tangent-symbol incidence.  Second-order
+    interactions come from the parent x tangent cross block.  Both are lifted
+    through the outer input dependency relation and projected back to the
+    enclosing symbolic system.
+    """
+    eqn = resolved.plan.eqn
+    spec = context.spec
+
+    # Keep the primal callback trace for diagnostics only.  A custom JVP
+    # overrides derivative semantics, so primal-callback interactions must not
+    # be added to the enclosing graph.
+    primal_scratch = InteractionGraph(n_symbols)
     primal_trace = _trace_jaxpr(
         instance=context.invocation.primal,
         input_deps=input_deps,
-        acc=scratch,
-        n_dofs=n_dofs,
+        acc=primal_scratch,
+        n_symbols=n_symbols,
     )
-    jvp_deps = tuple(
-        input_deps[binding.outer_input_index] for binding in context.spec.jvp_bindings
+
+    tangent_bindings = tuple(
+        binding for binding in spec.jvp_bindings if binding.tangent
     )
-    jvp_trace = _trace_jaxpr(
+    tangent_sizes = tuple(
+        int(np.prod(_shape_of(eqn.invars[binding.outer_input_index]), dtype=np.int64))
+        for binding in tangent_bindings
+    )
+    n_tangent_symbols = sum(tangent_sizes)
+    n_extended_symbols = n_symbols + n_tangent_symbols
+
+    # Each independent tangent scalar represents the directional variation of
+    # the corresponding outer primal scalar.  This sparse lifting relation is
+    # also what lets the same custom-JVP machinery work inside energy, weak,
+    # and mixed forms without knowing their row/column roles.
+    if tangent_bindings:
+        tangent_lift = sps.vstack(
+            [input_deps[binding.outer_input_index].csr for binding in tangent_bindings],
+            format="csr",
+        ).astype(bool)
+    else:
+        tangent_lift = sps.csr_matrix((0, n_symbols), dtype=bool)
+
+    if tangent_lift.shape != (n_tangent_symbols, n_symbols):
+        raise RuntimeError(
+            "custom_jvp tangent lifting shape mismatch: "
+            f"{tangent_lift.shape} != {(n_tangent_symbols, n_symbols)}"
+        )
+
+    jvp_input_deps: list[DependencySet] = []
+    tangent_offset = 0
+    for binding, child_var in zip(
+        spec.jvp_bindings,
+        context.invocation.jvp.plan.jaxpr.invars,
+        strict=True,
+    ):
+        outer_dep = input_deps[binding.outer_input_index]
+        child_shape = _shape_of(child_var)
+        if child_shape != outer_dep.shape:
+            raise RuntimeError(
+                "custom_jvp child input shape differs from its outer binding: "
+                f"{child_shape} != {outer_dep.shape}"
+            )
+
+        if binding.tangent:
+            dep = _independent_tangent_dependency(
+                child_shape,
+                parent_symbols=n_symbols,
+                tangent_symbols=n_tangent_symbols,
+                tangent_offset=tangent_offset,
+            )
+            tangent_offset += int(np.prod(child_shape, dtype=np.int64))
+        else:
+            dep = _augment_dependency_width(outer_dep, n_tangent_symbols)
+        jvp_input_deps.append(dep)
+
+    if tangent_offset != n_tangent_symbols:
+        raise RuntimeError("custom_jvp tangent symbol accounting mismatch")
+
+    jvp_acc = InteractionGraph(n_extended_symbols)
+    jvp_extended = _trace_jaxpr(
         instance=context.invocation.jvp,
-        input_deps=jvp_deps,
-        acc=scratch,
-        n_dofs=n_dofs,
+        input_deps=tuple(jvp_input_deps),
+        acc=jvp_acc,
+        n_symbols=n_extended_symbols,
     )
-    eqn = resolved.plan.eqn
-    ctx = RuleContext(eqn=eqn, input_deps=input_deps, route=None, n_dofs=n_dofs)
-    rule = DERIVATIVES_OPAQUE_NONLINEAR
-    prepared = rule.prepare(ctx)
-    rule.hessian(ctx, prepared, acc)
-    outputs = rule.dependencies(ctx, prepared)
-    nested_trace = CustomJvpInvocation(
-        eqn_index=resolved.plan.index,
-        primal=primal_trace,
-        jvp=jvp_trace,
+
+    n_outputs = len(eqn.outvars)
+    tangent_cursor = n_outputs
+    outputs: list[DependencySet] = []
+
+    for outvar, is_zero in zip(eqn.outvars, spec.output_zeros, strict=True):
+        out_shape = _shape_of(outvar)
+        if is_zero:
+            outputs.append(DependencySet.empty(out_shape, n_symbols))
+            continue
+
+        if tangent_cursor >= len(jvp_extended.output_deps):
+            raise RuntimeError("custom_jvp tangent output ABI is incomplete")
+        tangent_dep = jvp_extended.output_deps[tangent_cursor]
+        tangent_cursor += 1
+
+        tangent_columns = tangent_dep.csr[:, n_symbols:]
+        lifted = (tangent_columns @ tangent_lift).astype(bool).tocsr()
+        lifted.eliminate_zeros()
+        outputs.append(DependencySet(lifted, out_shape))
+
+    if tangent_cursor != len(jvp_extended.output_deps):
+        raise RuntimeError(
+            "custom_jvp tangent output ABI has unexpected trailing outputs"
+        )
+
+    # The custom derivative's second-order support is variation of the tangent
+    # output with parent coordinates: parent x tangent.  Parent x parent work
+    # done while recomputing primal outputs in the callback is deliberately
+    # ignored because custom_jvp overrides that derivative semantics.
+    jvp_interactions = jvp_acc.finalize()
+    cross = jvp_interactions[:n_symbols, n_symbols:]
+    outer_cross = (cross @ tangent_lift).astype(bool).tocsr()
+    outer_cross.eliminate_zeros()
+    if outer_cross.nnz:
+        acc.add_pattern(outer_cross, symmetric=True)
+
+    # Nested diagnostics exposed to callers must remain in the parent symbolic
+    # coordinate system; the temporary tangent block is an implementation
+    # detail of this handler.
+    projection = sps.vstack(
+        (
+            sps.eye(n_symbols, format="csr", dtype=bool),
+            tangent_lift,
+        ),
+        format="csr",
     )
-    return outputs, nested_trace
+    jvp_trace = _project_jaxpr_derivative_trace(jvp_extended, projection)
+
+    return (
+        tuple(outputs),
+        NestedDerivativeTrace(
+            invocation=CustomJvpInvocation(
+                eqn_index=resolved.plan.index,
+                primal=primal_trace,
+                jvp=jvp_trace,
+            ),
+            template=None,
+        ),
+    )
 
 
 def _trace_call(
     *,
     context: CallContext[JaxprInstance],
     input_deps: tuple[DependencySet, ...],
-    acc: HessianAccumulator,
-    n_dofs: int,
+    acc: InteractionGraph,
+    n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
     NestedDerivativeTrace,
@@ -461,7 +693,7 @@ def _trace_call(
         instance=nested.body,
         input_deps=child_input_deps,
         acc=acc,
-        n_dofs=n_dofs,
+        n_symbols=n_symbols,
     )
 
     return (
@@ -476,8 +708,8 @@ def _trace_cond(
     *,
     context: CondContext[JaxprInstance],
     input_deps: tuple[DependencySet, ...],
-    acc: HessianAccumulator,
-    n_dofs: int,
+    acc: InteractionGraph,
+    n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
     NestedDerivativeTrace,
@@ -489,7 +721,7 @@ def _trace_cond(
         instance=nested.body,
         input_deps=child_input_deps,
         acc=acc,
-        n_dofs=n_dofs,
+        n_symbols=n_symbols,
     )
 
     return (
@@ -510,8 +742,8 @@ def _trace_scan(
     resolved: ResolvedEqn,
     context: ScanContext[JaxprInstance],
     input_deps: tuple[DependencySet, ...],
-    acc: HessianAccumulator,
-    n_dofs: int,
+    acc: InteractionGraph,
+    n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
     NestedDerivativeTrace,
@@ -544,7 +776,7 @@ def _trace_scan(
 
         for outvar in eqn.outvars[num_carry:]:
             shape = _shape_of(outvar)
-            y_outputs.append(DependencySet.empty(shape, n_dofs))
+            y_outputs.append(DependencySet.empty(shape, n_symbols))
 
         return (
             final_carry + tuple(y_outputs),
@@ -576,7 +808,7 @@ def _trace_scan(
             instance=child.payload,
             input_deps=body_input_deps,
             acc=acc,
-            n_dofs=n_dofs,
+            n_symbols=n_symbols,
         )
 
         if len(body_trace.output_deps) < num_carry:
@@ -628,8 +860,8 @@ def _trace_map(
     resolved: ResolvedEqn,
     context: MapContext[JaxprInstance],
     input_deps: tuple[DependencySet, ...],
-    acc: HessianAccumulator,
-    n_dofs: int,
+    acc: InteractionGraph,
+    n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
     NestedDerivativeTrace,
@@ -637,7 +869,7 @@ def _trace_map(
     nested = context.invocation
     if not nested.iterations:
         ouputs = tuple(
-            DependencySet.empty(_shape_of(outvar), n_dofs)
+            DependencySet.empty(_shape_of(outvar), n_symbols)
             for outvar in resolved.plan.eqn.outvars
         )
         return ouputs, NestedDerivativeTrace(
@@ -652,24 +884,24 @@ def _trace_map(
             context=context,
             input_deps=input_deps,
             acc=acc,
-            n_dofs=n_dofs,
+            n_symbols=n_symbols,
         )
 
     # template tracing assigns one symbolic DOF to every scalar body input.
     # avoid it when that local symbolic problem is larger than tracing directly
-    # in the global DOF space.
+    # in the enclosing symbolic space.
     # just a heuristic rule, but it may avoid a lot of unnecessary symbolic tracing.
     representative = nested.iterations[0].body
-    n_local_dofs = sum(
+    n_local_symbols = sum(
         math.prod(_shape_of(var)) for var in representative.plan.jaxpr.invars
     )
-    if n_local_dofs <= n_dofs and _map_iterations_are_structurally_equal(nested):
+    if n_local_symbols <= n_symbols and _map_iterations_are_structurally_equal(nested):
         return _trace_map_template(
             resolved=resolved,
             context=context,
             input_deps=input_deps,
             acc=acc,
-            n_dofs=n_dofs,
+            n_symbols=n_symbols,
         )
 
     # Value-dependent routing differs between iterations:
@@ -679,7 +911,7 @@ def _trace_map(
         context=context,
         input_deps=input_deps,
         acc=acc,
-        n_dofs=n_dofs,
+        n_symbols=n_symbols,
     )
 
 
@@ -688,8 +920,8 @@ def _trace_map_unrolled(
     resolved: ResolvedEqn,
     context: MapContext[JaxprInstance],
     input_deps: tuple[DependencySet, ...],
-    acc: HessianAccumulator,
-    n_dofs: int,
+    acc: InteractionGraph,
+    n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
     NestedDerivativeTrace,
@@ -712,7 +944,7 @@ def _trace_map_unrolled(
         )
         body_inputs = tuple(const_deps) + step_deps
         body_trace = _trace_jaxpr(
-            instance=child.payload, input_deps=body_inputs, acc=acc, n_dofs=n_dofs
+            instance=child.payload, input_deps=body_inputs, acc=acc, n_symbols=n_symbols
         )
 
         if len(body_trace.output_deps) != len(resolved.plan.eqn.outvars):
@@ -729,7 +961,7 @@ def _trace_map_unrolled(
     for output_index, outvar in enumerate(resolved.plan.eqn.outvars):
         if spec.length == 0:
             shape = _shape_of(outvar)
-            outputs.append(DependencySet.empty(shape, n_dofs))
+            outputs.append(DependencySet.empty(shape, n_symbols))
             continue
         steps = collect_logical_output(
             ((item.index, item.body.output_deps) for item in iteration_traces),
@@ -753,8 +985,8 @@ def _trace_map_template(
     resolved: ResolvedEqn,
     context: MapContext[JaxprInstance],
     input_deps: tuple[DependencySet, ...],
-    acc: HessianAccumulator,
-    n_dofs: int,
+    acc: InteractionGraph,
+    n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
     NestedDerivativeTrace,
@@ -782,8 +1014,8 @@ def _trace_map_template(
         lifting = _input_lifting_matrix(
             body_input_deps,
             expected_shapes=template.input_shapes,
-            n_local_dofs=template.n_local_dofs,
-            n_dofs=n_dofs,
+            n_local_symbols=template.n_local_symbols,
+            n_symbols=n_symbols,
         )
 
         # Structural Jacobian propagation
@@ -793,8 +1025,8 @@ def _trace_map_template(
         )
         outputs_by_iteration.append((logical_index, lifted_outputs))
 
-        # Structural Hessian propagation
-        _lift_template_hessian(template.hessian, lifting, acc)
+        # Structural interaction propagation
+        _lift_template_interactions(template.interactions, lifting, acc)
 
     outputs: list[DependencySet] = []
 
@@ -916,7 +1148,7 @@ def _symbolic_input_dependencies(
 ]:
     shapes = tuple(_shape_of(var) for var in jaxpr.invars)
     sizes = tuple(int(np.prod(shape, dtype=np.int64)) for shape in shapes)
-    n_local_dofs = sum(sizes)
+    n_local_symbols = sum(sizes)
     dependencies: list[DependencySet] = []
     offset = 0
 
@@ -928,34 +1160,34 @@ def _symbolic_input_dependencies(
                 np.ones(size, dtype=bool),
                 (rows, cols),
             ),
-            shape=(size, n_local_dofs),
+            shape=(size, n_local_symbols),
             dtype=bool,
         )
 
         dependencies.append(DependencySet(csr, shape))
         offset += size
 
-    return tuple(dependencies), n_local_dofs
+    return tuple(dependencies), n_local_symbols
 
 
 def _build_map_derivative_template(
     representative: JaxprInstance,
 ) -> MapDerivativeTemplate:
     jaxpr = representative.plan.jaxpr
-    symbolic_inputs, n_local_dofs = _symbolic_input_dependencies(jaxpr)
-    local_acc = HessianAccumulator(n_local_dofs)
+    symbolic_inputs, n_local_symbols = _symbolic_input_dependencies(jaxpr)
+    local_acc = InteractionGraph(n_local_symbols)
     local_trace = _trace_jaxpr(
         instance=representative,
         input_deps=symbolic_inputs,
         acc=local_acc,
-        n_dofs=n_local_dofs,
+        n_symbols=n_local_symbols,
     )
 
     return MapDerivativeTemplate(
         input_shapes=tuple(dep.shape for dep in symbolic_inputs),
         output_deps=local_trace.output_deps,
-        hessian=local_acc.finalize(),
-        n_local_dofs=n_local_dofs,
+        interactions=local_acc.finalize(),
+        n_local_symbols=n_local_symbols,
         trace=local_trace,
     )
 
@@ -964,8 +1196,8 @@ def _input_lifting_matrix(
     input_deps: tuple[DependencySet, ...],
     *,
     expected_shapes: tuple[tuple[int, ...], ...],
-    n_local_dofs: int,
-    n_dofs: int,
+    n_local_symbols: int,
+    n_symbols: int,
 ) -> sps.csr_matrix:
     if len(input_deps) != len(expected_shapes):
         raise ValueError("map template/body input count mismatch")
@@ -978,11 +1210,11 @@ def _input_lifting_matrix(
 
     matrix = sps.vstack([dep.csr for dep in input_deps], format="csr")
 
-    if matrix.shape != (n_local_dofs, n_dofs):
+    if matrix.shape != (n_local_symbols, n_symbols):
         raise RuntimeError(
             f"invalid map lifting matrix shape "
             f"{matrix.shape}; expected "
-            f"({n_local_dofs}, {n_dofs})"
+            f"({n_local_symbols}, {n_symbols})"
         )
 
     return matrix
@@ -998,15 +1230,15 @@ def _lift_template_output(
     return DependencySet(csr, template_dep.shape)
 
 
-def _lift_template_hessian(
-    template_hessian: sps.csr_matrix,
+def _lift_template_interactions(
+    template_interactions: sps.csr_matrix,
     lifting: sps.csr_matrix,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
-    if template_hessian.nnz == 0 or lifting.nnz == 0:
+    if template_interactions.nnz == 0 or lifting.nnz == 0:
         return
 
-    global_pattern = (lifting.T @ template_hessian @ lifting).tocsr()
+    global_pattern = (lifting.T @ template_interactions @ lifting).tocsr()
     if global_pattern.nnz == 0:
         return
 

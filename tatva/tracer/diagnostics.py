@@ -5,10 +5,9 @@ from __future__ import annotations
 import functools
 
 from tatva.tracer.api import FunctionalAnalysis
-from tatva.tracer.helpers import _shape_of
 from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.contributions import ContributionBlock
-from tatva.tracer.program.derivatives import DerivativeTrace, trace_derivatives
+from tatva.tracer.program.derivatives import DerivativeTrace, trace_form_derivatives
 from tatva.tracer.program.incidence import (
     BlockDofIncidence,
     generate_contribution_blocks,
@@ -38,6 +37,7 @@ def incidence(
         functional._captured.closed_jaxpr,
         functional._captured.flat_args,
         functional._plan,
+        unavailable_inputs=functional._form.coordinate_input_indices,
     )
     return plan_tagged_block_dof_incidence(
         functional._plan,
@@ -61,7 +61,7 @@ def materialize(functional: FunctionalAnalysis) -> JaxprInstance:
 @functools.cache
 def global_derivatives(functional: FunctionalAnalysis) -> DerivativeTrace:
     """Materialize and analyze global derivative sparsity."""
-    return trace_derivatives(
+    return trace_form_derivatives(
         materialize(functional),
-        n_dofs=_shape_of(functional._captured.jaxpr.invars[0])[0],
+        functional._form,
     )

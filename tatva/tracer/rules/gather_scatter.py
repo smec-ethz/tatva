@@ -39,7 +39,7 @@ from tatva.tracer.local.localize import (
     localize_gather_route,
     localize_scatter_route,
 )
-from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
 from tatva.tracer.rules import tagged
 
 if TYPE_CHECKING:
@@ -191,7 +191,7 @@ def scatter_accumulate_dependencies(
 
 
 def scatter_mul_hessian(
-    ctx: RuleContext, prepared: PreparedScatter, acc: HessianAccumulator
+    ctx: RuleContext, prepared: PreparedScatter, acc: InteractionGraph
 ) -> None:
     valid = prepared.target_rows >= 0
 
@@ -351,7 +351,7 @@ SCATTER_BASIC = OperationSemantics(
     DerivativeRule(
         prepare=prepare_scatter,
         dependencies=scatter_accumulate_dependencies,
-        hessian=no_hessian,
+        interactions=no_hessian,
     ),
     routing=RoutingSemantics(
         inputs=scatter_concrete_inputs,
@@ -367,7 +367,7 @@ SCATTER_ACCUMULATE = OperationSemantics(
     DerivativeRule(
         prepare=prepare_scatter,
         dependencies=scatter_accumulate_dependencies,
-        hessian=no_hessian,
+        interactions=no_hessian,
     ),
     routing=RoutingSemantics(
         inputs=scatter_concrete_inputs,
@@ -382,7 +382,7 @@ SCATTER_MUL = OperationSemantics(
     DerivativeRule(
         prepare=prepare_scatter,
         dependencies=scatter_accumulate_dependencies,
-        hessian=scatter_mul_hessian,
+        interactions=scatter_mul_hessian,
     ),
     routing=RoutingSemantics(
         inputs=scatter_concrete_inputs,

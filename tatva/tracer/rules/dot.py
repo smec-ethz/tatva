@@ -11,7 +11,7 @@ from tatva.tracer.core.routes import Shape
 from tatva.tracer.core.semantics import DemandContext, RuleContext
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import Demand, TensorDemand
-from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
 
 
 @dataclass(frozen=True)
@@ -246,7 +246,7 @@ def dot_general_dependencies(
 def dot_general_hessian(
     ctx: RuleContext,
     prepared: DotGeneralMap,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     lhs, rhs = ctx.input_deps
 

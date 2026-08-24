@@ -81,7 +81,7 @@ def test_partition_and_compilation_do_not_trace_global_derivatives(monkeypatch):
 
     monkeypatch.setattr(
         tracer_diagnostics,
-        "trace_derivatives",
+        "trace_form_derivatives",
         unexpected_global_derivatives,
     )
     dofs = jnp.arange(8.0)

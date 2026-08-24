@@ -14,12 +14,10 @@ from tatva.tracer.core.routes import Shape
 @dataclass
 class DependencySet:
     csr: sps.csr_matrix
-    """scipy CSR matrix of shape (prod(shape), n_dofs) with boolean data, where each row
-    corresponds to a flattened array element and each column corresponds to a DOF. A True
-    value indicates that the array element depends on the corresponding DOF."""
+    """Boolean relation ``value scalar rows × symbolic coordinates``."""
 
     shape: Shape
-    """logical shape of the array this dep-set corresponds to (e.g., (3,4) for a 3×4 array);"""
+    """Logical shape of the array this dependency set describes."""
 
     def __post_init__(self):
         if self.csr.shape[0] != math.prod(self.shape):
@@ -29,18 +27,15 @@ class DependencySet:
             )
 
     @classmethod
-    def empty(cls, shape: Shape, n_dofs: int) -> DependencySet:
-        """Create a zero-dependency SparseDepSet of shape (*shape, n_dofs)."""
+    def empty(cls, shape: Shape, n_symbols: int) -> DependencySet:
         size = int(np.prod(shape))
-        dep = sps.csr_matrix((size, n_dofs), dtype=bool)
+        dep = sps.csr_matrix((size, n_symbols), dtype=bool)
         return cls(dep, shape)
 
     @classmethod
-    def singletons(cls, n_dofs: int) -> DependencySet:
-        """Create an identity-seeded SparseDepSet of shape (n_dofs,) where element i
-        depends only on DOF i."""
-        dep = sps.eye(n_dofs, format="csr", dtype=bool)
-        return cls(dep, (n_dofs,))
+    def singletons(cls, n_symbols: int) -> DependencySet:
+        dep = sps.eye(n_symbols, format="csr", dtype=bool)
+        return cls(dep, (n_symbols,))
 
     def copy(self) -> DependencySet:
         return DependencySet(self.csr.copy(), self.shape)
@@ -51,11 +46,9 @@ class DependencySet:
                 f"Cannot reshape dep-set of shape {self.shape} to shape {ns}: "
                 f"number of elements does not match"
             )
-
         return DependencySet(self.csr, ns)
 
     def total_union(self) -> DependencySet:
-        """OR all dependency sets in this array into a single 1D vector of shape ()."""
         if self.csr.shape[0] == 0:
             return DependencySet.empty((), self.csr.shape[1])
         reduced = sps.csr_matrix(self.csr.sum(axis=0).astype(bool))
@@ -66,7 +59,6 @@ class DependencySet:
         S_out: Shape,
         broadcast_dimensions: tuple[int, ...] | Sequence[int] | None = None,
     ) -> DependencySet:
-        """Broadcast this dep-array to a new logical shape S_out."""
         S_in = self.shape
         if S_in == S_out:
             return self
@@ -83,53 +75,39 @@ class DependencySet:
 
 
 @dataclass
-class HessianAccumulator:
-    """Accumulates Hessian coupling pairs as numpy-array chunks; fingerprints dep matrices
-    to skip redundant recordings."""
+class InteractionGraph:
+    """Accumulate structural nonlinear interactions between symbolic coordinates.
 
-    n_dofs: int
-    trial_test_split: int | None = None
+    The graph is square over the complete symbolic coordinate system.  Energy,
+    weak, and mixed operators are views obtained by selecting the declared row
+    and column blocks from this single graph.
+    """
+
+    n_symbols: int
 
     def __post_init__(self):
+        if self.n_symbols < 0:
+            raise ValueError("n_symbols must be nonnegative")
         self._row_chunks: list[np.ndarray] = []
         self._col_chunks: list[np.ndarray] = []
-        # we may do that if it becomes a bottleneck
-        # self._seen_fingerprints: set[int] = set()
 
     def add_cross(self, lhs_dep: DependencySet, rhs_dep: DependencySet) -> None:
-        # does that need special handling for trial/test split? Not really, because the
-        # cross product is already the right block, and the self-blocks are not included
-        # in the cross product. I don't know yet tbh
         if lhs_dep.csr.nnz == 0 or rhs_dep.csr.nnz == 0:
             return
-
-        P = (lhs_dep.csr.T @ rhs_dep.csr).tocsr()
-        r, c = P.nonzero()
-        self._add_coords(r, c)
-        self._add_coords(c, r)  # TODO: is it needed?
+        self._validate_width(lhs_dep)
+        self._validate_width(rhs_dep)
+        pattern = (lhs_dep.csr.T @ rhs_dep.csr).tocsr()
+        rows, cols = pattern.nonzero()
+        self._add_coords(rows, cols)
+        self._add_coords(cols, rows)
 
     def add_self(self, dep: DependencySet) -> None:
         if dep.csr.nnz == 0:
             return
-
-        csr = dep.csr
-
-        if self.trial_test_split is not None:
-            # Only trial<->test cross couplings survive, so compute just that block
-            # (trial_part.T @ test_part) instead of the full dep.T @ dep over all
-            # columns followed by masking — avoids the discarded self-blocks.
-            s = self.trial_test_split
-            trial_part = csr[:, :s]
-            test_part = csr[:, s:]
-            cross = (trial_part.T @ test_part).tocsr()
-            r, c = cross.nonzero()
-            c = c + s
-            self._add_coords(r, c)
-            self._add_coords(c, r)
-        else:
-            P = (csr.T @ csr).tocsr()
-            r, c = P.nonzero()
-            self._add_coords(r, c)
+        self._validate_width(dep)
+        pattern = (dep.csr.T @ dep.csr).tocsr()
+        rows, cols = pattern.nonzero()
+        self._add_coords(rows, cols)
 
     def add_paired_cross(
         self,
@@ -140,42 +118,70 @@ class HessianAccumulator:
     ) -> None:
         lhs_rows = np.asarray(lhs_rows, dtype=np.int64).ravel()
         rhs_rows = np.asarray(rhs_rows, dtype=np.int64).ravel()
-
         if lhs_rows.shape != rhs_rows.shape:
             raise ValueError(
                 f"lhs_rows shape {lhs_rows.shape} does not match rhs_rows shape "
                 f"{rhs_rows.shape}"
             )
-
         if lhs_rows.size == 0:
             return
-
+        self._validate_width(lhs)
+        self._validate_width(rhs)
         lhs_selected = lhs.csr[lhs_rows]
         rhs_selected = rhs.csr[rhs_rows]
-
         if lhs_selected.nnz == 0 or rhs_selected.nnz == 0:
             return
-
         cross = (lhs_selected.T @ rhs_selected).tocsr()
         rows, cols = cross.nonzero()
         self._add_coords(rows, cols)
         self._add_coords(cols, rows)
 
+    def add_pattern(
+        self,
+        pattern: sps.spmatrix,
+        *,
+        symmetric: bool = False,
+    ) -> None:
+        matrix = sps.csr_matrix(pattern)
+        if matrix.shape != (self.n_symbols, self.n_symbols):
+            raise ValueError(
+                f"interaction pattern shape {matrix.shape} does not match "
+                f"({self.n_symbols}, {self.n_symbols})"
+            )
+        rows, cols = matrix.nonzero()
+        self._add_coords(rows, cols)
+        if symmetric:
+            self._add_coords(cols, rows)
+
+    def _validate_width(self, dep: DependencySet) -> None:
+        if dep.csr.shape[1] != self.n_symbols:
+            raise ValueError(
+                f"dependency width {dep.csr.shape[1]} does not match interaction "
+                f"graph size {self.n_symbols}"
+            )
+
     def _add_coords(self, rows: NDArray, cols: NDArray) -> None:
-        """Append a chunk of coordinate pairs."""
         if rows.size == 0:
             return
-        self._row_chunks.append(np.asarray(rows))
-        self._col_chunks.append(np.asarray(cols))
+        self._row_chunks.append(np.asarray(rows, dtype=np.int64))
+        self._col_chunks.append(np.asarray(cols, dtype=np.int64))
 
     def finalize(self) -> sps.csr_matrix:
-        """Build the final binary CSR sparsity pattern from the accumulated chunks."""
         if not self._row_chunks:
-            return sps.csr_matrix((self.n_dofs, self.n_dofs), dtype=np.int8)
+            return sps.csr_matrix((self.n_symbols, self.n_symbols), dtype=np.int8)
         rows = np.concatenate(self._row_chunks)
         cols = np.concatenate(self._col_chunks)
         data = np.ones(rows.shape[0], dtype=np.int8)
-        pat = sps.csr_matrix((data, (rows, cols)), shape=(self.n_dofs, self.n_dofs))
-        pat.sum_duplicates()
-        pat.data[:] = 1
-        return pat
+        pattern = sps.csr_matrix(
+            (data, (rows, cols)),
+            shape=(self.n_symbols, self.n_symbols),
+        )
+        pattern.sum_duplicates()
+        pattern.data[:] = 1
+        return pattern
+
+
+# Transitional import compatibility for primitive-rule modules.  There is one
+# implementation only; old code importing HessianAccumulator gets the generic
+# symbolic interaction graph.
+HessianAccumulator = InteractionGraph

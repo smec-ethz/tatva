@@ -1,5 +1,5 @@
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Self
@@ -27,8 +27,8 @@ from tatva.tracer.core.routes import Route
 from tatva.tracer.core.semantics import (
     DemandContext,
     FullConcrete,
-    RegionalConcrete,
     PartialRouteContext,
+    RegionalConcrete,
     RegionalConcreteContext,
     RouteRequirement,
     RoutingSemantics,
@@ -162,6 +162,7 @@ class ConcreteResolver:
         plan: JaxprPlan,
         *,
         fallback: ConcreteFallback = ConcreteFallback.GLOBAL,
+        unavailable_inputs: Iterable[int] = (0,),
     ) -> tuple[Self, ConcreteFrame]:
         if closed_jaxpr.jaxpr is not plan.jaxpr:
             raise ValueError("plan does not match closed_jaxpr")
@@ -179,12 +180,26 @@ class ConcreteResolver:
         for var, value in zip(plan.jaxpr.constvars, closed_jaxpr.consts, strict=True):
             values[var] = value
 
-        # input zero is unavailable at planning time
-        unavailable = {plan.jaxpr.invars[0]: "the DOF input"}
+        unavailable_indices = tuple(sorted(set(int(i) for i in unavailable_inputs)))
+        if any(i < 0 or i >= len(plan.jaxpr.invars) for i in unavailable_indices):
+            raise ValueError("unavailable root input index is out of range")
 
-        # all remaining captured args are legal concrete inputs
-        for var, value in zip(plan.jaxpr.invars[1:], flat_args[1:], strict=True):
-            values[var] = value
+        unavailable = {
+            plan.jaxpr.invars[index]: (
+                "the DOF input"
+                if unavailable_indices == (0,) and index == 0
+                else f"root coordinate input {index}"
+            )
+            for index in unavailable_indices
+        }
+
+        # Non-coordinate captured arguments are legal concrete planning inputs.
+        unavailable_set = set(unavailable_indices)
+        for index, (var, value) in enumerate(
+            zip(plan.jaxpr.invars, flat_args, strict=True)
+        ):
+            if index not in unavailable_set:
+                values[var] = value
 
         producers = _build_producer_index(plan)
         resolver._frames[frame.path] = _FrameState(

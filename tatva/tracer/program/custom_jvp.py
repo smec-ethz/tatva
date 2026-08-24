@@ -55,39 +55,40 @@ def extract_custom_jvp_parameters(eqn: JaxprEqn) -> CustomJvpParameters:
     if not isinstance(jvp, Jaxpr):
         raise NotImplementedError("custom_jvp callback did not produce a Jaxpr")
 
-    jvp_consts = tuple(jvp_consts)
-    # JAX 0.11 trace_to_jaxpr_dynamic returns callback constants
-    # separately. Until their values are attached, their variables are
-    # exposed as leading jvp.invars rather than jvp.constvars.
-    if jvp_consts:
-        if jvp.consts:
-            if len(jvp.consts) != len(jvp_consts):
-                raise NotImplementedError(
-                    "custom_jvp JVP callback returned inconsistent constants"
-                )
-        else:
-            if len(jvp_consts) > len(jvp.invars):
-                raise NotImplementedError(
-                    "custom_jvp JVP callback returned more constants than leading Jaxpr inputs"
-                )
-
-            jvp = jvp.with_consts(jvp_consts)
-
     if jvp.effects:
         raise NotImplementedError("effectful custom_jvp JVP callbacks are unsupported")
 
-    # JAX keeps JVP captures in jvp.constvars and returns their values
-    # separately as jvp_consts. They are not leading explicit JVP inputs.
+    jvp_consts = tuple(jvp_consts)
     expected_inputs = 2 * dynamic_arity
+
+    # JAX 0.11 returns callback constant values separately while their variables
+    # initially remain leading Jaxpr inputs.  Attach those values first so the
+    # logical constvar/invar boundary reflects the executable ABI.  Older JAX
+    # versions already expose callback captures as constvars and take the other
+    # branch unchanged.
+    if (
+        jvp_consts
+        and len(jvp.constvars) == 0
+        and len(jvp.invars) == expected_inputs + len(jvp_consts)
+    ):
+        with_consts = getattr(jvp, "with_consts", None)
+        if with_consts is None:
+            raise NotImplementedError(
+                "custom_jvp callback constants require Jaxpr.with_consts() "
+                "normalization on this JAX version"
+            )
+        jvp = with_consts(jvp_consts)
+
     if len(jvp.invars) != expected_inputs:
         raise NotImplementedError(
-            "custom_jvp JVP input ABI is unsupported: expected "
-            f"{expected_inputs} inputs, got {len(jvp.invars)}"
+            "custom_jvp JVP input ABI is unsupported after callback-constant "
+            f"normalization: expected {expected_inputs} inputs, got "
+            f"{len(jvp.invars)}"
         )
     if len(jvp.constvars) != len(jvp_consts):
         raise NotImplementedError(
             "custom_jvp JVP capture ABI is unsupported: expected "
-            f"{len(jvp.constvars)} constants, got {len(jvp_consts)}"
+            f"{len(jvp_consts)} constant variables, got {len(jvp.constvars)}"
         )
 
     zeros = tuple(bool(value) for value in output_zeros)
@@ -101,4 +102,4 @@ def extract_custom_jvp_parameters(eqn: JaxprEqn) -> CustomJvpParameters:
             f"{expected_outputs} outputs, got {len(jvp.outvars)}"
         )
 
-    return CustomJvpParameters(primal, jvp, tuple(jvp_consts), num_consts, zeros)
+    return CustomJvpParameters(primal, jvp, jvp_consts, num_consts, zeros)
