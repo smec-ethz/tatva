@@ -88,12 +88,6 @@ from tatva.tracer.program.repeated import map_template_requires_mapped_concrete
 
 
 @dataclass(frozen=True)
-class NestedDerivativeTrace:
-    invocation: AnyNestedInvocation[JaxprDerivativeTrace]
-    template: JaxprDerivativeTrace | None
-
-
-@dataclass(frozen=True)
 class MapDerivativeTemplate:
     """Handle map by tracing a single iteration and broadcasting the result to all iterations."""
 
@@ -108,7 +102,7 @@ class MapDerivativeTemplate:
 class JaxprDerivativeTrace:
     dependencies: dict[Var, DependencySet]
     output_deps: tuple[DependencySet, ...]
-    nested: dict[int, NestedDerivativeTrace]
+    nested: dict[int, AnyNestedInvocation[JaxprDerivativeTrace]]
 
 
 @dataclass(frozen=True)
@@ -236,7 +230,7 @@ def _trace_jaxpr(
             n_symbols,
         )
 
-    nested_traces: dict[int, NestedDerivativeTrace] = {}
+    nested_traces: dict[int, AnyNestedInvocation[JaxprDerivativeTrace]] = {}
 
     def dependency_of(atom: Atom) -> DependencySet:
         if isinstance(atom, Literal):
@@ -309,7 +303,7 @@ class _DerivativeNestedHandler:
 
     def call(
         self, spec: CallSpec
-    ) -> tuple[tuple[DependencySet, ...], NestedDerivativeTrace]:
+    ) -> tuple[tuple[DependencySet, ...], AnyNestedInvocation[JaxprDerivativeTrace]]:
         return _trace_call(
             spec=spec,
             eqn_plan=self.eqn_plan,
@@ -322,7 +316,7 @@ class _DerivativeNestedHandler:
 
     def custom_jvp(
         self, spec: CustomJvpSpec
-    ) -> tuple[tuple[DependencySet, ...], NestedDerivativeTrace]:
+    ) -> tuple[tuple[DependencySet, ...], AnyNestedInvocation[JaxprDerivativeTrace]]:
         return _trace_custom_jvp(
             spec=spec,
             eqn_plan=self.eqn_plan,
@@ -335,7 +329,7 @@ class _DerivativeNestedHandler:
 
     def map(
         self, spec: MapSpec
-    ) -> tuple[tuple[DependencySet, ...], NestedDerivativeTrace]:
+    ) -> tuple[tuple[DependencySet, ...], AnyNestedInvocation[JaxprDerivativeTrace]]:
         return _trace_map(
             spec=spec,
             eqn_plan=self.eqn_plan,
@@ -348,7 +342,7 @@ class _DerivativeNestedHandler:
 
     def scan(
         self, spec: ScanSpec
-    ) -> tuple[tuple[DependencySet, ...], NestedDerivativeTrace]:
+    ) -> tuple[tuple[DependencySet, ...], AnyNestedInvocation[JaxprDerivativeTrace]]:
         return _trace_scan(
             spec=spec,
             eqn_plan=self.eqn_plan,
@@ -361,7 +355,7 @@ class _DerivativeNestedHandler:
 
     def cond(
         self, spec: CondSpec
-    ) -> tuple[tuple[DependencySet, ...], NestedDerivativeTrace]:
+    ) -> tuple[tuple[DependencySet, ...], AnyNestedInvocation[JaxprDerivativeTrace]]:
         return _trace_cond(
             spec=spec,
             eqn_plan=self.eqn_plan,
@@ -374,7 +368,7 @@ class _DerivativeNestedHandler:
 
     def linear_solve(
         self, spec: LinearSolveSpec
-    ) -> tuple[tuple[DependencySet, ...], NestedDerivativeTrace]:
+    ) -> tuple[tuple[DependencySet, ...], AnyNestedInvocation[JaxprDerivativeTrace]]:
         # Implicit solve AD is not represented by the primal callback bodies.
         # Keep the outer operation conservative and retain callback traces for
         # diagnostics/local planning only.
@@ -421,9 +415,7 @@ class _DerivativeNestedHandler:
             )
             for out in self.eqn_plan.eqn.outvars
         )
-        return result, NestedDerivativeTrace(
-            LinearSolveInvocation(self.eqn_plan.index, *traces), template=None
-        )
+        return result, LinearSolveInvocation(self.eqn_plan.index, *traces)
 
 
 def _trace_ordinary_eqn(
@@ -551,17 +543,15 @@ def _project_jaxpr_derivative_trace(
     trace: JaxprDerivativeTrace,
     projection: sps.csr_matrix,
 ) -> JaxprDerivativeTrace:
-    nested: dict[int, NestedDerivativeTrace] = {}
+    nested: dict[int, AnyNestedInvocation[JaxprDerivativeTrace]] = {}
     for index, item in trace.nested.items():
-        invocation = item.invocation.map_children(
+        invocation = item.map_children(
             lambda child: _project_jaxpr_derivative_trace(
                 child.payload,
                 projection,
             )
         )
-        nested[index] = NestedDerivativeTrace(
-            invocation=invocation, template=item.template
-        )
+        nested[index] = invocation
 
     return JaxprDerivativeTrace(
         dependencies={
@@ -584,7 +574,7 @@ def _trace_custom_jvp(
     input_deps: tuple[DependencySet, ...],
     acc: InteractionGraph,
     n_symbols: int,
-) -> tuple[tuple[DependencySet, ...], NestedDerivativeTrace]:
+) -> tuple[tuple[DependencySet, ...], AnyNestedInvocation[JaxprDerivativeTrace]]:
     """Use the staged custom-JVP program as the authoritative derivative rule.
 
     The enclosing symbolic coordinate system is extended temporarily with one
@@ -729,11 +719,8 @@ def _trace_custom_jvp(
 
     return (
         tuple(outputs),
-        NestedDerivativeTrace(
-            invocation=CustomJvpInvocation(
-                eqn_index=eqn_plan.index, primal=primal_trace, jvp=jvp_trace
-            ),
-            template=None,
+        CustomJvpInvocation(
+            eqn_index=eqn_plan.index, primal=primal_trace, jvp=jvp_trace
         ),
     )
 
@@ -749,7 +736,7 @@ def _trace_call(
     n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
-    NestedDerivativeTrace,
+    AnyNestedInvocation[JaxprDerivativeTrace],
 ]:
     child_frame = resolver.call_frame(frame, eqn_plan)
     child_input_deps = spec.select_inputs(input_deps)
@@ -766,12 +753,7 @@ def _trace_call(
     finally:
         resolver.release(child_frame)
 
-    return (
-        child_trace.output_deps,
-        NestedDerivativeTrace(
-            invocation=CallInvocation(eqn_plan.index, child_trace), template=None
-        ),
-    )
+    return (child_trace.output_deps, CallInvocation(eqn_plan.index, child_trace))
 
 
 def _trace_cond(
@@ -785,7 +767,7 @@ def _trace_cond(
     n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
-    NestedDerivativeTrace,
+    AnyNestedInvocation[JaxprDerivativeTrace],
 ]:
     branch_index, child_frame = resolver.cond_frame(frame, eqn_plan)
     child_input_deps = spec.select_inputs(input_deps)
@@ -804,10 +786,7 @@ def _trace_cond(
 
     return (
         body_trace.output_deps,
-        NestedDerivativeTrace(
-            invocation=CondInvocation(eqn_plan.index, branch_index, body_trace),
-            template=None,
-        ),
+        CondInvocation(eqn_plan.index, branch_index, body_trace),
     )
 
 
@@ -822,7 +801,7 @@ def _trace_scan(
     n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
-    NestedDerivativeTrace,
+    AnyNestedInvocation[JaxprDerivativeTrace],
 ]:
     nested_plan = eqn_plan.nested
     assert nested_plan is not None
@@ -891,12 +870,7 @@ def _trace_scan(
 
     return (
         final_carry + tuple(stacked_y),
-        NestedDerivativeTrace(
-            invocation=RepeatedInvocation.from_spec(
-                eqn_plan.index, spec, tuple(iteration_traces)
-            ),
-            template=None,
-        ),
+        RepeatedInvocation.from_spec(eqn_plan.index, spec, tuple(iteration_traces)),
     )
 
 
@@ -911,7 +885,7 @@ def _trace_map(
     n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
-    NestedDerivativeTrace,
+    AnyNestedInvocation[JaxprDerivativeTrace],
 ]:
     if map_template_requires_mapped_concrete(eqn_plan, spec):
         return _trace_map_unrolled(
@@ -966,10 +940,7 @@ def _trace_map(
         body=template.trace,
     )
 
-    return (
-        outputs,
-        NestedDerivativeTrace(invocation=invocation, template=None),
-    )
+    return (outputs, invocation)
 
 
 def _trace_map_unrolled(
@@ -983,7 +954,7 @@ def _trace_map_unrolled(
     n_symbols: int,
 ) -> tuple[
     tuple[DependencySet, ...],
-    NestedDerivativeTrace,
+    AnyNestedInvocation[JaxprDerivativeTrace],
 ]:
     const_deps = input_deps[: spec.num_consts]
     mapped_deps = input_deps[spec.num_consts :]
@@ -1028,12 +999,7 @@ def _trace_map_unrolled(
 
     return (
         tuple(outputs),
-        NestedDerivativeTrace(
-            invocation=RepeatedInvocation.from_spec(
-                eqn_plan.index, spec, tuple(children)
-            ),
-            template=None,
-        ),
+        RepeatedInvocation.from_spec(eqn_plan.index, spec, tuple(children)),
     )
 
 
