@@ -42,7 +42,6 @@ from tatva.tracer.core.nested import (
     CustomJvpContext,
     CustomJvpInvocation,
     IndexedChild,
-    IterationSelection,
     LinearSolveContext,
     LinearSolveInvocation,
     MapContext,
