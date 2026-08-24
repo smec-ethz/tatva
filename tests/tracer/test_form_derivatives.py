@@ -70,6 +70,38 @@ def test_energy_and_virtual_work_use_same_tangent_abstraction():
         raise AssertionError("weak form must not expose a Hessian alias")
 
 
+def test_scatter_mul_records_only_target_update_interactions():
+    x = jnp.arange(6, dtype=jnp.float32) + 1
+    targets = jnp.array([2, 0, 1])
+
+    def energy(values):
+        base = values[:3]
+        updates = values[3:]
+        return jnp.sum(base.at[targets].multiply(updates))
+
+    trace = _trace_form(energy, x, form=FormSpec.energy(input_index=0))
+
+    expected = np.zeros((6, 6), dtype=bool)
+    for update_row, target_row in enumerate(np.asarray(targets), start=3):
+        expected[target_row, update_row] = True
+        expected[update_row, target_row] = True
+    np.testing.assert_array_equal(trace.hessian.toarray().astype(bool), expected)
+
+
+def test_reduce_prod_records_distinct_pairs_within_each_reduction_bucket():
+    x = jnp.arange(6, dtype=jnp.float32) + 1
+
+    def energy(values):
+        return jnp.sum(jnp.prod(values.reshape(2, 3), axis=1))
+
+    trace = _trace_form(energy, x, form=FormSpec.energy(input_index=0))
+
+    expected = np.zeros((6, 6), dtype=bool)
+    expected[:3, :3] = ~np.eye(3, dtype=bool)
+    expected[3:, 3:] = ~np.eye(3, dtype=bool)
+    np.testing.assert_array_equal(trace.hessian.toarray().astype(bool), expected)
+
+
 def test_mixed_form_extracts_row_by_column_block_tangent():
     n = 4
     values = tuple(jnp.arange(n, dtype=jnp.float32) + shift for shift in range(4))
