@@ -45,15 +45,21 @@ from tatva.tracer.rules import tagged
 if TYPE_CHECKING:
     from tatva.tracer.core.semantics import RuleContext
 
+type GatherDerivativeRoute = (
+    GatherRoute | GatherRouteFragment | GatherEnvelopeFragment | None
+)
 
-def prepare_gather(ctx: RuleContext) -> GatherRoute | None:
+
+def prepare_gather(ctx: RuleContext) -> GatherDerivativeRoute:
     if len(ctx.input_deps) != 2 or len(ctx.eqn.outvars) != 1:
         raise ValueError(
             f"{ctx.eqn.primitive.name} must have two inputs and one output; got "
             f"{len(ctx.input_deps)} inputs and {len(ctx.eqn.outvars)} outputs"
         )
 
-    if ctx.route is not None and not isinstance(ctx.route, GatherRoute):
+    if ctx.route is not None and not isinstance(
+        ctx.route, (GatherRoute, GatherRouteFragment, GatherEnvelopeFragment)
+    ):
         raise TypeError(f"invalid gather route for equation {ctx.eqn}")
 
     return ctx.route
@@ -61,11 +67,12 @@ def prepare_gather(ctx: RuleContext) -> GatherRoute | None:
 
 def gather_dependencies(
     ctx: RuleContext,
-    prepared: GatherRoute | None,
+    prepared: GatherDerivativeRoute,
 ) -> tuple[DependencySet, ...]:
     source = ctx.input_deps[0]
     output_shape = _shape_of(ctx.eqn.outvars[0])
     n_output = int(np.prod(output_shape))
+    n_source = source.csr.shape[0]
 
     if prepared is None:
         union = source.total_union().csr
@@ -76,20 +83,83 @@ def gather_dependencies(
         )
         return (DependencySet(output_csr, output_shape),)
 
-    if prepared.source_rows.shape != (n_output,):
-        raise ValueError(
-            f"gather route has {prepared.source_rows.size} rows, expected {n_output}"
+    if isinstance(prepared, GatherRoute):
+        if prepared.source_rows.shape != (n_output,):
+            raise ValueError(
+                f"gather route has {prepared.source_rows.size} rows, expected {n_output}"
+            )
+        valid = prepared.source_rows >= 0
+        selection = sps.csr_matrix(
+            (
+                np.ones(np.count_nonzero(valid), dtype=bool),
+                (np.flatnonzero(valid), prepared.source_rows[valid]),
+            ),
+            shape=(n_output, source.csr.shape[0]),
+            dtype=bool,
         )
-    valid = prepared.source_rows >= 0
-    selection = sps.csr_matrix(
-        (
-            np.ones(np.count_nonzero(valid), dtype=bool),
-            (np.flatnonzero(valid), prepared.source_rows[valid]),
-        ),
-        shape=(n_output, source.csr.shape[0]),
-        dtype=bool,
-    )
-    return (DependencySet((selection @ source.csr).astype(bool).tocsr(), output_shape),)
+        return (
+            DependencySet((selection @ source.csr).astype(bool).tocsr(), output_shape),
+        )
+
+    if isinstance(prepared, GatherRouteFragment):
+        if prepared.output_rows.shape != prepared.source_rows.shape:
+            raise ValueError(
+                f"gather fragment has {prepared.output_rows.size} output rows, "
+                f"{prepared.source_rows.size} source rows"
+            )
+        valid = (
+            (prepared.source_rows >= 0)
+            & (prepared.output_rows >= 0)
+            & (prepared.output_rows < n_output)
+        )
+        selection = sps.csr_matrix(
+            (
+                np.ones(np.count_nonzero(valid), dtype=bool),
+                (prepared.output_rows[valid], prepared.source_rows[valid]),
+            ),
+            shape=(n_output, n_source),
+            dtype=bool,
+        )
+        return (
+            DependencySet((selection @ source.csr).astype(bool).tocsr(), output_shape),
+        )
+
+    if isinstance(prepared, GatherEnvelopeFragment):
+        if len(prepared.source_demands) != prepared.output_rows.size:
+            raise ValueError("gather envelope source demands count mismatch")
+
+        sel_rows: list[NDArray[np.int64]] = []
+        sel_cols: list[NDArray[np.int64]] = []
+
+        for out_row, source_demand in zip(
+            prepared.output_rows, prepared.source_demands
+        ):
+            if source_demand is None or out_row < 0 or out_row >= n_output:
+                continue
+            src_rows = source_demand.rows()
+            if src_rows.size > 0:
+                sel_rows.append(np.full(src_rows.size, out_row, dtype=np.int64))
+                sel_cols.append(src_rows)
+
+        if sel_rows:
+            all_rows = np.concatenate(sel_rows)
+            all_cols = np.concatenate(sel_cols)
+            selection = sps.csr_matrix(
+                (
+                    np.ones(all_rows.size, dtype=bool),
+                    (all_rows, all_cols),
+                ),
+                shape=(n_output, n_source),
+                dtype=bool,
+            )
+        else:
+            selection = sps.csr_matrix((n_output, n_source), dtype=bool)
+
+        return (
+            DependencySet((selection @ source.csr).astype(bool).tocsr(), output_shape),
+        )
+
+    raise TypeError(f"unsupported gather route type: {type(prepared)!r}")
 
 
 def _envelope_positions(

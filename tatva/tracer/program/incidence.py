@@ -50,12 +50,12 @@ from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import TensorDemand
 from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
-from tatva.tracer.program.forms import FormSpec
 from tatva.tracer.program.contributions import (
     ContributionBlock,
     ContributionTrace,
     ValueRef,
 )
+from tatva.tracer.program.forms import FormSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,20 +151,15 @@ def _backprop_plan_ordinary(
             )
         )
     else:
-        fragment = None
         active_demands = [
             demand.rows for demand in output_demands if demand is not None
         ]
-        if active_demands and (
-            routing.fragment is not no_route_fragment
-            or routing.partial_fragment is not None
-        ):
-            active_rows = np.unique(np.concatenate(active_demands))
-            fragment = resolver.route_fragment(
-                frame, eqn_plan, RouteRequest(active_rows)
-            )
-
-        route = resolver.route(frame, eqn_plan) if fragment is None else fragment
+        request = (
+            None
+            if not active_demands
+            else RouteRequest(np.unique(np.concatenate(active_demands)))
+        )
+        route = resolver.routed(frame, eqn_plan, request)
         result = semantics.tagged_demand(
             TaggedDemandContext(
                 eqn=eqn,

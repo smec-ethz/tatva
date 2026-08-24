@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.extend import core
 
@@ -10,6 +10,7 @@ if not hasattr(lax, "stack_p"):
     lax.stack_p = core.Primitive("stack_compat")
 
 from tatva.tracer.program.analysis import analyze
+from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.derivatives import trace_form_derivatives
 from tatva.tracer.program.forms import (
     CoordinateBlock,
@@ -17,13 +18,13 @@ from tatva.tracer.program.forms import (
     FormSpec,
     ValueSource,
 )
-from tatva.tracer.program.materialize import materialize_plan
 
 
-def _instance(fn, *args):
+def _trace_form(fn, *args, form):
     closed = jax.make_jaxpr(fn)(*args)
     plan = analyze(closed.jaxpr)
-    return materialize_plan(closed, args, plan)
+    resolver, frame = ConcreteResolver.root(closed, args, plan)
+    return trace_form_derivatives(plan, frame, resolver, form)
 
 
 def _binary(pattern):
@@ -43,13 +44,12 @@ def test_energy_and_virtual_work_use_same_tangent_abstraction():
     def weak(x, test):
         return jnp.sum(test * x)
 
-    energy_trace = trace_form_derivatives(
-        _instance(energy, u),
-        FormSpec.energy(input_index=0, name="u"),
-    )
-    weak_trace = trace_form_derivatives(
-        _instance(weak, u, v),
-        FormSpec(
+    energy_trace = _trace_form(energy, u, form=FormSpec.energy(input_index=0, name="u"))
+    weak_trace = _trace_form(
+        weak,
+        u,
+        v,
+        form=FormSpec(
             (
                 CoordinateBlock("u", 0, CoordinateRole.COLUMN, ValueSource.EXTERNAL),
                 CoordinateBlock("v", 1, CoordinateRole.ROW, ValueSource.ZERO),
@@ -77,9 +77,10 @@ def test_mixed_form_extracts_row_by_column_block_tangent():
     def mixed(u, p, v, q):
         return jnp.sum(v * (u + p)) + jnp.sum(q * (u * p))
 
-    trace = trace_form_derivatives(
-        _instance(mixed, *values),
-        FormSpec(
+    trace = _trace_form(
+        mixed,
+        *values,
+        form=FormSpec(
             (
                 CoordinateBlock("u", 0, CoordinateRole.COLUMN),
                 CoordinateBlock("p", 1, CoordinateRole.COLUMN),
@@ -116,10 +117,7 @@ def test_custom_jvp_uses_tangent_program_for_second_order_support():
     def energy(x):
         return jnp.sum(custom_square(x))
 
-    trace = trace_form_derivatives(
-        _instance(energy, u),
-        FormSpec.energy(input_index=0),
-    )
+    trace = _trace_form(energy, u, form=FormSpec.energy(input_index=0))
 
     np.testing.assert_array_equal(
         trace.hessian.toarray().astype(bool),
@@ -143,10 +141,7 @@ def test_custom_jvp_override_can_remove_primal_hessian_support():
     def energy(x):
         return jnp.sum(overridden(x))
 
-    trace = trace_form_derivatives(
-        _instance(energy, u),
-        FormSpec.energy(input_index=0),
-    )
+    trace = _trace_form(energy, u, form=FormSpec.energy(input_index=0))
 
     assert trace.hessian.nnz == 0
 
@@ -207,7 +202,7 @@ def test_packed_mixed_coordinate_selections_share_one_input_without_overlap():
             ),
         )
     )
-    trace = trace_form_derivatives(_instance(packed, trial, test), form)
+    trace = _trace_form(packed, trial, test, form=form)
     tangent = trace.tangent.toarray().astype(bool)
     expected = np.eye(n, dtype=bool)
     np.testing.assert_array_equal(tangent[:n, :n], expected)
