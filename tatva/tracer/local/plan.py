@@ -249,7 +249,7 @@ def _rank_scan_snapshots(
         return {}
     nested = eqn_plan.nested
     assert nested is not None
-    execution = spec.execution_indices()
+    execution = spec.execution_range()
     positions = {index: position for position, index in enumerate(execution)}
     prefix = execution[: max(positions[index] for index in indices) + 1]
     required = {
@@ -376,7 +376,7 @@ class _LocalRankPlanNestedHandler:
             for child in context.invocation.children()
         }
         indices = tuple(
-            index for index in context.spec.execution_indices() if index in traces
+            index for index in context.spec.execution_range() if index in traces
         )
         snapshots = _rank_scan_snapshots(
             self.eqn_plan, self.frame, self.resolver, context.spec, indices
