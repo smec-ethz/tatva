@@ -328,7 +328,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=structural.prepare_broadcast,
                 dependencies=structural.unary_routed_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             demand=structural.demand_broadcast_in_dim,
             tagged_demand=tagged.broadcast_in_dim,
@@ -344,7 +344,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=structural.prepare_transpose,
                 dependencies=structural.unary_routed_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             demand=structural.demand_transpose,
             tagged_demand=tagged.transpose,
@@ -358,7 +358,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=structural.prepare_slice,
                 dependencies=structural.unary_routed_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             demand=structural.demand_slice,
             tagged_demand=tagged.slice_,
@@ -374,7 +374,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=structural.prepare_tile,
                 dependencies=structural.unary_routed_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             demand=structural.demand_tile,
             tagged_demand=tagged.tile,
@@ -387,7 +387,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=structural.prepare_rev,
                 dependencies=structural.unary_routed_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             demand=structural.demand_rev,
             tagged_demand=tagged.rev,
@@ -401,7 +401,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=structural.prepare_concatenate,
                 dependencies=structural.multi_input_routed_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             demand=structural.demand_concatenate,
             tagged_demand=tagged.concatenate,
@@ -417,7 +417,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=structural.prepare_stack,
                 dependencies=structural.multi_input_routed_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             demand=structural.demand_stack,
             tagged_demand=tagged.stack,
@@ -429,7 +429,7 @@ def _register_structural_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=structural.prepare_pad,
                 dependencies=structural.multi_input_routed_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             demand=structural.demand_pad,
             tagged_demand=tagged.pad,
@@ -456,7 +456,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=gather_scatter.prepare_gather,
                 dependencies=gather_scatter.gather_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             routing=RoutingSemantics(
                 inputs=lambda _eqn: (1,),
@@ -526,7 +526,7 @@ def _register_routing_rules(reg: PrimitiveRegistry) -> None:
             DerivativeRule(
                 prepare=indexing.prepare_dynamic_slice,
                 dependencies=indexing.dynamic_slice_dependencies,
-                hessian=no_hessian,
+                interactions=no_hessian,
             ),
             routing=RoutingSemantics(
                 inputs=lambda eqn: tuple(range(1, len(eqn.invars))),

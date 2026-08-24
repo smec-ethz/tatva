@@ -1,11 +1,11 @@
-"""Contribution-block to global-DOF incidence construction.
+"""Contribution-block to coordinate incidence construction.
 
 Contribution domains are split into deterministic blocks. ``TaggedDemand``
 then propagates their sparse entry/block relations together in one reverse
-traversal. The normal distributed-planning path walks ``JaxprPlan`` templates
-and creates only temporary concrete frames for demanded nested iterations.
-Consumers can therefore partition computation without consulting
-``DerivativeTrace`` or constructing a Hessian.
+traversal. A ``FormSpec`` projects root-input demand into each declared
+coordinate block, so energy, weak, and mixed forms reuse the same tagged trace.
+The normal distributed-planning path walks ``JaxprPlan`` templates and creates
+only temporary concrete frames for demanded nested iterations.
 
 The older per-block and materialized tagged traversals remain available as
 correctness oracles while localization still consumes ``JaxprInstance``.
@@ -50,6 +50,7 @@ from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import TensorDemand
 from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
+from tatva.tracer.program.forms import FormSpec
 from tatva.tracer.program.contributions import (
     ContributionBlock,
     ContributionTrace,
@@ -805,25 +806,57 @@ class BlockDofIncidence:
         return self.csr.getcol(dof_id).nonzero()[0].astype(np.int64, copy=False)
 
 
-def plan_tagged_block_dof_incidence(
+@dataclass(frozen=True)
+class BlockCoordinateIncidence:
+    """Contribution-block incidence projected into named form coordinates."""
+
+    blocks: tuple[ContributionBlock, ...]
+    coordinate_order: tuple[str, ...]
+    by_coordinate: dict[str, sps.csr_matrix]
+
+    def __post_init__(self) -> None:
+        if tuple(self.by_coordinate) != self.coordinate_order:
+            raise ValueError("coordinate incidence order does not match its mapping")
+        normalized: dict[str, sps.csr_matrix] = {}
+        for name in self.coordinate_order:
+            matrix = sps.csr_matrix(self.by_coordinate[name], dtype=bool)
+            if matrix.shape[0] != len(self.blocks):
+                raise ValueError(
+                    f"coordinate incidence {name!r} has {matrix.shape[0]} rows; "
+                    f"expected {len(self.blocks)}"
+                )
+            matrix.sum_duplicates()
+            matrix.eliminate_zeros()
+            matrix.sort_indices()
+            if matrix.nnz:
+                matrix.data[:] = True
+            normalized[name] = matrix
+        object.__setattr__(self, "by_coordinate", normalized)
+
+    def coordinate(self, name: str) -> BlockDofIncidence:
+        try:
+            matrix = self.by_coordinate[name]
+        except KeyError as exc:
+            raise KeyError(f"unknown coordinate block {name!r}") from exc
+        return BlockDofIncidence(self.blocks, matrix)
+
+    def combined(self) -> BlockDofIncidence:
+        """Disjoint concatenation used for contribution partitioning only."""
+        matrices = [self.by_coordinate[name] for name in self.coordinate_order]
+        if matrices:
+            csr = sps.hstack(matrices, format="csr", dtype=bool)
+        else:
+            csr = sps.csr_matrix((len(self.blocks), 0), dtype=bool)
+        return BlockDofIncidence(self.blocks, csr)
+
+
+def _tagged_trace_for_blocks(
     plan: JaxprPlan,
     frame: ConcreteFrame,
     resolver: ConcreteResolver,
     contributions: ContributionTrace,
-    *,
     blocks: tuple[ContributionBlock, ...],
-) -> BlockDofIncidence:
-    """Compute block↔DOF incidence directly from a static analysis plan."""
-    if frame.plan is not plan:
-        raise ValueError("incidence plan does not match concrete frame")
-    if not plan.jaxpr.invars:
-        raise ValueError("functional JAXPR has no DOF input")
-
-    dof_shape = _shape_of(plan.jaxpr.invars[0])
-    if len(dof_shape) != 1:
-        raise ValueError(f"first input must be a flat DOF vector, got {dof_shape}")
-
-    n_dofs = dof_shape[0]
+) -> JaxprTaggedTrace:
     seed_pairs: dict[
         ValueRef,
         tuple[list[NDArray[np.int64]], list[NDArray[np.int64]]],
@@ -854,23 +887,91 @@ def plan_tagged_block_dof_incidence(
         )
         for value, (rows, labels) in seed_pairs.items()
     ]
-    trace = backpropagate_plan_tagged_demand(plan, frame, resolver, seeds)
-    dof_demand = trace.input_demands[0]
-    if dof_demand is None:
-        csr = sps.csr_matrix((len(blocks), n_dofs), dtype=bool)
-    else:
-        if dof_demand.shape != dof_shape:
-            raise RuntimeError(
-                f"tagged DOF demand has shape {dof_demand.shape}; expected {dof_shape}"
+    return backpropagate_plan_tagged_demand(plan, frame, resolver, seeds)
+
+
+def plan_tagged_block_coordinate_incidence(
+    plan: JaxprPlan,
+    frame: ConcreteFrame,
+    resolver: ConcreteResolver,
+    contributions: ContributionTrace,
+    *,
+    blocks: tuple[ContributionBlock, ...],
+    form: FormSpec,
+) -> BlockCoordinateIncidence:
+    """Trace contribution incidence once and project it into every form block."""
+    if frame.plan is not plan:
+        raise ValueError("incidence plan does not match concrete frame")
+
+    trace = _tagged_trace_for_blocks(
+        plan,
+        frame,
+        resolver,
+        contributions,
+        blocks,
+    )
+    matrices: dict[str, sps.csr_matrix] = {}
+
+    for coordinate in form.coordinates:
+        if coordinate.input_index >= len(plan.jaxpr.invars):
+            raise ValueError(
+                f"coordinate block {coordinate.name!r} references missing input "
+                f"{coordinate.input_index}"
             )
-        if np.any(dof_demand.blocks >= len(blocks)):
+        input_shape = _shape_of(plan.jaxpr.invars[coordinate.input_index])
+        input_size = int(math.prod(input_shape))
+        selected_rows = coordinate.rows(input_size)
+        n_coordinates = selected_rows.size
+        demand = trace.input_demands[coordinate.input_index]
+
+        if demand is None or n_coordinates == 0:
+            matrices[coordinate.name] = sps.csr_matrix(
+                (len(blocks), n_coordinates), dtype=bool
+            )
+            continue
+        if demand.shape != input_shape:
+            raise RuntimeError(
+                f"tagged demand for coordinate {coordinate.name!r} has shape "
+                f"{demand.shape}; expected {input_shape}"
+            )
+        if np.any(demand.blocks >= len(blocks)):
             raise RuntimeError("tagged propagation produced an unknown block ID")
-        csr = sps.csr_matrix(
+
+        lookup = np.full(input_size, -1, dtype=np.int64)
+        lookup[selected_rows] = np.arange(n_coordinates, dtype=np.int64)
+        coordinate_rows = lookup[demand.rows]
+        keep = coordinate_rows >= 0
+        matrices[coordinate.name] = sps.csr_matrix(
             (
-                np.ones(dof_demand.nnz, dtype=bool),
-                (dof_demand.blocks, dof_demand.rows),
+                np.ones(np.count_nonzero(keep), dtype=bool),
+                (demand.blocks[keep], coordinate_rows[keep]),
             ),
-            shape=(len(blocks), n_dofs),
+            shape=(len(blocks), n_coordinates),
             dtype=bool,
         )
-    return BlockDofIncidence(blocks=blocks, csr=csr)
+
+    return BlockCoordinateIncidence(
+        blocks=blocks,
+        coordinate_order=tuple(block.name for block in form.coordinates),
+        by_coordinate=matrices,
+    )
+
+
+def plan_tagged_block_dof_incidence(
+    plan: JaxprPlan,
+    frame: ConcreteFrame,
+    resolver: ConcreteResolver,
+    contributions: ContributionTrace,
+    *,
+    blocks: tuple[ContributionBlock, ...],
+) -> BlockDofIncidence:
+    """Backward-compatible first-input energy incidence."""
+    form = FormSpec.energy(input_index=0)
+    return plan_tagged_block_coordinate_incidence(
+        plan,
+        frame,
+        resolver,
+        contributions,
+        blocks=blocks,
+        form=form,
+    ).coordinate("u")

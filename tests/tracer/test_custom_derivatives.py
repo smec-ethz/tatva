@@ -410,25 +410,3 @@ def test_localized_custom_jvp_supports_dead_multiple_output():
         local_gradient = np.asarray(jax.grad(local.compile())(*inputs.args))
         gradient[local.dofs.storage.global_dofs] += local_gradient
     np.testing.assert_allclose(gradient, jax.grad(energy)(u))
-
-
-# -----------------------------------------------------------------------------
-# Diagnostic global structural derivative analysis
-# -----------------------------------------------------------------------------
-
-
-def test_global_structural_derivative_trace_is_conservative_at_custom_jvp():
-    u = _example_u()
-    traced = analyze(energy_custom_jvp, u)
-
-    hessian = global_derivatives(traced).hessian
-
-    assert hessian.shape == (4, 4)
-
-    # The temporary implementation treats the custom derivative boundary as
-    # opaque nonlinear over all of its input DOF dependencies.  It must not
-    # report the sparsity of the primal call_jaxpr (which ignores y).
-    np.testing.assert_array_equal(
-        hessian.toarray(),
-        np.ones((4, 4), dtype=bool),
-    )

@@ -31,9 +31,10 @@ from tatva.tracer.program.analysis import JaxprPlan
 from tatva.tracer.program.analysis import analyze as analyze_jaxpr
 from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
+from tatva.tracer.program.forms import FormSpec, SymbolicLayout
 from tatva.tracer.program.incidence import (
     generate_contribution_blocks,
-    plan_tagged_block_dof_incidence,
+    plan_tagged_block_coordinate_incidence,
 )
 from tatva.tracer.support import require_local_routes, require_registered_operations
 
@@ -58,6 +59,7 @@ class FunctionalAnalysis[**P, R]:
     _captured: CapturedJaxpr[P, R]
     _plan: JaxprPlan
     _contributions: ContributionTrace
+    _form: FormSpec
 
     def distribute(
         self,
@@ -80,28 +82,40 @@ class FunctionalAnalysis[**P, R]:
             self._captured.closed_jaxpr,
             self._captured.flat_args,
             self._plan,
+            unavailable_inputs=self._form.coordinate_input_indices,
         )
-        incidence = plan_tagged_block_dof_incidence(
+        coordinate_incidence = plan_tagged_block_coordinate_incidence(
             self._plan,
             frame,
             resolver,
             self._contributions,
             blocks=blocks,
+            form=self._form,
         )
+        partition_incidence = coordinate_incidence.combined()
         contribution_partition, block_to_part = partition_contribution_blocks(
-            incidence,
+            partition_incidence,
             n_parts=parts,
             strategy=PartitionStrategy.INCIDENCE,
         )
 
+        first_column = next(
+            block for block in self._form.coordinates if block.role.is_column
+        )
+        owner_incidence = coordinate_incidence.coordinate(first_column.name)
         if dof_owner is None:
             owner = dof_owner_from_incidence(
-                incidence,
+                owner_incidence,
                 block_to_part=block_to_part,
                 n_parts=parts,
             )
         else:
             owner = validate_dof_owner(dof_owner, n_ranks=parts)
+            if owner.size != owner_incidence.n_dofs:
+                raise ValueError(
+                    f"dof_owner has {owner.size} entries but canonical column "
+                    f"block {first_column.name!r} has {owner_incidence.n_dofs}"
+                )
 
         return DistributionPlan(
             _functional=self,
@@ -148,6 +162,7 @@ class DistributionPlan[**P, R]:
             functional._captured.closed_jaxpr,
             functional._captured.flat_args,
             functional._plan,
+            unavailable_inputs=functional._form.coordinate_input_indices,
         )
         demand = backpropagate_plan_demand(
             functional._plan,
@@ -181,6 +196,7 @@ class DistributionPlan[**P, R]:
             _contributions=functional._contributions,
             _owned=owned,
             _plan=local_plan,
+            _form=functional._form,
         )
         self._rank_cache[rank] = local
         return local
@@ -201,6 +217,7 @@ class LocalFunctional[**P, R]:
     _contributions: ContributionTrace
     _owned: tuple[OwnedContribution, ...]
     _plan: LocalJaxprPlan
+    _form: FormSpec
 
     @functools.cached_property
     def _executable(self):
@@ -246,6 +263,7 @@ class LocalFunctional[**P, R]:
             self._executable,
             self.dofs,
             self._captured.flat_args,
+            form=self._form,
         )
 
     def derivatives(self) -> LocalDerivativeTrace:
@@ -282,16 +300,35 @@ class LocalFunctional[**P, R]:
 
 def analyze_captured[**P, R](
     captured: CapturedJaxpr[P, R],
+    *,
+    form: FormSpec | None = None,
 ) -> FunctionalAnalysis[P, R]:
-    """Structurally analyze an already captured functional."""
+    """Structurally analyze an already captured scalar form."""
     jaxpr = captured.jaxpr
     if not jaxpr.invars:
         raise ValueError("Functional JAXPR has no inputs")
 
+    form = FormSpec.energy(input_index=0) if form is None else form
+    symbolic = SymbolicLayout.from_form(form, jaxpr)
+
+    # Distributed storage is still backed by the canonical first column input.
+    # The derivative core already supports arbitrary/mixed coordinate blocks;
+    # multi-column distributed storage is intentionally a separate runtime step.
+    first_column = next(
+        (block for block in form.coordinates if block.role.is_column),
+        None,
+    )
+    if first_column is None:
+        raise ValueError("form has no column coordinate block")
+    if first_column.input_index != 0:
+        raise NotImplementedError(
+            "distributed form analysis currently requires its first column "
+            "coordinate block on flat input 0"
+        )
     dof_shape = _shape_of(jaxpr.invars[0])
     if len(dof_shape) != 1:
         raise ValueError(
-            f"First input must be a flat DOF vector, got shape {dof_shape}"
+            f"First column input must be a flat DOF vector, got shape {dof_shape}"
         )
 
     require_registered_operations(jaxpr)
@@ -300,12 +337,27 @@ def analyze_captured[**P, R](
         captured.closed_jaxpr,
         captured.flat_args,
         plan,
+        unavailable_inputs=form.coordinate_input_indices,
     )
     contributions = detect_contributions(plan, frame, resolver)
     return FunctionalAnalysis(
         _captured=captured,
         _plan=plan,
         _contributions=contributions,
+        _form=form,
+    )
+
+
+def analyze_form[**P, R](
+    form: FormSpec,
+    fn: typing.Callable[P, R],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> FunctionalAnalysis[P, R]:
+    """Capture and analyze a scalar form with explicit coordinate metadata."""
+    return analyze_captured(
+        make_captured_jaxpr(fn, *args, **kwargs),
+        form=form,
     )
 
 
@@ -314,5 +366,5 @@ def analyze[**P, R](
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> FunctionalAnalysis[P, R]:
-    """Capture and structurally analyze a functional."""
+    """Capture an energy functional using the generic scalar-form pipeline."""
     return analyze_captured(make_captured_jaxpr(fn, *args, **kwargs))

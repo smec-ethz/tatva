@@ -217,7 +217,6 @@ def lower_gather(ctx: LoweringContext) -> tuple[Any, ...]:
             local = jnp.where(matched, positions, global_indices.size).astype(
                 values.dtype
             )
-
             component = rebase.component
             indices = jnp.concatenate(
                 (
@@ -227,7 +226,6 @@ def lower_gather(ctx: LoweringContext) -> tuple[Any, ...]:
                 ),
                 axis=-1,
             )
-
         params = dict(ctx.plan.eqn.params)
         params["slice_sizes"] = route.slice_sizes
         result = ctx.plan.eqn.primitive.bind(operand, indices, **params)
@@ -286,9 +284,9 @@ def lower_scatter_set(
             raise RuntimeError(
                 "localized scatter operand projection contains duplicate output rows"
             )
-
         output = output.at[jnp.asarray(route.operand_output_rows)].set(
-            flat_operand[jnp.asarray(route.operand_rows)], unique_indices=True
+            flat_operand[jnp.asarray(route.operand_rows)],
+            unique_indices=True,
         )
 
     # Apply surviving updates.
@@ -301,7 +299,8 @@ def lower_scatter_set(
             )
 
         output = output.at[jnp.asarray(route.target_rows)].set(
-            flat_updates[jnp.asarray(route.update_rows)], unique_indices=True
+            flat_updates[jnp.asarray(route.update_rows)],
+            unique_indices=True,
         )
 
     return (jnp.reshape(output, route.output_shape),)
@@ -421,16 +420,14 @@ def lower_select_n(
         value = ctx.inputs[case_index + 1]
         assert value is not None
         source = jnp.ravel(value)[jnp.asarray(case_route.source_rows)]
-
         rows = np.asarray(case_route.output_rows, dtype=np.int64)
-
         if np.unique(rows).size != rows.size:
             raise RuntimeError(
                 "localized select_n route contains duplicate output rows"
             )
-
-        output = output.at[jnp.asarray(case_route.output_rows)].set(
-            source, unique_indices=True
+        output = output.at[jnp.asarray(rows)].set(
+            source,
+            unique_indices=True,
         )
 
     return (jnp.reshape(output, route.output_shape),)

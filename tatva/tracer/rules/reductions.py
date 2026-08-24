@@ -21,7 +21,7 @@ from tatva.tracer.local.demand import (
     _RangeAxis,
     axis_indices,
 )
-from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
 from tatva.tracer.rules import tagged
 
 
@@ -113,7 +113,7 @@ def zero_reduction_dependencies(
 def reduce_prod_hessian(
     ctx: RuleContext,
     prepared: PreparedReduction,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     deps = prepared.deps.csr
     groups = prepared.input_to_output
@@ -213,7 +213,7 @@ REDUCE_BASIC = OperationSemantics(
     DerivativeRule(
         prepare=prepare_reduction,
         dependencies=reduction_dependencies,
-        hessian=no_hessian,
+        interactions=no_hessian,
     ),
     demand=reduce_sum_demand,
     tagged_demand=tagged.reduction,
@@ -222,7 +222,7 @@ REDUCE_PROD = OperationSemantics(
     DerivativeRule(
         prepare=prepare_reduction,
         dependencies=reduction_dependencies,
-        hessian=reduce_prod_hessian,
+        interactions=reduce_prod_hessian,
     ),
     tagged_demand=tagged.reduction,
 )

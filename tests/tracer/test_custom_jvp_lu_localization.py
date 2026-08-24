@@ -103,7 +103,9 @@ def test_custom_jvp_lu_pivot_gather_stays_in_selected_batch_domain():
     assert pivot_gather.input_layouts[0].local_shape == (selected.size, 1, 4, 4)
     assert pivot_gather.input_layouts[1] is not None
     assert pivot_gather.input_layouts[1].local_shape == (selected.size, 1, 4, 3)
-    assert tuple(rebase.component for rebase in pivot_gather.route.local.rebases) == (0,)
+    assert tuple(rebase.component for rebase in pivot_gather.route.local.rebases) == (
+        0,
+    )
 
     x_local = x[selected]
 
@@ -119,7 +121,9 @@ def test_custom_jvp_lu_pivot_gather_stays_in_selected_batch_domain():
     )
 
     local_grad = jax.grad(lambda value: jnp.sum(run_local(value)))(x_local)
-    reference_grad = jax.grad(lambda value: jnp.sum(function(value)[selected]))(x)[selected]
+    reference_grad = jax.grad(lambda value: jnp.sum(function(value)[selected]))(x)[
+        selected
+    ]
     np.testing.assert_allclose(
         np.asarray(local_grad),
         np.asarray(reference_grad),
@@ -142,9 +146,9 @@ def test_public_functional_custom_jvp_lu_distributes_without_global_lu():
 
     def energy(dofs):
         matrices = dofs.reshape(n_elements, 1, matrix_size, matrix_size)
-        matrices = matrices + 2.0 * jnp.eye(matrix_size, dtype=dofs.dtype)[
-            None, None, :, :
-        ]
+        matrices = (
+            matrices + 2.0 * jnp.eye(matrix_size, dtype=dofs.dtype)[None, None, :, :]
+        )
         return jnp.sum(local_energy(matrices))
 
     dofs = jnp.arange(n_elements * matrix_size * matrix_size, dtype=jnp.float32) / 100
@@ -163,9 +167,7 @@ def test_public_functional_custom_jvp_lu_distributes_without_global_lu():
         assert local.dofs.compute_rows.size < dofs.size
 
         local_values.append(fn(*localized.args, **localized.kwargs))
-        local_gradient = np.asarray(
-            jax.grad(fn)(*localized.args, **localized.kwargs)
-        )
+        local_gradient = np.asarray(jax.grad(fn)(*localized.args, **localized.kwargs))
         assembled_gradient[local.dofs.storage.global_dofs] += local_gradient
 
     np.testing.assert_allclose(

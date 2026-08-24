@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from tatva.tracer.local.layout import TensorLayout
     from tatva.tracer.local.localize import LocalRoute
     from tatva.tracer.lowering.rules import LoweringRule
-    from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+    from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
 
 type ContributionCoefficient = int | float | complex
 
@@ -115,7 +115,7 @@ def contribution_barrier(ctx: ContributionContext) -> ContributionDecision:
 def no_hessian(
     ctx: RuleContext,
     prepared: object,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     """A linear primitive contributes no primitive-local second derivatives."""
 
@@ -177,7 +177,12 @@ class RuleContext:
     eqn: JaxprEqn
     input_deps: tuple[DependencySet, ...]
     route: Route | None
-    n_dofs: int
+    n_symbols: int
+
+    @property
+    def n_dofs(self) -> int:
+        """Compatibility alias for primitive rules not yet renamed."""
+        return self.n_symbols
 
 
 class PrepareRule[T](Protocol):
@@ -188,9 +193,9 @@ class DependencyRule[T](Protocol):
     def __call__(self, ctx: RuleContext, prepared: T) -> tuple[DependencySet, ...]: ...
 
 
-class HessianRule[T](Protocol):
+class InteractionRule[T](Protocol):
     def __call__(
-        self, ctx: RuleContext, prepared: T, acc: HessianAccumulator
+        self, ctx: RuleContext, prepared: T, acc: InteractionGraph
     ) -> None: ...
 
 
@@ -261,7 +266,12 @@ NO_LOCALIZATION = LocalizationSemantics()
 class DerivativeRule[T]:
     prepare: PrepareRule[T]
     dependencies: DependencyRule[T]
-    hessian: HessianRule[T]
+    interactions: InteractionRule[T]
+
+    @property
+    def hessian(self) -> InteractionRule[T]:
+        """Compatibility alias; interactions is the canonical compiler term."""
+        return self.interactions
 
 
 class RouteRequirement(Enum):

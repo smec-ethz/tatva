@@ -15,7 +15,7 @@ from tatva.tracer.program.dependencies import DependencySet
 
 if TYPE_CHECKING:
     from tatva.tracer.core.semantics import RuleContext
-    from tatva.tracer.program.dependencies import HessianAccumulator
+    from tatva.tracer.program.dependencies import InteractionGraph
 
 
 @dataclass(frozen=True)
@@ -71,7 +71,7 @@ def opaque_dependencies(
 def opaque_nonlinear_hessian(
     ctx: RuleContext,
     prepared: OpaqueData,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     acc.add_self(prepared.total)
 

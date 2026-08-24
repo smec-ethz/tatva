@@ -485,14 +485,8 @@ def _compute_scatter_target_rows(
 
         if index_vector_size:
             if len(indices_shape) == 1:
-                # One index vector shared by every update-window element.
-                #
-                # This is produced by expressions such as
-                #
-                #     x.at[..., i, j].set(values)
-                #
-                # where leading dimensions of `values` are update-window
-                # dimensions, not scatter-index batch dimensions.
+                # One fixed index vector is shared by every update-window
+                # element, e.g. x.at[..., i, j].set(values).
                 index_vectors = np.broadcast_to(
                     np.asarray(indices, dtype=np.int64).reshape(1, index_vector_size),
                     (n_updates, index_vector_size),
@@ -501,11 +495,8 @@ def _compute_scatter_target_rows(
                 key = tuple(
                     index_batch_coords[:, i] for i in range(index_batch_coords.shape[1])
                 )
-
-                index_vectors = np.asarray(indices[key], dtype=np.int64)
-                index_vectors = index_vectors.reshape(
-                    n_updates,
-                    index_vector_size,
+                index_vectors = np.asarray(indices[key], dtype=np.int64).reshape(
+                    n_updates, index_vector_size
                 )
         else:
             index_vectors = np.empty((n_updates, 0), dtype=np.int64)
@@ -561,5 +552,4 @@ def _compute_scatter_target_rows(
         return target_rows
 
     except (ValueError, IndexError, TypeError):
-        # TODO: looks fishy, necessary?
         return None

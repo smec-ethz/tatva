@@ -14,7 +14,7 @@ from tatva.tracer.core.semantics import (
 )
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import Demand, TensorDemand, _FullAxis
-from tatva.tracer.program.dependencies import DependencySet, HessianAccumulator
+from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
 from tatva.tracer.rules import concrete, tagged
 
 if TYPE_CHECKING:
@@ -58,7 +58,7 @@ def unary_passthrough_dependencies(
 def nonlinear_unary_hessian(
     ctx: RuleContext,
     prepared: ElementwiseUnaryData,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     acc.add_self(prepared.dep)
 
@@ -79,7 +79,7 @@ def integer_pow_dependencies(
 def integer_pow_hessian(
     ctx: RuleContext,
     prepared: None,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     n = int(ctx.eqn.params["y"])
     if n in (0, 1):
@@ -133,7 +133,7 @@ def union_dependencies(
 def elementwise_mul_hessian(
     ctx: RuleContext,
     prepared: ElementwiseBinaryData,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     acc.add_cross(prepared.lhs, prepared.rhs)
 
@@ -141,7 +141,7 @@ def elementwise_mul_hessian(
 def elementwise_div_hessian(
     ctx: RuleContext,
     prepared: ElementwiseBinaryData,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     lhs, rhs = prepared.lhs, prepared.rhs
     # d²(a / b) / da db
@@ -154,7 +154,7 @@ def elementwise_div_hessian(
 def elementwise_pow_hessian(
     ctx: RuleContext,
     prepared: ElementwiseBinaryData,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     lhs, rhs = prepared.lhs, prepared.rhs
     acc.add_self(lhs)
@@ -165,7 +165,7 @@ def elementwise_pow_hessian(
 def elementwise_atan2_hessian(
     ctx: RuleContext,
     prepared: ElementwiseBinaryData,
-    acc: HessianAccumulator,
+    acc: InteractionGraph,
 ) -> None:
     lhs, rhs = prepared.lhs, prepared.rhs
     acc.add_self(lhs)
@@ -281,7 +281,7 @@ ELEMENTWISE_BINARY_BASIC = OperationSemantics(
     DerivativeRule(
         prepare=prepare_elementwise_binary,
         dependencies=union_dependencies,
-        hessian=no_hessian,
+        interactions=no_hessian,
     ),
     demand=elementwise_demand,
     tagged_demand=tagged.elementwise,
@@ -313,7 +313,7 @@ ELEMENTWISE_NARY_BASIC = OperationSemantics(
     DerivativeRule(
         prepare=prepare_elementwise_nary,
         dependencies=nary_union_dependencies,
-        hessian=no_hessian,
+        interactions=no_hessian,
     ),
     demand=elementwise_demand,
     tagged_demand=tagged.elementwise,
