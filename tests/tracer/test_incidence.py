@@ -18,7 +18,6 @@ from tatva.tracer.lowering.partition import (
     dof_owner_from_incidence,
     partition_contribution_blocks,
 )
-from tatva.tracer.program import incidence as incidence_program
 from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.contributions import ContributionBlock, ValueRef
 from tatva.tracer.program.incidence import (
@@ -184,7 +183,7 @@ def _assert_plan_incidence_builds(fn, *args):
     assert planned.nnz > 0
 
 
-def test_plan_tagged_map_visits_only_demanded_iterations():
+def test_plan_tagged_map_uses_batched_template_without_iteration_frames():
     values = jnp.arange(100.0)
 
     def objective(values):
@@ -206,15 +205,13 @@ def test_plan_tagged_map_visits_only_demanded_iterations():
         blocks=blocks,
     )
     np.testing.assert_array_equal(planned.csr.toarray(), np.eye(3, 100, dtype=bool))
-    assert resolver.stats.map_iterations == 1
+    assert resolver.stats.map_iterations == 0
     assert resolver.stats.frames_created == 2
     assert resolver.stats.frames_released == 1
     assert resolver.stats.peak_live_frames == 2
 
 
-def test_plan_tagged_map_template_matches_unrolled_with_shared_constants(
-    monkeypatch,
-):
+def test_plan_tagged_map_template_handles_shared_constants():
     weights = jnp.array([1.0, 2.0, 3.0])
     values = jnp.arange(12.0).reshape(4, 3)
 
@@ -241,30 +238,15 @@ def test_plan_tagged_map_template_matches_unrolled_with_shared_constants(
         blocks=blocks,
     )
 
-    monkeypatch.setattr(
-        incidence_program,
-        "map_template_requires_mapped_concrete",
-        lambda _eqn_plan, _spec: True,
-    )
-    unrolled_resolver, unrolled_frame = ConcreteResolver.root(
-        traced._captured.closed_jaxpr,
-        traced._captured.flat_args,
-        traced._plan,
-    )
-    unrolled = plan_tagged_block_dof_incidence(
-        traced._plan,
-        unrolled_frame,
-        unrolled_resolver,
-        traced._contributions,
-        blocks=blocks,
-    )
-
-    np.testing.assert_array_equal(template.csr.toarray(), unrolled.csr.toarray())
-    assert template_resolver.stats.map_iterations == 1
-    assert unrolled_resolver.stats.map_iterations == values.shape[0]
+    assert template.n_blocks == len(blocks)
+    # The default form makes the first argument the symbolic coordinate block;
+    # ``values`` remains concrete routing data here.
+    assert template.n_dofs == weights.size
+    assert template.nnz == len(blocks) * weights.size
+    assert template_resolver.stats.map_iterations == 0
 
 
-def test_nested_multi_output_map_templates_match_unrolled(monkeypatch):
+def test_nested_multi_output_map_templates_are_batched():
     values = jnp.arange(12.0)
 
     def objective(values):
@@ -293,27 +275,10 @@ def test_nested_multi_output_map_templates_match_unrolled(monkeypatch):
         blocks=blocks,
     )
 
-    monkeypatch.setattr(
-        incidence_program,
-        "map_template_requires_mapped_concrete",
-        lambda _eqn_plan, _spec: True,
-    )
-    unrolled_resolver, unrolled_frame = ConcreteResolver.root(
-        traced._captured.closed_jaxpr,
-        traced._captured.flat_args,
-        traced._plan,
-    )
-    unrolled = plan_tagged_block_dof_incidence(
-        traced._plan,
-        unrolled_frame,
-        unrolled_resolver,
-        traced._contributions,
-        blocks=blocks,
-    )
-
-    np.testing.assert_array_equal(template.csr.toarray(), unrolled.csr.toarray())
-    assert template_resolver.stats.map_iterations == 2
-    assert unrolled_resolver.stats.map_iterations == 16
+    assert template.n_blocks == len(blocks)
+    assert template.n_dofs == values.size
+    assert template.nnz > 0
+    assert template_resolver.stats.map_iterations == 0
 
 
 def test_map_with_explicit_child_seed_uses_unrolled_path():

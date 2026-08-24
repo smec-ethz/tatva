@@ -157,9 +157,9 @@ def test_rank_planning_does_not_resolve_undemanded_map_iterations():
         (DemandSeed(root.value, block.demand),),
     )
 
-    assert resolver.stats.map_iterations == 1
+    assert resolver.stats.map_iterations == 0
     plan = build_rank_local_plan(traced._plan, frame, resolver, demand)
-    assert resolver.stats.map_iterations == 2
+    assert resolver.stats.map_iterations == 0
     assert resolver.stats.frames_created - resolver.stats.frames_released == 1
     mapped = next(
         eqn.nested

@@ -63,7 +63,7 @@ from tatva.tracer.local.demand import (
 from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.contributions import ValueRef
-from tatva.tracer.program.repeated import map_template_requires_mapped_concrete
+from tatva.tracer.program.map_batch import BatchedMapProgram
 
 
 def _expand_batch_demand(
@@ -262,73 +262,49 @@ class _DemandPlanNestedHandler:
         return tuple(outer), CustomJvpInvocation(self.eqn_plan.index, primal, jvp)
 
     def map(self, spec: MapSpec) -> tuple[tuple[Demand, ...], NestedDemandTrace]:
-        if map_template_requires_mapped_concrete(self.eqn_plan, spec):
-            return self._map_unrolled(spec)
+        program = self.resolver.batched_map_program(self.eqn_plan)
 
-        # Explicit child seeds can differ by iteration.
-        has_map_seeds = any(
-            step.eqn_index == self.eqn_plan.index and step.kind is NestedKind.MAP
-            for step in self.seed_node.children
-        )
-        if has_map_seeds:
-            return self._map_unrolled(spec)
-
-        indices = _plan_map_indices(self.eqn_plan, spec, self.outputs, self.seed_node)
-        if indices.size == 0:
-            return (
-                tuple(self._empty_outer()),
-                RepeatedInvocation.from_spec(self.eqn_plan.index, spec, ()),
-            )
-
-        representative = int(indices[0])
-        child_outputs = tuple(
-            take_leading_axis_demand(demand, representative) for demand in self.outputs
+        output_demands = _batched_map_output_demands(
+            eqn_plan=self.eqn_plan,
+            spec=spec,
+            program=program,
+            outer_outputs=self.outputs,
+            seed_node=self.seed_node,
         )
 
-        # The first implementation only templates a single common pattern.
-        for index_ in indices[1:]:
-            pattern = tuple(
-                take_leading_axis_demand(demand, int(index_)) for demand in self.outputs
-            )
-            if pattern != child_outputs:
-                return self._map_unrolled(spec)
+        # Only genuinely nested seed paths fall back.
+        if output_demands is None:
+            return self._map_unrolled(spec)
 
-        child_frame = self.resolver.map_frame(self.frame, self.eqn_plan, representative)
-        step = child_frame.path[-1]
+        indices = _plan_map_indices(
+            self.eqn_plan,
+            spec,
+            self.outputs,
+            self.seed_node,
+        )
+
+        child = self.resolver.batched_map_frame(
+            self.frame, self.eqn_plan, program, analysis=True
+        )
 
         try:
-            child = _backprop_plan_jaxpr(
-                child_frame.plan,
-                child_frame,
+            trace = _backprop_plan_jaxpr(
+                program.analysis_plan,
+                child,
                 self.resolver,
-                self.seed_node.children.get(step, _SeedNode()),
-                output_demands=child_outputs,
+                _SeedNode(),
+                output_demands=output_demands,
             )
         finally:
-            self.resolver.release(child_frame)
-
-        outer = self._empty_outer()
-
-        for input_index, demand in enumerate(child.input_demands):
-            if demand is None:
-                continue
-
-            lifted = (
-                demand
-                if input_index < spec.num_consts
-                else lift_leading_axis_demand_many(
-                    demand,
-                    outer_shape=_shape_of(self.eqn_plan.eqn.invars[input_index]),
-                    indices=indices,
-                )
-            )
-            outer[input_index] = merge_demands(outer[input_index], lifted)
-
-        selection = IterationSelection.from_indices(spec.length, indices)
+            self.resolver.release(child)
 
         return (
-            tuple(outer),
-            MapInvocation(eqn_index=self.eqn_plan.index, indices=selection, body=child),
+            trace.input_demands,
+            MapInvocation(
+                eqn_index=self.eqn_plan.index,
+                indices=IterationSelection.from_indices(spec.length, indices),
+                body=trace,
+            ),
         )
 
     def _map_unrolled(
@@ -589,6 +565,71 @@ def _plan_map_indices(
     if np.any(indices < 0) or np.any(indices >= spec.length):
         raise IndexError("map demand contains an out-of-range iteration")
     return indices
+
+
+def _map_direct_seed_nodes(
+    *,
+    eqn_index: int,
+    seed_node: _SeedNode,
+) -> tuple[tuple[int, _SeedNode], ...]:
+    result: list[tuple[int, _SeedNode]] = []
+
+    for step, child in seed_node.children.items():
+        if step.eqn_index == eqn_index and step.kind is NestedKind.MAP:
+            if step.iteration is None:
+                raise RuntimeError("map seed requires an iteration")
+
+            result.append((int(step.iteration), child))
+
+    return tuple(result)
+
+
+def _batched_map_output_demands(
+    *,
+    eqn_plan: EqnPlan,
+    spec: MapSpec,
+    program: BatchedMapProgram,
+    outer_outputs: tuple[Demand, ...],
+    seed_node: _SeedNode,
+) -> tuple[Demand, ...] | None:
+    demands: list[Demand] = list(outer_outputs) + [None] * (
+        len(program.analysis_plan.jaxpr.outvars) - program.num_outputs
+    )
+
+    for iteration, node in _map_direct_seed_nodes(
+        eqn_index=eqn_plan.index,
+        seed_node=seed_node,
+    ):
+        # Keep a safe fallback for seeds nested deeper than the
+        # immediate map body. Supporting those requires recursively
+        # exposing nested JAXPR vars.
+        if node.children:
+            return None
+
+        for var, demand in node.values.items():
+            try:
+                output_index = program.exposed[var]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "map seed variable is not exposed by the batched analysis program"
+                ) from exc
+
+            outer_shape = _shape_of(program.analysis_plan.jaxpr.outvars[output_index])
+            expected_shape = (spec.length, *demand.shape)
+
+            if outer_shape != expected_shape:
+                raise RuntimeError(
+                    "batched exposed map value has shape "
+                    f"{outer_shape}, expected "
+                    f"{expected_shape}"
+                )
+
+            lifted = lift_leading_axis_demand(
+                demand, outer_shape=outer_shape, index=iteration
+            )
+            demands[output_index] = merge_demands(demands[output_index], lifted)
+
+    return tuple(demands)
 
 
 def lift_leading_axis_demand_many(
