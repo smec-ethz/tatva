@@ -11,7 +11,6 @@ from tatva.tracer import FunctionalAnalysis, analyze
 from tatva.tracer.core.nested import CustomJvpSpec
 from tatva.tracer.diagnostics import (
     contribution_blocks,
-    global_derivatives,
     incidence,
 )
 from tatva.tracer.local.plan import LocalEqnPlan, LocalJaxprPlan
@@ -330,7 +329,7 @@ def test_custom_jvp_program_is_localized_before_transpose_lowering():
         assert eqn.input_layouts[0].local_shape == (40, 1, 2, 2)
         assert eqn.output_layouts[0].local_shape == (40, 1, 2, 2)
         assert eqn.nested is not None
-        for child_eqn in eqn.nested.invocation.jvp.eqns:
+        for child_eqn in eqn.nested.invocation.jvp.eqns:  # ty: ignore[unresolved-attribute]
             for layout in child_eqn.output_layouts:
                 if layout is not None and layout.global_shape[:1] == (200,):
                     assert layout.local_shape[0] == 40

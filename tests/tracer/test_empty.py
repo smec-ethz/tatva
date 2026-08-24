@@ -3,7 +3,12 @@ import jax.numpy as jnp
 from jax._src.lax import lax
 
 from tatva.tracer.core.registry import SEMANTICS
-from tatva.tracer.core.semantics import DemandContext, RegionalConcreteContext
+from tatva.tracer.core.semantics import (
+    DemandContext,
+    FullConcrete,
+    RegionalConcreteContext,
+    UnsupportedConcrete,
+)
 from tatva.tracer.local.demand import TensorDemand
 
 
@@ -27,9 +32,11 @@ def test_empty_cannot_supply_concrete_routing_data():
     eqn = _empty_eqn()
     semantics = SEMANTICS.get_ordinary(lax.empty_p)
     demand = TensorDemand.full((4,))
+    assert demand is not None
 
     decision = semantics.regional_concrete(
         RegionalConcreteContext(eqn=eqn, output_index=0, demand=demand)
     )
 
+    assert isinstance(decision, (FullConcrete, UnsupportedConcrete))
     assert "uninitialized" in decision.reason

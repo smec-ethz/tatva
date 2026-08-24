@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax.extend import core
+from jax.extend.core import Var
 
 # The repository targets the newer JAX scan ABI. The execution environment
 # used for this regression suite may expose an older ABI without ft_in.
@@ -48,11 +49,13 @@ def _localized_map(function, x, demand):
     _ensure_scan_ft_in(closed)
     plan = analyze(closed.jaxpr)
     resolver, frame = ConcreteResolver.root(closed, (x,), plan)
+    output = plan.jaxpr.outvars[0]
+    assert isinstance(output, Var)
     trace = backpropagate_plan_demand(
         plan,
         frame,
         resolver,
-        [DemandSeed(ValueRef((), plan.jaxpr.outvars[0]), demand)],
+        [DemandSeed(ValueRef((), output), demand)],
     )
     local = build_rank_local_plan(plan, frame, resolver, trace)
     nested = next(eqn.nested for eqn in local.eqns if eqn.nested is not None)
@@ -142,16 +145,19 @@ def test_stateful_scan_keeps_repeated_invocation():
     closed = jax.make_jaxpr(function)(x)
     _ensure_scan_ft_in(closed, num_carry=1)
     plan = analyze(closed.jaxpr)
+    assert plan.eqns[0].nested is not None
     assert isinstance(plan.eqns[0].nested.spec, ScanSpec)
 
     resolver, frame = ConcreteResolver.root(closed, (x,), plan)
     demand = TensorDemand.full((6,))
     assert demand is not None
+    output = plan.jaxpr.outvars[0]
+    assert isinstance(output, Var)
     trace = backpropagate_plan_demand(
         plan,
         frame,
         resolver,
-        [DemandSeed(ValueRef((), plan.jaxpr.outvars[0]), demand)],
+        [DemandSeed(ValueRef((), output), demand)],
     )
     local = build_rank_local_plan(plan, frame, resolver, trace)
     nested = next(eqn.nested for eqn in local.eqns if eqn.nested is not None)

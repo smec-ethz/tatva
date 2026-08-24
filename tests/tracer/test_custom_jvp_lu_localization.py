@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.extend import core
+from jax.extend.core import Var
 
 # Compatibility for the execution environment used here. The target JAX 0.11
 # exposes lax.stack_p; older JAX versions do not.
 if not hasattr(lax, "stack_p"):
     lax.stack_p = core.Primitive("stack_compat")
 
+from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import TensorDemand
 from tatva.tracer.local.liveness import DemandSeed, backpropagate_plan_demand
 from tatva.tracer.local.localize import LocalDynamicGatherRoute
@@ -46,14 +48,16 @@ def _localized(function, x, selected):
     closed = jax.make_jaxpr(function)(x)
     plan = analyze(closed.jaxpr)
     resolver, frame = ConcreteResolver.root(closed, (x,), plan)
-    output_shape = tuple(closed.jaxpr.outvars[0].aval.shape)
+    output = closed.jaxpr.outvars[0]
+    assert isinstance(output, Var)
+    output_shape = _shape_of(output)
     demand = TensorDemand.axis_selection(output_shape, 0, selected)
     assert demand is not None
     trace = backpropagate_plan_demand(
         plan,
         frame,
         resolver,
-        [DemandSeed(ValueRef((), plan.jaxpr.outvars[0]), demand)],
+        [DemandSeed(ValueRef((), output), demand)],
     )
     return build_rank_local_plan(plan, frame, resolver, trace), trace
 

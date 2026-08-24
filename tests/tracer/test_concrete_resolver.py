@@ -57,7 +57,7 @@ def test_recursive_value_evaluates_computed_concrete_data_and_is_memoized():
         jnp.arange(12.0),
         jnp.array([0, 2, 3], dtype=jnp.int32),
     )
-    captured, plan, resolver, frame = _setup(objective, *args)
+    _captured, plan, resolver, frame = _setup(objective, *args)
     gather = _eqn(plan, "gather")
     index_atom = gather.eqn.invars[1]
     assert isinstance(index_atom, Var)
@@ -140,7 +140,7 @@ def test_route_fragments_resolve_without_a_jaxpr_instance(
     primitive_name,
     requested,
 ):
-    captured, plan, resolver, frame = _setup(fn, *args)
+    _captured, plan, resolver, frame = _setup(fn, *args)
     eqn_plan = _eqn(plan, primitive_name)
     request = RouteRequest(np.asarray(requested, dtype=np.int64))
 
@@ -153,11 +153,11 @@ def test_route_fragments_resolve_without_a_jaxpr_instance(
     assert routing is not None, (
         f"Missing routing semantics for {eqn_plan.eqn.primitive}"
     )
-    concrete = {
-        eqn_plan.eqn.invars[index]: resolver.value(frame, eqn_plan.eqn.invars[index])
-        for index in routing.inputs(eqn_plan.eqn)
-        if isinstance(eqn_plan.eqn.invars[index], Var)
-    }
+    concrete: dict[Var, object] = {}
+    for index in routing.inputs(eqn_plan.eqn):
+        atom = eqn_plan.eqn.invars[index]
+        if isinstance(atom, Var):
+            concrete[atom] = resolver.value(frame, atom)
     expected = routing.fragment(eqn_plan.eqn, concrete, request)
     _assert_fragment_equal(actual, expected)
 
