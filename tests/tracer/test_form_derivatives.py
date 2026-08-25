@@ -393,3 +393,59 @@ def test_annotated_analyze_end_to_end():
             np.eye(derivative.tangent.shape[0], dtype=bool),
         )
 
+
+def test_annotated_test_may_precede_storage_backed_trial_input():
+    n_elements = 8
+    width = 2
+    trial = jnp.arange(n_elements * width, dtype=jnp.float32) + 1
+    test = jnp.arange(n_elements * width, dtype=jnp.float32) + 2
+
+    def weak(v: Test, u: Trial) -> jax.Array:
+        return jnp.sum(v.reshape(n_elements, width) * u.reshape(n_elements, width))
+
+    distribution = analyze_functional(weak, test, trial).distribute(
+        parts=2,
+        blocks_per_part=2,
+    )
+
+    local_values = []
+    for rank in range(distribution.parts):
+        local = distribution.rank(rank)
+        assert local.dof_input_index == 1
+        localized = local.localize(test, trial)
+        assert localized.args[0].size < test.size
+        assert localized.args[1].size < trial.size
+        local_values.append(local.compile()(*localized.args, **localized.kwargs))
+        derivative = local.derivatives()
+        assert derivative.row_block_names == ("v",)
+        assert derivative.column_block_names == ("u",)
+
+    np.testing.assert_allclose(sum(local_values), weak(test, trial))
+
+
+def test_annotated_state_may_follow_a_noncoordinate_input():
+    n_elements = 8
+    width = 2
+    scale = jnp.asarray(1.5, dtype=jnp.float32)
+    state = jnp.arange(n_elements * width, dtype=jnp.float32) + 1
+
+    def energy(coefficient, values: State) -> jax.Array:
+        local = values.reshape(n_elements, width)
+        return coefficient * jnp.sum(local * local)
+
+    distribution = analyze_functional(energy, scale, state).distribute(
+        parts=2,
+        blocks_per_part=2,
+    )
+
+    local_values = []
+    for rank in range(distribution.parts):
+        local = distribution.rank(rank)
+        assert local.dof_input_index == 1
+        localized = local.localize(scale, state)
+        assert localized.args[0] is None
+        assert localized.args[1].size < state.size
+        local_values.append(local.compile()(*localized.args, **localized.kwargs))
+        assert local.derivatives().hessian.shape[0] == localized.args[1].size
+
+    np.testing.assert_allclose(sum(local_values), energy(scale, state))

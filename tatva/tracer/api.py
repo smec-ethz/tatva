@@ -71,6 +71,7 @@ class FunctionalAnalysis[**P, R]:
     _plan: JaxprPlan
     _contributions: ContributionTrace
     _form: FormSpec
+    _dof_input_index: int
     _resolver: ConcreteResolver
     _root_frame: ConcreteFrame
 
@@ -330,7 +331,8 @@ class DistributionPlan[**P, R]:
         )
         require_local_routes((local_plan,))
 
-        compute_layout = local_plan.input_layouts[0]
+        dof_input_index = functional._dof_input_index
+        compute_layout = local_plan.input_layouts[dof_input_index]
         if compute_layout is None:
             raise RuntimeError("DOF input unexpectedly dead")
 
@@ -344,6 +346,7 @@ class DistributionPlan[**P, R]:
             rank=rank,
             parts=self.parts,
             dofs=dofs,
+            dof_input_index=dof_input_index,
             _captured=functional._captured,
             _contributions=functional._contributions,
             _owned=owned,
@@ -365,6 +368,7 @@ class LocalFunctional[**P, R]:
     rank: int
     parts: int
     dofs: LocalDofPlan
+    dof_input_index: int
     _captured: CapturedJaxpr[P, R]
     _contributions: ContributionTrace
     _owned: tuple[OwnedContribution, ...]
@@ -397,7 +401,7 @@ class LocalFunctional[**P, R]:
             ):
                 if layout is None:
                     continue
-                if index == 0:
+                if index == self.dof_input_index:
                     value = value[jnp.asarray(compute_rows)]
                 executable_inputs.append(value)
 
@@ -416,6 +420,7 @@ class LocalFunctional[**P, R]:
             self.dofs,
             self._captured.flat_args,
             form=self._form,
+            dof_input_index=self.dof_input_index,
         )
 
     def derivatives(self) -> LocalDerivativeTrace:
@@ -444,6 +449,7 @@ class LocalFunctional[**P, R]:
             self.dofs,
             specializers,
             self._plan.input_layouts,
+            self.dof_input_index,
             args=args,
             kwargs=kwargs,
         )
@@ -465,24 +471,30 @@ def analyze_captured[**P, R](
     if form is None:
         form = FormSpec.energy(input_index=0)
 
-    # Distributed storage is still backed by the canonical first column input.
-    # The derivative core already supports arbitrary/mixed coordinate blocks;
-    # multi-column distributed storage is intentionally a separate runtime step.
-    first_column = next(
-        (block for block in form.coordinates if block.role.is_column),
-        None,
-    )
-    if first_column is None:
+    columns = tuple(block for block in form.coordinates if block.role.is_column)
+    if not columns:
         raise ValueError("form has no column coordinate block")
-    if first_column.input_index != 0:
+    if len(columns) != 1:
         raise NotImplementedError(
-            "distributed form analysis currently requires its first column "
-            "coordinate block on flat input 0"
+            "distributed form analysis currently requires one full flat "
+            "column coordinate input"
         )
-    dof_shape = _shape_of(jaxpr.invars[0])
+    column = columns[0]
+    if column.selection is not None:
+        raise NotImplementedError(
+            "distributed form analysis does not support a partial column "
+            "coordinate selection"
+        )
+    dof_input_index = column.input_index
+    if dof_input_index >= len(jaxpr.invars):
+        raise ValueError(
+            f"column coordinate references input {dof_input_index}, but the "
+            f"captured JAXPR has {len(jaxpr.invars)} inputs"
+        )
+    dof_shape = _shape_of(jaxpr.invars[dof_input_index])
     if len(dof_shape) != 1:
         raise ValueError(
-            f"First column input must be a flat DOF vector, got shape {dof_shape}"
+            f"Column input must be a flat DOF vector, got shape {dof_shape}"
         )
 
     require_registered_operations(jaxpr)
@@ -499,6 +511,7 @@ def analyze_captured[**P, R](
         _plan=plan,
         _contributions=contributions,
         _form=form,
+        _dof_input_index=dof_input_index,
         _resolver=resolver,
         _root_frame=frame,
     )
