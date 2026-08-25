@@ -37,7 +37,9 @@ from numpy.typing import ArrayLike, NDArray
 
 from tatva.tracer.core.routes import Shape
 from tatva.tracer.local.demand import TensorDemand, merge_demands
+from tatva.tracer.local.dof_plan import validate_dof_owner
 from tatva.tracer.program.contributions import (
+    ContributionBlock,
     ContributionRoot,
 )
 from tatva.tracer.program.incidence import BlockDofIncidence
@@ -61,6 +63,60 @@ class MtKaHyParOptions:
 
         if self.threads is not None and self.threads <= 0:
             raise ValueError("Mt-KaHyPar threads must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class DistributionAssignments:
+    n_parts: int
+    strategy: PartitionStrategy
+    block_to_part: NDArray[np.int64]
+    dof_owner: NDArray[np.int64]
+
+    def __post_init__(self) -> None:
+        block_to_part = np.asarray(self.block_to_part, dtype=np.int64)
+        dof_owner = np.asarray(self.dof_owner, dtype=np.int64)
+
+        if np.any((block_to_part < 0) | (block_to_part >= self.n_parts)):
+            raise ValueError("invalid block partition assignment")
+        if np.any((dof_owner < 0) | (dof_owner >= self.n_parts)):
+            raise ValueError("invalid DOF owner assignment")
+
+        block_to_part.setflags(write=False)
+        dof_owner.setflags(write=False)
+        object.__setattr__(self, "block_to_part", block_to_part)
+        object.__setattr__(self, "dof_owner", dof_owner)
+
+
+def plan_distribution_assignments(
+    partition_incidence: BlockDofIncidence,
+    owner_incidence: BlockDofIncidence,
+    *,
+    n_parts: int,
+    strategy: PartitionStrategy,
+    dof_owner=None,
+) -> DistributionAssignments:
+    if partition_incidence.blocks != owner_incidence.blocks:
+        raise ValueError("partition and owner incidence must have the same blocks")
+
+    _, block_to_part = partition_contribution_blocks(
+        partition_incidence, n_parts=n_parts, strategy=strategy
+    )
+
+    if dof_owner is None:
+        owners = dof_owner_from_incidence(
+            owner_incidence,
+            block_to_part=block_to_part,
+            n_parts=n_parts,
+        )
+    else:
+        owners = validate_dof_owner(dof_owner, n_ranks=n_parts)
+
+    return DistributionAssignments(
+        n_parts=n_parts,
+        strategy=strategy,
+        block_to_part=block_to_part,
+        dof_owner=owners,
+    )
 
 
 @dataclass(frozen=True)
@@ -165,7 +221,7 @@ def _validate_block_owners(
 
 
 def _owned_from_block_owners(
-    incidence: BlockDofIncidence,
+    blocks: tuple[ContributionBlock, ...],
     owners: ArrayLike,
     *,
     n_parts: int,
@@ -173,12 +229,12 @@ def _owned_from_block_owners(
     """Merge blocks with the same root/part into executable root demands."""
     mapping = _validate_block_owners(
         owners,
-        n_blocks=incidence.n_blocks,
+        n_blocks=len(blocks),
         n_parts=n_parts,
     )
     merged: dict[tuple[int, int], TensorDemand] = {}
 
-    for block, part in zip(incidence.blocks, mapping, strict=True):
+    for block, part in zip(blocks, mapping, strict=True):
         key = (block.root_id, int(part))
         demand = merge_demands(merged.get(key), block.demand)
         assert demand is not None
@@ -402,6 +458,42 @@ def mtkahypar_block_owners(
     return owners
 
 
+def partition_contribution_from_assignments(
+    blocks: tuple[ContributionBlock, ...],
+    assignments: DistributionAssignments,
+) -> ContributionPartition:
+    return ContributionPartition(
+        n_parts=assignments.n_parts,
+        strategy=assignments.strategy,
+        owned=_owned_from_block_owners(
+            blocks,
+            assignments.block_to_part,
+            n_parts=assignments.n_parts,
+        ),
+        block_to_part=assignments.block_to_part.copy(),
+    )
+
+
+def contribution_partition_from_owners(
+    blocks: tuple[ContributionBlock, ...],
+    *,
+    block_to_part: ArrayLike,
+    n_parts: int,
+    strategy: PartitionStrategy,
+) -> ContributionPartition:
+    """Construct contribution ownership from an already-computed assignment."""
+    owners = _validate_block_owners(
+        block_to_part, n_blocks=len(blocks), n_parts=n_parts
+    )
+
+    return ContributionPartition(
+        n_parts=n_parts,
+        strategy=strategy,
+        owned=_owned_from_block_owners(blocks, owners, n_parts=n_parts),
+        block_to_part=owners.copy(),
+    )
+
+
 def partition_contribution_blocks(
     incidence: BlockDofIncidence,
     *,
@@ -424,11 +516,8 @@ def partition_contribution_blocks(
     else:
         raise ValueError(f"unsupported block partition strategy {strategy!r}")
 
-    partition = ContributionPartition(
-        n_parts=n_parts,
-        strategy=strategy,
-        owned=_owned_from_block_owners(incidence, owners, n_parts=n_parts),
-        block_to_part=owners.copy(),
+    partition = contribution_partition_from_owners(
+        incidence.blocks, block_to_part=owners, n_parts=n_parts, strategy=strategy
     )
     return partition, owners
 

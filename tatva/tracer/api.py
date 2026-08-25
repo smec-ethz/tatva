@@ -14,7 +14,6 @@ from tatva.tracer.local.derivatives import LocalDerivativeTrace, trace_local_der
 from tatva.tracer.local.dof_plan import (
     LocalDofPlan,
     build_local_dof_plan,
-    validate_dof_owner,
 )
 from tatva.tracer.local.inputs import LocalizeOverrides, localize_inputs
 from tatva.tracer.local.liveness import DemandSeed, backpropagate_plan_demand
@@ -22,10 +21,11 @@ from tatva.tracer.local.plan import LocalJaxprPlan, build_rank_local_plan
 from tatva.tracer.lowering.executor import build_local_executable
 from tatva.tracer.lowering.partition import (
     ContributionPartition,
+    DistributionAssignments,
     OwnedContribution,
     PartitionStrategy,
-    dof_owner_from_incidence,
-    partition_contribution_blocks,
+    partition_contribution_from_assignments,
+    plan_distribution_assignments,
 )
 from tatva.tracer.program.analysis import JaxprPlan
 from tatva.tracer.program.analysis import analyze as analyze_jaxpr
@@ -68,6 +68,7 @@ class FunctionalAnalysis[**P, R]:
         *,
         parts: int,
         blocks_per_part: int = 4,
+        strategy: PartitionStrategy = PartitionStrategy.INCIDENCE,
         dof_owner: ArrayLike | None = None,
     ) -> DistributionPlan[P, R]:
         """Build global partition metadata without materializing rank-local plans."""
@@ -88,35 +89,45 @@ class FunctionalAnalysis[**P, R]:
             blocks=blocks,
             form=self._form,
         )
-        partition_incidence = coordinate_incidence.combined()
-        contribution_partition, block_to_part = partition_contribution_blocks(
-            partition_incidence,
-            n_parts=parts,
-            strategy=PartitionStrategy.INCIDENCE,
-        )
 
+        partition_incidence = coordinate_incidence.combined()
         first_column = next(
-            block for block in self._form.coordinates if block.role.is_column
+            coordinate
+            for coordinate in self._form.coordinates
+            if coordinate.role.is_column
         )
         owner_incidence = coordinate_incidence.coordinate(first_column.name)
-        if dof_owner is None:
-            owner = dof_owner_from_incidence(
-                owner_incidence,
-                block_to_part=block_to_part,
-                n_parts=parts,
+
+        assignments = plan_distribution_assignments(
+            partition_incidence,
+            owner_incidence,
+            n_parts=parts,
+            strategy=strategy,
+            dof_owner=dof_owner,
+        )
+        partition = partition_contribution_from_assignments(blocks, assignments)
+
+        return self._build_distribution_plan(
+            partition=partition,
+            assignments=assignments,
+        )
+
+    def _build_distribution_plan(
+        self,
+        *,
+        partition: ContributionPartition,
+        assignments: DistributionAssignments,
+    ) -> DistributionPlan[P, R]:
+        """Build replicated global metadata from completed assignments."""
+        if partition.n_parts != assignments.n_parts:
+            raise ValueError(
+                "partition and assignments must have the same number of parts"
             )
-        else:
-            owner = validate_dof_owner(dof_owner, n_ranks=parts)
-            if owner.size != owner_incidence.n_dofs:
-                raise ValueError(
-                    f"dof_owner has {owner.size} entries but canonical column "
-                    f"block {first_column.name!r} has {owner_incidence.n_dofs}"
-                )
 
         return DistributionPlan(
             _functional=self,
-            _partition=contribution_partition,
-            _dof_owner=owner,
+            _partition=partition,
+            _dof_owner=assignments.dof_owner.copy(),
         )
 
 

@@ -967,19 +967,18 @@ def _tagged_trace_for_blocks(
         tuple[list[NDArray[np.int64]], list[NDArray[np.int64]]],
     ] = {}
 
-    for expected_id, block in enumerate(blocks):
-        if block.id != expected_id:
-            raise ValueError("contribution block IDs must be dense and ordered")
+    for local_id, block in enumerate(blocks):
         root = contributions.root(block.root_id)
         if block.demand.shape != root.domain.shape:
             raise ValueError(
                 f"block {block.id} demand shape {block.demand.shape} does not "
                 f"match root {root.id} shape {root.domain.shape}"
             )
+
         rows, labels = seed_pairs.setdefault(root.value, ([], []))
         block_rows = block.demand.rows()
         rows.append(block_rows)
-        labels.append(np.full(block_rows.size, block.id, dtype=np.int64))
+        labels.append(np.full(block_rows.size, local_id, dtype=np.int64))
 
     seeds = [
         TaggedDemandSeed(
