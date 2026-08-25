@@ -12,6 +12,8 @@ from tatva.tracer.program.forms import (
     CoordinateBlock,
     CoordinateRole,
     FormSpec,
+    Test,
+    Trial,
     ValueSource,
 )
 
@@ -24,6 +26,8 @@ __all__ = (
     "LocalArguments",
     "LocalDerivativeTrace",
     "LocalFunctional",
+    "Test",
+    "Trial",
     "ValueSource",
     "analyze",
     "analyze_captured",

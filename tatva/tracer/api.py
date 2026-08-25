@@ -31,7 +31,7 @@ from tatva.tracer.program.analysis import JaxprPlan
 from tatva.tracer.program.analysis import analyze as analyze_jaxpr
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
-from tatva.tracer.program.forms import FormSpec, SymbolicLayout
+from tatva.tracer.program.forms import FormSpec, infer_form_spec
 from tatva.tracer.program.incidence import (
     BlockCoordinateIncidence,
     generate_contribution_blocks,
@@ -460,8 +460,10 @@ def analyze_captured[**P, R](
     if not jaxpr.invars:
         raise ValueError("Functional JAXPR has no inputs")
 
-    form = FormSpec.energy(input_index=0) if form is None else form
-    symbolic = SymbolicLayout.from_form(form, jaxpr)
+    if form is None:
+        form = infer_form_spec(captured.fn, captured.call_abi)
+    if form is None:
+        form = FormSpec.energy(input_index=0)
 
     # Distributed storage is still backed by the canonical first column input.
     # The derivative core already supports arbitrary/mixed coordinate blocks;
