@@ -82,6 +82,8 @@ def _inverse_broadcast(
     output_shape: Shape,
     dimensions: tuple[int, ...] | None = None,
 ) -> TaggedDemand:
+    if input_shape == output_shape and dimensions is None:
+        return demand
     if dimensions is None:
         offset = len(output_shape) - len(input_shape)
         dimensions = tuple(range(offset, len(output_shape)))

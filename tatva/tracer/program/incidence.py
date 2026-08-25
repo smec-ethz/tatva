@@ -156,11 +156,12 @@ def _backprop_plan_ordinary(
         active_demands = [
             demand.rows for demand in output_demands if demand is not None
         ]
-        request = (
-            None
-            if not active_demands
-            else RouteRequest(np.unique(np.concatenate(active_demands)))
-        )
+        if not active_demands:
+            request = None
+        elif len(active_demands) == 1:
+            request = RouteRequest(active_demands[0])
+        else:
+            request = RouteRequest(np.unique(np.concatenate(active_demands)))
         route = resolver.routed(frame, eqn_plan, request)
         result = semantics.tagged_demand(
             TaggedDemandContext(

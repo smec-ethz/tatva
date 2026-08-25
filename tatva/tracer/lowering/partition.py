@@ -465,30 +465,33 @@ def dof_owner_from_incidence(
     #       -> DOF × part
     eligible = (incidence.csr.T @ block_part).astype(bool).tocsr()
     owner = np.zeros(n_dofs, dtype=np.int64)
-    loads = np.zeros(n_parts, dtype=np.int64)
-
+    loads = [0] * n_parts
     indptr = eligible.indptr
     indices = eligible.indices
 
     for dof in range(n_dofs):
         start = indptr[dof]
         stop = indptr[dof + 1]
-        candidates = indices[start:stop]
+        count = stop - start
 
-        if candidates.size == 0:
-            # Preserve owner=0 convention if required, but DON'T
-            # include an unowned/unreferenced DOF in balancing.
+        if count == 1:
+            selected = int(indices[start])
+            owner[dof] = selected
+            loads[selected] += 1
+        elif count == 0:
             owner[dof] = 0
-            continue
-
-        candidate_loads = loads[candidates]
-
-        # CSR column indices are normally sorted, so np.argmin gives:
-        #   1. minimum load
-        #   2. lowest part number on ties
-        selected = int(candidates[np.argmin(candidate_loads)])
-        owner[dof] = selected
-        loads[selected] += 1
+        else:
+            candidates = indices[start:stop]
+            min_load = loads[candidates[0]]
+            selected = int(candidates[0])
+            for c in candidates[1:]:
+                c_idx = int(c)
+                load_c = loads[c_idx]
+                if load_c < min_load:
+                    min_load = load_c
+                    selected = c_idx
+            owner[dof] = selected
+            loads[selected] += 1
 
     return owner
 
