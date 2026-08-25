@@ -27,10 +27,12 @@ demand or construct local layouts.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 
 import numpy as np
+import scipy.sparse as sps
 from numpy.typing import ArrayLike, NDArray
 
 from tatva.tracer.core.routes import Shape
@@ -44,6 +46,21 @@ from tatva.tracer.program.incidence import BlockDofIncidence
 class PartitionStrategy(Enum):
     CONTIGUOUS = auto()
     INCIDENCE = auto()
+    MTKAHYPAR = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class MtKaHyParOptions:
+    imbalance: float = 0.03
+    seed: int = 42
+    threads: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.imbalance < 0.0:
+            raise ValueError("Mt-KaHyPar imbalance must be nonnegative")
+
+        if self.threads is not None and self.threads <= 0:
+            raise ValueError("Mt-KaHyPar threads must be positive")
 
 
 @dataclass(frozen=True)
@@ -221,7 +238,19 @@ def greedy_incidence_block_owners(
     largest = float(weights.max())
     soft_cap = max(target, largest)
     loads = np.zeros(n_parts, dtype=float)
-    rank_dofs = [set() for _ in range(n_parts)]
+    # A dense membership mask keeps the same rank/DOF relation as a set while
+    # making block scoring and updates vectorized.  The incidence is already
+    # expressed in global DOF IDs, so every row can index its rank mask
+    # directly.  Retain the sparse-set implementation when the dense form
+    # would be unreasonably large for a high-rank, high-DOF problem.
+    dense_membership_bytes = n_parts * incidence.n_dofs
+    use_dense_membership = dense_membership_bytes <= 64 * 1024 * 1024
+    rank_dof_mask = (
+        np.zeros((n_parts, incidence.n_dofs), dtype=bool)
+        if use_dense_membership
+        else None
+    )
+    rank_dof_sets = None if use_dense_membership else [set() for _ in range(n_parts)]
     owners = np.empty(incidence.n_blocks, dtype=np.int64)
 
     # High-incidence blocks establish shared-DOF affinity first.  Dense block
@@ -242,17 +271,133 @@ def greedy_incidence_block_owners(
         ]
         candidates = feasible or list(range(n_parts))
 
-        def score(
-            part: int,
-            block_dofs: NDArray[np.int64] = dofs,
-        ) -> tuple[int, float, int]:
-            introduced = sum(int(dof) not in rank_dofs[part] for dof in block_dofs)
+        def score(part: int) -> tuple[int, float, int]:
+            if rank_dof_mask is not None:
+                introduced = int(
+                    dofs.size - np.count_nonzero(rank_dof_mask[part, dofs])
+                )
+            else:
+                assert rank_dof_sets is not None
+                introduced = sum(int(dof) not in rank_dof_sets[part] for dof in dofs)
             return introduced, loads[part], part
 
         owner = min(candidates, key=score)
         owners[block_id] = owner
         loads[owner] += weight
-        rank_dofs[owner].update(int(dof) for dof in dofs)
+        if rank_dof_mask is not None:
+            rank_dof_mask[owner, dofs] = True
+        else:
+            assert rank_dof_sets is not None
+            rank_dof_sets[owner].update(int(dof) for dof in dofs)
+
+    return owners
+
+
+def mtkahypar_block_owners(
+    incidence: BlockDofIncidence,
+    *,
+    n_parts: int,
+    options: MtKaHyParOptions | None = None,
+) -> NDArray[np.int64]:
+    """Partition contribution blocks using Mt-KaHyPar.
+
+    Hypernodes are contribution blocks and hyperedges are DOFs.
+    A DOF hyperedge connects all contribution blocks incident to that DOF.
+    """
+    if n_parts <= 0:
+        raise ValueError("n_parts must be positive")
+
+    n_blocks = incidence.n_blocks
+
+    if n_blocks == 0:
+        return np.empty(0, dtype=np.int64)
+
+    if n_parts == 1:
+        return np.zeros(n_blocks, dtype=np.int64)
+
+    if n_parts > n_blocks:
+        raise ValueError(
+            f"cannot partition {n_blocks} contribution blocks "
+            f"into {n_parts} nonempty parts"
+        )
+
+    try:
+        import mtkahypar
+    except ImportError as exc:
+        raise ImportError(
+            "PartitionStrategy.MTKAHYPAR requires the optional 'mtkahypar' package. "
+            "Install it with `pip install mtkahypar`."
+        ) from exc
+
+    options = options or MtKaHyParOptions()
+    preset = mtkahypar.PresetType.DEFAULT
+    objective = mtkahypar.Objective.KM1
+
+    # incidence.csr:
+    #     block × dof
+    #
+    # Mt-KaHyPar wants one list of hypernodes for each hyperedge, i.e. for each DOF we
+    # need the incident contribution blocks.
+    by_dof = incidence.csr.tocsc(copy=False)
+    by_dof.sort_indices()
+
+    indptr = by_dof.indptr
+    block_indices = by_dof.indices
+
+    # Hyperedges of size 0 or 1 cannot affect a cut/connectivity objective, so omit them
+    # entirely.
+    #
+    # This also avoids feeding useless degenerate nets into the partitioner.
+    edge_sizes = np.diff(indptr)
+    useful_dofs = np.flatnonzero(edge_sizes >= 2)
+
+    hyperedges = [
+        block_indices[indptr[dof] : indptr[dof + 1]]
+        .astype(np.int64, copy=False)
+        .tolist()
+        for dof in useful_dofs
+    ]
+
+    # If there are no shared DOFs, there is no hypergraph objective to optimize. Use the
+    # deterministic cheap fallback.
+    if not hyperedges:
+        return contiguous_block_owners(incidence, n_parts=n_parts)
+
+    threads = options.threads if options.threads is not None else (os.cpu_count() or 1)
+    mtk = mtkahypar.initialize(threads)
+    context = mtk.context_from_preset(preset)
+
+    context.set_partitioning_parameters(n_parts, float(options.imbalance), objective)
+    mtkahypar.set_seed(int(options.seed))
+
+    # Keep library output out of tatva unless explicitly exposed as a future debug option.
+    context.logging = False
+
+    node_weights = [1] * n_blocks
+    hyperedge_weights = [1] * len(hyperedges)
+
+    hypergraph = mtk.create_hypergraph(
+        context,
+        n_blocks,
+        len(hyperedges),
+        hyperedges,
+        node_weights,
+        hyperedge_weights,
+    )
+
+    partitioned = hypergraph.partition(context)
+
+    owners = np.fromiter(
+        (int(partitioned.block_id(block)) for block in range(n_blocks)),
+        dtype=np.int64,
+        count=n_blocks,
+    )
+    if owners.shape != (n_blocks,):
+        raise RuntimeError(
+            f"Mt-KaHyPar returned partition with shape {owners.shape}; expected {(n_blocks,)}"
+        )
+    if np.any((owners < 0) | (owners >= n_parts)):
+        raise RuntimeError("Mt-KaHyPar returned an invalid block ID")
 
     return owners
 
@@ -269,16 +414,19 @@ def partition_contribution_blocks(
 
     if strategy is PartitionStrategy.CONTIGUOUS:
         owners = contiguous_block_owners(incidence, n_parts=n_parts)
-        effective_strategy = strategy
+
     elif strategy is PartitionStrategy.INCIDENCE:
         owners = greedy_incidence_block_owners(incidence, n_parts=n_parts)
-        effective_strategy = strategy
+
+    elif strategy is PartitionStrategy.MTKAHYPAR:
+        owners = mtkahypar_block_owners(incidence, n_parts=n_parts)
+
     else:
         raise ValueError(f"unsupported block partition strategy {strategy!r}")
 
     partition = ContributionPartition(
         n_parts=n_parts,
-        strategy=effective_strategy,
+        strategy=strategy,
         owned=_owned_from_block_owners(incidence, owners, n_parts=n_parts),
         block_to_part=owners.copy(),
     )
@@ -291,28 +439,54 @@ def dof_owner_from_incidence(
     block_to_part: ArrayLike,
     n_parts: int,
 ) -> NDArray[np.int64]:
-    """Choose a balanced owner among the ranks that compute each DOF."""
+    """Choose a balanced owner among ranks that compute each DOF."""
     block_owners = _validate_block_owners(
         block_to_part,
         n_blocks=incidence.n_blocks,
         n_parts=n_parts,
     )
-    owner = np.zeros(incidence.n_dofs, dtype=np.int64)
-    loads = np.zeros(n_parts, dtype=np.int64)
-    by_dof = incidence.csr.tocsc(copy=False)
+    n_dofs = incidence.n_dofs
 
-    for dof in range(incidence.n_dofs):
-        start = by_dof.indptr[dof]
-        stop = by_dof.indptr[dof + 1]
-        blocks = by_dof.indices[start:stop]
-        if blocks.size == 0:
+    # Build DOF -> part incidence directly.
+    #
+    # block_part[b, p] = True iff block b belongs to part p.
+    block_part = sps.csr_matrix(
+        (
+            np.ones(incidence.n_blocks, dtype=bool),
+            (np.arange(incidence.n_blocks, dtype=np.int64), block_owners),
+        ),
+        shape=(incidence.n_blocks, n_parts),
+        dtype=bool,
+    )
+
+    # incidence.csr is block × DOF.
+    # Therefore:
+    #     DOF × block @ block × part
+    #       -> DOF × part
+    eligible = (incidence.csr.T @ block_part).astype(bool).tocsr()
+    owner = np.zeros(n_dofs, dtype=np.int64)
+    loads = np.zeros(n_parts, dtype=np.int64)
+
+    indptr = eligible.indptr
+    indices = eligible.indices
+
+    for dof in range(n_dofs):
+        start = indptr[dof]
+        stop = indptr[dof + 1]
+        candidates = indices[start:stop]
+
+        if candidates.size == 0:
+            # Preserve owner=0 convention if required, but DON'T
+            # include an unowned/unreferenced DOF in balancing.
             owner[dof] = 0
             continue
-        else:
-            candidates = np.unique(block_owners[blocks])
-            selected = min(
-                (int(part) for part in candidates), key=lambda p: (loads[p], p)
-            )
+
+        candidate_loads = loads[candidates]
+
+        # CSR column indices are normally sorted, so np.argmin gives:
+        #   1. minimum load
+        #   2. lowest part number on ties
+        selected = int(candidates[np.argmin(candidate_loads)])
         owner[dof] = selected
         loads[selected] += 1
 
