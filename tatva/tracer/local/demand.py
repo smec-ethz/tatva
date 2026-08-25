@@ -196,24 +196,35 @@ class TensorDemand:
     def axes(self) -> tuple[AxisSubset, ...]:
         return self.subset.axes
 
-    def rows(self: TensorDemand) -> NDArray[np.int64]:
-        """Exact C-order scalar rows represented by a structured demand.
-
-        This is an ephemeral representation for applying scalar-entry routes.
-        """
+    def rows(self) -> NDArray[np.int64]:
+        """Exact C-order scalar rows represented by this Cartesian demand."""
         if not self.shape:
             return np.array([0], dtype=np.int64)
 
-        indices = tuple(
-            axis_indices(axis, extent=extent)
-            for extent, axis in zip(self.shape, self.subset.axes)
-        )
+        if self.is_full:
+            return np.arange(int(np.prod(self.shape, dtype=np.int64)), dtype=np.int64)
 
-        grids = np.meshgrid(*indices, indexing="ij")
+        # C-order flat strides.
+        strides = np.empty(len(self.shape), dtype=np.int64)
+        stride = 1
 
-        return np.ravel_multi_index(
-            tuple(grid.ravel() for grid in grids), self.shape
-        ).astype(np.int64, copy=False)
+        for axis in range(len(self.shape) - 1, -1, -1):
+            strides[axis] = stride
+            stride *= self.shape[axis]
+
+        rows = np.zeros(1, dtype=np.int64)
+
+        for extent, subset, stride in zip(self.shape, self.axes, strides, strict=True):
+            indices = axis_indices(subset, extent=extent)
+            if indices.size == 1:
+                # Very common for gather envelopes: batch and non-pivot
+                # axes are fixed.
+                rows += int(indices[0]) * stride
+                continue
+
+            rows = (rows[:, None] + indices[None, :] * stride).reshape(-1)
+
+        return rows
 
     @classmethod
     def full(cls, shape: tuple[int, ...]) -> Self | None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import scipy.sparse as sps
 from jax.extend.core import JaxprEqn, Literal
 from numpy.typing import NDArray
 
@@ -21,7 +22,14 @@ from tatva.tracer.core.routes import (
     _compute_scatter_target_rows,
 )
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.local.demand import Demand, TensorDemand, _FullAxis, _RangeAxis
+from tatva.tracer.local.demand import (
+    AxisSubset,
+    Demand,
+    TensorDemand,
+    _axis_from_indices,
+    _FullAxis,
+    _RangeAxis,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,23 +63,268 @@ class GatherEnvelopeFragment:
     """
 
     output_rows: NDArray[np.int64]
-    source_demands: tuple[TensorDemand | None, ...]
+    # source_demands: tuple[TensorDemand | None, ...]
+    # index_rows: NDArray[np.int64]
+    # dynamic_components: tuple[int, ...]
+
+    # shape of gather operand
+    operand_shape: tuple[int, ...]
+    # per requested output row, half-open interval on every operand axis
+    # shape = (n_output_rows, operand_ndim)
+    starts: NDArray[np.int64]
+    stops: NDArray[np.int64]
+
+    # False means this output row has no source candidate at all.
+    valid_mask: NDArray[np.bool_]
+
     index_rows: NDArray[np.int64]
     dynamic_components: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        rows = np.asarray(self.output_rows, dtype=np.int64).ravel().copy()
-        if rows.size != len(self.source_demands):
-            raise ValueError("one gather source envelope is required per output row")
-        if rows.size > 1 and np.any(rows[1:] <= rows[:-1]):
-            raise ValueError("gather envelope output rows must be strictly increasing")
-        index_rows = np.asarray(self.index_rows, dtype=np.int64).copy()
-        if index_rows.ndim != 2 or index_rows.shape[0] != rows.size:
-            raise ValueError("gather envelope index rows are not output-aligned")
-        rows.flags.writeable = False
-        index_rows.flags.writeable = False
-        object.__setattr__(self, "output_rows", rows)
+        output_rows = np.array(self.output_rows, dtype=np.int64, copy=True).ravel()
+        starts = np.array(self.starts, dtype=np.int64, copy=True)
+        stops = np.array(self.stops, dtype=np.int64, copy=True)
+        valid_mask = np.array(self.valid_mask, dtype=np.bool_, copy=True).ravel()
+        index_rows = np.array(self.index_rows, dtype=np.int64, copy=True)
+
+        n_rows = output_rows.size
+        ndim = len(self.operand_shape)
+
+        if starts.shape != (n_rows, ndim):
+            raise ValueError("gather envelope starts shape mismatch")
+        if stops.shape != (n_rows, ndim):
+            raise ValueError("gather envelope stops shape mismatch")
+        if valid_mask.shape != (n_rows,):
+            raise ValueError("gather envelope valid-mask shape mismatch")
+        if index_rows.shape[0] != n_rows:
+            raise ValueError("gather envelope index-row shape mismatch")
+        shape = np.asarray(self.operand_shape, dtype=np.int64)
+
+        if np.any(starts < 0):
+            raise ValueError("gather envelope starts must be nonnegative")
+        if np.any(stops < starts):
+            raise ValueError("gather envelope stops precede starts")
+        if ndim and np.any(stops > shape[None, :]):
+            raise ValueError("gather envelope exceeds operand shape")
+
+        output_rows.setflags(write=False)
+        starts.setflags(write=False)
+        stops.setflags(write=False)
+        valid_mask.setflags(write=False)
+        index_rows.setflags(write=False)
+
+        object.__setattr__(self, "output_rows", output_rows)
+        object.__setattr__(self, "starts", starts)
+        object.__setattr__(self, "stops", stops)
+        object.__setattr__(self, "valid_mask", valid_mask)
         object.__setattr__(self, "index_rows", index_rows)
+
+    def materialize_source_rows(self) -> EnvelopeRowRelation:
+        starts = self.starts
+        stops = self.stops
+
+        extents = stops - starts
+        counts = np.prod(extents, axis=1, dtype=np.int64)
+        indptr = np.empty(counts.size + 1, dtype=np.int64)
+        indptr[0] = 0
+        np.cumsum(counts, out=indptr[1:])
+        total = int(indptr[-1])
+
+        if total == 0:
+            return EnvelopeRowRelation(indptr, np.empty(0, dtype=np.int64))
+
+        strides = _c_order_strides(self.operand_shape)
+
+        # Flat row corresponding to each box's lower corner.
+        bases = starts @ strides
+        result = np.empty(total, dtype=np.int64)
+
+        # Usually one pattern for pivot gathers. At boundaries there may
+        # be a handful, but never one Python iteration per output scalar.
+        patterns, inverse = np.unique(extents, axis=0, return_inverse=True)
+
+        for pattern_index, pattern in enumerate(patterns):
+            envelope_rows = np.flatnonzero(inverse == pattern_index)
+            local_offsets = _cartesian_flat_offsets(pattern, strides)
+            width = local_offsets.size
+
+            if width == 0:
+                continue
+
+            destination = (
+                indptr[envelope_rows, None] + np.arange(width, dtype=np.int64)[None, :]
+            )
+            values = bases[envelope_rows, None] + local_offsets[None, :]
+            result[destination.ravel()] = values.ravel()
+
+        return EnvelopeRowRelation(indptr=indptr, rows=result)
+
+    def sparse_relation(self, *, n_output: int) -> sps.csr_matrix:
+        """Boolean output-row -> possible operand-row relation."""
+        n_source = int(np.prod(self.operand_shape, dtype=np.int64))
+        if np.any(self.output_rows < 0) or np.any(self.output_rows >= n_output):
+            raise ValueError("gather envelope output row outside output extent")
+
+        relation = self.materialize_source_rows()
+        counts = np.diff(relation.indptr)
+
+        if counts.size != self.output_rows.size:
+            raise RuntimeError("gather envelope relation/output-row mismatch")
+
+        if relation.rows.size == 0:
+            return sps.csr_matrix((n_output, n_source), dtype=bool)
+
+        # Each requested gather output row is repeated once for each
+        # possible source row represented by its envelope.
+        output_rows = np.repeat(self.output_rows, counts)
+        if output_rows.size != relation.rows.size:
+            raise RuntimeError("gather envelope relation accounting mismatch")
+
+        result = sps.csr_matrix(
+            (
+                np.ones(relation.rows.size, dtype=bool),
+                (output_rows, relation.rows),
+            ),
+            shape=(n_output, n_source),
+            dtype=bool,
+        )
+
+        result.sum_duplicates()
+        result.data[:] = True
+        result.eliminate_zeros()
+
+        return result
+
+    def merged_source_demand(self, positions: NDArray[np.int64]) -> TensorDemand | None:
+        positions = np.asarray(positions, dtype=np.int64).ravel()
+        if positions.size == 0:
+            return None
+
+        positions = positions[self.valid_mask[positions]]
+        if positions.size == 0:
+            return None
+
+        starts = self.starts[positions]
+        stops = self.stops[positions]
+
+        axes = tuple(
+            _union_intervals(starts[:, axis], stops[:, axis], extent=int(extent))
+            for axis, extent in enumerate(self.operand_shape)
+        )
+
+        return TensorDemand.from_axes(self.operand_shape, axes)
+
+
+@dataclass(frozen=True, slots=True)
+class EnvelopeRowRelation:
+    """Candidate operand rows for each envelope output row."""
+
+    # Length n_output + 1.
+    indptr: NDArray[np.int64]
+    # Flattened operand rows.
+    rows: NDArray[np.int64]
+
+
+def _c_order_strides(
+    shape: tuple[int, ...],
+) -> NDArray[np.int64]:
+    strides = np.empty(len(shape), dtype=np.int64)
+    stride = 1
+
+    for axis in range(len(shape) - 1, -1, -1):
+        strides[axis] = stride
+        stride *= shape[axis]
+
+    return strides
+
+
+def _cartesian_flat_offsets(
+    extents: NDArray[np.int64],
+    strides: NDArray[np.int64],
+) -> NDArray[np.int64]:
+    """Flat offsets for one Cartesian box starting at zero."""
+
+    offsets = np.zeros(1, dtype=np.int64)
+
+    for extent, stride in zip(extents, strides, strict=True):
+        extent = int(extent)
+
+        if extent == 1:
+            continue
+
+        axis_offsets = np.arange(extent, dtype=np.int64) * stride
+        offsets = (offsets[:, None] + axis_offsets[None, :]).reshape(-1)
+
+    return offsets
+
+
+def _union_intervals(
+    starts: NDArray[np.int64], stops: NDArray[np.int64], *, extent: int
+):
+    starts = np.asarray(starts, dtype=np.int64).ravel()
+    stops = np.asarray(stops, dtype=np.int64).ravel()
+
+    if starts.shape != stops.shape:
+        raise ValueError("interval starts/stops shape mismatch")
+
+    if starts.size == 0:
+        raise ValueError("cannot form an axis from no intervals")
+
+    # Fast path: every selected envelope covers the complete axis.
+    if np.all(starts == 0) and np.all(stops == extent):
+        return _FullAxis()
+
+    # Fast path: singleton coordinates. This is extremely common for
+    # batch axes and fixed gather dimensions.
+    widths = stops - starts
+
+    if np.all(widths == 1):
+        indices = np.unique(starts)
+        return _axis_from_indices(extent, indices)
+
+    # General interval union.
+    order = np.argsort(starts, kind="stable")
+
+    sorted_starts = starts[order]
+    sorted_stops = stops[order]
+
+    merged_starts: list[int] = []
+    merged_stops: list[int] = []
+
+    current_start = int(sorted_starts[0])
+    current_stop = int(sorted_stops[0])
+
+    for start_, stop_ in zip(sorted_starts[1:], sorted_stops[1:], strict=True):
+        start = int(start_)
+        stop = int(stop_)
+
+        if start <= current_stop:
+            current_stop = max(current_stop, stop)
+        else:
+            merged_starts.append(current_start)
+            merged_stops.append(current_stop)
+
+            current_start = start
+            current_stop = stop
+
+    merged_starts.append(current_start)
+    merged_stops.append(current_stop)
+
+    # One contiguous interval: keep the compact interval
+    # representation.
+    if len(merged_starts) == 1:
+        return _axis_interval(extent, merged_starts[0], merged_stops[0])
+
+    # Multiple disjoint ranges. Materialize only this axis, not the
+    # Cartesian product across tensor dimensions.
+    indices = np.concatenate(
+        [
+            np.arange(start, stop, dtype=np.int64)
+            for start, stop in zip(merged_starts, merged_stops, strict=True)
+        ]
+    )
+
+    return _axis_from_indices(extent, indices)
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,12 +610,8 @@ def resolve_partial_gather_route_fragment(ctx) -> RouteFragment | None:
         source_rows = np.full(n_output, -1, dtype=np.int64)
         if np.any(valid_mask):
             if operand_shape:
-                source_rows[valid_mask] = np.ravel_multi_index(
-                    tuple(
-                        target_coords[valid_mask, a] for a in range(len(operand_shape))
-                    ),
-                    operand_shape,
-                )
+                strides = _c_order_strides(operand_shape)
+                source_rows[valid_mask] = target_coords[valid_mask] @ strides
             else:
                 source_rows[valid_mask] = 0
 
@@ -372,42 +621,85 @@ def resolve_partial_gather_route_fragment(ctx) -> RouteFragment | None:
             index_rows=index_rows,
         )
 
-    dynamic_axes = frozenset(start_index_map[c] for c in dynamic_components)
-    source_demands: list[TensorDemand | None] = []
+    dynamic_axes = frozenset(
+        start_index_map[component] for component in dynamic_components
+    )
+    ndim = len(operand_shape)
+    starts = np.empty((n_output, ndim), dtype=np.int64)
+    stops = np.empty((n_output, ndim), dtype=np.int64)
 
-    for row in range(n_output):
-        valid = True
-        axes = []
-        for axis, extent in enumerate(operand_shape):
-            offset = int(offsets[row, axis])
-            if axis in dynamic_axes:
-                start = offset
-                stop = int(upper_starts[axis]) + offset + 1
-                axes.append(_axis_interval(extent, start, stop))
-                continue
+    # Whether the output row can correspond to at least one valid
+    # operand coordinate.
+    valid_mask = np.ones(n_output, dtype=bool)
 
-            start = int(fixed_starts[row, axis])
+    # Construct the Cartesian source envelope one operand axis at a time.
+    #
+    # This loop is O(operand rank), not O(number of output rows).
+    for axis, extent_ in enumerate(operand_shape):
+        extent = int(extent_)
+        offset = offsets[:, axis]
+
+        if axis in dynamic_axes:
+            # The gather start on this axis is unknown.
+            #
+            # A legal start lies in
+            #
+            #     0 <= start <= upper_starts[axis]
+            #
+            # and the scalar output coordinate is
+            #
+            #     start + offset.
+            #
+            # Therefore every possible source coordinate lies in
+            #
+            #     [offset,
+            #      upper_starts[axis] + offset]
+            #
+            # inclusive.
+            lower = offset
+            upper_exclusive = offset + int(upper_starts[axis]) + 1
+
+            # Intersect the candidate interval with the operand axis.
+            lower = np.maximum(lower, 0)
+            upper_exclusive = np.minimum(upper_exclusive, extent)
+
+            starts[:, axis] = lower
+            stops[:, axis] = upper_exclusive
+
+            # Usually this remains true, but keep the check because unusual
+            # gather geometry can make the window offset itself invalid.
+            valid_mask &= upper_exclusive > lower
+            continue
+
+        # This axis has a known start coordinate.
+        start = fixed_starts[:, axis]
+
+        if axis in start_index_map:
             if mode_name in {"CLIP", "PROMISE_IN_BOUNDS"}:
-                start = min(max(start, 0), int(upper_starts[axis]))
-            elif axis in start_index_map and (
-                start < 0 or start > int(upper_starts[axis])
-            ):
-                valid = False
-                break
+                start = np.clip(start, 0, int(upper_starts[axis]))
 
-            coordinate = start + offset
-            if coordinate < 0 or coordinate >= extent:
-                valid = False
-                break
-            axes.append(_axis_interval(extent, coordinate, coordinate + 1))
+            elif mode_name == "FILL_OR_DROP":
+                valid_mask &= (start >= 0) & (start <= int(upper_starts[axis]))
 
-        source_demands.append(
-            TensorDemand.from_axes(operand_shape, tuple(axes)) if valid else None
-        )
+        # Batching axes and ordinary window axes already have a fixed
+        # structural start.
+        coordinate = start + offset
+        valid_mask &= (coordinate >= 0) & (coordinate < extent)
+
+        # Fixed axes are singleton intervals.
+        #
+        # Clip only for safe storage on invalid FILL/DROP rows.
+        # valid_mask retains the semantic invalidity.
+        safe_coordinate = np.clip(coordinate, 0, max(extent - 1, 0))
+        starts[:, axis] = safe_coordinate
+        stops[:, axis] = safe_coordinate + 1
 
     return GatherEnvelopeFragment(
         output_rows=output_rows,
-        source_demands=tuple(source_demands),
+        operand_shape=operand_shape,
+        starts=starts,
+        stops=stops,
+        valid_mask=valid_mask,
         index_rows=index_rows,
         dynamic_components=tuple(dynamic_components),
     )
