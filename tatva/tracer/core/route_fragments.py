@@ -23,7 +23,6 @@ from tatva.tracer.core.routes import (
 )
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.local.demand import (
-    AxisSubset,
     Demand,
     TensorDemand,
     _axis_from_indices,
