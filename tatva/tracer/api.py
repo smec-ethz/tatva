@@ -29,7 +29,7 @@ from tatva.tracer.lowering.partition import (
 )
 from tatva.tracer.program.analysis import JaxprPlan
 from tatva.tracer.program.analysis import analyze as analyze_jaxpr
-from tatva.tracer.program.concrete_resolver import ConcreteResolver
+from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
 from tatva.tracer.program.forms import FormSpec, SymbolicLayout
 from tatva.tracer.program.incidence import (
@@ -60,6 +60,8 @@ class FunctionalAnalysis[**P, R]:
     _plan: JaxprPlan
     _contributions: ContributionTrace
     _form: FormSpec
+    _resolver: ConcreteResolver
+    _root_frame: ConcreteFrame
 
     def distribute(
         self,
@@ -78,16 +80,10 @@ class FunctionalAnalysis[**P, R]:
             self._contributions,
             blocks_per_root=blocks_per_part * parts,
         )
-        resolver, frame = ConcreteResolver.root(
-            self._captured.closed_jaxpr,
-            self._captured.flat_args,
-            self._plan,
-            unavailable_inputs=self._form.coordinate_input_indices,
-        )
         coordinate_incidence = plan_tagged_block_coordinate_incidence(
             self._plan,
-            frame,
-            resolver,
+            self._root_frame,
+            self._resolver,
             self._contributions,
             blocks=blocks,
             form=self._form,
@@ -158,22 +154,16 @@ class DistributionPlan[**P, R]:
             )
             for item in owned
         )
-        resolver, frame = ConcreteResolver.root(
-            functional._captured.closed_jaxpr,
-            functional._captured.flat_args,
-            functional._plan,
-            unavailable_inputs=functional._form.coordinate_input_indices,
-        )
         demand = backpropagate_plan_demand(
             functional._plan,
-            frame,
-            resolver,
+            functional._root_frame,
+            functional._resolver,
             seeds,
         )
         local_plan = build_rank_local_plan(
             functional._plan,
-            frame,
-            resolver,
+            functional._root_frame,
+            functional._resolver,
             demand,
         )
         require_local_routes((local_plan,))
@@ -345,6 +335,8 @@ def analyze_captured[**P, R](
         _plan=plan,
         _contributions=contributions,
         _form=form,
+        _resolver=resolver,
+        _root_frame=frame,
     )
 
 
