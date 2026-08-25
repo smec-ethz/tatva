@@ -78,6 +78,7 @@ from tatva.tracer.core.nested import (
     dispatch_nested_spec,
 )
 from tatva.tracer.core.registry import SEMANTICS
+from tatva.tracer.core.route_fragments import RouteRequest
 from tatva.tracer.core.semantics import RuleContext
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
@@ -418,12 +419,20 @@ def _trace_ordinary_eqn(
     eqn = eqn_plan.eqn
     semantics = SEMANTICS.get_ordinary(eqn.primitive)
 
-    # output_rows = [
-    #     np.arange(int(np.prod(_shape_of(outvar))), dtype=np.int64)
-    #     for outvar in eqn.outvars
-    # ]
-    # request = None if not output_rows else RouteRequest(np.concatenate(output_rows))
-    route = resolver.route(frame, eqn_plan)
+    routing = semantics.routing
+
+    if routing is None:
+        route = None
+
+    elif routing.partial_fragment is not None and len(eqn.outvars) == 1:
+        output_shape = _shape_of(eqn.outvars[0])
+        n_output = int(np.prod(output_shape, dtype=np.int64))
+
+        request = RouteRequest(np.arange(n_output, dtype=np.int64))
+        route = resolver.routed(frame, eqn_plan, request)
+
+    else:
+        route = resolver.route(frame, eqn_plan)
 
     ctx = RuleContext(
         eqn=eqn,

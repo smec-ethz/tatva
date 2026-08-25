@@ -31,7 +31,7 @@ from tatva.tracer.core.semantics import (
     no_hessian,
 )
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.local.demand import Demand, TensorDemand, merge_demands
+from tatva.tracer.local.demand import Demand, TensorDemand
 from tatva.tracer.local.localize import (
     LocalDynamicGatherRoute,
     LocalGatherRoute,
@@ -125,39 +125,21 @@ def gather_dependencies(
         )
 
     if isinstance(prepared, GatherEnvelopeFragment):
-        if len(prepared.source_demands) != prepared.output_rows.size:
-            raise ValueError("gather envelope source demands count mismatch")
-
-        sel_rows: list[NDArray[np.int64]] = []
-        sel_cols: list[NDArray[np.int64]] = []
-
-        for out_row, source_demand in zip(
-            prepared.output_rows, prepared.source_demands
-        ):
-            if source_demand is None or out_row < 0 or out_row >= n_output:
-                continue
-            src_rows = source_demand.rows()
-            if src_rows.size > 0:
-                sel_rows.append(np.full(src_rows.size, out_row, dtype=np.int64))
-                sel_cols.append(src_rows)
-
-        if sel_rows:
-            all_rows = np.concatenate(sel_rows)
-            all_cols = np.concatenate(sel_cols)
-            selection = sps.csr_matrix(
-                (
-                    np.ones(all_rows.size, dtype=bool),
-                    (all_rows, all_cols),
-                ),
-                shape=(n_output, n_source),
-                dtype=bool,
+        relation = prepared.sparse_relation(n_output=n_output)
+        if relation.shape != (n_output, n_source):
+            raise RuntimeError(
+                "gather envelope relation shape mismatch: "
+                f"{relation.shape} != "
+                f"{(n_output, n_source)}"
             )
-        else:
-            selection = sps.csr_matrix((n_output, n_source), dtype=bool)
 
-        return (
-            DependencySet((selection @ source.csr).astype(bool).tocsr(), output_shape),
-        )
+        output_csr = (relation @ source.csr).astype(bool).tocsr()
+
+        output_csr.sum_duplicates()
+        output_csr.data[:] = True
+        output_csr.eliminate_zeros()
+
+        return (DependencySet(output_csr, output_shape),)
 
     raise TypeError(f"unsupported gather route type: {type(prepared)!r}")
 
@@ -183,14 +165,15 @@ def gather_demand(ctx: DemandContext) -> tuple[Demand, ...]:
 
     if isinstance(route, GatherEnvelopeFragment):
         positions = _envelope_positions(route, output_rows)
-        operand: Demand = None
-        for position in positions:
-            operand = merge_demands(operand, route.source_demands[position])
-        result[0] = operand
+        result[0] = route.merged_source_demand(positions)
         index_rows = route.index_rows[positions].ravel()
-        result[1] = TensorDemand.from_rows_hull(
-            _shape_of(ctx.eqn.invars[1]), index_rows
-        )
+
+        if index_rows.size:
+            result[1] = TensorDemand.from_rows_hull(
+                _shape_of(ctx.eqn.invars[1]),
+                index_rows,
+            )
+
         return tuple(result)
 
     if isinstance(route, GatherRouteFragment):

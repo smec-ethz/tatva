@@ -23,7 +23,7 @@ from tatva.tracer.core.nested import (
 )
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import RouteFragment, RouteRequest
-from tatva.tracer.core.routes import Route
+from tatva.tracer.core.routes import Route, _compute_gather_route_rows
 from tatva.tracer.core.semantics import (
     DemandContext,
     FullConcrete,
@@ -58,6 +58,10 @@ class ConcreteEvaluationError(RuntimeError):
     """Demand-scoped concrete evaluation cannot be performed safely."""
 
 
+class UnsupportedConcreteEvaluation(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class ConcreteEscalation:
     path: FramePath
@@ -71,6 +75,7 @@ class ConcreteEscalation:
 
 
 type ConcreteEvalRule = Callable[[tuple[Any, ...], dict[str, Any]], tuple[Any, ...]]
+type ConcreteEqnEvalRule = Callable[[JaxprEqn, tuple[Any, ...]], tuple[Any, ...]]
 
 type ConcreteValue = Any
 type ConcreteEnv = dict[Var, ConcreteValue]
@@ -80,18 +85,22 @@ def evaluate_concrete_eqn(
     eqn: JaxprEqn,
     inputs: tuple[ConcreteValue, ...],
 ) -> tuple[ConcreteValue, ...]:
-    # these are numpy fast paths for some primitives, but not all. For the rest we fall
-    # back to the primitive's bind method.
-    evaluator = _CONCRETE_EVALS.get(eqn.primitive)
-    if evaluator is not None:
-        outputs = evaluator(inputs, eqn.params)
+    eqn_evaluator = _CONCRETE_EQN_EVALS.get(eqn.primitive)
+    if eqn_evaluator is not None:
+        outputs = eqn_evaluator(eqn, inputs)
     else:
-        warnings.warn(
-            f"Warning: no concrete evaluator for {eqn.primitive.name}, falling back to bind",
-            stacklevel=2,
-        )
-        result = eqn.primitive.bind(*inputs, **eqn.params)
-        outputs = tuple(result) if eqn.primitive.multiple_results else (result,)
+        # these are numpy fast paths for some primitives, but not all. For the rest we fall
+        # back to the primitive's bind method.
+        evaluator = _CONCRETE_EVALS.get(eqn.primitive)
+        if evaluator is not None:
+            outputs = evaluator(inputs, eqn.params)
+        else:
+            warnings.warn(
+                f"Warning: no concrete evaluator for {eqn.primitive.name}, falling back to bind",
+                stacklevel=2,
+            )
+            result = eqn.primitive.bind(*inputs, **eqn.params)
+            outputs = tuple(result) if eqn.primitive.multiple_results else (result,)
 
     if len(outputs) != len(eqn.outvars):
         raise RuntimeError(
@@ -1159,6 +1168,7 @@ def _build_producer_index(plan: JaxprPlan) -> dict[Var, tuple[EqnPlan, int]]:
 # --------------------------------------
 
 _CONCRETE_EVALS: dict[Primitive, ConcreteEvalRule] = {}
+_CONCRETE_EQN_EVALS: dict[Primitive, ConcreteEqnEvalRule] = {}
 
 
 def _simple_np(fn):
@@ -1176,6 +1186,17 @@ def register(
     ) -> ConcreteEvalRule:
         for primitive in primitives:
             _CONCRETE_EVALS[primitive] = rule
+        return rule
+
+    return decorator
+
+
+def register_eqn(
+    *primitives: Primitive,
+) -> Callable[[ConcreteEqnEvalRule], ConcreteEqnEvalRule]:
+    def decorator(rule: ConcreteEqnEvalRule) -> ConcreteEqnEvalRule:
+        for primitive in primitives:
+            _CONCRETE_EQN_EVALS[primitive] = rule
         return rule
 
     return decorator
@@ -1230,7 +1251,7 @@ def eval_broadcast_in_dim(inputs, params):
 @register(lax.convert_element_type_p)
 def _eval_convert_dtype(inputs, params):
     (x,) = inputs
-    return (x.astype(params["new_dtype"]),)
+    return (np.asarray(x).astype(params["new_dtype"]),)
 
 
 @register(lax.iota_p)
@@ -1306,3 +1327,101 @@ def eval_slice(inputs, params):
             )
         ],
     )
+
+
+@register(lax.dot_general_p)
+def eval_dot_general(inputs, params):
+    lhs, rhs = (np.asarray(inputs[0]), np.asarray(inputs[1]))
+    ((lhs_contract, rhs_contract), (lhs_batch, rhs_batch)) = params["dimension_numbers"]
+
+    lhs_contract = tuple(lhs_contract)
+    rhs_contract = tuple(rhs_contract)
+    lhs_batch = tuple(lhs_batch)
+    rhs_batch = tuple(rhs_batch)
+
+    lhs_labels = list(range(lhs.ndim))
+    next_label = lhs.ndim
+
+    rhs_labels: list[int | None] = [None] * rhs.ndim
+
+    # Batch dimensions share labels.
+    for lhs_axis, rhs_axis in zip(lhs_batch, rhs_batch, strict=True):
+        rhs_labels[rhs_axis] = lhs_labels[lhs_axis]
+
+    # Contracting dimensions share labels.
+    for lhs_axis, rhs_axis in zip(lhs_contract, rhs_contract, strict=True):
+        rhs_labels[rhs_axis] = lhs_labels[lhs_axis]
+
+    # Everything else on RHS gets a fresh label.
+    for axis in range(rhs.ndim):
+        if rhs_labels[axis] is None:
+            rhs_labels[axis] = next_label
+            next_label += 1
+
+    rhs_labels_int = [int(x) for x in rhs_labels]
+
+    lhs_free = [
+        axis
+        for axis in range(lhs.ndim)
+        if axis not in lhs_batch and axis not in lhs_contract
+    ]
+    rhs_free = [
+        axis
+        for axis in range(rhs.ndim)
+        if axis not in rhs_batch and axis not in rhs_contract
+    ]
+    out_labels = (
+        [lhs_labels[a] for a in lhs_batch]
+        + [lhs_labels[a] for a in lhs_free]
+        + [rhs_labels_int[a] for a in rhs_free]
+    )
+
+    preferred = params.get("preferred_element_type")
+    kwargs = {}
+    if preferred is not None:
+        kwargs["dtype"] = np.dtype(preferred)
+
+    result = np.einsum(
+        lhs, lhs_labels, rhs, rhs_labels_int, out_labels, optimize=True, **kwargs
+    )
+
+    return (result,)
+
+
+@register_eqn(lax.gather_p)
+def eval_gather(
+    eqn: JaxprEqn,
+    inputs: tuple[Any, ...],
+):
+    operand = np.asarray(inputs[0])
+    indices = np.asarray(inputs[1])
+
+    output_shape = _shape_of(eqn.outvars[0])
+    output_size = int(np.prod(output_shape, dtype=np.int64))
+    output_rows = np.arange(output_size, dtype=np.int64)
+    source_rows, _ = _compute_gather_route_rows(eqn, indices, output_rows)
+
+    valid = source_rows >= 0
+
+    if not np.all(valid):
+        fill_value = eqn.params.get("fill_value")
+
+        if fill_value is None:
+            # Initially fall back rather than subtly implementing
+            # the wrong JAX fill semantics.
+            raise UnsupportedConcreteEvaluation(
+                "host gather evaluator does not support implicit fill value"
+            )
+
+        result = np.empty(
+            output_size,
+            dtype=operand.dtype,
+        )
+
+        result[valid] = operand.ravel()[source_rows[valid]]
+        result[~valid] = fill_value
+
+    else:
+        result = operand.ravel()[source_rows]
+
+    return (result.reshape(output_shape),)

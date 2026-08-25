@@ -269,31 +269,50 @@ def gather(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
         return tuple(None for _ in ctx.eqn.invars)
 
     if isinstance(ctx.route, GatherEnvelopeFragment):
+        output = ctx.output_demands[0]
+        if output is None:
+            return tuple(None for _ in ctx.eqn.invars)
+
+        relation = ctx.route.materialize_source_rows()
         positions = np.searchsorted(ctx.route.output_rows, output.rows)
-        if np.any(positions >= ctx.route.output_rows.size) or np.any(
-            ctx.route.output_rows[positions] != output.rows
-        ):
-            raise ValueError("gather envelope does not cover tagged output rows")
-        rows: list[np.ndarray] = []
-        blocks: list[np.ndarray] = []
-        for position, block in zip(positions, output.blocks, strict=True):
-            source = ctx.route.source_demands[position]
-            if source is None:
-                continue
-            candidates = source.rows()
-            rows.append(candidates)
-            blocks.append(np.full(candidates.size, block, dtype=np.int64))
-        operand = (
-            None
-            if not rows
-            else TaggedDemand(
-                _shape_of(ctx.eqn.invars[0]),
-                np.concatenate(rows),
-                np.concatenate(blocks),
+        valid = positions < ctx.route.output_rows.size
+
+        if not np.all(valid):
+            raise ValueError("tagged gather output row not covered by envelope")
+
+        if not np.all(ctx.route.output_rows[positions] == output.rows):
+            raise ValueError("tagged gather output row not covered by envelope")
+
+        starts = relation.indptr[positions]
+        counts = relation.indptr[positions + 1] - starts
+        total = int(counts.sum(dtype=np.int64))
+
+        if total == 0:
+            operand = None
+
+        else:
+            # For each tagged output entry, identify the tagged entry
+            # owning each expanded candidate.
+            owners = np.repeat(np.arange(output.rows.size, dtype=np.int64), counts)
+
+            # Offset within that entry's candidate list.
+            tagged_indptr = np.empty(output.rows.size + 1, dtype=np.int64)
+            tagged_indptr[0] = 0
+            np.cumsum(counts, out=tagged_indptr[1:])
+
+            local_offsets = np.arange(total, dtype=np.int64) - np.repeat(
+                tagged_indptr[:-1], counts
             )
-        )
+            candidate_positions = starts[owners] + local_offsets
+            source_rows = relation.rows[candidate_positions]
+            source_blocks = np.repeat(output.blocks, counts)
+            operand = TaggedDemand(
+                _shape_of(ctx.eqn.invars[0]), source_rows, source_blocks
+            )
+
         result: list[Tagged] = [None] * len(ctx.eqn.invars)
         result[0] = operand
+
         return tuple(result)
 
     if isinstance(ctx.route, GatherRouteFragment):
