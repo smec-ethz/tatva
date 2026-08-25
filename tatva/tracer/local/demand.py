@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Self
+from typing import Self, cast
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -285,23 +285,6 @@ class TensorDemand:
 
         The result is exact when the requested rows already form a Cartesian
         product. Otherwise this intentionally computes the Cartesian hull.
-
-        Example:
-
-            shape = (3, 4)
-            rows corresponding to:
-                (0, 1)
-                (2, 3)
-
-        require axis indices:
-
-            axis 0: {0, 2}
-            axis 1: {1, 3}
-
-        so the structured hull additionally contains:
-
-            (0, 3)
-            (2, 1)
         """
         shape = tuple(int(extent) for extent in shape)
         _validate_shape(shape)
@@ -311,10 +294,50 @@ class TensorDemand:
         if rows.size == 0 or n_entries == 0:
             return None
 
-        if np.any(rows < 0) or np.any(rows >= n_entries):
+        # 0-D scalar shape
+        if not shape:
+            if np.any(rows != 0):
+                raise ValueError(f"flat rows are outside tensor with shape {shape}")
+            return cls(AxisProduct((), ()))
+
+        # Single-element fast path
+        if rows.size == 1:
+            val = int(rows[0])
+            if val < 0 or val >= n_entries:
+                raise ValueError(f"flat rows are outside tensor with shape {shape}")
+            if len(shape) == 1:
+                axis_subset = _axis_from_range(shape[0], val, val + 1)
+                assert axis_subset is not None
+                return cls(AxisProduct(shape, (axis_subset,)))
+            coords = np.unravel_index(val, shape)
+            axes = tuple(
+                _axis_from_range(extent, int(c), int(c) + 1)
+                for extent, c in zip(shape, coords, strict=True)
+            )
+            return cls(AxisProduct(shape, cast(tuple[AxisSubset, ...], axes)))
+
+        # Validate bounds
+        r_min = int(np.min(rows))
+        r_max = int(np.max(rows))
+        if r_min < 0 or r_max >= n_entries:
             raise ValueError(f"flat rows are outside tensor with shape {shape}")
 
-        rows = np.unique(rows)
+        # 1-D tensor fast path
+        if len(shape) == 1:
+            extent = shape[0]
+            axis_subset = _axis_from_indices(extent, rows)
+            if axis_subset is None:
+                return None
+            return cls(AxisProduct(shape, (axis_subset,)))
+
+        # Deduplicate rows only if needed
+        is_sorted = bool(np.all(rows[1:] >= rows[:-1]))
+        if is_sorted:
+            diffs = rows[1:] != rows[:-1]
+            if np.any(~diffs):
+                rows = rows[np.r_[True, diffs]]
+        else:
+            rows = np.unique(rows)
 
         if rows.size == n_entries:
             return cls(AxisProduct(shape, tuple(_FullAxis() for _ in shape)))
@@ -323,7 +346,25 @@ class TensorDemand:
         axes: list[AxisSubset] = []
 
         for extent, axis_coordinates in zip(shape, coordinates):
-            selected = np.unique(axis_coordinates)
+            c_min = int(np.min(axis_coordinates))
+            c_max = int(np.max(axis_coordinates))
+            if c_min == c_max:
+                axis_subset = _axis_from_range(extent, c_min, c_min + 1)
+                assert axis_subset is not None
+                axes.append(axis_subset)
+                continue
+
+            c_sorted = bool(np.all(axis_coordinates[1:] >= axis_coordinates[:-1]))
+            if c_sorted:
+                c_diffs = axis_coordinates[1:] != axis_coordinates[:-1]
+                selected = (
+                    axis_coordinates[np.r_[True, c_diffs]]
+                    if np.any(~c_diffs)
+                    else axis_coordinates
+                )
+            else:
+                selected = np.unique(axis_coordinates)
+
             axis_subset = _axis_from_indices(extent, selected)
             if axis_subset is None:
                 raise RuntimeError("non-empty row hull produced an empty axis")
