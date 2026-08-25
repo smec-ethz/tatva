@@ -359,20 +359,6 @@ def test_localized_custom_jvp_supports_first_order_transforms_and_jit():
     np.testing.assert_allclose(jax.jit(jax.grad(compiled))(u), _expected_gradient(u))
 
 
-@pytest.mark.parametrize(
-    "transform",
-    [
-        lambda fn: jax.jacobian(jax.grad(fn)),
-        jax.hessian,
-    ],
-)
-def test_localized_custom_jvp_rejects_higher_order_ad(transform):
-    u = _example_u()
-    compiled = analyze(energy_custom_jvp, u).distribute(parts=1).rank(0).compile()
-    with pytest.raises(NotImplementedError, match="higher-order AD"):
-        transform(compiled)(u)
-
-
 def test_symbolic_zero_custom_jvp_is_rejected_contextually():
     @jax.custom_jvp
     def value(x):

@@ -9,6 +9,7 @@ from jax.extend import core
 if not hasattr(lax, "stack_p"):
     lax.stack_p = core.Primitive("stack_compat")
 
+from tatva.tracer import analyze as analyze_functional
 from tatva.tracer.program.analysis import analyze
 from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.derivatives import trace_form_derivatives
@@ -16,6 +17,9 @@ from tatva.tracer.program.forms import (
     CoordinateBlock,
     CoordinateRole,
     FormSpec,
+    State,
+    Test,
+    Trial,
     ValueSource,
 )
 
@@ -165,6 +169,47 @@ def test_lu_hessian_is_batch_local():
     np.testing.assert_array_equal(trace.hessian.toarray().astype(bool), expected)
 
 
+def test_sort_hessian_is_conservative_within_each_slice_only():
+    x = jnp.arange(12, dtype=jnp.float32) + 1
+
+    def energy(values):
+        keys = values[:6].reshape(2, 3)
+        payload = values[6:].reshape(2, 3)
+        _, sorted_payload = lax.sort((keys, payload), dimension=1, num_keys=1)
+        return jnp.sum(sorted_payload)
+
+    trace = _trace_form(energy, x, form=FormSpec.energy(input_index=0))
+
+    expected = np.zeros((12, 12), dtype=bool)
+    for rows in (
+        np.asarray([0, 1, 2, 6, 7, 8]),
+        np.asarray([3, 4, 5, 9, 10, 11]),
+    ):
+        expected[np.ix_(rows, rows)] = True
+    np.testing.assert_array_equal(trace.hessian.toarray().astype(bool), expected)
+
+
+def test_batched_inverse_hessian_does_not_couple_matrix_batches():
+    n_batch = 3
+    matrix_size = 2
+    x = jnp.arange(n_batch * matrix_size**2, dtype=jnp.float32) / 100
+
+    def energy(values):
+        matrices = values.reshape(n_batch, matrix_size, matrix_size)
+        matrices = matrices + 3.0 * jnp.eye(matrix_size)[None, :, :]
+        return jnp.sum(jnp.linalg.inv(matrices) * matrices)
+
+    trace = _trace_form(energy, x, form=FormSpec.energy(input_index=0))
+    pattern = trace.hessian.toarray().astype(bool)
+
+    expected = np.zeros_like(pattern)
+    batch_size = matrix_size**2
+    for batch in range(n_batch):
+        rows = np.arange(batch * batch_size, (batch + 1) * batch_size)
+        expected[np.ix_(rows, rows)] = True
+    np.testing.assert_array_equal(pattern, expected)
+
+
 def test_mixed_form_extracts_row_by_column_block_tangent():
     n = 4
     values = tuple(jnp.arange(n, dtype=jnp.float32) + shift for shift in range(4))
@@ -304,3 +349,47 @@ def test_packed_mixed_coordinate_selections_share_one_input_without_overlap():
     np.testing.assert_array_equal(tangent[:n, n:], expected)
     np.testing.assert_array_equal(tangent[n:, :n], expected)
     np.testing.assert_array_equal(tangent[n:, n:], expected)
+
+
+def test_annotated_trial_and_test_inference():
+    from tatva.tracer.capture import CallABI
+    from tatva.tracer.program.forms import infer_form_spec
+
+    def weak(u: Trial[jax.Array], v: Test[jax.Array], p: float) -> jax.Array:
+        return jnp.sum(u * v * p)
+
+    abi, _ = CallABI.from_call(weak, (jnp.zeros(4), jnp.zeros(4), 1.0), {})
+    form = infer_form_spec(weak, abi)
+    assert form is not None
+    assert len(form.coordinates) == 2
+    assert form.coordinates[0].name == "u"
+    assert form.coordinates[0].role == CoordinateRole.COLUMN
+    assert form.coordinates[0].value_source == ValueSource.EXTERNAL
+    assert form.coordinates[1].name == "v"
+    assert form.coordinates[1].role == CoordinateRole.ROW
+    assert form.coordinates[1].value_source == ValueSource.ZERO
+
+
+def test_annotated_analyze_end_to_end():
+    n_elements = 6
+    width = 2
+    u = jnp.arange(n_elements * width, dtype=jnp.float32) + 1
+    v = jnp.zeros_like(u)
+
+    def weak(x: Trial, test: Test) -> jax.Array:
+        return jnp.sum(x.reshape(n_elements, width) * test.reshape(n_elements, width))
+
+    distribution = analyze_functional(weak, u, v).distribute(
+        parts=2,
+        blocks_per_part=2,
+    )
+
+    for rank in range(distribution.parts):
+        derivative = distribution.rank(rank).derivatives()
+        assert derivative.row_block_names == ("test",)
+        assert derivative.column_block_names == ("x",)
+        np.testing.assert_array_equal(
+            derivative.tangent.toarray().astype(bool),
+            np.eye(derivative.tangent.shape[0], dtype=bool),
+        )
+
