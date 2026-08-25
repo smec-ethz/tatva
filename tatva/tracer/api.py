@@ -33,8 +33,19 @@ from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolv
 from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
 from tatva.tracer.program.forms import FormSpec, SymbolicLayout
 from tatva.tracer.program.incidence import (
+    BlockCoordinateIncidence,
     generate_contribution_blocks,
     plan_tagged_block_coordinate_incidence,
+)
+from tatva.tracer.program.incidence_distributed import (
+    BlockCoordinateIncidenceShard,
+    BlockShard,
+    DistributedPlanningError,
+    block_shard_for_rank,
+    broadcast_assignments,
+    collective_check,
+    gather_coordinate_incidence,
+    shard_coordinate_incidence,
 )
 from tatva.tracer.support import require_local_routes, require_registered_operations
 
@@ -90,18 +101,9 @@ class FunctionalAnalysis[**P, R]:
             form=self._form,
         )
 
-        partition_incidence = coordinate_incidence.combined()
-        first_column = next(
-            coordinate
-            for coordinate in self._form.coordinates
-            if coordinate.role.is_column
-        )
-        owner_incidence = coordinate_incidence.coordinate(first_column.name)
-
-        assignments = plan_distribution_assignments(
-            partition_incidence,
-            owner_incidence,
-            n_parts=parts,
+        assignments = self._distribution_assignments(
+            coordinate_incidence,
+            parts=parts,
             strategy=strategy,
             dof_owner=dof_owner,
         )
@@ -110,6 +112,141 @@ class FunctionalAnalysis[**P, R]:
         return self._build_distribution_plan(
             partition=partition,
             assignments=assignments,
+        )
+
+    def distribute_mpi(
+        self,
+        *,
+        comm,
+        blocks_per_part: int = 4,
+        strategy: PartitionStrategy = PartitionStrategy.INCIDENCE,
+        dof_owner: ArrayLike | None = None,
+        root: int = 0,
+    ) -> LocalFunctional[P, R]:
+        """Collectively build and return this MPI rank's distribution plan."""
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+
+        if size <= 0:
+            raise ValueError("MPI communicator is empty")
+
+        if root < 0 or root >= size:
+            raise ValueError(f"root {root} is outside communicator of size {size}")
+
+        if blocks_per_part <= 0:
+            raise ValueError("blocks_per_part must be positive")
+
+        blocks = generate_contribution_blocks(
+            self._contributions, blocks_per_root=blocks_per_part * size
+        )
+
+        # Every compiler rank receives a contiguous subset of contribution
+        # blocks and performs only that subset's tagged propagation.
+        shard = block_shard_for_rank(blocks, rank=rank, size=size)
+        local_error: BaseException | None = None
+
+        try:
+            local_incidence = self._trace_incidence_shard(shard)
+        except Exception as exc:  # noqa: BLE001
+            local_incidence = None
+            local_error = exc
+
+        collective_check(comm, local_error, phase="tagged incidence")
+
+        assert local_incidence is not None
+
+        # Reconstruct the global block × coordinate incidence only on the
+        # partition root.
+        global_coordinates = gather_coordinate_incidence(
+            local_incidence,
+            global_blocks=blocks,
+            comm=comm,
+            root=root,
+        )
+
+        # The root now executes exactly the same semantic steps as serial
+        # distribute():
+        #   combined incidence -> block partition
+        #   canonical column    -> DOF ownership
+        assignments: DistributionAssignments | None = None
+        root_error: BaseException | None = None
+
+        if rank == root:
+            try:
+                assert global_coordinates is not None
+
+                assignments = self._distribution_assignments(
+                    global_coordinates,
+                    parts=size,
+                    strategy=strategy,
+                    dof_owner=dof_owner,
+                )
+
+            except Exception as exc:  # noqa: BLE001
+                root_error = exc
+
+        root_error_text = (
+            None
+            if root_error is None
+            else (f"{type(root_error).__name__}: {root_error}")
+        )
+        root_error_text = comm.bcast(root_error_text, root=root)
+        if root_error_text is not None:
+            raise DistributedPlanningError(
+                f"MPI distribution planning failed on rank {root}: {root_error_text}"
+            )
+
+        # Important: the coordinate width is global even though the block
+        # dimension is sharded. Therefore every rank already knows the
+        # canonical DOF count; no separate metadata helper is necessary.
+        first_column = next(
+            coordinate
+            for coordinate in self._form.coordinates
+            if coordinate.role.is_column
+        )
+        n_dofs = int(local_incidence.by_coordinate[first_column.name].shape[1])
+
+        assignments = broadcast_assignments(
+            assignments,
+            n_blocks=len(blocks),
+            n_dofs=n_dofs,
+            n_parts=size,
+            strategy=strategy,
+            comm=comm,
+            root=root,
+        )
+
+        partition = partition_contribution_from_assignments(blocks, assignments)
+        distribution = self._build_distribution_plan(
+            partition=partition, assignments=assignments
+        )
+
+        return distribution.rank(rank)
+
+    def _distribution_assignments(
+        self,
+        coordinate_incidence: BlockCoordinateIncidence,
+        *,
+        parts: int,
+        strategy: PartitionStrategy,
+        dof_owner: ArrayLike | None,
+    ) -> DistributionAssignments:
+        partition_incidence = coordinate_incidence.combined()
+
+        first_column = next(
+            coordinate
+            for coordinate in self._form.coordinates
+            if coordinate.role.is_column
+        )
+
+        owner_incidence = coordinate_incidence.coordinate(first_column.name)
+
+        return plan_distribution_assignments(
+            partition_incidence,
+            owner_incidence,
+            n_parts=parts,
+            strategy=strategy,
+            dof_owner=dof_owner,
         )
 
     def _build_distribution_plan(
@@ -129,6 +266,20 @@ class FunctionalAnalysis[**P, R]:
             _partition=partition,
             _dof_owner=assignments.dof_owner.copy(),
         )
+
+    def _trace_incidence_shard(
+        self, shard: BlockShard
+    ) -> BlockCoordinateIncidenceShard:
+
+        incidence = plan_tagged_block_coordinate_incidence(
+            self._plan,
+            self._root_frame,
+            self._resolver,
+            self._contributions,
+            blocks=shard.blocks,
+            form=self._form,
+        )
+        return shard_coordinate_incidence(incidence, shard=shard)
 
 
 @dataclass(frozen=True, eq=False)

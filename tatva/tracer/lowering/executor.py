@@ -323,6 +323,9 @@ def _lower_custom_jvp(
     context: CustomJvpContext[LocalJaxprPlan],
     inputs: tuple[Any | None, ...],
 ) -> tuple[Any | None, ...]:
+    # Higher-order AD is not validated. However, jax can differentiate through it and
+    # this should be correct...
+    # We do not reject higher-order AD, unless we detect this becomes a problem.
     spec = context.spec
     outer_layouts = plan.input_layouts
     live_outer_indices: list[int] = []
@@ -360,17 +363,6 @@ def _lower_custom_jvp(
 
     @local.defjvp
     def jvp(primals, tangents):
-        # JAX 0.11 uses these forward-mode tracers when an AD transformation
-        # is already active at this custom boundary. DynamicJaxprTracer from
-        # jit is deliberately allowed.
-        if any(
-            type(value).__name__ in {"JVPTracer", "LinearizeTracer"}
-            for value in primals
-        ):
-            raise NotImplementedError(
-                "higher-order AD through localized custom_jvp is not supported"
-            )
-
         values: list[Any | None] = []
         layouts: list[TensorLayout | None] = []
 
