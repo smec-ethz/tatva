@@ -12,14 +12,18 @@ front-end conveniences that lower to ``CoordinateBlock`` metadata.
 from __future__ import annotations
 
 import math
+import typing
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Annotated, Any
 
 import numpy as np
 import scipy.sparse as sps
 from jax.extend.core import Jaxpr
 from numpy.typing import NDArray
 
+from tatva.tracer.capture import CallABI
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.program.dependencies import DependencySet
 
@@ -51,6 +55,108 @@ class ValueSource(Enum):
 
 
 type CoordinateSelection = slice | tuple[int, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class FormCoordinate:
+    role: CoordinateRole
+    value_source: ValueSource = ValueSource.EXTERNAL
+    name: str | None = None
+    selection: CoordinateSelection = None
+
+
+type Trial[T] = Annotated[
+    T,
+    FormCoordinate(role=CoordinateRole.COLUMN, value_source=ValueSource.EXTERNAL),
+]
+type Test[T] = Annotated[
+    T,
+    FormCoordinate(role=CoordinateRole.ROW, value_source=ValueSource.ZERO),
+]
+type State[T] = Annotated[
+    T,
+    FormCoordinate(
+        role=CoordinateRole.ROW_AND_COLUMN, value_source=ValueSource.EXTERNAL
+    ),
+]
+
+
+def extract_form_coordinates(hint: Any) -> list[FormCoordinate]:
+    """Recursively extract FormCoordinate instances from Annotated or TypeAliasType hints."""
+    coords: list[FormCoordinate] = []
+
+    def _walk(node: Any) -> None:
+        if node is None:
+            return
+
+        origin = typing.get_origin(node)
+
+        # Generic alias of TypeAliasType (e.g. Trial[Array])
+        if isinstance(origin, typing.TypeAliasType):
+            _walk(origin.__value__)
+            return
+
+        # Bare TypeAliasType (e.g. Trial)
+        if isinstance(node, typing.TypeAliasType):
+            _walk(node.__value__)
+            return
+
+        # typing.Annotated
+        if origin is typing.Annotated:
+            args = typing.get_args(node)
+            for metadata in args[1:]:
+                if isinstance(metadata, FormCoordinate):
+                    coords.append(metadata)
+                else:
+                    _walk(metadata)
+            _walk(args[0])
+
+    _walk(hint)
+    return coords
+
+
+def infer_form_spec(fn: Callable, call_abi: CallABI) -> FormSpec | None:
+    try:
+        hints = typing.get_type_hints(fn, include_extras=True)
+    except Exception:  # ruff: ignore[blind-except]
+        return None
+
+    blocks: list[CoordinateBlock] = []
+    param_ranges = {name: span for name, _, span in call_abi.parameter_trees()}
+
+    for name in call_abi.signature.parameters:
+        hint = hints.get(name)
+        if hint is None:
+            continue
+
+        coordinates = extract_form_coordinates(hint)
+        if not coordinates:
+            continue
+
+        span = param_ranges.get(name)
+        if span is None:
+            continue
+
+        for metadata in coordinates:
+            for flat_idx in range(span.start, span.stop):
+                block_name = metadata.name or (
+                    name
+                    if span.stop - span.start == 1
+                    else f"{name}_{flat_idx - span.start}"
+                )
+                blocks.append(
+                    CoordinateBlock(
+                        name=block_name,
+                        input_index=flat_idx,
+                        role=metadata.role,
+                        value_source=metadata.value_source,
+                        selection=metadata.selection,
+                    )
+                )
+
+    if not blocks:
+        return None
+    return FormSpec(tuple(blocks))
 
 
 @dataclass(frozen=True, slots=True)
