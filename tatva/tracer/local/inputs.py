@@ -85,6 +85,7 @@ def _localize_flat_inputs(
     global_flat: tuple[Any, ...],
     input_layouts: tuple[TensorLayout | None, ...],
     dof_plan: LocalDofPlan,
+    dof_input_index: int,
 ) -> tuple[Any | None, ...]:
     if len(global_flat) != len(input_layouts):
         raise RuntimeError("call ABI and local input layouts disagree")
@@ -94,9 +95,11 @@ def _localize_flat_inputs(
     for flat_index, (value, layout) in enumerate(
         zip(global_flat, input_layouts, strict=True)
     ):
-        if flat_index == 0:
+        if flat_index == dof_input_index:
             # Canonical DOF input:
             # user-facing local form is owned + ghost storage.
+            if layout is None:
+                raise RuntimeError("canonical DOF input is compiler-dead")
             local.append(jnp.asarray(value)[jnp.asarray(dof_plan.storage.global_dofs)])
             continue
 
@@ -248,13 +251,17 @@ def localize_inputs(
     dof_plan: LocalDofPlan,
     specializers: LocalizeOverrides,
     input_layouts: tuple[TensorLayout | None, ...],
+    dof_input_index: int,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
     global_bound = call_abi.bind(*args, **kwargs)
     global_flat = call_abi.flatten_bound(global_bound)
     local_flat = _localize_flat_inputs(
-        global_flat=global_flat, input_layouts=input_layouts, dof_plan=dof_plan
+        global_flat=global_flat,
+        input_layouts=input_layouts,
+        dof_plan=dof_plan,
+        dof_input_index=dof_input_index,
     )
 
     localized_arguments: dict[str, Any] = {}

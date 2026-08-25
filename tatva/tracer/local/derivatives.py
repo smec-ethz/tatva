@@ -146,6 +146,7 @@ def _build_local_symbolic_seeds(
     form: FormSpec,
     executable: LocalExecutable,
     dof_plan: LocalDofPlan,
+    dof_input_index: int,
     global_inputs: tuple[Any, ...],
     jaxpr_input_shapes: tuple[tuple[int, ...], ...],
 ) -> tuple[
@@ -153,8 +154,8 @@ def _build_local_symbolic_seeds(
     tuple[DependencySet, ...],
     dict[str, NDArray[np.int64]],
 ]:
-    if not executable.input_indices or executable.input_indices[0] != 0:
-        raise RuntimeError("local executable does not have a live first state input")
+    if dof_input_index not in executable.input_indices:
+        raise RuntimeError("local executable does not have a live DOF input")
     if len(jaxpr_input_shapes) != len(executable.input_indices):
         raise RuntimeError("local executable ABI and captured JAXPR inputs disagree")
 
@@ -183,7 +184,7 @@ def _build_local_symbolic_seeds(
         original_size = int(np.prod(np.shape(global_inputs[original_index])))
         selected_global = block.rows(original_size)
 
-        if original_index == 0:
+        if original_index == dof_input_index:
             # Symbolic state coordinates use storage order, but the executable
             # receives compute order.  This distinction is represented by the
             # explicit root seed below rather than by inserting a JAX gather.
@@ -232,7 +233,7 @@ def _build_local_symbolic_seeds(
         for shape in jaxpr_input_shapes
     ]
 
-    # Bind executable rows to symbolic columns.  For the first state input the
+    # Bind executable rows to symbolic columns.  For the storage-backed DOF input the
     # symbolic ordering is storage-local, so map through compute_global ->
     # storage-local positions explicitly.
     for form_block, symbolic_block in zip(
@@ -241,7 +242,7 @@ def _build_local_symbolic_seeds(
         slot, executable_rows = block_rows_by_slot[form_block.name]
         global_ids = block_global_ids[form_block.name]
 
-        if form_block.input_index == 0:
+        if form_block.input_index == dof_input_index:
             lookup = {
                 int(global_id): symbolic_block.offset + local_index
                 for local_index, global_id in enumerate(global_ids)
@@ -279,6 +280,7 @@ def trace_local_derivatives(
     global_inputs: tuple[Any, ...],
     *,
     form: FormSpec | None = None,
+    dof_input_index: int = 0,
 ) -> LocalDerivativeTrace:
     """Trace one lowered rank scalar form in local symbolic coordinates."""
     if len(global_inputs) != len(executable.plan.input_layouts):
@@ -287,7 +289,7 @@ def trace_local_derivatives(
             f"got {len(global_inputs)}"
         )
 
-    form = FormSpec.energy(input_index=0) if form is None else form
+    form = FormSpec.energy(input_index=dof_input_index) if form is None else form
     examples = executable.pack_global_inputs(*global_inputs)
     closed_jaxpr = jax.make_jaxpr(executable)(*examples)
     require_registered_operations(closed_jaxpr.jaxpr)
@@ -297,6 +299,7 @@ def trace_local_derivatives(
         form=form,
         executable=executable,
         dof_plan=dof_plan,
+        dof_input_index=dof_input_index,
         global_inputs=global_inputs,
         jaxpr_input_shapes=tuple(_shape_of(var) for var in closed_jaxpr.jaxpr.invars),
     )
