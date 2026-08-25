@@ -506,32 +506,98 @@ def reduction(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
     )
 
 
-def cumulative(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
+def cumulative(
+    ctx: TaggedDemandContext,
+) -> tuple[Tagged, ...]:
     output = _output(ctx)
     if output is None:
         return (None,)
+
     input_shape = _shape_of(ctx.eqn.invars[0])
+
+    if output.shape != input_shape:
+        raise ValueError("cumulative tagged rule requires input/output shapes to match")
+
     axis = int(ctx.eqn.params["axis"])
     if axis < 0:
         axis += len(input_shape)
+
+    if axis < 0 or axis >= len(input_shape):
+        raise ValueError(f"cumulative axis {axis} outside rank {len(input_shape)}")
+
     reverse = bool(ctx.eqn.params.get("reverse", False))
-    out_coords = _coords(output.rows, output.shape)
-    rows: list[np.ndarray] = []
-    blocks: list[np.ndarray] = []
-    for coords, block in zip(out_coords, output.blocks, strict=True):
-        position = int(coords[axis])
-        values = (
-            np.arange(position, input_shape[axis], dtype=np.int64)
-            if reverse
-            else np.arange(position + 1, dtype=np.int64)
-        )
-        expanded = np.repeat(coords[None, :], values.size, axis=0)
-        expanded[:, axis] = values
-        rows.append(_rows(expanded, input_shape))
-        blocks.append(np.full(values.size, block, dtype=np.int64))
-    if not rows:
+
+    extent = int(input_shape[axis])
+    if extent == 0 or output.nnz == 0:
         return (None,)
-    return (TaggedDemand(input_shape, np.concatenate(rows), np.concatenate(blocks)),)
+
+    # C-order stride of the cumulative axis.
+    #
+    # For a flattened row:
+    #
+    #   row = fiber_base + axis_position * axis_stride
+    #
+    # where fiber_base identifies all coordinates except `axis`.
+    axis_stride = int(math.prod(input_shape[axis + 1 :]))
+    positions = (output.rows // axis_stride) % extent
+    fiber_bases = output.rows - positions * axis_stride
+
+    # Collapse all tagged output entries belonging to the same
+    # (fiber, block).
+    #
+    # This is the important optimization: the union of cumulative
+    # prefixes/suffixes can be represented by one boundary per group.
+    order = np.lexsort((output.blocks, fiber_bases))
+
+    sorted_bases = fiber_bases[order]
+    sorted_blocks = output.blocks[order]
+    sorted_positions = positions[order]
+
+    group_start_mask = np.ones(sorted_bases.size, dtype=bool)
+    group_start_mask[1:] = (sorted_bases[1:] != sorted_bases[:-1]) | (
+        sorted_blocks[1:] != sorted_blocks[:-1]
+    )
+    group_starts = np.flatnonzero(group_start_mask)
+    group_bases = sorted_bases[group_starts]
+    group_blocks = sorted_blocks[group_starts]
+
+    if reverse:
+        # Union of suffixes:
+        #
+        #   [p1, extent) U [p2, extent)
+        #       = [min(p1, p2), extent)
+        boundaries = np.minimum.reduceat(sorted_positions, group_starts)
+        first_axis_values = boundaries
+        counts = extent - boundaries
+
+    else:
+        # Union of prefixes:
+        #
+        #   [0, p1] U [0, p2]
+        #       = [0, max(p1, p2)]
+        boundaries = np.maximum.reduceat(sorted_positions, group_starts)
+        first_axis_values = np.zeros_like(boundaries)
+        counts = boundaries + 1
+
+    counts = counts.astype(np.int64, copy=False)
+
+    total = int(counts.sum(dtype=np.int64))
+    if total == 0:
+        return (None,)
+
+    # CSR-like offsets for each (fiber, block) group's interval.
+    indptr = np.empty(counts.size + 1, dtype=np.int64)
+    indptr[0] = 0
+    np.cumsum(counts, out=indptr[1:])
+
+    # Expand all groups in one vectorized operation.
+    owners = np.repeat(np.arange(counts.size, dtype=np.int64), counts)
+    local_offsets = np.arange(total, dtype=np.int64) - np.repeat(indptr[:-1], counts)
+    axis_values = first_axis_values[owners] + local_offsets
+    input_rows = group_bases[owners] + axis_values * axis_stride
+    input_blocks = group_blocks[owners]
+
+    return (TaggedDemand(input_shape, input_rows, input_blocks),)
 
 
 def dot_general(ctx: TaggedDemandContext) -> tuple[Tagged, ...]:
