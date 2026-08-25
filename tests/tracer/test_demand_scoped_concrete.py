@@ -131,6 +131,28 @@ def test_sort_promotes_only_its_concrete_dependency_and_reports_it():
     assert not escalation.requested.is_full
 
 
+def test_batched_sort_is_concrete_regionally_for_complete_axis_slices():
+    def objective(dofs, metric):
+        return jnp.sum(dofs[jnp.argsort(metric, axis=1)])
+
+    n_batch = 100
+    width = 4
+    metric = jnp.arange(n_batch * width, dtype=jnp.float32).reshape(n_batch, width)[
+        :, ::-1
+    ]
+    plan, resolver, frame = _setup(objective, jnp.arange(width, dtype=float), metric)
+    gather = _eqn(plan, "gather")
+    requested = np.arange(37 * width, 38 * width, dtype=np.int64)
+
+    fragment = resolver.route_fragment(frame, gather, RouteRequest(requested))
+
+    assert fragment is not None
+    np.testing.assert_array_equal(fragment.source_rows, [3, 2, 1, 0])
+    assert resolver.stats.full_escalations == 0
+    assert resolver.stats.regional_evaluated_eqns > 0
+    assert resolver.stats.regional_entries < n_batch * width
+
+
 def test_strict_fallback_rejects_a_global_concrete_operation():
     def objective(dofs, metric):
         return jnp.sum(dofs[jnp.argsort(metric)])

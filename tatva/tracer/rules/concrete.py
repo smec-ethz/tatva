@@ -15,7 +15,7 @@ from tatva.tracer.core.semantics import (
     RegionalConcretePlan,
     UnsupportedConcrete,
 )
-from tatva.tracer.local.demand import Demand
+from tatva.tracer.local.demand import Demand, _FullAxis
 from tatva.tracer.local.layout import TensorLayout
 
 
@@ -31,6 +31,20 @@ def regional_bind(
     """Use ordinary demand propagation and bind on proven-compatible compact arrays."""
 
     def plan(_ctx: RegionalConcreteContext) -> RegionalConcretePlan:
+        return RegionalConcrete(demand_rule, _bind_requested)
+
+    return plan
+
+
+def regional_sort(
+    demand_rule: Callable[[DemandContext], tuple[Demand, ...]],
+):
+    """Evaluate complete sort-axis slices without promoting independent axes."""
+
+    def plan(ctx: RegionalConcreteContext) -> RegionalConcretePlan:
+        dimension = int(ctx.eqn.params["dimension"])
+        if not isinstance(ctx.demand.axis_subset(dimension), _FullAxis):
+            return FullConcrete("sort requires a complete invocation-local sorted axis")
         return RegionalConcrete(demand_rule, _bind_requested)
 
     return plan

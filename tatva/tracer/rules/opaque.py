@@ -6,11 +6,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import scipy.sparse as sps
-from jax.extend.core import Literal
 
-from tatva.tracer.core.semantics import DemandContext, DerivativeRule, no_hessian
+from tatva.tracer.core.semantics import DerivativeRule, no_hessian
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.local.demand import Demand, TensorDemand
 from tatva.tracer.program.dependencies import DependencySet
 
 if TYPE_CHECKING:
@@ -74,20 +72,6 @@ def opaque_nonlinear_hessian(
     acc: InteractionGraph,
 ) -> None:
     acc.add_self(prepared.total)
-
-
-def full_operand_demand(ctx: DemandContext) -> tuple[Demand, ...]:
-    """Require every non-literal operand whenever any result is live."""
-    if not any(demand is not None for demand in ctx.output_demands):
-        return tuple(None for _ in ctx.eqn.invars)
-
-    return tuple(
-        None if isinstance(atom, Literal) else TensorDemand.full(_shape_of(atom))
-        for atom in ctx.eqn.invars
-    )
-
-
-sort_demand = full_operand_demand
 
 
 DERIVATIVES_OPAQUE_NONLINEAR = DerivativeRule(

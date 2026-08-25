@@ -61,6 +61,7 @@ from . import (
     linalg,
     opaque,
     reductions,
+    sort,
     structural,
     tagged,
 )
@@ -644,13 +645,11 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
     reg.register(
         lax.sort_p,
         OperationSemantics(
-            derivatives=opaque.DERIVATIVES_OPAQUE_NONLINEAR,
-            demand=opaque.sort_demand,
-            tagged_demand=tagged.sort,
+            derivatives=sort.DERIVATIVES_SORT,
+            demand=sort.sort_demand,
+            tagged_demand=sort.sort_tagged_demand,
             lowering=lowerings.lower_sort,
-            regional_concrete=concrete_rules.full(
-                "sort requires a globally ordered invocation-local input"
-            ),
+            regional_concrete=concrete_rules.regional_sort(sort.sort_demand),
         ),
     )
 

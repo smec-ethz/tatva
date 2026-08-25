@@ -85,6 +85,50 @@ from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
 from tatva.tracer.program.forms import FormSpec, SymbolicLayout
+from tatva.tracer.rules.linalg import add_batch_self, expand_batch_dependencies
+
+
+def _batch_union_dependencies(
+    dependencies: tuple[DependencySet, ...],
+    *,
+    batch_shape: tuple[int, ...],
+    n_symbols: int,
+) -> DependencySet:
+    """Union solve dependencies per independent output batch item.
+
+    Captures whose leading axes match the solve batch retain that locality.
+    A differentiable capture without compatible batch axes is shared by every
+    batch item and therefore conservatively influences all of them.
+    """
+    batch_size = int(np.prod(batch_shape, dtype=np.int64))
+    batch_rank = len(batch_shape)
+    combined = sps.csr_matrix((batch_size, n_symbols), dtype=bool)
+
+    for dependency in dependencies:
+        if dependency.csr.nnz == 0:
+            continue
+
+        if dependency.shape[:batch_rank] == batch_shape:
+            item_size = int(np.prod(dependency.shape[batch_rank:], dtype=np.int64))
+            scalar_size = int(np.prod(dependency.shape, dtype=np.int64))
+            aggregate = sps.csr_matrix(
+                (
+                    np.ones(scalar_size, dtype=np.int8),
+                    (
+                        np.repeat(np.arange(batch_size, dtype=np.int64), item_size),
+                        np.arange(scalar_size, dtype=np.int64),
+                    ),
+                ),
+                shape=(batch_size, scalar_size),
+            )
+            local = aggregate @ dependency.csr
+        else:
+            total = dependency.total_union().csr
+            local = sps.vstack([total] * batch_size, format="csr")
+
+        combined = (combined + local).astype(bool).tocsr()
+
+    return DependencySet(combined, batch_shape)
 
 
 @dataclass(frozen=True)
@@ -369,19 +413,23 @@ class _DerivativeNestedHandler:
             for callback, child_frame in zip(
                 spec.callbacks(), callback_frames, strict=True
             ):
-                deps = tuple(
-                    rhs
-                    if binding.runtime
-                    else self.input_deps[binding.outer_input_index]
-                    for binding in callback.inputs
-                    if binding.outer_input_index is not None
-                )
+                deps_list: list[DependencySet] = []
+                for binding in callback.inputs:
+                    if binding.runtime:
+                        deps_list.append(rhs)
+                    else:
+                        outer_index = binding.outer_input_index
+                        if outer_index is None:
+                            raise RuntimeError(
+                                "linear-solve capture has no outer input binding"
+                            )
+                        deps_list.append(self.input_deps[outer_index])
                 traces.append(
                     _trace_jaxpr(
                         plan=child_frame.plan,
                         frame=child_frame,
                         resolver=self.resolver,
-                        input_deps=deps,
+                        input_deps=tuple(deps_list),
                         acc=self.acc,
                         n_symbols=self.n_symbols,
                     )
@@ -390,20 +438,38 @@ class _DerivativeNestedHandler:
             for child_frame in callback_frames:
                 self.resolver.release(child_frame)
 
-        union = (
-            sps.vstack([dep.total_union().csr for dep in self.input_deps], format="csr")
-            .sum(axis=0)
-            .astype(bool)
-        )
-        result = tuple(
-            DependencySet(
-                sps.vstack(
-                    [sps.csr_matrix(union)] * int(np.prod(_shape_of(out))), format="csr"
-                ),
-                _shape_of(out),
+        output_shapes = tuple(_shape_of(out) for out in self.eqn_plan.eqn.outvars)
+        output_shape = output_shapes[0]
+        batch_shape = output_shape[:-2] if len(output_shape) >= 3 else ()
+
+        if batch_shape:
+            batch_dependencies = _batch_union_dependencies(
+                self.input_deps,
+                batch_shape=batch_shape,
+                n_symbols=self.n_symbols,
             )
-            for out in self.eqn_plan.eqn.outvars
-        )
+            add_batch_self(self.acc, batch_dependencies)
+            result = tuple(
+                expand_batch_dependencies(batch_dependencies, shape)
+                for shape in output_shapes
+            )
+        else:
+            union = (
+                sps.vstack(
+                    [dep.total_union().csr for dep in self.input_deps], format="csr"
+                )
+                .sum(axis=0)
+                .astype(bool)
+            )
+            result = tuple(
+                DependencySet(
+                    sps.vstack(
+                        [sps.csr_matrix(union)] * int(np.prod(shape)), format="csr"
+                    ),
+                    shape,
+                )
+                for shape in output_shapes
+            )
         return result, LinearSolveInvocation(self.eqn_plan.index, *traces)
 
 

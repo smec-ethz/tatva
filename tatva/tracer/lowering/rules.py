@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.extend.core import Literal
 
 from tatva.tracer.local.localize import (
     LocalDynamicGatherRoute,
@@ -436,8 +435,10 @@ def lower_select_n(
 def lower_sort(
     ctx: LoweringContext,
 ) -> tuple[Any | None, ...]:
-    """Sort complete local copies, then project each live output layout."""
+    """Sort complete local axis slices, then project each live result."""
     operands = []
+    source_layout = None
+    dimension = int(ctx.plan.eqn.params["dimension"])
 
     for index, (value, layout) in enumerate(
         zip(ctx.inputs, ctx.plan.input_layouts, strict=True)
@@ -445,17 +446,33 @@ def lower_sort(
         if value is None:
             raise RuntimeError(f"sort: runtime input {index} is dead")
 
-        if layout is not None and not layout.is_full:
+        if layout is None:
+            raise RuntimeError(f"sort: runtime operand {index} has no local layout")
+
+        if layout.local_shape[dimension] != layout.global_shape[dimension]:
             raise RuntimeError(
-                f"sort: operand {index} must use a full global layout, "
-                f"got {layout.local_shape} of {layout.global_shape}"
+                f"sort: operand {index} must contain the complete sorted axis"
             )
+
+        if source_layout is None:
+            source_layout = layout
+        elif source_layout.global_shape != layout.global_shape or any(
+            not np.array_equal(
+                source_layout.global_axis_indices(axis),
+                layout.global_axis_indices(axis),
+            )
+            for axis in range(layout.ndim)
+        ):
+            raise RuntimeError("sort: all operands must use the same local layout")
 
         operands.append(value)
 
+    if source_layout is None:
+        raise RuntimeError("sort: no live operand layout")
+
     result = lax.sort(
         tuple(operands),
-        dimension=ctx.plan.eqn.params["dimension"],
+        dimension=dimension,
         is_stable=ctx.plan.eqn.params["is_stable"],
         num_keys=ctx.plan.eqn.params["num_keys"],
     )
@@ -469,16 +486,14 @@ def lower_sort(
             outputs.append(None)
             continue
 
-        projected = value
-        for axis in range(layout.ndim):
-            if layout.local_shape[axis] == layout.global_shape[axis]:
-                continue
-            projected = jnp.take(
-                projected,
-                jnp.asarray(layout.global_axis_indices(axis)),
-                axis=axis,
+        target_local_rows = np.arange(layout.local_size, dtype=np.int64)
+        target_global_rows = layout.local_rows_to_global_rows(target_local_rows)
+        source_local_rows = source_layout.global_rows_to_local_rows(target_global_rows)
+        outputs.append(
+            jnp.reshape(
+                jnp.ravel(value)[jnp.asarray(source_local_rows)],
+                layout.local_shape,
             )
-
-        outputs.append(projected)
+        )
 
     return tuple(outputs)

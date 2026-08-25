@@ -6,7 +6,8 @@ from jax.extend.core import Literal
 
 from tatva.tracer.api import analyze
 from tatva.tracer.core.registry import SEMANTICS
-from tatva.tracer.core.semantics import DemandContext
+from tatva.tracer.core.semantics import DemandContext, TaggedDemandContext
+from tatva.tracer.core.tagged import TaggedDemand
 from tatva.tracer.local.demand import TensorDemand
 
 
@@ -37,6 +38,53 @@ def test_sort_demand_requires_full_copies_of_every_operand():
     assert len(demands) == 2
     assert all(demand is not None and demand.is_full for demand in demands)
     assert all(not isinstance(atom, Literal) for atom in eqn.invars)
+
+
+def test_batched_sort_demand_preserves_independent_axis_selection():
+    shape = (6, 1, 4)
+    eqn = _sort_eqn(
+        lambda key, value: lax.sort((key, value), dimension=2, num_keys=1),
+        jnp.zeros(shape),
+        jnp.zeros(shape),
+    )
+    first = TensorDemand.axis_selection(shape, axis=0, indices=[1, 4])
+    second = TensorDemand.axis_selection(shape, axis=0, indices=[2])
+    assert first is not None and second is not None
+
+    demands = SEMANTICS.get_ordinary(lax.sort_p).demand(
+        DemandContext(eqn=eqn, output_demands=(first, second), route=None)
+    )
+
+    assert len(demands) == 2
+    for demand in demands:
+        assert demand is not None
+        np.testing.assert_array_equal(demand.selected_indices(0), [1, 2, 4])
+        np.testing.assert_array_equal(demand.selected_indices(1), [0])
+        np.testing.assert_array_equal(demand.selected_indices(2), [0, 1, 2, 3])
+
+
+def test_batched_sort_tagged_demand_stays_within_one_slice():
+    shape = (3, 4)
+    eqn = _sort_eqn(
+        lambda key, value: lax.sort((key, value), dimension=1, num_keys=1),
+        jnp.zeros(shape),
+        jnp.zeros(shape),
+    )
+    output = TaggedDemand(
+        shape,
+        np.asarray([1 * shape[1] + 2]),
+        np.asarray([7]),
+    )
+
+    demands = SEMANTICS.get_ordinary(lax.sort_p).tagged_demand(
+        TaggedDemandContext(eqn=eqn, output_demands=(None, output), route=None)
+    )
+
+    assert len(demands) == 2
+    for demand in demands:
+        assert demand is not None
+        np.testing.assert_array_equal(demand.rows, [4, 5, 6, 7])
+        np.testing.assert_array_equal(demand.blocks, [7, 7, 7, 7])
 
 
 def test_partitioned_sort_keeps_global_inputs_and_local_sorted_rows():
@@ -85,6 +133,33 @@ def test_multi_operand_sort_preserves_cosorted_pairing_after_localization():
     for rank in range(2):
         local = distributed.rank(rank)
         inputs = local.localize(keys, values)
+        local_values.append(local.compile()(*inputs.args, **inputs.kwargs))
+
+    np.testing.assert_allclose(sum(local_values), objective(keys, values))
+
+
+def test_batched_sort_localizes_independent_slices():
+    n_batch = 12
+    width = 4
+
+    def objective(flat_keys, values):
+        keys = flat_keys.reshape(n_batch, width)
+        _, sorted_values = lax.sort((keys, values), dimension=1, num_keys=1)
+        return jnp.sum(sorted_values)
+
+    keys = jnp.arange(n_batch * width, dtype=jnp.float32)[::-1]
+    values = jnp.arange(n_batch * width, dtype=jnp.float32).reshape(n_batch, width)
+    distributed = analyze(objective, keys, values).distribute(
+        parts=3, blocks_per_part=2
+    )
+
+    local_values = []
+    for rank in range(distributed.parts):
+        local = distributed.rank(rank)
+        inputs = local.localize(keys, values)
+        assert inputs.args[0].size < keys.size
+        assert inputs.args[1].shape[0] < values.shape[0]
+        assert inputs.args[1].shape[1] == width
         local_values.append(local.compile()(*inputs.args, **inputs.kwargs))
 
     np.testing.assert_allclose(sum(local_values), objective(keys, values))

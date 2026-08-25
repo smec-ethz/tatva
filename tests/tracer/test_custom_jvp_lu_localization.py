@@ -186,3 +186,39 @@ def test_public_functional_custom_jvp_lu_distributes_without_global_lu():
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+def test_batched_inverse_transpose_solve_keeps_lu_local():
+    from tatva.tracer.api import analyze as analyze_functional
+
+    n_batch = 12
+    matrix_size = 2
+
+    def energy(dofs):
+        matrices = dofs.reshape(n_batch, 1, matrix_size, matrix_size)
+        matrices = matrices + 3.0 * jnp.eye(matrix_size)[None, None, :, :]
+        inverse = jnp.linalg.inv(matrices)
+        return jnp.sum(inverse * matrices)
+
+    dofs = jnp.arange(n_batch * matrix_size * matrix_size, dtype=jnp.float32) / 100
+    distribution = analyze_functional(energy, dofs).distribute(
+        parts=3, blocks_per_part=2
+    )
+
+    local_values = []
+    for rank in range(distribution.parts):
+        local = distribution.rank(rank)
+        localized = local.localize(dofs)
+        assert local.dofs.compute_rows.size < dofs.size
+        local_values.append(local.compile()(*localized.args, **localized.kwargs))
+        assert local.derivatives().hessian.shape == (
+            local.dofs.storage.local_size,
+            local.dofs.storage.local_size,
+        )
+
+    np.testing.assert_allclose(
+        np.asarray(sum(local_values)),
+        np.asarray(energy(dofs)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
