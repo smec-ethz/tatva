@@ -24,10 +24,9 @@ def test_invocation_local_opaque_cumprod_preserves_value_and_gradient():
     gradient = np.zeros(u.shape, dtype=np.float32)
     for rank in range(distributed.parts):
         local = distributed.rank(rank)
-        inputs = local.localize(u)
-        compiled = local.compile()
-        value += float(compiled(*inputs.args, **inputs.kwargs))
-        local_gradient = np.asarray(jax.grad(compiled)(*inputs.args, **inputs.kwargs))
+        args, kwargs = local.inputs(u)
+        value += float(local(*args, **kwargs))
+        local_gradient = np.asarray(jax.grad(local)(*args, **kwargs))
         gradient[local.dofs.storage.global_dofs] += local_gradient
 
     np.testing.assert_allclose(value, _element_cumprod_energy(u), rtol=1e-5)

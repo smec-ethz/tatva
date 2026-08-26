@@ -24,9 +24,8 @@ def _find_linear_solve(plan):
 def _local_executable(fn, dofs):
     traced = analyze(fn, dofs)
     local = traced.distribute(parts=1).rank(0)
-    executable = local.compile()
     rows = jnp.asarray(local.dofs.storage.global_dofs)
-    return lambda x: executable(x[rows])
+    return lambda x: local(x[rows])
 
 
 def _partitioned_local_executables(fn, dofs, n_parts):
@@ -35,9 +34,8 @@ def _partitioned_local_executables(fn, dofs, n_parts):
     result = []
     for part in range(n_parts):
         local = distributed.rank(part)
-        executable = local.compile()
         rows = jnp.asarray(local.dofs.storage.global_dofs)
-        result.append(lambda x, executable=executable, rows=rows: executable(x[rows]))
+        result.append(lambda x, local=local, rows=rows: local(x[rows]))
     return tuple(result)
 
 

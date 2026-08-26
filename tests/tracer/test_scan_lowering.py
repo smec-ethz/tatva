@@ -15,8 +15,8 @@ def _bind_reverse(energy, reverse):
 def _lower_part(fn, u, *, n_parts=1, part=0):
     traced = analyze(fn, u)
     local = traced.distribute(parts=n_parts).rank(part)
-    inputs = local.localize(u)
-    return local.compile()(*inputs.args, **inputs.kwargs)
+    args, kwargs = local.inputs(u)
+    return local(*args, **kwargs)
 
 
 def test_scan_lowering_matches_forward_and_reverse_scans():

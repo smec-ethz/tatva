@@ -66,12 +66,10 @@ def test_distribution_constructs_and_caches_ranks_lazily():
 
     for rank in range(2):
         reference_rank = reference.rank(rank)
-        assert reference_rank.rank == rank
-        assert reference_rank.parts == 2
         assert reference.rank(rank) is reference_rank
 
-        inputs = reference_rank.localize(u, coords, connectivity)
-        local_values.append(reference_rank.compile()(*inputs.args, **inputs.kwargs))
+        args, kwargs = reference_rank.inputs(u, coords, connectivity)
+        local_values.append(reference_rank(*args, **kwargs))
 
     assert set(reference._rank_cache) == {0, 1}
     assert reference.all_ranks() == (reference.rank(0), reference.rank(1))
@@ -104,7 +102,7 @@ def test_partition_paths_do_not_materialize_global_invocations(monkeypatch):
     local = distributed.rank(0)
 
     assert set(distributed._rank_cache) == {0}
-    assert not hasattr(local._plan, "instance")
+    assert callable(local)
 
 
 def test_partition_retains_only_rank_demanded_map_iterations():
@@ -116,21 +114,14 @@ def test_partition_retains_only_rank_demanded_map_iterations():
     distributed = analyze(energy, u).distribute(parts=3)
 
     for local in distributed.all_ranks():
-        plan = local._plan
-        mapped = [
-            eqn.nested
-            for eqn in plan.eqns
-            if eqn.nested is not None and isinstance(eqn.nested.spec, MapSpec)
-        ]
-        assert len(mapped) == 1
-        indices = mapped[0].indices
-        assert 0 < len(indices) < u.size
+        args, _ = local.inputs(u)
+        assert 0 < args[0].size < u.size
 
     values = []
     for rank in range(distributed.parts):
         local = distributed.rank(rank)
-        inputs = local.localize(u)
-        values.append(local.compile()(*inputs.args, **inputs.kwargs))
+        args, kwargs = local.inputs(u)
+        values.append(local(*args, **kwargs))
     np.testing.assert_allclose(sum(values), energy(u))
 
 

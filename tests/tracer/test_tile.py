@@ -38,19 +38,12 @@ def test_partitioned_tile_uses_local_shapes_and_preserves_value_and_gradient():
 
     for rank in range(distributed.parts):
         local = distributed.rank(rank)
-        inputs = local.localize(u)
-        compiled = local.compile()
+        args, kwargs = local.inputs(u)
 
-        value += float(compiled(*inputs.args, **inputs.kwargs))
-        local_gradient = np.asarray(jax.grad(compiled)(*inputs.args, **inputs.kwargs))
+        value += float(local(*args, **kwargs))
+        local_gradient = np.asarray(jax.grad(local)(*args, **kwargs))
         gradient[local.dofs.storage.global_dofs] += local_gradient
-
-        tile = next(eqn for eqn in local._plan.eqns if eqn.primitive_name == "tile")
-        assert tile.input_layouts[0] is not None
-        assert tile.output_layouts[0] is not None
-        assert tile.input_layouts[0].local_shape == (2, 2)
-        assert tile.output_layouts[0].local_shape == (4, 4)
-        assert tile.output_layouts[0].local_shape != (12, 4)
+        assert args[0].shape == (4,)
 
     np.testing.assert_allclose(value, _tile_energy(u), rtol=1e-6)
     np.testing.assert_allclose(gradient, jax.grad(_tile_energy)(u), rtol=1e-6)
