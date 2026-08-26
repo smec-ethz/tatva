@@ -21,7 +21,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import prod
 
+import jax.numpy as jnp
 import numpy as np
+from jax import Array
 from numpy.typing import ArrayLike, NDArray
 
 from tatva.tracer.local.demand import (
@@ -353,6 +355,41 @@ class TensorLayout:
         global_rows = np.ravel_multi_index(global_coords, self.global_shape)
 
         return np.asarray(global_rows, dtype=np.int64).reshape(original_shape)
+
+    def extract(self, value: ArrayLike) -> Array:
+        """Extract the local value from the tensor layout."""
+        result = jnp.asarray(value)
+
+        if tuple(result.shape) != self.global_shape:
+            raise ValueError(
+                f"global input shape {result.shape} does not "
+                f"match layout {self.global_shape}"
+            )
+
+        for axis in range(self.ndim):
+            subset = self.axis_subset(axis)
+
+            if isinstance(subset, _FullAxis):
+                continue
+
+            if isinstance(subset, _RangeAxis):
+                slices = [slice(None)] * result.ndim
+                slices[axis] = slice(subset.start, subset.stop)
+                result = result[tuple(slices)]
+                continue
+
+            if isinstance(subset, _IndexAxis):
+                result = jnp.take(result, jnp.asarray(subset.indices), axis=axis)
+                continue
+
+            raise TypeError(f"unsupported axis subset {type(subset)!r}")
+
+        if tuple(result.shape) != self.local_shape:
+            raise RuntimeError(
+                f"localized value has shape {result.shape}; expected {self.local_shape}"
+            )
+
+        return result
 
 
 def finalize_layout(

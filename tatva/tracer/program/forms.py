@@ -25,6 +25,7 @@ from numpy.typing import NDArray
 
 from tatva.tracer.capture import CallABI
 from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.inputs import LocalInputPlan
 from tatva.tracer.program.dependencies import DependencySet
 
 
@@ -242,6 +243,123 @@ class FormSpec:
     @property
     def coordinate_input_indices(self) -> tuple[int, ...]:
         return tuple(sorted({block.input_index for block in self.coordinates}))
+
+
+@dataclass(frozen=True, slots=True)
+class LocalForm:
+    spec: FormSpec
+    row_global_ids: NDArray[np.int64]
+    column_global_ids: NDArray[np.int64]
+    global_shape: tuple[int, int]
+    row_block_names: tuple[str, ...]
+    column_block_names: tuple[str, ...]
+
+
+def localize_form(
+    form: FormSpec,
+    inputs: LocalInputPlan,
+) -> LocalForm:
+    """Project a global form onto the rank-local input coordinate spaces."""
+
+    local_blocks: list[CoordinateBlock] = []
+    block_global_ids: dict[str, NDArray[np.int64]] = {}
+    block_global_sizes: dict[str, int] = {}
+
+    # Localize every form coordinate block.
+    for block in form.coordinates:
+        try:
+            candidate_global_rows = inputs.global_rows(block.input_index)
+            global_value = inputs.global_examples[block.input_index]
+        except IndexError as exc:
+            raise RuntimeError(
+                f"coordinate block {block.name!r} references "
+                f"input {block.input_index}, which does not exist"
+            ) from exc
+
+        if candidate_global_rows is None:
+            raise RuntimeError(
+                f"coordinate block {block.name!r} references "
+                f"compiler-dead local input {block.input_index}"
+            )
+
+        original_input_size = int(np.prod(np.shape(global_value), dtype=np.int64))
+        local_block, global_ids = _local_coordinate_block(
+            block, candidate_global_rows, original_input_size
+        )
+
+        local_blocks.append(local_block)
+        block_global_ids[block.name] = global_ids
+        block_global_sizes[block.name] = block.rows(original_input_size).size
+
+    local_spec = FormSpec(tuple(local_blocks))
+
+    # Convert per-coordinate-block global IDs into the flattened
+    # row/column coordinate spaces used by the matrix pattern.
+    def coordinate_axis(
+        *, rows: bool
+    ) -> tuple[NDArray[np.int64], tuple[str, ...], int]:
+        ids: list[NDArray[np.int64]] = []
+        names: list[str] = []
+
+        offset = 0
+
+        for block in form.coordinates:
+            included = block.role.is_row if rows else block.role.is_column
+            if not included:
+                continue
+
+            names.append(block.name)
+            ids.append(block_global_ids[block.name] + offset)
+            offset += block_global_sizes[block.name]
+
+        global_ids = np.concatenate(ids) if ids else np.empty(0, dtype=np.int64)
+
+        return (global_ids, tuple(names), offset)
+
+    row_ids, row_names, global_rows = coordinate_axis(rows=True)
+    column_ids, column_names, global_columns = coordinate_axis(rows=False)
+
+    return LocalForm(
+        spec=local_spec,
+        row_global_ids=row_ids,
+        column_global_ids=column_ids,
+        global_shape=(global_rows, global_columns),
+        row_block_names=row_names,
+        column_block_names=column_names,
+    )
+
+
+def _local_coordinate_block(
+    block: CoordinateBlock,
+    candidate_global_rows: NDArray[np.int64],
+    original_input_size: int,
+) -> tuple[CoordinateBlock, NDArray[np.int64]]:
+    selected_global_rows = block.rows(original_input_size)
+    position = {
+        int(global_row): index for index, global_row in enumerate(selected_global_rows)
+    }
+    local_rows = np.fromiter(
+        (
+            local_row
+            for local_row, global_row in enumerate(candidate_global_rows)
+            if int(global_row) in position
+        ),
+        dtype=np.int64,
+    )
+    block_global_ids = np.fromiter(
+        (position[int(candidate_global_rows[row])] for row in local_rows),
+        dtype=np.int64,
+    )
+    return (
+        CoordinateBlock(
+            name=block.name,
+            input_index=block.input_index,
+            role=block.role,
+            value_source=block.value_source,
+            selection=tuple(int(row) for row in local_rows),
+        ),
+        block_global_ids,
+    )
 
 
 @dataclass(frozen=True, slots=True)

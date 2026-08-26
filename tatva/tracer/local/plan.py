@@ -126,6 +126,14 @@ class LocalJaxprPlan:
     eqns: tuple[LocalEqnPlan, ...]
 
     @property
+    def live_input_indices(self) -> tuple[int, ...]:
+        return tuple(
+            index
+            for index, layout in enumerate(self.input_layouts)
+            if layout is not None
+        )
+
+    @property
     def global_eqn_count(self) -> int:
         return len(self.plan.eqns)
 

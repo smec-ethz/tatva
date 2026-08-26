@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import StrEnum
 
 import numpy as np
 import scipy.sparse as sps
@@ -45,10 +45,10 @@ from tatva.tracer.program.contributions import (
 from tatva.tracer.program.incidence import BlockDofIncidence
 
 
-class PartitionStrategy(Enum):
-    CONTIGUOUS = auto()
-    INCIDENCE = auto()
-    MTKAHYPAR = auto()
+class PartitionStrategy(StrEnum):
+    CONTIGUOUS = "contiguous"
+    INCIDENCE = "incidence"
+    MTKAHYPAR = "mtkahypar"
 
 
 @dataclass(frozen=True, slots=True)
