@@ -5,8 +5,9 @@ import pytest
 import scipy.sparse as sps
 
 import tatva.tracer.diagnostics as tracer_diagnostics
-from tatva.tracer import LocalDerivativeTrace, analyze
+from tatva.tracer.api import analyze
 from tatva.tracer.diagnostics import global_derivatives
+from tatva.tracer.local.sparsity import LocalMatrixPattern
 
 
 def _stencil_energy(dofs):
@@ -46,25 +47,29 @@ def test_local_hessians_use_storage_coordinates_and_reconstruct_global_pattern()
 
     for rank in range(distributed.parts):
         local = distributed.rank(rank)
-        derivatives = local.derivatives()
+        pattern = local.sparsity
 
-        assert isinstance(derivatives, LocalDerivativeTrace)
-        assert local.derivatives() is derivatives
-        assert derivatives.hessian.shape == (
+        assert isinstance(pattern, LocalMatrixPattern)
+        assert local.sparsity is pattern
+        assert pattern.pattern.shape == (
             local.dofs.storage.local_size,
             local.dofs.storage.local_size,
         )
         np.testing.assert_array_equal(
-            derivatives.storage_global_dofs,
+            pattern.row_global_ids,
             local.dofs.storage.global_dofs,
         )
-        global_coo = derivatives.global_hessian_coo()
+        np.testing.assert_array_equal(
+            pattern.column_global_ids,
+            local.dofs.storage.global_dofs,
+        )
+        global_coo = pattern.global_coo()
         assert sps.isspmatrix_coo(global_coo)
         translated.append(global_coo)
 
         storage_example = dofs[jnp.asarray(local.dofs.storage.global_dofs)]
-        numerical = np.asarray(jax.hessian(local.compile())(storage_example))
-        structural = derivatives.hessian.astype(bool).toarray()
+        numerical = np.asarray(jax.hessian(local)(storage_example))
+        structural = pattern.pattern.toarray()
         assert np.all((np.abs(numerical) > 0) <= structural)
 
     assert any(
@@ -92,7 +97,7 @@ def test_partition_and_compilation_do_not_trace_global_derivatives(monkeypatch):
     for rank in range(distributed.parts):
         local = distributed.rank(rank)
         storage = dofs[jnp.asarray(local.dofs.storage.global_dofs)]
-        values.append(local.compile()(storage))
+        values.append(local(storage))
 
     np.testing.assert_allclose(sum(values), _stencil_energy(dofs))
     assert not hasattr(traced, "derivatives")
@@ -107,7 +112,7 @@ def test_nested_local_hessian_union_matches_global_pattern(energy):
     distributed = traced.distribute(parts=2)
 
     translated = [
-        distributed.rank(rank).derivatives().global_hessian_coo()
+        distributed.rank(rank).sparsity.global_coo()
         for rank in range(distributed.parts)
     ]
     global_pattern = global_derivatives(traced).hessian.astype(bool)

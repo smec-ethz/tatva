@@ -100,15 +100,14 @@ def test_partitioned_sort_keeps_global_inputs_and_local_sorted_rows():
     local_grads = []
     for rank in range(2):
         local = distributed.rank(rank)
-        inputs = local.localize(keys, values)
+        args, kwargs = local.inputs(keys, values)
         # Sort's demand rule makes both operands available in their global form.
-        assert tuple(inputs.args[0].shape) == tuple(keys.shape)
-        assert tuple(inputs.args[1].shape) == tuple(values.shape)
+        assert tuple(args[0].shape) == tuple(keys.shape)
+        assert tuple(args[1].shape) == tuple(values.shape)
 
-        local_function = local.compile()
-        local_values.append(local_function(*inputs.args, **inputs.kwargs))
-        local_grads.append(jax.grad(local_function, argnums=(0, 1))(*inputs.args))
-        assert "sort[" in str(jax.make_jaxpr(local_function)(*inputs.args))
+        local_values.append(local(*args, **kwargs))
+        local_grads.append(jax.grad(local, argnums=(0, 1))(*args))
+        assert "sort[" in str(jax.make_jaxpr(local)(*args))
 
     np.testing.assert_allclose(sum(local_values), objective(keys, values))
     global_grads = jax.grad(objective, argnums=(0, 1))(keys, values)
@@ -132,8 +131,8 @@ def test_multi_operand_sort_preserves_cosorted_pairing_after_localization():
     local_values = []
     for rank in range(2):
         local = distributed.rank(rank)
-        inputs = local.localize(keys, values)
-        local_values.append(local.compile()(*inputs.args, **inputs.kwargs))
+        args, kwargs = local.inputs(keys, values)
+        local_values.append(local(*args, **kwargs))
 
     np.testing.assert_allclose(sum(local_values), objective(keys, values))
 
@@ -156,10 +155,10 @@ def test_batched_sort_localizes_independent_slices():
     local_values = []
     for rank in range(distributed.parts):
         local = distributed.rank(rank)
-        inputs = local.localize(keys, values)
-        assert inputs.args[0].size < keys.size
-        assert inputs.args[1].shape[0] < values.shape[0]
-        assert inputs.args[1].shape[1] == width
-        local_values.append(local.compile()(*inputs.args, **inputs.kwargs))
+        args, kwargs = local.inputs(keys, values)
+        assert args[0].size < keys.size
+        assert args[1].shape[0] < values.shape[0]
+        assert args[1].shape[1] == width
+        local_values.append(local(*args, **kwargs))
 
     np.testing.assert_allclose(sum(local_values), objective(keys, values))

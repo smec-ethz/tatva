@@ -1,33 +1,27 @@
-from typing import cast
-
 import jax.numpy as jnp
 import numpy as np
 
 from tatva.lifter import Lifter
 from tatva.tracer.api import analyze_captured
 from tatva.tracer.capture import CapturedJaxpr
-from tatva.tracer.local.dof_plan import LocalDofPlan
-from tatva.tracer.local.inputs import _localize_tree
+from tatva.tracer.local.inputs import _reconstruct_node
 
 
-def test_localize_tree_preserves_leafless_pytree_children():
+def test_reconstruct_node_preserves_leafless_pytree_children():
     lifter = Lifter(6)
     free_dofs = jnp.array([0, 1, 2])
     constrained_dofs = jnp.array([], dtype=jnp.int32)
 
-    localized = _localize_tree(
-        global_value=lifter,
+    localized, _ = _reconstruct_node(
+        lifter,
         leaves=iter(((free_dofs, None), (constrained_dofs, None))),
-        rank=0,
-        halo=cast(LocalDofPlan, None),  # Lifter reconstruction does not use it.
         specializers={},
-        parameter_name="lifter",
-        is_parameter_root=True,
+        param_name="lifter",
     )
 
-    assert localized.value._runtime_values == {}
-    np.testing.assert_array_equal(localized.value.free_dofs, free_dofs)
-    np.testing.assert_array_equal(localized.value.constrained_dofs, constrained_dofs)
+    assert localized._runtime_values == {}
+    np.testing.assert_array_equal(localized.free_dofs, free_dofs)
+    np.testing.assert_array_equal(localized.constrained_dofs, constrained_dofs)
 
 
 def test_dead_gather_indices_do_not_prevent_local_execution():
@@ -53,16 +47,16 @@ def test_dead_gather_indices_do_not_prevent_local_execution():
     local_values = []
     for rank in range(2):
         local = distributed.rank(rank)
-        inputs = local.localize(u, coords, connectivity)
-        local_u, local_coords, local_connectivity = inputs.args
+        args, kwargs = local.inputs(u, coords, connectivity)
+        local_u, local_coords, local_connectivity = args
 
-        assert not inputs.kwargs
+        assert not kwargs
         assert 0 < local_u.shape[0] < u.shape[0]
         assert local_coords.shape[1:] == coords.shape[1:]
         assert 0 < local_coords.shape[0] < coords.shape[0]
         assert local_connectivity is None
 
-        local_values.append(local.compile()(*inputs.args, **inputs.kwargs))
+        local_values.append(local(*args, **kwargs))
 
     np.testing.assert_allclose(
         sum(local_values), energy(u, coords, connectivity), rtol=1e-6
@@ -98,19 +92,19 @@ def test_distinct_index_inputs_may_use_distinct_operand_maps():
     local_values = []
     for rank in range(2):
         local = distributed.rank(rank)
-        inputs = local.localize(
+        args, kwargs = local.inputs(
             u,
             auxiliary,
             u_indices,
             auxiliary_indices,
         )
-        _, _, local_u_indices, local_auxiliary_indices = inputs.args
+        _, _, local_u_indices, local_auxiliary_indices = args
 
-        assert not inputs.kwargs
+        assert not kwargs
         assert local_u_indices is None
         assert local_auxiliary_indices is None
 
-        local_values.append(local.compile()(*inputs.args, **inputs.kwargs))
+        local_values.append(local(*args, **kwargs))
 
     np.testing.assert_allclose(
         sum(local_values),

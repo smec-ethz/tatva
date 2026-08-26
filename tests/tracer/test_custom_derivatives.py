@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tatva.tracer import FunctionalAnalysis, analyze
+from tatva.tracer.api import FunctionalAnalysis, analyze
 from tatva.tracer.core.nested import CustomJvpSpec
 from tatva.tracer.diagnostics import (
     contribution_blocks,
@@ -212,24 +212,16 @@ def test_custom_jvp_local_plan_keeps_derivative_only_operand():
     u = _example_u()
     traced = analyze(energy_custom_jvp, u)
     local = traced.distribute(parts=1).rank(0)
+    args, _ = local.inputs(u)
 
-    custom_eqns = _custom_jvp_local_eqns(local._plan)
-    assert len(custom_eqns) == 1
-
-    eqn_plan = custom_eqns[0]
-    assert eqn_plan.nested is not None
-    input_indices = tuple(range(len(eqn_plan.input_layouts)))
-
-    # x and y must both survive, even though y is unused by the primal body.
-    assert len(input_indices) == 2
-
-    for input_index in input_indices:
-        layout = eqn_plan.input_layouts[input_index]
-        assert layout is not None, f"custom operand {input_index} was dropped"
-        assert layout.is_full, (
-            f"custom operand {input_index} is not invocation-local FULL: "
-            f"global={layout.global_shape}, local={layout.local_shape}"
-        )
+    # The lowered callable must retain the custom call and its derivative-only
+    # operand, even though that operand is unused by the primal body.
+    custom_eqn = next(
+        eqn
+        for eqn in jax.make_jaxpr(local)(*args).jaxpr.eqns
+        if eqn.primitive.name == "custom_jvp_call"
+    )
+    assert len(custom_eqn.invars) == 2
 
 
 # -----------------------------------------------------------------------------
@@ -241,10 +233,8 @@ def test_compiled_custom_jvp_preserves_primal_value():
     u = _example_u()
     traced = analyze(energy_custom_jvp, u)
     local = traced.distribute(parts=1).rank(0)
-    compiled = local.compile()
-
     expected = energy_custom_jvp(u)
-    actual = compiled(u)
+    actual = local(u)
 
     np.testing.assert_allclose(
         np.asarray(actual),
@@ -272,9 +262,7 @@ def test_compiled_custom_jvp_preserves_custom_gradient():
 
     traced = analyze(energy_custom_jvp, u)
     local = traced.distribute(parts=1).rank(0)
-    compiled = local.compile()
-
-    actual = jax.grad(compiled)(u)
+    actual = jax.grad(local)(u)
 
     np.testing.assert_allclose(
         np.asarray(actual),
@@ -303,10 +291,9 @@ def test_partitioned_custom_jvp_preserves_first_order_ad():
 
     for rank in range(distributed.parts):
         local = distributed.rank(rank)
-        inputs = local.localize(u)
-        compiled = local.compile()
-        values.append(compiled(*inputs.args, **inputs.kwargs))
-        gradient = np.asarray(jax.grad(compiled)(*inputs.args, **inputs.kwargs))
+        args, kwargs = local.inputs(u)
+        values.append(local(*args, **kwargs))
+        gradient = np.asarray(jax.grad(local)(*args, **kwargs))
         gradient_sum[local.dofs.storage.global_dofs] += gradient
 
     np.testing.assert_allclose(sum(values), energy_custom_jvp(u), rtol=1e-6, atol=1e-6)
@@ -323,21 +310,11 @@ def test_custom_jvp_program_is_localized_before_transpose_lowering():
 
     for rank in range(distributed.parts):
         local = distributed.rank(rank)
-        eqn = _custom_jvp_local_eqns(local._plan)[0]
-        assert eqn.input_layouts[0] is not None
-        assert eqn.output_layouts[0] is not None
-        assert eqn.input_layouts[0].local_shape == (40, 1, 2, 2)
-        assert eqn.output_layouts[0].local_shape == (40, 1, 2, 2)
-        assert eqn.nested is not None
-        for child_eqn in eqn.nested.invocation.jvp.eqns:  # ty: ignore[unresolved-attribute]
-            for layout in child_eqn.output_layouts:
-                if layout is not None and layout.global_shape[:1] == (200,):
-                    assert layout.local_shape[0] == 40
-
-        inputs = local.localize(u)
-        compiled = local.compile()
-        value += float(compiled(*inputs.args, **inputs.kwargs))
-        local_gradient = np.asarray(jax.grad(compiled)(*inputs.args, **inputs.kwargs))
+        args, kwargs = local.inputs(u)
+        assert args[0].size < u.size
+        assert "custom_jvp_call" in str(jax.make_jaxpr(local)(*args, **kwargs))
+        value += float(local(*args, **kwargs))
+        local_gradient = np.asarray(jax.grad(local)(*args, **kwargs))
         gradient[local.dofs.storage.global_dofs] += local_gradient
 
     np.testing.assert_allclose(value, energy_transposed_custom_jvp(u))
@@ -347,7 +324,7 @@ def test_custom_jvp_program_is_localized_before_transpose_lowering():
 def test_localized_custom_jvp_supports_first_order_transforms_and_jit():
     u = _example_u()
     tangent = jnp.ones_like(u)
-    compiled = analyze(energy_custom_jvp, u).distribute(parts=1).rank(0).compile()
+    compiled = analyze(energy_custom_jvp, u).distribute(parts=1).rank(0)
     expected = jax.jvp(energy_custom_jvp, (u,), (tangent,))
     actual = jax.jit(lambda x, xd: jax.jvp(compiled, (x,), (xd,)))(u, tangent)
     np.testing.assert_allclose(actual[0], expected[0])
@@ -391,7 +368,7 @@ def test_localized_custom_jvp_supports_dead_multiple_output():
     gradient = np.zeros_like(np.asarray(u))
     for rank in range(2):
         local = distributed.rank(rank)
-        inputs = local.localize(u)
-        local_gradient = np.asarray(jax.grad(local.compile())(*inputs.args))
+        args, _ = local.inputs(u)
+        local_gradient = np.asarray(jax.grad(local)(*args))
         gradient[local.dofs.storage.global_dofs] += local_gradient
     np.testing.assert_allclose(gradient, jax.grad(energy)(u))

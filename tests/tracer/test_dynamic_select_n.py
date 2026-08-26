@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
-from tatva.tracer import analyze
+from tatva.tracer.api import analyze
 
 
 def _energy(u):
@@ -21,10 +21,9 @@ def test_dof_dependent_select_n_plans_and_lowers_locally():
     gradients = []
     for rank in range(2):
         local = distributed.rank(rank)
-        inputs = local.localize(u)
-        compiled = local.compile()
-        values.append(compiled(*inputs.args, **inputs.kwargs))
-        gradients.append(jax.grad(compiled)(*inputs.args, **inputs.kwargs))
+        args, kwargs = local.inputs(u)
+        values.append(local(*args, **kwargs))
+        gradients.append(jax.grad(local)(*args, **kwargs))
 
     np.testing.assert_allclose(sum(values), _energy(u))
     expected_grad = jax.grad(_energy)(u)

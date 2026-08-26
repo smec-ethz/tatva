@@ -9,7 +9,7 @@ from jax.extend import core
 if not hasattr(lax, "stack_p"):
     lax.stack_p = core.Primitive("stack_compat")
 
-from tatva.tracer import analyze as analyze_functional
+from tatva.tracer.api import analyze as analyze_functional
 from tatva.tracer.program.analysis import analyze
 from tatva.tracer.program.concrete_resolver import ConcreteResolver
 from tatva.tracer.program.derivatives import trace_form_derivatives
@@ -287,7 +287,7 @@ def test_custom_jvp_override_can_remove_primal_hessian_support():
 
 
 def test_distributed_weak_form_reuses_local_form_derivative_pipeline():
-    from tatva.tracer import analyze_form
+    from tatva.tracer.api import analyze_form
 
     n_elements = 6
     width = 2
@@ -309,16 +309,16 @@ def test_distributed_weak_form_reuses_local_form_derivative_pipeline():
     )
 
     for rank in range(distribution.parts):
-        derivative = distribution.rank(rank).derivatives()
-        assert derivative.row_block_names == ("v",)
-        assert derivative.column_block_names == ("u",)
+        pattern = distribution.rank(rank).sparsity
+        assert pattern.row_block_names == ("v",)
+        assert pattern.column_block_names == ("u",)
         np.testing.assert_array_equal(
-            derivative.tangent.toarray().astype(bool),
-            np.eye(derivative.tangent.shape[0], dtype=bool),
+            pattern.pattern.toarray().astype(bool),
+            np.eye(pattern.pattern.shape[0], dtype=bool),
         )
         np.testing.assert_array_equal(
-            derivative.block_global_ids["v"],
-            derivative.block_global_ids["u"],
+            pattern.row_global_ids,
+            pattern.column_global_ids,
         )
 
 
@@ -385,12 +385,12 @@ def test_annotated_analyze_end_to_end():
     )
 
     for rank in range(distribution.parts):
-        derivative = distribution.rank(rank).derivatives()
-        assert derivative.row_block_names == ("test",)
-        assert derivative.column_block_names == ("x",)
+        pattern = distribution.rank(rank).sparsity
+        assert pattern.row_block_names == ("test",)
+        assert pattern.column_block_names == ("x",)
         np.testing.assert_array_equal(
-            derivative.tangent.toarray().astype(bool),
-            np.eye(derivative.tangent.shape[0], dtype=bool),
+            pattern.pattern.toarray().astype(bool),
+            np.eye(pattern.pattern.shape[0], dtype=bool),
         )
 
 
@@ -411,14 +411,13 @@ def test_annotated_test_may_precede_storage_backed_trial_input():
     local_values = []
     for rank in range(distribution.parts):
         local = distribution.rank(rank)
-        assert local.dof_input_index == 1
-        localized = local.localize(test, trial)
-        assert localized.args[0].size < test.size
-        assert localized.args[1].size < trial.size
-        local_values.append(local.compile()(*localized.args, **localized.kwargs))
-        derivative = local.derivatives()
-        assert derivative.row_block_names == ("v",)
-        assert derivative.column_block_names == ("u",)
+        args, kwargs = local.inputs(test, trial)
+        assert args[0].size < test.size
+        assert args[1].size < trial.size
+        local_values.append(local(*args, **kwargs))
+        pattern = local.sparsity
+        assert pattern.row_block_names == ("v",)
+        assert pattern.column_block_names == ("u",)
 
     np.testing.assert_allclose(sum(local_values), weak(test, trial))
 
@@ -441,11 +440,10 @@ def test_annotated_state_may_follow_a_noncoordinate_input():
     local_values = []
     for rank in range(distribution.parts):
         local = distribution.rank(rank)
-        assert local.dof_input_index == 1
-        localized = local.localize(scale, state)
-        assert localized.args[0] is None
-        assert localized.args[1].size < state.size
-        local_values.append(local.compile()(*localized.args, **localized.kwargs))
-        assert local.derivatives().hessian.shape[0] == localized.args[1].size
+        args, kwargs = local.inputs(scale, state)
+        assert args[0] is None
+        assert args[1].size < state.size
+        local_values.append(local(*args, **kwargs))
+        assert local.sparsity.pattern.shape[0] == args[1].size
 
     np.testing.assert_allclose(sum(local_values), energy(scale, state))

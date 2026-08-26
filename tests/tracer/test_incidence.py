@@ -140,8 +140,8 @@ def test_incidence_partition_executes_same_functional():
     values = []
     for rank in range(2):
         local = distributed.rank(rank)
-        inputs = local.localize(u, connectivity)
-        values.append(local.compile()(*inputs.args, **inputs.kwargs))
+        args, kwargs = local.inputs(u, connectivity)
+        values.append(local(*args, **kwargs))
 
     np.testing.assert_allclose(sum(values), _gather_energy(u, connectivity))
 

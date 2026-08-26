@@ -12,7 +12,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_custom_jvp_keeps_primal_and_jvp_captures_separate() -> None:
-    from tatva.tracer import analyze
+    from tatva.tracer.api import analyze
 
     primal_scale = jnp.asarray(3.0)
     jvp_scale = jnp.asarray(5.0)
@@ -32,18 +32,17 @@ def test_custom_jvp_keeps_primal_and_jvp_captures_separate() -> None:
 
     u = jnp.arange(6.0, dtype=jnp.float32)
     local = analyze(objective, u).distribute(parts=1).rank(0)
-    args = local.localize(u)
-    executable = local.compile()
+    args, kwargs = local.inputs(u)
 
-    assert jnp.allclose(executable(*args.args, **args.kwargs), objective(u))
+    assert jnp.allclose(local(*args, **kwargs), objective(u))
     assert jnp.allclose(
-        jax.grad(executable)(*args.args),
+        jax.grad(local)(*args),
         2 * primal_scale * jvp_scale * u,
     )
 
 
 def test_custom_vjp_is_explicitly_unsupported() -> None:
-    from tatva.tracer import analyze
+    from tatva.tracer.api import analyze
     from tatva.tracer.support import SupportPreflightError
 
     @jax.custom_vjp

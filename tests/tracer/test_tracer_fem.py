@@ -10,7 +10,7 @@ from tatva import Mesh, Operator, linalg
 from tatva.compound import Compound, field
 from tatva.element.base import Tri3
 from tatva.lifter import Fixed, Lifter, Periodic, RuntimeValue
-from tatva.tracer import analyze, analyze_captured
+from tatva.tracer.api import analyze, analyze_captured
 from tatva.tracer.capture import CapturedJaxpr
 
 jax.config.update("jax_enable_x64", True)
@@ -130,31 +130,24 @@ def test_tracer_fem():
     n_parts = 6
     rank = 0
     distributed = traced.distribute(parts=n_parts)
-    op_slice = next(
-        flat_slice
-        for name, _tree, flat_slice in cap.call_abi.parameter_trees()
-        if name == "op"
-    )
     for local_rank in distributed.all_ranks():
-        plan = local_rank._plan
-        coordinate_layout = next(
-            layout
-            for layout in plan.input_layouts[op_slice]
-            if layout is not None and layout.global_shape == mesh.coords.shape
+        args, _ = local_rank.inputs(
+            jnp.zeros(lifter.size_reduced),
+            lifter=lifter.at("u").set(1.0),
+            mat=mat,
+            op=op,
         )
-        assert not coordinate_layout.is_full
-        assert coordinate_layout.local_shape[0] < mesh.coords.shape[0]
+        assert args[1].mesh.coords.shape[0] < mesh.coords.shape[0]
 
     local = distributed.rank(rank)
-    energy_local = local.compile()
-    inputs = local.localize(
+    args, _ = local.inputs(
         jnp.zeros(lifter.size_reduced), lifter=lifter.at("u").set(1.0), mat=mat, op=op
     )
-    _z_local, op_local, lifter_local, mat_local = inputs.args
+    _z_local, op_local, lifter_local, mat_local = args
 
     # execute the local function
 
-    energy_local(
+    local(
         jnp.zeros(local.dofs.storage.local_size),
         op_local,
         lifter_local.at("u").set(1e-4),
@@ -182,10 +175,8 @@ def test_local_grad_u_sum_matches_original():
     op = Operator(mesh, Tri3())
     traced = analyze(energy_functional, jnp.zeros(mesh.coords.shape[0] * 2), op=op)
     local = traced.distribute(parts=1).rank(0)
-    energy_local = local.compile()
-
     random_x = jax.random.normal(jax.random.PRNGKey(0), (mesh.coords.size,)) * 1e-3
     e_original = energy_functional(random_x, op)
-    e_local = energy_local(random_x, op)
+    e_local = local(random_x, op)
 
     assert np.isclose(e_original, e_local)

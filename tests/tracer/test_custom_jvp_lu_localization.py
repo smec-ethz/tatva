@@ -164,14 +164,13 @@ def test_public_functional_custom_jvp_lu_distributes_without_global_lu():
 
     for rank in range(distribution.parts):
         local = distribution.rank(rank)
-        localized = local.localize(dofs)
-        fn = local.compile()
+        args, kwargs = local.inputs(dofs)
 
         # The LU callback must execute on a strict subset of the global domain.
         assert local.dofs.compute_rows.size < dofs.size
 
-        local_values.append(fn(*localized.args, **localized.kwargs))
-        local_gradient = np.asarray(jax.grad(fn)(*localized.args, **localized.kwargs))
+        local_values.append(local(*args, **kwargs))
+        local_gradient = np.asarray(jax.grad(local)(*args, **kwargs))
         assembled_gradient[local.dofs.storage.global_dofs] += local_gradient
 
     np.testing.assert_allclose(
@@ -208,10 +207,10 @@ def test_batched_inverse_transpose_solve_keeps_lu_local():
     local_values = []
     for rank in range(distribution.parts):
         local = distribution.rank(rank)
-        localized = local.localize(dofs)
+        args, kwargs = local.inputs(dofs)
         assert local.dofs.compute_rows.size < dofs.size
-        local_values.append(local.compile()(*localized.args, **localized.kwargs))
-        assert local.derivatives().hessian.shape == (
+        local_values.append(local(*args, **kwargs))
+        assert local.sparsity.pattern.shape == (
             local.dofs.storage.local_size,
             local.dofs.storage.local_size,
         )
