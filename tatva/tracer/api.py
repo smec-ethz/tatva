@@ -2,27 +2,26 @@ from __future__ import annotations
 
 import functools
 import typing
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
-import jax.numpy as jnp
 from numpy.typing import ArrayLike, NDArray
 
 from tatva.tracer.capture import CapturedJaxpr, make_captured_jaxpr
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.local.derivatives import LocalDerivativeTrace, trace_local_derivatives
 from tatva.tracer.local.dof_plan import (
     LocalDofPlan,
     build_local_dof_plan,
 )
-from tatva.tracer.local.inputs import LocalizeOverrides, localize_inputs
+from tatva.tracer.local.inputs import LocalInputPlan, build_local_input_plan
 from tatva.tracer.local.liveness import DemandSeed, backpropagate_plan_demand
-from tatva.tracer.local.plan import LocalJaxprPlan, build_rank_local_plan
-from tatva.tracer.lowering.executor import build_local_executable
+from tatva.tracer.local.plan import build_rank_local_plan
+from tatva.tracer.local.sparsity import LocalMatrixPattern, trace_local_matrix_pattern
+from tatva.tracer.lowering.executor import build_local_function
 from tatva.tracer.lowering.partition import (
     ContributionPartition,
     DistributionAssignments,
-    OwnedContribution,
     PartitionStrategy,
     partition_contribution_from_assignments,
     plan_distribution_assignments,
@@ -31,7 +30,12 @@ from tatva.tracer.program.analysis import JaxprPlan
 from tatva.tracer.program.analysis import analyze as analyze_jaxpr
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.contributions import ContributionTrace, detect_contributions
-from tatva.tracer.program.forms import FormSpec, infer_form_spec
+from tatva.tracer.program.forms import (
+    FormSpec,
+    LocalForm,
+    infer_form_spec,
+    localize_form,
+)
 from tatva.tracer.program.incidence import (
     BlockCoordinateIncidence,
     generate_contribution_blocks,
@@ -49,13 +53,10 @@ from tatva.tracer.program.incidence_distributed import (
 )
 from tatva.tracer.support import require_local_routes, require_registered_operations
 
+if typing.TYPE_CHECKING:
+    from mpi4py import MPI
 
-@dataclass(frozen=True)
-class LocalArguments:
-    """Rank-local arguments ready to pass to a compiled local functional."""
-
-    args: tuple[Any, ...]
-    kwargs: dict[str, Any]
+    Comm = MPI.Comm
 
 
 @dataclass(frozen=True, eq=False)
@@ -115,7 +116,7 @@ class FunctionalAnalysis[**P, R]:
             assignments=assignments,
         )
 
-    def distribute_mpi(
+    def distribute_collectively(
         self,
         *,
         comm,
@@ -342,17 +343,28 @@ class DistributionPlan[**P, R]:
             rank=rank,
             n_ranks=self.parts,
         )
-        local = LocalFunctional(
-            rank=rank,
-            parts=self.parts,
+
+        input_plan = build_local_input_plan(
+            captured=functional._captured,
+            local_plan=local_plan,
             dofs=dofs,
             dof_input_index=dof_input_index,
-            _captured=functional._captured,
-            _contributions=functional._contributions,
-            _owned=owned,
-            _plan=local_plan,
-            _form=functional._form,
         )
+        executable = build_local_function(
+            local_plan,
+            contributions=functional._contributions,
+            owned=owned,
+            captured=functional._captured,
+            inputs=input_plan,
+        )
+        local_form = localize_form(functional._form, input_plan)
+        local = LocalFunctional(
+            dofs=dofs,
+            _function=executable,
+            _inputs=input_plan,
+            _form=local_form,
+        )
+
         self._rank_cache[rank] = local
         return local
 
@@ -365,95 +377,30 @@ class DistributionPlan[**P, R]:
 class LocalFunctional[**P, R]:
     """Self-contained program and storage layout for one rank."""
 
-    rank: int
-    parts: int
     dofs: LocalDofPlan
-    dof_input_index: int
-    _captured: CapturedJaxpr[P, R]
-    _contributions: ContributionTrace
-    _owned: tuple[OwnedContribution, ...]
-    _plan: LocalJaxprPlan
-    _form: FormSpec
+
+    _function: Callable[P, R]
+    _inputs: LocalInputPlan
+    _form: LocalForm
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        return self._function(*args, **kwargs)
+
+    def inputs(
+        self, *args: P.args, **kwargs: P.kwargs
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Return the rank-local input plan for the given arguments."""
+        bound = self._inputs.localize(*args, **kwargs)
+        return bound.args, bound.kwargs
+
+    def example_inputs(self) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Return a rank-local example input for the given arguments."""
+        bound = self._inputs.example_call()
+        return bound.args, bound.kwargs
 
     @functools.cached_property
-    def _executable(self):
-        return build_local_executable(
-            self._plan,
-            contributions=self._contributions,
-            owned=self._owned,
-        )
-
-    @functools.cached_property
-    def _compiled(self) -> typing.Callable[..., R]:
-        executable = self._executable
-        compute_rows = self.dofs.compute_rows
-        call_abi = self._captured.call_abi
-        input_layouts = self._plan.input_layouts
-
-        @functools.wraps(self._captured.fn)
-        def local_function(*args, **kwargs):
-            bound = call_abi.bind(*args, **kwargs)
-            flat = call_abi.flatten_bound(bound)
-            executable_inputs = []
-
-            for index, (value, layout) in enumerate(
-                zip(flat, input_layouts, strict=True)
-            ):
-                if layout is None:
-                    continue
-                if index == self.dof_input_index:
-                    value = value[jnp.asarray(compute_rows)]
-                executable_inputs.append(value)
-
-            return executable(*executable_inputs)
-
-        return local_function
-
-    def compile(self) -> typing.Callable[..., R]:
-        """Return the cached executable over rank-local inputs."""
-        return self._compiled
-
-    @functools.cached_property
-    def _derivatives(self) -> LocalDerivativeTrace:
-        return trace_local_derivatives(
-            self._executable,
-            self.dofs,
-            self._captured.flat_args,
-            form=self._form,
-            dof_input_index=self.dof_input_index,
-        )
-
-    def derivatives(self) -> LocalDerivativeTrace:
-        """Analyze derivatives in storage-local DOF coordinates."""
-        return self._derivatives
-
-    def localize(
-        self,
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> LocalArguments:
-        """Transform global arguments into this rank's input representation."""
-        return self.localize_with({}, *args, **kwargs)
-
-    def localize_with(
-        self,
-        specializers: LocalizeOverrides,
-        /,
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> LocalArguments:
-        """Localize inputs with overrides for user-defined PyTree types."""
-        local_args, local_kwargs = localize_inputs(
-            self.rank,
-            self._captured.call_abi,
-            self.dofs,
-            specializers,
-            self._plan.input_layouts,
-            self.dof_input_index,
-            args=args,
-            kwargs=kwargs,
-        )
-        return LocalArguments(args=local_args, kwargs=local_kwargs)
+    def sparsity(self) -> LocalMatrixPattern:
+        return trace_local_matrix_pattern(self._function, self._inputs, self._form)
 
 
 def analyze_captured[**P, R](
@@ -519,7 +466,7 @@ def analyze_captured[**P, R](
 
 def analyze_form[**P, R](
     form: FormSpec,
-    fn: typing.Callable[P, R],
+    fn: Callable[P, R],
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> FunctionalAnalysis[P, R]:
@@ -531,9 +478,70 @@ def analyze_form[**P, R](
 
 
 def analyze[**P, R](
-    fn: typing.Callable[P, R],
+    fn: Callable[P, R],
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> FunctionalAnalysis[P, R]:
     """Capture an energy functional using the generic scalar-form pipeline."""
     return analyze_captured(make_captured_jaxpr(fn, *args, **kwargs))
+
+
+class DistributionTarget:
+    @dataclass(frozen=True, eq=False)
+    class Collective:
+        comm: Comm
+        strategy: (
+            PartitionStrategy | Literal["contiguous", "incidence", "mtkahypar"]
+        ) = PartitionStrategy.INCIDENCE
+        blocks_per_part: int = 4
+
+    @dataclass(frozen=True, eq=False)
+    class Rank:
+        n_parts: int
+        rank: int
+        strategy: (
+            PartitionStrategy | Literal["contiguous", "incidence", "mtkahypar"]
+        ) = PartitionStrategy.INCIDENCE
+        blocks_per_part: int = 4
+
+    type Target = Collective | Rank
+
+
+def distribute[**P, R](
+    fn: Callable[P, R],
+    target: DistributionTarget.Target,
+    /,
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> LocalFunctional[P, R]:
+    """Analyze a scalar functional and distribute it to a target rank.
+
+    With a `DistributionTarget.Collective`, every rank in the MPI communicator
+    participates in planning and receives its rank-local functional. A
+    `DistributionTarget.Rank` performs planning serially and returns the local functional
+    for the selected rank.
+
+    Args:
+        fn: The scalar energy functional to analyze and distribute.
+        target: The collective or serial rank distribution target.
+        args: Example positional arguments used to trace ``fn``.
+        kwargs: Example keyword arguments used to trace ``fn``.
+
+    Returns:
+        The executable rank-local functional for the target rank.
+    """
+    analysis = analyze_captured(make_captured_jaxpr(fn, *args, **kwargs))
+
+    if isinstance(target, DistributionTarget.Rank):
+        return analysis.distribute(
+            parts=target.n_parts,
+            strategy=PartitionStrategy(target.strategy),
+            blocks_per_part=target.blocks_per_part,
+        ).rank(target.rank)
+
+    elif isinstance(target, DistributionTarget.Collective):
+        return analysis.distribute_collectively(
+            comm=target.comm,
+            strategy=PartitionStrategy(target.strategy),
+            blocks_per_part=target.blocks_per_part,
+        )

@@ -1,8 +1,11 @@
-"""
-Recursive structural Jacobian and Hessian sparsity propagation.
+"""Structural tangent-pattern tracing for scalar functionals.
 
-This module consumes a materialized `JaxprInstance` tree and propagates
-structural derivative dependencies with respect to the declared coordinate blocks.
+``tangent_pattern`` is the functional-level entry point. It captures the callable,
+infers or accepts its coordinate form, analyzes the resulting JAXPR, and returns a
+sparse row-coordinate by column-coordinate pattern.
+
+The recursive engine propagates structural derivative dependencies through a
+``JaxprPlan`` with respect to the declared coordinate blocks.
 
 A `DependencySet` represents structural Jacobian support: each tensor entry maps
 to the set of symbolic coordinates that may influence it. Primitive-local derivative
@@ -50,14 +53,16 @@ Key invariants:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import scipy.sparse as sps
 from jax.core import Atom
 from jax.extend.core import Literal, Var
 
-from tatva.tracer.capture import CapturedJaxpr
+from tatva.tracer.capture import make_captured_jaxpr
 from tatva.tracer.core.nested import (
     AnyNestedInvocation,
     CallInvocation,
@@ -81,11 +86,12 @@ from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import RouteRequest
 from tatva.tracer.core.semantics import RuleContext
 from tatva.tracer.helpers import _shape_of
-from tatva.tracer.program.analysis import EqnPlan, JaxprPlan
+from tatva.tracer.program.analysis import EqnPlan, JaxprPlan, analyze
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
 from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
-from tatva.tracer.program.forms import FormSpec, SymbolicLayout
+from tatva.tracer.program.forms import FormSpec, SymbolicLayout, infer_form_spec
 from tatva.tracer.rules.linalg import add_batch_self, expand_batch_dependencies
+from tatva.tracer.support import require_registered_operations
 
 
 def _batch_union_dependencies(
@@ -164,6 +170,37 @@ class DerivativeTrace:
         return self.tangent
 
 
+def tangent_pattern(
+    functional: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    form: FormSpec | None = None,
+) -> sps.csr_matrix:
+    """Trace a scalar functional's structural row-by-column tangent pattern.
+
+    Coordinate roles are taken from ``form`` when supplied, otherwise from
+    ``Trial``, ``Test``, or ``State`` annotations on ``functional``. Unannotated
+    functionals are treated as energies with their first flattened input as the
+    shared row and column coordinate.
+    """
+    captured = make_captured_jaxpr(functional, *args, **kwargs)
+    if form is None:
+        form = infer_form_spec(functional, captured.call_abi)
+    if form is None:
+        form = FormSpec.energy(input_index=0)
+
+    require_registered_operations(captured.jaxpr)
+    plan = analyze(captured.jaxpr)
+    resolver, frame = ConcreteResolver.root(
+        captured.closed_jaxpr,
+        captured.flat_args,
+        plan,
+        unavailable_inputs=form.coordinate_input_indices,
+    )
+    return trace_form_derivatives(plan, frame, resolver, form).tangent
+
+
 def trace_form_derivatives(
     plan: JaxprPlan,
     frame: ConcreteFrame,
@@ -213,24 +250,6 @@ def trace_seeded_derivatives(
         symbolic_layout=symbolic_layout,
         interactions=acc.finalize(),
     )
-
-
-def trace_derivatives(
-    captured: CapturedJaxpr,
-    plan: JaxprPlan,
-    n_dofs: int,
-) -> DerivativeTrace:
-    """Backward-compatible energy entry point using the generic form tracer."""
-    resolver, frame = ConcreteResolver.root(captured.jaxpr, captured.flat_args, plan)
-    trace = trace_form_derivatives(
-        plan, frame, resolver, FormSpec.energy(input_index=0)
-    )
-    if trace.symbolic_layout.size != n_dofs:
-        raise ValueError(
-            f"energy coordinate size {trace.symbolic_layout.size} does not match "
-            f"n_dofs={n_dofs}"
-        )
-    return trace
 
 
 def _trace_jaxpr(

@@ -7,17 +7,19 @@ emitted by that walk become the compiled JAX computation.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import functools
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import Array, lax
+from jax import lax
 from jax.extend.core import Literal, Var
 from numpy.typing import NDArray
 
+from tatva.tracer.capture import CapturedJaxpr
 from tatva.tracer.core.nested import (
     CallContext,
     CondContext,
@@ -32,12 +34,8 @@ from tatva.tracer.core.nested import (
     dispatch_nested,
 )
 from tatva.tracer.core.registry import SEMANTICS
-from tatva.tracer.local.demand import (
-    TensorDemand,
-    _FullAxis,
-    _IndexAxis,
-    _RangeAxis,
-)
+from tatva.tracer.local.demand import TensorDemand
+from tatva.tracer.local.inputs import LocalInputPlan
 from tatva.tracer.local.layout import TensorLayout
 from tatva.tracer.local.localize import (
     LocalDynamicSliceRoute,
@@ -56,49 +54,6 @@ from tatva.tracer.lowering.rules import (
     lower_bind,
 )
 from tatva.tracer.program.contributions import ContributionTrace
-
-
-def extract_local_value(
-    value,
-    layout: TensorLayout,
-) -> Array:
-    """Convenience helper for testing/local input construction.
-
-    Production distributed execution can supply already-local tensors
-    directly.
-    """
-    result = jnp.asarray(value)
-
-    if tuple(result.shape) != layout.global_shape:
-        raise ValueError(
-            f"global input shape {result.shape} does not "
-            f"match layout {layout.global_shape}"
-        )
-
-    for axis in range(layout.ndim):
-        subset = layout.axis_subset(axis)
-
-        if isinstance(subset, _FullAxis):
-            continue
-
-        if isinstance(subset, _RangeAxis):
-            slices = [slice(None)] * result.ndim
-            slices[axis] = slice(subset.start, subset.stop)
-            result = result[tuple(slices)]
-            continue
-
-        if isinstance(subset, _IndexAxis):
-            result = jnp.take(result, jnp.asarray(subset.indices), axis=axis)
-            continue
-
-        raise TypeError(f"unsupported axis subset {type(subset)!r}")
-
-    if tuple(result.shape) != layout.local_shape:
-        raise RuntimeError(
-            f"localized value has shape {result.shape}; expected {layout.local_shape}"
-        )
-
-    return result
 
 
 def _project_local_value(
@@ -1387,7 +1342,7 @@ def _project_repeated_value(
     if not isinstance(plan.eqn.invars[input_index], Literal):
         raise TypeError(f"live {label} {input_index} has no outer layout")
 
-    return extract_local_value(value, body_layout)
+    return body_layout.extract(value)
 
 
 def _same_layout(
@@ -1826,60 +1781,32 @@ class LocalContributionTerm:
         object.__setattr__(self, "owned_shape", tuple(int(x) for x in self.owned_shape))
 
 
-@dataclass(frozen=True)
-class LocalExecutable:
-    plan: LocalJaxprPlan
-    input_indices: tuple[int, ...]
-    contribution_terms: tuple[LocalContributionTerm, ...]
-    function: Callable
-
-    # unused, only used in a test
-    def pack_global_inputs(
-        self,
-        *global_inputs,
-    ) -> tuple[Any, ...]:
-        if len(global_inputs) != len(self.plan.input_layouts):
-            raise ValueError(
-                f"expected {len(self.plan.input_layouts)} "
-                f"global inputs, got {len(global_inputs)}"
-            )
-
-        result = []
-
-        for index in self.input_indices:
-            layout = self.plan.input_layouts[index]
-            assert layout is not None
-            result.append(extract_local_value(global_inputs[index], layout))
-
-        return tuple(result)
-
-    def __call__(
-        self,
-        *local_inputs,
-    ):
-        return self.function(*local_inputs)
-
-
-def build_local_executable(
+def build_local_function[**P, R](
     plan: LocalJaxprPlan,
-    *,
     contributions: ContributionTrace,
     owned: tuple[OwnedContribution, ...],
-) -> LocalExecutable:
-    input_indices = tuple(
-        index for index, layout in enumerate(plan.input_layouts) if layout is not None
-    )
+    captured: CapturedJaxpr[P, R],
+    inputs: LocalInputPlan,
+) -> Callable[P, R]:
+    """Build the caller-facing local function over the original Python ABI.
+
+    Bindings are ordered exactly like the compact executable inputs. They omit
+    compiler-dead original inputs and apply storage-to-compute projections where
+    required.
+    """
+
     contribution_terms = _compile_contribution_terms(plan, contributions, owned)
 
-    def function(
-        *local_inputs,
-    ):
-        env = _execute_frame(plan, tuple(local_inputs))
+    @functools.wraps(captured.fn)
+    def local_function(
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
+        bound = inputs.abi.bind(*args, **kwargs)
+        local_flat = inputs.abi.flatten_bound(bound)
+        compute_inputs = inputs.compute_inputs(local_flat)
+
+        env = _execute_frame(plan, compute_inputs)
         return _reconstruct_local_scalar(env, contribution_terms)
 
-    return LocalExecutable(
-        plan=plan,
-        input_indices=input_indices,
-        contribution_terms=contribution_terms,
-        function=function,
-    )
+    return local_function
