@@ -18,6 +18,7 @@
 
 from abc import ABC, abstractmethod
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
@@ -100,6 +101,32 @@ class Element(ABC):
         N = self.shape_function(xi)
         return linalg.contract("n,n...->...", N, nodal_values)
 
+    def _gradient_with_inv_jacobian(
+        self, xi: Array, nodal_values: Array, nodal_coords: Array
+    ) -> tuple[Array, Array]:
+        """Returns the gradient of the nodal values at the local coordinates xi and the inverse Jacobian.
+
+        Args:
+            xi: Local coordinates (shape: (n_dim,)).
+            nodal_values: Values at the nodes of the element (shape: (n_nodes, n_values)).
+            nodal_coords: Coordinates of the nodes of the element (shape: (n_nodes, n_dim)).
+        """
+        # 'd': spatial dimension, 'n': number of nodes,
+        dNdr = self.shape_function_derivative(xi)  # (d, n)
+        J = linalg.contract(
+            "in,nj->ij", dNdr, nodal_coords
+        )  # (d, n) x (n, d) -> (d, d)
+        invJ = linalg.inv(J)
+        dNdX = linalg.contract("ij,jn->in", invJ, dNdr)  # (d, d) x (d, n) -> (d, n)
+        # the contraction leaves the node axis summed and d leading; move d to the end
+        gradient = jnp.moveaxis(
+            linalg.contract("in,n...->i...", dNdX, nodal_values),
+            0,
+            -1,
+        )  # (..., d)
+
+        return gradient, invJ
+
     def gradient(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
         """Returns the gradient of the nodal values at the local coordinates xi.
 
@@ -111,19 +138,25 @@ class Element(ABC):
         Returns:
             Gradient of the nodal values at the local coordinates (shape: (n_values, n_dim)).
         """
-        # 'd': spatial dimension, 'n': number of nodes,
-        #
-        dNdr = self.shape_function_derivative(xi)  # (d, n)
-        J = linalg.contract(
-            "in,nj->ij", dNdr, nodal_coords
-        )  # (d, n) x (n, d) -> (d, d)
-        dNdX = linalg.contract(
-            "ij,jn->in", linalg.inv(J), dNdr
-        )  # (d, d) x (d, n) -> (d, n)
-        # the contraction leaves the node axis summed and d leading; move d to the end
-        return jnp.moveaxis(
-            linalg.contract("in,n...->i...", dNdX, nodal_values), 0, -1
-        )  # (..., d)
+        gradient, _ = self._gradient_with_inv_jacobian(xi, nodal_values, nodal_coords)
+        return gradient
+
+    def hessian(self, xi: Array, nodal_values: Array, nodal_coords: Array) -> Array:
+        """Returns the Hessian of the nodal values at the local coordinates xi.
+
+        Args:
+            xi: Local coordinates (shape: (n_dim,)).
+            nodal_values: Values at the nodes of the element (shape: (n_nodes, n_values)).
+            nodal_coords: Coordinates of the nodes of the element (shape: (n_nodes, n_dim)).
+
+        Returns:
+            Hessian of the nodal values at the local coordinates (shape: (n_values, n_dim, n_dim)).
+        """
+        dgrad_dxi, inv_J = jax.jacfwd(
+            self._gradient_with_inv_jacobian, argnums=0, has_aux=True
+        )(xi, nodal_values, nodal_coords)
+
+        return linalg.einsum("...ir,jr->...ij", dgrad_dxi, inv_J)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array
