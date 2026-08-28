@@ -409,6 +409,26 @@ class Operator(Generic[ElementT]):
 
         return self._vmap_over_elements_and_quads(nodal_values, _gradient_quad)
 
+    def hess(self, nodal_values: jax.Array) -> jax.Array:
+        """Computes the Hessian of the nodal values at the quad points.
+
+        Args:
+            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
+
+        Returns:
+            A `jax.Array` with the Hessian of the nodal values at each quadrature point
+            of each element (shape: (n_elements, n_quad_points, n_values, n_dim, n_dim)).
+        """
+
+        def _hessian_quad(
+            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
+        ) -> jax.Array:
+            """Calls the function (hessian) on a quad point."""
+            u_hess = self.element.hessian(xi, el_nodal_values, el_nodal_coords)
+            return u_hess
+
+        return self._vmap_over_elements_and_quads(nodal_values, _hessian_quad)
+
     def make_interpolate(self, points: jax.Array) -> Callable[[jax.Array], jax.Array]:
         """Returns a function that interpolates nodal values to a set of static points.
 
