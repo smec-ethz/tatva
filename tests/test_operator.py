@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tatva.element import Tri3
+from tatva.element import Quad8, Tri3
 from tatva.mesh import Mesh
 from tatva.operator import Operator
 
@@ -123,6 +123,20 @@ def test_grad_of_linear_field_is_constant(tri_operator: Operator):
     grad = tri_operator.grad(nodal_values)
     expected = np.array([[[2.0, 3.0]], [[2.0, 3.0]]], dtype=np.float64)
     np.testing.assert_allclose(grad, expected)
+
+
+def test_hess_maps_nonzero_hessian_over_quadrature_points():
+    element = Quad8()
+    coords = element._reference_nodes()
+    operator = Operator(Mesh(coords=coords, elements=jnp.arange(8)[None, :]), element)
+    x, y = coords[:, 0], coords[:, 1]
+    nodal_values = x**2 + 2.0 * x * y + 3.0 * y**2
+
+    hess = operator.hess(nodal_values)
+    expected = np.broadcast_to(
+        np.array([[2.0, 2.0], [2.0, 6.0]]), (1, len(element.quad_points), 2, 2)
+    )
+    np.testing.assert_allclose(hess, expected, atol=1e-12)
 
 
 def test_integrate_nodal_field_matches_area(tri_operator: Operator):
