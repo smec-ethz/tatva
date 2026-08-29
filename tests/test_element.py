@@ -82,6 +82,19 @@ def test_scalar_gradient_is_exact(element_class, coords, coeffs):
         )
 
 
+def test_scalar_hessian_is_exact():
+    element = Quad8()
+    coords = element._reference_nodes()
+    x, y = coords[:, 0], coords[:, 1]
+    nodal_values = x**2 + 2.0 * x * y + 3.0 * y**2
+    expected = np.array([[2.0, 2.0], [2.0, 6.0]])
+
+    for xi in element.quad_points:
+        np.testing.assert_allclose(
+            element.hessian(xi, nodal_values, coords), expected, atol=1e-12
+        )
+
+
 # ---------------------------------------------------------------------------
 # Vector gradient: u_i = A[i,j] * x_j  =>  ∂u_i/∂x_j = A[i,j]
 # (component-first convention; line elements excluded — their gradient is
