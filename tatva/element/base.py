@@ -156,7 +156,7 @@ class Element(ABC):
             self._gradient_with_inv_jacobian, argnums=0, has_aux=True
         )(xi, nodal_values, nodal_coords)
 
-        return linalg.einsum("...ir,jr->...ij", dgrad_dxi, inv_J)
+        return linalg.contract("...ir,jr->...ij", dgrad_dxi, inv_J)
 
     def get_local_values(
         self, xi: Array, nodal_values: Array, nodal_coords: Array

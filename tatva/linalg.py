@@ -106,9 +106,9 @@ string naming the contraction::
     val  = linalg.contract("n,n...->...",  N,           nodal_values)
 
 The spec is a *name*, not an instruction. It is never handed to ``jnp.einsum`` --
-every one of these sums over a shared index, so einsum would lower all four to a
+every one of these sums over a shared index, so einsum would lower all of them to a
 ``dot``, which is the thing this module exists to avoid. It is resolved at trace
-time against ``_known_implementationss``, a four-line table holding how each contraction
+time against ``_known_implementations``, a small table holding how each contraction
 is spelled and why.
 
 Why a spec rather than differently-named functions: how a contraction should be
@@ -314,11 +314,34 @@ def _dot_on_cpu_broadcast_elsewhere(A: Array, B: Array) -> Array:
     return jax.lax.platform_dependent(A, B, cpu=_dot, default=_dot_broadcast)
 
 
-# Currently in tatva we have four contractions: matmul, vecmat, row_contract, and vec_contract:
+def _hessian_transform_dot(A: Array, B: Array) -> Array:
+    """Contract the last axes of ``A`` and ``B``, leaving ``B``'s first axis free."""
+    return A @ B.T
+
+
+def _hessian_transform_broadcast(A: Array, B: Array) -> Array:
+    """Broadcast spelling of ``...ir,jr->...ij`` that does not lower to a dot."""
+    return jnp.sum(A[..., :, :, None] * B.T, axis=-2)
+
+
+def _hessian_transform_on_cpu_broadcast_elsewhere(A: Array, B: Array) -> Array:
+    """Use the measured CPU winner and the dot-free spelling on GPU.
+
+    On 200k element-sized contractions on CPU, matmul took 1.2/2.0 ms for scalar/vector
+    2-D fields and 2.6/8.6 ms in 3-D; broadcast took 2.4/4.1 ms and 7.8/12.2 ms.
+    As for ``_MATMUL``, GPU uses broadcast to keep this tiny contraction fusible.
+    """
+    return jax.lax.platform_dependent(
+        A, B, cpu=_hessian_transform_dot, default=_hessian_transform_broadcast
+    )
+
+
+# Currently in tatva we have five contractions:
 _MATMUL = "ab,bc->ac"  # (p, q) x (q, r): the element Jacobian and the product after it
 _VECMAT = "a,ab->b"  # (q,) x (q, r): the Line2/Line3 tangent vector
 _ROW_CONTRACT = "ab,b...->a..."  # (p, q) x (q, ...): dNdX against nodal values
 _VEC_CONTRACT = "a,a...->..."  # (q,) x (q, ...): N against nodal values
+_HESSIAN_TRANSFORM = "...ab,cb->...ac"  # (..., i, r) x (j, r) -> (..., i, j)
 
 
 _known_implementations = {
@@ -326,14 +349,24 @@ _known_implementations = {
     _VECMAT: _dot,  # vector-matrix: dot everywhere
     _ROW_CONTRACT: _dot_broadcast,  # row-contract: broadcast everywhere
     _VEC_CONTRACT: _dot_broadcast,  # vec-contract: broadcast everywhere
+    _HESSIAN_TRANSFORM: _hessian_transform_on_cpu_broadcast_elsewhere,
 }
 
-# (A.ndim, B.ndim); None means "any rank >= 1", i.e. the spec has an ellipsis there.
+# (A.ndim, B.ndim); None means any rank containing the explicitly named axes.
 _known_ranks = {
     _MATMUL: (2, 2),
     _VECMAT: (1, 2),
     _ROW_CONTRACT: (2, None),
     _VEC_CONTRACT: (1, None),
+    _HESSIAN_TRANSFORM: (None, 2),
+}
+
+_known_contraction_axes = {
+    _MATMUL: (-1, 0),
+    _VECMAT: (-1, 0),
+    _ROW_CONTRACT: (-1, 0),
+    _VEC_CONTRACT: (-1, 0),
+    _HESSIAN_TRANSFORM: (-1, -1),
 }
 
 
@@ -411,7 +444,7 @@ def contract(spec: str, A: Array, B: Array) -> Array:
     it, which is exactly what this function exists to record.
 
     Args:
-        spec: einsum-style contraction, e.g. ``"in,nj->ij"``. Must name one of the four
+        spec: einsum-style contraction, e.g. ``"in,nj->ij"``. Must name one of the
             supported contractions; letters are arbitrary.
         A: first operand, a single tensor.
         B: second operand, a single tensor.
@@ -441,18 +474,31 @@ def contract(spec: str, A: Array, B: Array) -> Array:
     # check that the operand shapes match the expected ranks for this spec
     expected_a, expected_b = _known_ranks[canonical]
     got = (A.ndim, B.ndim)
-    if A.ndim != expected_a or (expected_b is not None and B.ndim != expected_b):
-        wanted = f"({expected_a}, {expected_b if expected_b is not None else '>=1'})"
+    a_term, b_term = canonical.split("->")[0].split(",")
+    min_a = len([token for token in _tokenize(a_term) if token != "..."])
+    min_b = len([token for token in _tokenize(b_term) if token != "..."])
+    a_rank_matches = A.ndim >= min_a if expected_a is None else A.ndim == expected_a
+    b_rank_matches = B.ndim >= min_b if expected_b is None else B.ndim == expected_b
+
+    if not a_rank_matches or not b_rank_matches:
+        wanted_a = expected_a if expected_a is not None else f">={min_a}"
+        wanted_b = expected_b if expected_b is not None else f">={min_b}"
+        wanted = f"({wanted_a}, {wanted_b})"
         raise ValueError(
             f"tatva.linalg.contract({spec!r}, ...) wants operand ranks {wanted}, got {got} from "
             f"shapes {A.shape} and {B.shape}. These take a single tensor each -- batch "
             "with jax.vmap, which fuses the contraction into the surrounding work "
             "instead of materialising it."
         )
-    if A.shape[-1] != B.shape[0]:
+
+    a_axis, b_axis = _known_contraction_axes[canonical]
+
+    if A.shape[a_axis] != B.shape[b_axis]:
+        b_axis_name = "first" if b_axis == 0 else "last"
         raise ValueError(
-            f"tatva.linalg.contract({spec!r}, ...) contracts A's last axis with B's first, but "
-            f"they are {A.shape[-1]} and {B.shape[0]} from shapes {A.shape} and "
+            f"tatva.linalg.contract({spec!r}, ...) contracts A's last axis with B's "
+            f"{b_axis_name}, but they are {A.shape[a_axis]} and {B.shape[b_axis]} from "
+            f"shapes {A.shape} and "
             f"{B.shape}."
         )
 

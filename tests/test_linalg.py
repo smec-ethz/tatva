@@ -186,6 +186,7 @@ def test_tensordot_rejects_a_stack_of_matrices():
         ("n,n...->...", (4,), (4,), "n,n->"),
         ("n,n...->...", (4,), (4, 3), "n,nc->c"),
         ("n,nj->j", (4,), (4, 2), "n,nj->j"),
+        ("...ir,jr->...ij", (3, 2, 2), (2, 2), "cir,jr->cij"),
     ],
 )
 def test_contract_computes_what_the_spec_says(spec, a_shape, b_shape, einsum):
@@ -238,6 +239,13 @@ def test_contract_rejects_a_mismatched_contraction_axis():
         linalg.contract("in,nj->ij", jnp.zeros((2, 3)), jnp.zeros((4, 2)))
 
 
+def test_hessian_transform_rejects_invalid_operand_ranks():
+    with pytest.raises(ValueError, match="ranks"):
+        linalg.contract("...ir,jr->...ij", jnp.zeros((2,)), jnp.zeros((2, 2)))
+    with pytest.raises(ValueError, match="ranks"):
+        linalg.contract("...ir,jr->...ij", jnp.zeros((2, 2)), jnp.zeros((3, 2, 2)))
+
+
 def test_contract_rejects_an_unparseable_spec():
     A = jnp.zeros((2, 3))
     B = jnp.zeros((3, 4))
@@ -265,6 +273,23 @@ def test_contract_dispatches_the_matmul_spec_on_the_lowering_platform():
 
     for text in (cpu, gpu):
         assert "conditional" not in text  # pruned, not selected at runtime
+
+
+def test_contract_dispatches_the_hessian_transform_on_the_lowering_platform():
+    A = jnp.ones((64, 3, 2, 2))
+    B = jnp.ones((64, 2, 2))
+    fn = jax.jit(jax.vmap(lambda a, b: linalg.contract("...ir,jr->...ij", a, b)))
+    traced = fn.trace(A, B)
+
+    cpu = traced.lower(lowering_platforms=("cpu",)).as_text()
+    assert cpu.count("dot_general") == 1
+
+    gpu = traced.lower(lowering_platforms=("cuda",)).as_text()
+    assert gpu.count("dot_general") == 0
+    assert gpu.count("stablehlo.multiply") == 1
+
+    for text in (cpu, gpu):
+        assert "conditional" not in text
 
 
 @pytest.mark.parametrize("spec", ["in,n...->i...", "n,n...->..."])
@@ -325,6 +350,7 @@ def test_every_contract_spec_in_the_library_is_in_the_table():
         ("in,n...->i...", (2, 4), (4, 3), "in,nc->ic"),
         ("n,n...->...", (4,), (4, 3), "n,nc->c"),
         ("n,nj->j", (4,), (4, 2), "n,nj->j"),
+        ("...ir,jr->...ij", (3, 2, 2), (2, 2), "cir,jr->cij"),
     ],
 )
 def test_contract_differentiates_like_the_einsum_it_names(
@@ -355,6 +381,7 @@ def test_contract_differentiates_like_the_einsum_it_names(
         ("in,n...->i...", (2, 4), (4, 3), "ein,enc->eic"),
         ("n,n...->...", (4,), (4, 3), "en,enc->ec"),
         ("n,nj->j", (4,), (4, 2), "en,enj->ej"),
+        ("...ir,jr->...ij", (3, 2, 2), (2, 2), "ecir,ejr->ecij"),
     ],
 )
 def test_contract_vmaps_over_elements(spec, a_shape, b_shape, einsum):
@@ -381,6 +408,7 @@ def test_contract_vmaps_over_elements(spec, a_shape, b_shape, einsum):
         ("pq,qr->pr", [(2, 4), (4, 2)], "contract"),  # same contraction, other letters
         ("in,n...->i...", [(2, 4), (4, 3)], "contract"),
         ("n,n...->...", [(4,), (4, 3)], "contract"),
+        ("...ir,jr->...ij", [(3, 2, 2), (2, 2)], "contract"),
         # not in the table: falls back rather than raising, which is what makes this a
         # drop-in replacement
         ("eq,q->eq", [(64, 4), (4,)], "jnp.einsum"),  # sums nothing
