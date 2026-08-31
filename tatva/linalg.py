@@ -140,6 +140,8 @@ dimension can grow large, use ``@`` and let XLA call the GEMM -- large matrices 
 the case that machinery was built for, and there it wins.
 """
 
+from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import jax
@@ -246,6 +248,231 @@ def det(J: Array) -> Array:
     return jnp.linalg.det(J)
 
 
+# --------------------------------------------------------------------------------
+# contract is a drop-in replacement for einsum with a fixed set of contractions
+# --------------------------------------------------------------------------------
+
+
+def _parse_einsum_subscripts(
+    subscripts: str, operands: tuple[Array, ...]
+) -> tuple[list[list[str]], list[str]]:
+    """Parse string-form einsum subscripts into physical axis labels.
+
+    Each ellipsis is expanded according to the corresponding operand rank. Ellipsis
+    axes are right-aligned across operands, following NumPy/JAX broadcasting rules,
+    and represented by synthetic labels such as ``"@0"`` that cannot collide with
+    user labels. For an implicit-output spec, broadcast axes are emitted first and
+    labels that occur exactly once follow in alphabetical order.
+
+    Args:
+        subscripts: Explicit or implicit string-form einsum specification, such as
+            ``"...ij,...jk->...ik"`` or ``"ij,jk"``.
+        operands: Operands used to determine how many physical axes each ellipsis
+            represents and to validate each input term's rank.
+
+    Returns:
+        A pair ``(input_labels, output_labels)``. ``input_labels`` contains one list
+        per operand and exactly one label per operand axis. ``output_labels`` gives
+        the result-axis order. Neither result contains an unexpanded ellipsis.
+
+    Raises:
+        ValueError: If the number of input terms does not match the operands, a term
+            does not match its operand rank, a label or ellipsis is malformed, or
+            the output contains duplicate or unknown labels.
+    """
+    cleaned = subscripts.replace(" ", "")
+    if cleaned.count("->") > 1:
+        raise ValueError(f"invalid einsum subscripts {subscripts!r}")
+
+    if "->" in cleaned:
+        inputs, output = cleaned.split("->")
+    else:
+        inputs, output = cleaned, None
+
+    input_terms = inputs.split(",")
+    if len(input_terms) != len(operands):
+        raise ValueError(
+            f"einsum subscripts contain {len(input_terms)} input terms, but "
+            f"{len(operands)} operands were passed"
+        )
+
+    tokenized = [_tokenize(term) for term in input_terms]
+    ellipsis_ranks: list[int] = []
+    for tokens, operand in zip(tokenized, operands):
+        if tokens.count("...") > 1:
+            raise ValueError("an einsum input term may contain at most one ellipsis")
+        for label in tokens:
+            if label != "..." and (
+                len(label) != 1 or not label.isascii() or not label.isalpha()
+            ):
+                raise ValueError(f"invalid einsum label {label!r}")
+        explicit_rank = len(tokens) - tokens.count("...")
+        ellipsis_rank = operand.ndim - explicit_rank
+        if ellipsis_rank < 0 or ("..." not in tokens and ellipsis_rank != 0):
+            raise ValueError(
+                f"einsum term {''.join(tokens)!r} does not match operand shape {operand.shape}"
+            )
+        ellipsis_ranks.append(ellipsis_rank)
+
+    max_ellipsis_rank = max(ellipsis_ranks, default=0)
+    # These cannot collide with user labels, which are restricted to ASCII letters.
+    ellipsis_labels = [f"@{i}" for i in range(max_ellipsis_rank)]
+    expanded_inputs: list[list[str]] = []
+    for tokens, ellipsis_rank in zip(tokenized, ellipsis_ranks):
+        expanded: list[str] = []
+        for token in tokens:
+            if token == "...":
+                expanded.extend(ellipsis_labels[max_ellipsis_rank - ellipsis_rank :])
+            else:
+                expanded.append(token)
+        expanded_inputs.append(expanded)
+
+    counts: dict[str, int] = {}
+    for labels in expanded_inputs:
+        for label in labels:
+            counts[label] = counts.get(label, 0) + 1
+
+    if output is None:
+        # NumPy/JAX put broadcast axes first, then labels occurring exactly once in
+        # alphabetical order for the implicit-output form.
+        output_labels = ellipsis_labels + sorted(
+            label
+            for label, count in counts.items()
+            if count == 1 and not label.startswith("@")
+        )
+    else:
+        output_tokens = _tokenize(output)
+        if output_tokens.count("...") > 1:
+            raise ValueError("an einsum output term may contain at most one ellipsis")
+        output_labels = []
+        for token in output_tokens:
+            if token == "...":
+                output_labels.extend(ellipsis_labels)
+            elif len(token) == 1 and token.isascii() and token.isalpha():
+                output_labels.append(token)
+            else:
+                raise ValueError(f"invalid einsum label {token!r}")
+
+    if len(set(output_labels)) != len(output_labels):
+        raise ValueError("einsum output labels must be unique")
+    missing = [label for label in output_labels if label not in counts]
+    if missing:
+        raise ValueError(
+            f"einsum output label {missing[0]!r} does not appear in an input"
+        )
+    return expanded_inputs, output_labels
+
+
+def _diagonalize_repeated_axes(
+    operand: Array, labels: list[str]
+) -> tuple[Array, list[str]]:
+    """Take diagonals for labels repeated within a single einsum operand.
+
+    A repeated label denotes equal coordinates on its axes: for example, ``"ii"``
+    selects a matrix diagonal rather than treating the two ``i`` axes independently.
+    Each pair of repeated axes is collapsed with ``jnp.diagonal`` until every label
+    is unique. Since ``jnp.diagonal`` appends its diagonal axis, the returned labels
+    are reordered in the same way as the returned operand.
+
+    Args:
+        operand: Operand whose rank matches the number of labels.
+        labels: Expanded axis labels for ``operand``. The input list is not mutated.
+
+    Returns:
+        The diagonalized operand and its updated, unique axis-label list.
+
+    Raises:
+        ValueError: If two axes carrying the same label have different sizes.
+    """
+    labels = list(labels)
+    while len(set(labels)) != len(labels):
+        for axis1, label in enumerate(labels):
+            try:
+                axis2 = labels.index(label, axis1 + 1)
+            except ValueError:
+                continue
+            if operand.shape[axis1] != operand.shape[axis2]:
+                raise ValueError(
+                    f"dimensions for repeated einsum label {label!r} must match, got "
+                    f"{operand.shape[axis1]} and {operand.shape[axis2]}"
+                )
+            operand = jnp.diagonal(operand, axis1=axis1, axis2=axis2)
+            labels = [
+                current
+                for axis, current in enumerate(labels)
+                if axis not in (axis1, axis2)
+            ] + [label]
+            break
+    return operand, labels
+
+
+def _einsum_broadcast(
+    subscripts: str, *operands: Any, preferred_element_type: Any | None = None
+) -> Array:
+    """General einsum implemented as aligned broadcasting, multiplication and sum.
+
+    This supports explicit and implicit string specs, ellipses, diagonals, output
+    permutations, and any number of operands.  It deliberately does not call
+    ``jnp.einsum`` or ``lax.dot_general``, so small contractions remain ordinary,
+    fusible elementwise/reduction work on GPU.
+
+    The tradeoff is the same as for any outer-product spelling: the conceptual
+    intermediate contains every free and contracted axis.  Use this for tiny tensor
+    contractions, not large matrices, and let ``jax.vmap`` introduce batch axes.
+
+    ``precision`` and contraction-path options are intentionally absent because there
+    is no dot or contraction path to configure. ``preferred_element_type`` casts the
+    arithmetic and accumulation to the requested dtype.
+    """
+    if not isinstance(subscripts, str):
+        raise TypeError("einsum_broadcast supports the string subscript form only")
+    if not operands:
+        raise ValueError("einsum_broadcast needs at least one operand")
+
+    arrays = tuple(jnp.asarray(operand) for operand in operands)
+    input_labels, output_labels = _parse_einsum_subscripts(subscripts, arrays)
+
+    diagonalized = [
+        _diagonalize_repeated_axes(operand, labels)
+        for operand, labels in zip(arrays, input_labels)
+    ]
+    arrays = tuple(item[0] for item in diagonalized)
+    input_labels = [item[1] for item in diagonalized]
+
+    reduction_labels: list[str] = []
+    for labels in input_labels:
+        for label in labels:
+            if label not in output_labels and label not in reduction_labels:
+                reduction_labels.append(label)
+    axis_labels = output_labels + reduction_labels
+
+    aligned: list[Array] = []
+    for operand, labels in zip(arrays, input_labels):
+        present = [label for label in axis_labels if label in labels]
+        permutation = tuple(labels.index(label) for label in present)
+        if permutation != tuple(range(operand.ndim)):
+            operand = jnp.transpose(operand, permutation)
+        shape = tuple(
+            operand.shape[present.index(label)] if label in present else 1
+            for label in axis_labels
+        )
+        aligned.append(jnp.reshape(operand, shape))
+
+    if preferred_element_type is not None:
+        aligned = [operand.astype(preferred_element_type) for operand in aligned]
+
+    product = aligned[0]
+    for operand in aligned[1:]:
+        product = product * operand
+    if reduction_labels:
+        product = jnp.sum(
+            product,
+            axis=tuple(range(len(output_labels), len(axis_labels))),
+            dtype=product.dtype,
+        )
+    return product
+
+
 def _dot_broadcast(A: Array, B: Array) -> Array:
     """
     Contracts the last axis of `A` with the first axis of `B` and leaves every other
@@ -278,96 +505,27 @@ def _dot_broadcast(A: Array, B: Array) -> Array:
             "outer product before reducing, so a batch axis materialises it in full."
         )
 
-    Ae = A.reshape(A.shape + (1,) * (B.ndim - 1))
-    Be = B.reshape((1,) * (A.ndim - 1) + B.shape)
-    return jnp.sum(Ae * Be, axis=A.ndim - 1)
+    spec = "a,a...->..." if A.ndim == 1 else "ab,b...->a..."
+    return _einsum_broadcast(spec, A, B)
 
 
-# --------------------------------------------------------------------------------
-# contract is a drop-in replacement for einsum with a fixed set of contractions
-# --------------------------------------------------------------------------------
-#
+_einsum = jnp.einsum
 
-
-def _dot(A: Array, B: Array) -> Array:
-    """The contraction as XLA's `dot`. Fast where XLA can fuse or fold it away.
-
-    Args:
-        A: a single vector or matrix, shape (q,) or (p, q).
-        B: a single tensor, shape (q, ...) or (q, r).
-
-    Returns:
-        The contraction, shape (p, ...) or (...), with axes in the order they appear in `B`
-        after the contracted axis.
-    """
-
-    return A @ B
-
-
-def _dot_on_cpu_broadcast_elsewhere(A: Array, B: Array) -> Array:
-    """
-    The only spec-dependent dispatch, and the only place a backend is consulted.
-    On CPU, `dot` is fused away by XLA, so we use `@` to avoid the broadcast form.
-    But only for matrix-matrix products: `dot` is not fused for vector-vector or matrix-vector.
-    On GPU, we avoid `dot` altogether and use use _broadcast form instead.
-    """
-    return jax.lax.platform_dependent(A, B, cpu=_dot, default=_dot_broadcast)
-
-
-def _hessian_transform_dot(A: Array, B: Array) -> Array:
-    """Contract the last axes of ``A`` and ``B``, leaving ``B``'s first axis free."""
-    return A @ B.T
-
-
-def _hessian_transform_broadcast(A: Array, B: Array) -> Array:
-    """Broadcast spelling of ``...ir,jr->...ij`` that does not lower to a dot."""
-    return jnp.sum(A[..., :, :, None] * B.T, axis=-2)
-
-
-def _hessian_transform_on_cpu_broadcast_elsewhere(A: Array, B: Array) -> Array:
-    """Use the measured CPU winner and the dot-free spelling on GPU.
-
-    On 200k element-sized contractions on CPU, matmul took 1.2/2.0 ms for scalar/vector
-    2-D fields and 2.6/8.6 ms in 3-D; broadcast took 2.4/4.1 ms and 7.8/12.2 ms.
-    As for ``_MATMUL``, GPU uses broadcast to keep this tiny contraction fusible.
-    """
-    return jax.lax.platform_dependent(
-        A, B, cpu=_hessian_transform_dot, default=_hessian_transform_broadcast
-    )
-
-
-# Currently in tatva we have five contractions:
-_MATMUL = "ab,bc->ac"  # (p, q) x (q, r): the element Jacobian and the product after it
-_VECMAT = "a,ab->b"  # (q,) x (q, r): the Line2/Line3 tangent vector
-_ROW_CONTRACT = "ab,b...->a..."  # (p, q) x (q, ...): dNdX against nodal values
-_VEC_CONTRACT = "a,a...->..."  # (q,) x (q, ...): N against nodal values
-_HESSIAN_TRANSFORM = "...ab,cb->...ac"  # (..., i, r) x (j, r) -> (..., i, j)
-
-
-_known_implementations = {
-    _MATMUL: _dot_on_cpu_broadcast_elsewhere,  # matrix-matrix: dot on CPU, broadcast otherwise
-    _VECMAT: _dot,  # vector-matrix: dot everywhere
-    _ROW_CONTRACT: _dot_broadcast,  # row-contract: broadcast everywhere
-    _VEC_CONTRACT: _dot_broadcast,  # vec-contract: broadcast everywhere
-    _HESSIAN_TRANSFORM: _hessian_transform_on_cpu_broadcast_elsewhere,
+_POLICIES: dict[str, tuple[Callable, Callable]] = {
+    # (p, q) x (q, r): the element Jacobian and the product after it
+    "ab,bc->ac": (_einsum, _einsum_broadcast),
+    # (q,) x (q, r): the Line2/Line3 tangent vector
+    "a,ab->b": (_einsum, _einsum),
+    # (p, q) x (q, ...): dNdX against nodal values
+    "ab,b...->a...": (_einsum_broadcast, _einsum_broadcast),
+    # (q,) x (q, ...): N against nodal values
+    "a,a...->...": (_einsum_broadcast, _einsum_broadcast),
+    # (..., i, r) x (j, r) -> (..., i, j)
+    "...ab,cb->...ac": (_einsum, _einsum_broadcast),
 }
 
-# (A.ndim, B.ndim); None means any rank containing the explicitly named axes.
-_known_ranks = {
-    _MATMUL: (2, 2),
-    _VECMAT: (1, 2),
-    _ROW_CONTRACT: (2, None),
-    _VEC_CONTRACT: (1, None),
-    _HESSIAN_TRANSFORM: (None, 2),
-}
-
-_known_contraction_axes = {
-    _MATMUL: (-1, 0),
-    _VECMAT: (-1, 0),
-    _ROW_CONTRACT: (-1, 0),
-    _VEC_CONTRACT: (-1, 0),
-    _HESSIAN_TRANSFORM: (-1, -1),
-}
+# Compatibility for code that only inspects whether a canonical spec is registered.
+_known_implementations = _POLICIES
 
 
 def _tokenize(term: str) -> list[str]:
@@ -459,50 +617,67 @@ def contract(spec: str, A: Array, B: Array) -> Array:
     # convert the spec to canonical form, to match keys in the known implementations
     canonical = _canonicalise(spec)
     # look up the implementation for the canonical spec
-    implementation = _known_implementations.get(canonical)
+    policy = _POLICIES.get(canonical)
 
-    if implementation is None:
-        supported = ", ".join(repr(s) for s in _known_implementations)
+    if policy is None:
+        supported = ", ".join(repr(s) for s in _POLICIES)
         raise ValueError(
-            f"tatva.linalg.contract has no implementation for {spec!r} (canonically {canonical!r})."
+            f"tatva.linalg.contract has no implementation policy for {spec!r} "
+            f"(canonically {canonical!r})."
             f" Supported contractions are {supported}. This is deliberate rather than a "
             "gap: each entry is a measured decision about how to spell the contraction "
             "so it does not lower to a `dot`. Add an entry, with the measurement, rather "
             "than reaching for jnp.einsum -- see the module docstring."
         )
 
-    # check that the operand shapes match the expected ranks for this spec
-    expected_a, expected_b = _known_ranks[canonical]
-    got = (A.ndim, B.ndim)
-    a_term, b_term = canonical.split("->")[0].split(",")
-    min_a = len([token for token in _tokenize(a_term) if token != "..."])
-    min_b = len([token for token in _tokenize(b_term) if token != "..."])
-    a_rank_matches = A.ndim >= min_a if expected_a is None else A.ndim == expected_a
-    b_rank_matches = B.ndim >= min_b if expected_b is None else B.ndim == expected_b
-
-    if not a_rank_matches or not b_rank_matches:
-        wanted_a = expected_a if expected_a is not None else f">={min_a}"
-        wanted_b = expected_b if expected_b is not None else f">={min_b}"
-        wanted = f"({wanted_a}, {wanted_b})"
+    operands = (jnp.asarray(A), jnp.asarray(B))
+    try:
+        input_labels, _ = _parse_einsum_subscripts(canonical, operands)
+    except ValueError as error:
         raise ValueError(
-            f"tatva.linalg.contract({spec!r}, ...) wants operand ranks {wanted}, got {got} from "
-            f"shapes {A.shape} and {B.shape}. These take a single tensor each -- batch "
-            "with jax.vmap, which fuses the contraction into the surrounding work "
-            "instead of materialising it."
+            f"tatva.linalg.contract({spec!r}, ...) received operand ranks "
+            f"{(A.ndim, B.ndim)} from shapes {A.shape} and {B.shape}, which do not "
+            "match the registered spec. Batch with jax.vmap rather than adding an "
+            "unregistered batch axis."
+        ) from error
+
+    for label in set(input_labels[0]).intersection(input_labels[1]):
+        a_axis = input_labels[0].index(label)
+        b_axis = input_labels[1].index(label)
+        a_size, b_size = A.shape[a_axis], B.shape[b_axis]
+        if a_size == b_size or a_size == 1 or b_size == 1:
+            continue
+        a_axis_name = (
+            "first"
+            if a_axis == 0
+            else "last"
+            if a_axis == A.ndim - 1
+            else f"axis {a_axis}"
+        )
+        b_axis_name = (
+            "first"
+            if b_axis == 0
+            else "last"
+            if b_axis == B.ndim - 1
+            else f"axis {b_axis}"
+        )
+        raise ValueError(
+            f"tatva.linalg.contract({spec!r}, ...) contracts A's {a_axis_name} axis "
+            f"with B's {b_axis_name} axis using label {label!r}, but they are "
+            f"{a_size} and {b_size} from shapes {A.shape} and {B.shape}."
         )
 
-    a_axis, b_axis = _known_contraction_axes[canonical]
+    on_cpu, on_default = policy
 
-    if A.shape[a_axis] != B.shape[b_axis]:
-        b_axis_name = "first" if b_axis == 0 else "last"
-        raise ValueError(
-            f"tatva.linalg.contract({spec!r}, ...) contracts A's last axis with B's "
-            f"{b_axis_name}, but they are {A.shape[a_axis]} and {B.shape[b_axis]} from "
-            f"shapes {A.shape} and "
-            f"{B.shape}."
-        )
+    if on_cpu is on_default:
+        return on_cpu(canonical, A, B)
 
-    return implementation(A, B)
+    return jax.lax.platform_dependent(
+        A,
+        B,
+        cpu=partial(on_cpu, canonical),
+        default=partial(on_default, canonical),
+    )
 
 
 def einsum(spec: Any, *operands: Any, **kwargs: Any) -> Array:
@@ -539,7 +714,7 @@ def einsum(spec: Any, *operands: Any, **kwargs: Any) -> Array:
         return jnp.einsum(spec, *operands, **kwargs)
 
     # look up the implementation for the canonical spec
-    if canonical not in _known_implementations or len(operands) != 2:
+    if canonical not in _POLICIES or len(operands) != 2:
         return jnp.einsum(spec, *operands, **kwargs)
 
     return contract(spec, *operands)

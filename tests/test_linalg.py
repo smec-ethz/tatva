@@ -108,6 +108,99 @@ def test_det_rejects_anything_that_is_not_a_single_matrix(shape):
 
 
 # --------------------------------------------------------------------------------
+# general broadcast einsum
+# --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("spec", "shapes"),
+    [
+        ("ij,jk->ik", [(2, 3), (3, 4)]),
+        ("ij,jk->ki", [(2, 3), (3, 4)]),
+        ("...ij,...jk->...ik", [(5, 2, 3), (1, 3, 4)]),
+        ("ii->i", [(3, 3)]),
+        ("...ii->...i", [(2, 3, 3)]),
+        ("ij->ji", [(2, 3)]),
+        ("ij,jk,kl->il", [(2, 3), (3, 4), (4, 5)]),
+        ("ij,jk", [(2, 3), (3, 4)]),
+        ("i,j->ij", [(2,), (3,)]),
+        ("ij->", [(2, 3)]),
+    ],
+)
+def test_einsum_broadcast_matches_jnp_einsum(spec, shapes):
+    rng = np.random.default_rng(20)
+    operands = [jnp.asarray(rng.random(shape)) for shape in shapes]
+    assert jnp.allclose(
+        linalg._einsum_broadcast(spec, *operands), jnp.einsum(spec, *operands)
+    )
+
+
+def test_einsum_broadcast_supports_named_axis_broadcasting():
+    A = jnp.arange(3.0).reshape(1, 3)
+    B = jnp.arange(12.0).reshape(3, 4)
+    assert jnp.allclose(
+        linalg._einsum_broadcast("ij,jk->ik", A, B), jnp.einsum("ij,jk->ik", A, B)
+    )
+
+
+def test_einsum_broadcast_honours_preferred_element_type():
+    A = jnp.ones((2, 3), dtype=jnp.float16)
+    B = jnp.ones((3, 4), dtype=jnp.float16)
+    result = linalg._einsum_broadcast(
+        "ij,jk->ik", A, B, preferred_element_type=jnp.float32
+    )
+    assert result.dtype == jnp.float32
+    assert jnp.allclose(result, jnp.einsum("ij,jk->ik", A, B))
+
+
+def test_einsum_broadcast_lowers_without_dot_general():
+    A = jnp.ones((8, 2, 3))
+    B = jnp.ones((8, 3, 4))
+    text = (
+        jax.jit(lambda a, b: linalg._einsum_broadcast("...ij,...jk->...ki", a, b))
+        .lower(A, B)
+        .as_text()
+    )
+    assert "dot_general" not in text
+    assert "stablehlo.multiply" in text
+    assert "stablehlo.reduce" in text
+
+
+@pytest.mark.parametrize(
+    ("spec", "shapes", "message"),
+    [
+        ("ij,jk->ik", [(2, 3)], "input terms"),
+        ("ii->i", [(2, 3)], "repeated einsum label"),
+        ("ij->ik", [(2, 3)], "does not appear"),
+    ],
+)
+def test_einsum_broadcast_rejects_invalid_specs(spec, shapes, message):
+    with pytest.raises(ValueError, match=message):
+        linalg._einsum_broadcast(spec, *(jnp.ones(shape) for shape in shapes))
+
+
+@pytest.mark.parametrize(
+    ("spec", "shapes"),
+    [
+        ("ij,jk->ik", [(2, 3), (3, 4)]),
+        ("...ij,...jk->...ki", [(5, 2, 3), (1, 3, 4)]),
+        ("ij,jk,kl->il", [(2, 3), (3, 4), (4, 5)]),
+    ],
+)
+def test_dot_is_the_general_normal_einsum_path(spec, shapes):
+    rng = np.random.default_rng(21)
+    operands = [jnp.asarray(rng.random(shape)) for shape in shapes]
+    assert jnp.allclose(linalg._einsum(spec, *operands), jnp.einsum(spec, *operands))
+
+
+def test_dot_honours_preferred_element_type():
+    A = jnp.ones((2, 3), dtype=jnp.float16)
+    B = jnp.ones((3, 4), dtype=jnp.float16)
+    result = linalg._einsum("ij,jk->ik", A, B, preferred_element_type=jnp.float32)
+    assert result.dtype == jnp.float32
+
+
+# --------------------------------------------------------------------------------
 # tensordot
 # --------------------------------------------------------------------------------
 
