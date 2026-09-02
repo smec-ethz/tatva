@@ -5,6 +5,14 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.6](https://github.com/smec-ethz/tatva/compare/v0.11.5...v0.11.6) (2026-09-02)
+
+
+### Bug Fixes
+
+* **linalg:** add contraction for "...ab,cb-&gt;...ac" used in hessian ([a11c976](https://github.com/smec-ethz/tatva/commit/a11c9763813fcdcfc5f9a2cf17067e8198402c5f))
+* **operator:** add op.hess to evaluate the hessian of nodal vals at quad points ([27f63a5](https://github.com/smec-ethz/tatva/commit/27f63a5eaa07d47d746d8f233c93b18df322f9bf))
+
 ## [0.11.5](https://github.com/smec-ethz/tatva/compare/v0.11.4...v0.11.5) (2026-08-18)
 
 
