@@ -292,7 +292,13 @@ def _materialize_custom_jvp(
         const_values=nested_plan.branch_consts[0],
     )
     jvp_inputs = tuple(
-        None if binding.tangent else outer[binding.outer_input_index]
+        None
+        if binding.tangent
+        else (
+            primal.output_values[binding.primal_output_index]
+            if binding.primal_output_index is not None
+            else outer[binding.outer_input_index]
+        )
         for binding in spec.jvp_bindings
     )
     jvp = _materialize_jaxpr(

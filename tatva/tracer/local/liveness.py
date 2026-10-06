@@ -97,6 +97,7 @@ class JaxprDemandTrace:
     eqn_input_demands: dict[int, tuple[Demand, ...]]
     input_demands: tuple[Demand, ...]
     nested: dict[int, NestedDemandTrace]
+    output_demands: tuple[Demand, ...] = ()
 
 
 @dataclass
@@ -229,24 +230,38 @@ class _DemandPlanNestedHandler:
             self.frame, self.eqn_plan
         )
         primal_step, jvp_step = primal_frame.path[-1], jvp_frame.path[-1]
-        jvp_outputs: list[Demand] = list(self.outputs)
-        for is_zero, demand in zip(spec.output_zeros, self.outputs, strict=True):
-            if not is_zero:
-                jvp_outputs.append(demand)
+        primal_outputs = list(self.outputs)
         try:
+            while True:
+                jvp_outputs: list[Demand] = list(primal_outputs)
+                for is_zero, demand in zip(
+                    spec.output_zeros, primal_outputs, strict=True
+                ):
+                    if not is_zero:
+                        jvp_outputs.append(demand)
+                jvp = _backprop_plan_jaxpr(
+                    jvp_frame.plan,
+                    jvp_frame,
+                    self.resolver,
+                    self.seed_node.children.get(jvp_step, _SeedNode()),
+                    output_demands=tuple(jvp_outputs),
+                )
+                updated = list(primal_outputs)
+                for binding, demand in zip(
+                    spec.jvp_bindings, jvp.input_demands, strict=True
+                ):
+                    if binding.primal_output_index is not None:
+                        index = binding.primal_output_index
+                        updated[index] = merge_demands(updated[index], demand)
+                if updated == primal_outputs:
+                    break
+                primal_outputs = updated
             primal = _backprop_plan_jaxpr(
                 primal_frame.plan,
                 primal_frame,
                 self.resolver,
                 self.seed_node.children.get(primal_step, _SeedNode()),
-                output_demands=self.outputs,
-            )
-            jvp = _backprop_plan_jaxpr(
-                jvp_frame.plan,
-                jvp_frame,
-                self.resolver,
-                self.seed_node.children.get(jvp_step, _SeedNode()),
-                output_demands=tuple(jvp_outputs),
+                output_demands=tuple(primal_outputs),
             )
         finally:
             self.resolver.release(primal_frame)
@@ -256,8 +271,9 @@ class _DemandPlanNestedHandler:
             outer[index] = merge_demands(outer[index], demand)
 
         for binding, demand in zip(spec.jvp_bindings, jvp.input_demands, strict=True):
-            index = binding.outer_input_index
-            outer[index] = merge_demands(outer[index], demand)
+            if binding.primal_output_index is None:
+                index = binding.outer_input_index
+                outer[index] = merge_demands(outer[index], demand)
 
         return tuple(outer), CustomJvpInvocation(self.eqn_plan.index, primal, jvp)
 
@@ -780,6 +796,11 @@ def _backprop_plan_jaxpr(
         eqn_input_demands=eqn_input_demands,
         input_demands=tuple(demands.get(var) for var in jaxpr.invars),
         nested=nested_traces,
+        output_demands=output_demands
+        or tuple(
+            demands.get(atom) if isinstance(atom, Var) else None
+            for atom in jaxpr.outvars
+        ),
     )
 
 

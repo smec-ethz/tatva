@@ -8,7 +8,7 @@ emitted by that walk become the compiled JAX computation.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -163,7 +163,7 @@ def _frame_outputs(
             continue
 
         if isinstance(atom, Literal):
-            result.append(atom.val)
+            result.append(jnp.asarray(atom.val, dtype=atom.aval.dtype))
             continue
 
         result.append(env[atom])
@@ -320,8 +320,20 @@ def _lower_custom_jvp(
     def jvp(primals, tangents):
         values: list[Any | None] = []
         layouts: list[TensorLayout | None] = []
+        # Re-enter the custom derivative boundary for solved values. Higher
+        # derivatives must differentiate these values implicitly as well.
+        primal_values = (
+            local(*primals)
+            if any(b.primal_output_index is not None for b in spec.jvp_bindings)
+            else ()
+        )
 
         for child_index, binding in enumerate(spec.jvp_bindings):
+            if binding.primal_output_index is not None:
+                index = binding.primal_output_index
+                values.append(primal_values[index])
+                layouts.append(context.invocation.primal.output_layouts[index])
+                continue
             outer_index = binding.outer_input_index
             position = live_position.get(outer_index)
             if position is None:
@@ -353,7 +365,12 @@ def _lower_custom_jvp(
             if primal_value is None:
                 tangent_outputs_list.append(None)
             elif is_zero:
-                tangent_outputs_list.append(jnp.zeros_like(primal_value))
+                dtype = (
+                    primal_value.dtype
+                    if jnp.issubdtype(primal_value.dtype, jnp.inexact)
+                    else jax.dtypes.float0
+                )
+                tangent_outputs_list.append(jnp.zeros_like(primal_value, dtype=dtype))
             else:
                 tangent_outputs_list.append(tangent_value)
 
@@ -361,7 +378,22 @@ def _lower_custom_jvp(
 
         return primal_outputs, tangent_outputs
 
-    return tuple(local(*live_outer_values))
+    outputs = local(*live_outer_values)
+    return tuple(
+        None
+        if target is None
+        else _project_local_value(
+            value,
+            source_layout=source,
+            target_layout=target,
+        )
+        for value, source, target in zip(
+            outputs,
+            context.invocation.primal.output_layouts,
+            plan.output_layouts,
+            strict=True,
+        )
+    )
 
 
 def _lower_cond(

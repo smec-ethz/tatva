@@ -4,6 +4,7 @@ from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     CondAnalysisSemantics,
     CustomJvpAnalysisSemantics,
+    HighPrimitiveAnalysisSemantics,
     LinearSolveAnalysisSemantics,
     NestedOperationSemantics,
     OperationSemantics,
@@ -72,6 +73,7 @@ class PrimitiveRegistry:
                         CondAnalysisSemantics,
                         LinearSolveAnalysisSemantics,
                         CustomJvpAnalysisSemantics,
+                        HighPrimitiveAnalysisSemantics,
                     ),
                 ):
                     errors.append(

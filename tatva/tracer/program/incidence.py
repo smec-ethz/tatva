@@ -231,26 +231,39 @@ def _backprop_plan_custom_jvp(
     jvp_step = jvp_frame.path[-1]
     # Incidence follows the custom tangent program. Its primal-valued outputs
     # are not derivative outputs; nonzero tangent outputs inherit outer tags.
-    jvp_outputs: list[Tagged] = [None] * len(output_demands)
-    for is_zero, demand in zip(spec.output_zeros, output_demands, strict=True):
-        if not is_zero:
-            jvp_outputs.append(demand)
+    demands = list(output_demands)
+    outer: list[Tagged] = [None] * len(eqn_plan.eqn.invars)
     try:
-        child = _backprop_tagged_plan(
-            jvp_frame.plan,
-            jvp_frame,
-            resolver,
-            _seed_child(seed_node, jvp_step) or _TaggedSeedNode(),
-            output_demands=tuple(jvp_outputs),
-        )
+        # Derivative coefficients can need additional solved entries. Follow
+        # their implicit incidence until the finite colored demand stabilizes.
+        while True:
+            jvp_outputs: list[Tagged] = [None] * len(output_demands)
+            for is_zero, demand in zip(spec.output_zeros, demands, strict=True):
+                if not is_zero:
+                    jvp_outputs.append(demand)
+            child = _backprop_tagged_plan(
+                jvp_frame.plan,
+                jvp_frame,
+                resolver,
+                _seed_child(seed_node, jvp_step) or _TaggedSeedNode(),
+                output_demands=tuple(jvp_outputs),
+            )
+            updated = list(demands)
+            for binding, demand in zip(
+                spec.jvp_bindings, child.input_demands, strict=True
+            ):
+                if binding.primal_output_index is not None:
+                    index = binding.primal_output_index
+                    updated[index] = merge_tagged(updated[index], demand)
+                else:
+                    index = binding.outer_input_index
+                    outer[index] = merge_tagged(outer[index], demand)
+            if updated == demands:
+                break
+            demands = updated
     finally:
         resolver.release(primal_frame)
         resolver.release(jvp_frame)
-
-    outer: list[Tagged] = [None] * len(eqn_plan.eqn.invars)
-    for binding, demand in zip(spec.jvp_bindings, child.input_demands, strict=True):
-        index = binding.outer_input_index
-        outer[index] = merge_tagged(outer[index], demand)
     return tuple(outer), TaggedTraversalSummary(NestedKind.CUSTOM_JVP)
 
 

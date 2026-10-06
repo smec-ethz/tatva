@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn
 
+from tatva.tracer.core.nested import CustomJvpBinding
+
 
 @dataclass(frozen=True, slots=True)
 class CustomJvpParameters:
@@ -14,6 +16,8 @@ class CustomJvpParameters:
     jvp_consts: tuple[object, ...]
     num_consts: int
     output_zeros: tuple[bool, ...]
+    primal_consts: tuple[object, ...] = ()
+    bindings: tuple[CustomJvpBinding, ...] | None = None
 
 
 def extract_custom_jvp_parameters(eqn: JaxprEqn) -> CustomJvpParameters:

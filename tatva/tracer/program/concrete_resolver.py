@@ -686,7 +686,14 @@ class ConcreteResolver:
             if binding.tangent:
                 jvp_bindings.append(None)
                 unavailable[index] = f"custom_jvp runtime tangent input {index}"
+            elif binding.primal_output_index is not None:
+                jvp_bindings.append(
+                    _ParentBinding(
+                        primal, primal.plan.jaxpr.outvars[binding.primal_output_index]
+                    )
+                )
             else:
+                assert binding.outer_input_index is not None
                 jvp_bindings.append(
                     _ParentBinding(
                         parent, eqn_plan.eqn.invars[binding.outer_input_index]

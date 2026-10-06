@@ -160,19 +160,34 @@ class LinearSolveSpec:
 
 @dataclass(frozen=True)
 class CustomJvpBinding:
-    """One JVP-program input sourced from an outer primal or its tangent."""
+    """One JVP input: an outer primal, its tangent, or a solved primal output."""
 
-    outer_input_index: int
+    outer_input_index: int | None = None
     tangent: bool = False
+    primal_output_index: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.outer_input_index is None) == (self.primal_output_index is None):
+            raise ValueError("a JVP binding needs exactly one input or primal output")
+        if self.tangent and self.primal_output_index is not None:
+            raise ValueError("a primal output binding cannot be a tangent")
+        index = (
+            self.outer_input_index
+            if self.outer_input_index is not None
+            else self.primal_output_index
+        )
+        if index < 0:
+            raise ValueError("a JVP binding index must be nonnegative")
 
 
 @dataclass(frozen=True)
 class CustomJvpSpec:
     """Runtime mapping for the staged JVP callback.
 
-    jvp_bindings covers only explicit JVP jaxpr inputs: dynamic primals followed by their
-    tangents. lifted primal constants stay on the outer custom-jvp equation, while
-    jvp-only captures are child jaxpr constvars.
+    jvp_bindings describes explicit callback inputs. Ordinary custom JVPs use
+    dynamic primals followed by their tangents; custom roots additionally receive
+    solved primal outputs. Lifted primal constants stay on the outer equation,
+    while callback-only captures are child jaxpr constvars.
     """
 
     jvp_bindings: tuple[CustomJvpBinding, ...]

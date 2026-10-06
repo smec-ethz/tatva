@@ -705,8 +705,12 @@ def _trace_custom_jvp(
     for binding, child_var in zip(
         spec.jvp_bindings, jvp_frame.plan.jaxpr.invars, strict=True
     ):
-        outer_dep = input_deps[binding.outer_input_index]
         child_shape = _shape_of(child_var)
+        outer_dep = (
+            DependencySet.empty(child_shape, n_symbols)
+            if binding.primal_output_index is not None
+            else input_deps[binding.outer_input_index]
+        )
         if child_shape != outer_dep.shape:
             raise RuntimeError(
                 "custom_jvp child input shape differs from its outer binding: "
@@ -775,6 +779,32 @@ def _trace_custom_jvp(
         raise RuntimeError(
             "custom_jvp tangent output ABI has unexpected trailing outputs"
         )
+
+    # Solved primal values carry the implicit first-order dependencies, not
+    # derivatives through the numerical solver. First discover these from the
+    # tangent incidence with roots held fixed; then trace coefficient variation
+    # with the solved values bound to those dependencies.
+    if any(b.primal_output_index is not None for b in spec.jvp_bindings):
+        for index, binding in enumerate(spec.jvp_bindings):
+            if binding.primal_output_index is not None:
+                jvp_input_deps[index] = _augment_dependency_width(
+                    outputs[binding.primal_output_index],
+                    n_tangent_symbols,
+                )
+        primal_frame, jvp_frame = resolver.custom_jvp_frames(frame, eqn_plan)
+        try:
+            jvp_acc = InteractionGraph(n_extended_symbols)
+            jvp_extended = _trace_jaxpr(
+                plan=jvp_frame.plan,
+                frame=jvp_frame,
+                resolver=resolver,
+                input_deps=tuple(jvp_input_deps),
+                acc=jvp_acc,
+                n_symbols=n_extended_symbols,
+            )
+        finally:
+            resolver.release(jvp_frame)
+            resolver.release(primal_frame)
 
     # The custom derivative's second-order support is variation of the tangent
     # output with parent coordinates: parent x tangent.  Parent x parent work

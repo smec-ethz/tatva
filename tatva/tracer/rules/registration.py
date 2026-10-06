@@ -28,6 +28,7 @@ from tatva.tracer.core.semantics import (
     CondAnalysisSemantics,
     CustomJvpAnalysisSemantics,
     DerivativeRule,
+    HighPrimitiveAnalysisSemantics,
     LinearSolveAnalysisSemantics,
     LocalizationSemantics,
     NestedOperationSemantics,
@@ -35,6 +36,7 @@ from tatva.tracer.core.semantics import (
     RouteRequirement,
     RoutingSemantics,
     ScanAnalysisSemantics,
+    eval_jaxpr_call_target,
     no_hessian,
 )
 from tatva.tracer.lowering import rules as lowerings
@@ -657,6 +659,23 @@ def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
 def _register_nested_rules(
     reg: PrimitiveRegistry,
 ) -> None:
+    from jax._src.core import eval_jaxpr_p
+    from jax._src.hijax import call_hi_primitive_p
+
+    reg.register(
+        eval_jaxpr_p,
+        NestedOperationSemantics(
+            analysis=CallAnalysisSemantics(
+                call_kind=CallKind.JIT,
+                target=eval_jaxpr_call_target,
+            )
+        ),
+    )
+
+    reg.register(
+        call_hi_primitive_p,
+        NestedOperationSemantics(analysis=HighPrimitiveAnalysisSemantics()),
+    )
     reg.register(
         primitives.jit_p,
         NestedOperationSemantics(

@@ -11,6 +11,7 @@ from tatva.tracer.core.semantics import (
     CallAnalysisSemantics,
     CondAnalysisSemantics,
     CustomJvpAnalysisSemantics,
+    HighPrimitiveAnalysisSemantics,
     LinearSolveAnalysisSemantics,
     NestedOperationSemantics,
     ScanAnalysisSemantics,
@@ -20,6 +21,11 @@ from tatva.tracer.local.plan import (
     pending_routes,
 )
 from tatva.tracer.program.custom_jvp import extract_custom_jvp_parameters
+from tatva.tracer.program.custom_root import (
+    extract_custom_root_parameters,
+    high_primitive_kind,
+    root_linear_map_target,
+)
 
 
 class SupportCapability(Enum):
@@ -63,6 +69,12 @@ def _nested_jaxprs(
     semantics: NestedOperationSemantics,
 ) -> tuple[Jaxpr, ...]:
     analysis = semantics.analysis
+
+    if isinstance(analysis, HighPrimitiveAnalysisSemantics):
+        if high_primitive_kind(eqn) == "root":
+            extracted = extract_custom_root_parameters(eqn)
+            return (extracted.primal_jaxpr, extracted.jvp_jaxpr)
+        return (normalize_nested_jaxpr(root_linear_map_target(eqn).body).jaxpr,)
 
     if isinstance(analysis, CustomJvpAnalysisSemantics):
         extracted = extract_custom_jvp_parameters(eqn)
@@ -138,6 +150,22 @@ def registration_issues(
                 continue
 
             analysis = semantics.analysis
+            if isinstance(analysis, HighPrimitiveAnalysisSemantics):
+                try:
+                    children = _nested_jaxprs(eqn, semantics)
+                except NotImplementedError as exc:
+                    issues.append(
+                        SupportIssue(
+                            SupportCapability.REGISTRATION,
+                            eqn.primitive.name,
+                            _format_eqn_path(eqn_path),
+                            str(exc),
+                        )
+                    )
+                    continue
+                for child in children:
+                    visit(child, eqn_path)
+                continue
             if isinstance(analysis, CustomJvpAnalysisSemantics):
                 # JAX derivative programs may recursively contain the same
                 # custom-JVP call (LU's JVP in JAX 0.11 does this). Each

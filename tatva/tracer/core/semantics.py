@@ -346,6 +346,13 @@ def direct_call_target(eqn: JaxprEqn) -> CallTarget:
     return CallTarget(body=value)
 
 
+def eval_jaxpr_call_target(eqn: JaxprEqn) -> CallTarget:
+    value = eqn.params.get("call_jaxpr")
+    if not isinstance(value, (Jaxpr, ClosedJaxpr)):
+        raise TypeError("eval_jaxpr is missing its call_jaxpr body")
+    return CallTarget(value)
+
+
 @dataclass(frozen=True, slots=True)
 class CallAnalysisSemantics:
     call_kind: CallKind
@@ -372,12 +379,18 @@ class CustomJvpAnalysisSemantics:
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class HighPrimitiveAnalysisSemantics:
+    pass
+
+
 type NestedAnalysisSemantics = (
     CallAnalysisSemantics
     | ScanAnalysisSemantics
     | CondAnalysisSemantics
     | LinearSolveAnalysisSemantics
     | CustomJvpAnalysisSemantics
+    | HighPrimitiveAnalysisSemantics
 )
 
 

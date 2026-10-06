@@ -515,7 +515,14 @@ def _build_rank_local_jaxpr_plan(
     layouts = _finalize_layouts(trace)
     const_layouts = tuple(_atom_layout(var, layouts) for var in jaxpr.constvars)
     input_layouts = tuple(_atom_layout(var, layouts) for var in jaxpr.invars)
-    output_layouts = tuple(_atom_layout(atom, layouts) for atom in jaxpr.outvars)
+    # Literal callback results (for example integer solver diagnostics) have
+    # no variable demand entry, but still need a layout at the call boundary.
+    output_layouts = tuple(
+        _demand_layout(trace.output_demands[index])
+        if isinstance(atom, Literal) and trace.output_demands
+        else _atom_layout(atom, layouts)
+        for index, atom in enumerate(jaxpr.outvars)
+    )
     local_eqns: list[LocalEqnPlan] = []
 
     for eqn_plan in plan.eqns:
