@@ -1260,7 +1260,11 @@ def _eval_iota(_inputs, params):
     shp = params.get("shape")
     newshp = [1] * len(shp)
     newshp[dim] = shp[dim]
-    return (np.broadcast_to(np.arange(shp[dim]).reshape(newshp), shp),)
+    return (
+        np.broadcast_to(
+            np.arange(shp[dim], dtype=params["dtype"]).reshape(newshp), shp
+        ),
+    )
 
 
 try:
