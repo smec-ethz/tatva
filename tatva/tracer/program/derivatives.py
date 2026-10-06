@@ -183,6 +183,10 @@ def tangent_pattern(
     ``Trial``, ``Test``, or ``State`` annotations on ``functional``. Unannotated
     functionals are treated as energies with their first flattened input as the
     shared row and column coordinate.
+
+    Custom-derivative primal solvers are opaque in this path. Only their
+    derivative programs need structural support; executable decomposition has
+    a separate preflight that also checks primal implementations.
     """
     captured = make_captured_jaxpr(functional, *args, **kwargs)
     if form is None:
@@ -190,8 +194,8 @@ def tangent_pattern(
     if form is None:
         form = FormSpec.energy(input_index=0)
 
-    require_registered_operations(captured.jaxpr)
-    plan = analyze(captured.jaxpr)
+    require_registered_operations(captured.jaxpr, derivative_only=True)
+    plan = analyze(captured.jaxpr, derivative_only=True)
     resolver, frame = ConcreteResolver.root(
         captured.closed_jaxpr,
         captured.flat_args,
@@ -733,14 +737,19 @@ def _trace_custom_jvp(
         raise RuntimeError("custom_jvp tangent symbol accounting mismatch")
 
     try:
-        primal_trace = _trace_jaxpr(
-            plan=primal_frame.plan,
-            frame=primal_frame,
-            resolver=resolver,
-            input_deps=input_deps,
-            acc=InteractionGraph(n_symbols),  # diagnostics only
-            n_symbols=n_symbols,
-        )
+        if primal_frame.plan.opaque:
+            # Sparsity comes from the custom derivative; the solver's primal
+            # implementation contributes no diagnostic derivative program.
+            primal_trace = JaxprDerivativeTrace({}, (), {})
+        else:
+            primal_trace = _trace_jaxpr(
+                plan=primal_frame.plan,
+                frame=primal_frame,
+                resolver=resolver,
+                input_deps=input_deps,
+                acc=InteractionGraph(n_symbols),  # diagnostics only
+                n_symbols=n_symbols,
+            )
 
         jvp_extended = _trace_jaxpr(
             plan=jvp_frame.plan,
@@ -828,6 +837,19 @@ def _trace_custom_jvp(
         format="csr",
     )
     jvp_trace = _project_jaxpr_derivative_trace(jvp_extended, projection)
+
+    if primal_frame.plan.opaque:
+        primal_trace = JaxprDerivativeTrace(
+            dependencies={
+                var: dep
+                for var, dep in zip(
+                    primal_frame.plan.jaxpr.outvars, outputs, strict=True
+                )
+                if isinstance(var, Var)
+            },
+            output_deps=tuple(outputs),
+            nested={},
+        )
 
     return (
         tuple(outputs),

@@ -6,6 +6,8 @@ from typing import Any, Self
 
 import numpy as np
 from jax import lax
+from jax._src.core import eval_jaxpr
+from jax._src.interpreters.partial_eval import dce_jaxpr
 from jax.core import Atom
 from jax.extend.core import ClosedJaxpr, JaxprEqn, Literal, Primitive, Var
 
@@ -277,6 +279,28 @@ class ConcreteResolver:
                     value = self._regional_binding(binding, child_demand).values
             state.values[atom] = value
             return value
+
+        if frame.plan.opaque:
+            # Delegate a primal-only callback to JAX only when a route actually
+            # requests its value. Coordinate/tangent inputs remain unavailable.
+            if atom not in frame.plan.jaxpr.outvars:
+                raise DynamicRoutingError(
+                    "opaque primal callbacks expose only their outputs for concrete routing"
+                )
+            # JAX can prune unused operands through its own control-flow rules
+            # without requiring Tatva operation semantics for the primal body.
+            pruned, _ = dce_jaxpr(
+                frame.plan.jaxpr,
+                tuple(v is atom for v in frame.plan.jaxpr.outvars),
+            )
+            primal_inputs = tuple(self.value(frame, v) for v in pruned.invars)
+            primal_consts = tuple(self.value(frame, v) for v in pruned.constvars)
+            outputs = eval_jaxpr(pruned, primal_consts, *primal_inputs)
+            self.stats.evaluated_eqns += 1
+            for var, value in zip(pruned.outvars, outputs, strict=True):
+                if isinstance(var, Var):
+                    state.values[var] = np.asarray(value)
+            return self._full_value(frame, atom)
 
         producer = state.producers.get(atom)
         if producer is None:

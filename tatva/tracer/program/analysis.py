@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from jax._src.interpreters.partial_eval import dce_jaxpr
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
 from tatva.tracer.core.nested import (
@@ -112,6 +113,10 @@ class JaxprPlan:
     concrete_inputs: frozenset[int]
     # outputs that the parent requires concretely
     concrete_outputs: frozenset[int]
+    derivative_only: bool = False
+    # An opaque custom-derivative primal may be evaluated by JAX if routing
+    # needs a concrete value, but its implementation is not structurally traced.
+    opaque: bool = False
 
 
 def backward_output_slice(
@@ -147,7 +152,13 @@ def analyze(
     jaxpr: Jaxpr,
     *,
     concrete_outputs: frozenset[int] = frozenset(),
+    derivative_only: bool = False,
 ) -> JaxprPlan:
+    """Plan supported operations for execution or structural derivatives.
+
+    Derivative-only plans keep custom-derivative primal callbacks opaque. Their
+    JVP programs still receive full structural analysis and routing checks.
+    """
     # validate output indices before doing any work
     for index in concrete_outputs:
         if index < 0 or index >= len(jaxpr.outvars):
@@ -188,6 +199,7 @@ def analyze(
         if isinstance(semantics, NestedOperationSemantics):
             nested = _analyze_nested(
                 eqn,
+                derivative_only=derivative_only,
                 semantics=semantics.analysis,
                 concrete_outputs=required_outputs,
             )
@@ -261,6 +273,7 @@ def analyze(
         eqns=eqn_plans,
         concrete_inputs=concrete_inputs,
         concrete_outputs=concrete_outputs,
+        derivative_only=derivative_only,
     )
 
 
@@ -269,16 +282,19 @@ def _analyze_nested(
     *,
     semantics: NestedAnalysisSemantics,
     concrete_outputs: frozenset[int],
+    derivative_only: bool,
 ) -> NestedPlan:
     if isinstance(semantics, HighPrimitiveAnalysisSemantics):
         if high_primitive_kind(eqn) == "root":
             return _analyze_custom_jvp(
                 eqn,
+                derivative_only=derivative_only,
                 concrete_outputs=concrete_outputs,
                 extracted=extract_custom_root_parameters(eqn),
             )
         return _analyze_call(
             eqn,
+            derivative_only=derivative_only,
             semantics=ROOT_LINEAR_MAP_ANALYSIS,
             concrete_outputs=concrete_outputs,
         )
@@ -286,12 +302,14 @@ def _analyze_nested(
     if isinstance(semantics, CustomJvpAnalysisSemantics):
         return _analyze_custom_jvp(
             eqn,
+            derivative_only=derivative_only,
             concrete_outputs=concrete_outputs,
         )
 
     if isinstance(semantics, CallAnalysisSemantics):
         return _analyze_call(
             eqn,
+            derivative_only=derivative_only,
             semantics=semantics,
             concrete_outputs=concrete_outputs,
         )
@@ -299,17 +317,20 @@ def _analyze_nested(
     if isinstance(semantics, ScanAnalysisSemantics):
         return _analyze_scan(
             eqn,
+            derivative_only=derivative_only,
             concrete_outputs=concrete_outputs,
         )
 
     if isinstance(semantics, CondAnalysisSemantics):
         return _analyze_cond(
             eqn,
+            derivative_only=derivative_only,
             concrete_outputs=concrete_outputs,
         )
     if isinstance(semantics, LinearSolveAnalysisSemantics):
         return _analyze_linear_solve(
             eqn,
+            derivative_only=derivative_only,
             concrete_outputs=concrete_outputs,
         )
 
@@ -320,6 +341,7 @@ def _analyze_custom_jvp(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
+    derivative_only: bool,
     extracted: CustomJvpParameters | None = None,
 ) -> NestedPlan:
     if extracted is None:
@@ -331,15 +353,31 @@ def _analyze_custom_jvp(
             "custom_jvp primal output ABI does not match its call"
         )
 
-    primal = analyze(
-        extracted.primal_jaxpr,
-        concrete_outputs=concrete_outputs,
-    )
+    def primal_plan(required_outputs: frozenset[int]) -> JaxprPlan:
+        if derivative_only:
+            _, used_inputs = dce_jaxpr(
+                extracted.primal_jaxpr,
+                tuple(i in required_outputs for i in range(len(eqn.outvars))),
+            )
+            return JaxprPlan(
+                jaxpr=extracted.primal_jaxpr,
+                eqns=(),
+                concrete_inputs=frozenset(
+                    i for i, used in enumerate(used_inputs) if used
+                ),
+                concrete_outputs=required_outputs,
+                derivative_only=True,
+                opaque=True,
+            )
+        return analyze(extracted.primal_jaxpr, concrete_outputs=required_outputs)
+
+    primal = primal_plan(concrete_outputs)
     # Derivative callback values are runtime-only. Concrete output propagation
     # belongs to the primal callback, while JVP routing requirements are still
     # discovered by analyzing its complete program.
     jvp = analyze(
         extracted.jvp_jaxpr,
+        derivative_only=derivative_only,
     )
     dynamic_arity = len(eqn.invars) - extracted.num_consts
     bindings = extracted.bindings or tuple(
@@ -364,7 +402,7 @@ def _analyze_custom_jvp(
             required = (
                 frozenset({binding.primal_output_index}) | primal.concrete_outputs
             )
-            primal = analyze(extracted.primal_jaxpr, concrete_outputs=required)
+            primal = primal_plan(required)
             concrete.update(primal.concrete_inputs)
         else:
             assert binding.outer_input_index is not None
@@ -385,6 +423,7 @@ def _analyze_linear_solve(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
+    derivative_only: bool,
 ) -> NestedPlan:
     """Analyze all executable custom-linear-solve callbacks.
 
@@ -426,7 +465,7 @@ def _analyze_linear_solve(
         # still traversed so captured concrete requirements are propagated.
         # The runtime vector is unavailable during planning, so solution demand
         # must not be converted into a concrete callback-output requirement.
-        body = analyze(child.jaxpr)
+        body = analyze(child.jaxpr, derivative_only=derivative_only)
         for i in body.concrete_inputs:
             binding = bindings[i]
             if binding.outer_input_index is not None:
@@ -447,6 +486,7 @@ def _analyze_call(
     *,
     semantics: CallAnalysisSemantics,
     concrete_outputs: frozenset[int],
+    derivative_only: bool,
 ) -> NestedPlan:
     target = semantics.target(eqn)
     nested = normalize_nested_jaxpr(target.body)
@@ -471,6 +511,7 @@ def _analyze_call(
 
     body = analyze(
         nested.jaxpr,
+        derivative_only=derivative_only,
         concrete_outputs=concrete_outputs,
     )
     concrete_inputs = frozenset(
@@ -490,6 +531,7 @@ def _analyze_cond(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
+    derivative_only: bool,
 ) -> NestedPlan:
     branches_raw = eqn.params.get("branches")
     if branches_raw is None:
@@ -517,6 +559,7 @@ def _analyze_cond(
     branch_plans = tuple(
         analyze(
             b.jaxpr,
+            derivative_only=derivative_only,
             concrete_outputs=concrete_outputs,
         )
         for b in branches
@@ -541,6 +584,7 @@ def _analyze_scan(
     eqn: JaxprEqn,
     *,
     concrete_outputs: frozenset[int],
+    derivative_only: bool,
 ) -> NestedPlan:
     nested = normalize_nested_jaxpr(eqn.params["jaxpr"])
 
@@ -564,6 +608,7 @@ def _analyze_scan(
             num_consts,
             length,
             reverse,
+            derivative_only=derivative_only,
         )
 
     body = nested.jaxpr
@@ -609,6 +654,7 @@ def _analyze_scan(
     if length == 0:
         body_plan = analyze(
             body,
+            derivative_only=derivative_only,
         )
 
         required_outer_inputs = {
@@ -644,6 +690,7 @@ def _analyze_scan(
 
         body_plan = analyze(
             body,
+            derivative_only=derivative_only,
             concrete_outputs=required_body_outputs,
         )
 
@@ -688,6 +735,8 @@ def _analyze_carry_free_scan(
     num_consts: int,
     length: int,
     reverse: bool,
+    *,
+    derivative_only: bool,
 ) -> NestedPlan:
     body = nested.jaxpr
 
@@ -704,6 +753,7 @@ def _analyze_carry_free_scan(
 
     body_plan = analyze(
         body,
+        derivative_only=derivative_only,
         concrete_outputs=concrete_outputs,
     )
 

@@ -67,18 +67,28 @@ class SupportPreflightError(RuntimeError):
 def _nested_jaxprs(
     eqn: JaxprEqn,
     semantics: NestedOperationSemantics,
+    *,
+    derivative_only: bool = False,
 ) -> tuple[Jaxpr, ...]:
     analysis = semantics.analysis
 
     if isinstance(analysis, HighPrimitiveAnalysisSemantics):
         if high_primitive_kind(eqn) == "root":
             extracted = extract_custom_root_parameters(eqn)
-            return (extracted.primal_jaxpr, extracted.jvp_jaxpr)
+            return (
+                (extracted.jvp_jaxpr,)
+                if derivative_only
+                else (extracted.primal_jaxpr, extracted.jvp_jaxpr)
+            )
         return (normalize_nested_jaxpr(root_linear_map_target(eqn).body).jaxpr,)
 
     if isinstance(analysis, CustomJvpAnalysisSemantics):
         extracted = extract_custom_jvp_parameters(eqn)
-        return (extracted.primal_jaxpr, extracted.jvp_jaxpr)
+        return (
+            (extracted.jvp_jaxpr,)
+            if derivative_only
+            else (extracted.primal_jaxpr, extracted.jvp_jaxpr)
+        )
 
     if isinstance(analysis, CallAnalysisSemantics):
         target = analysis.target(eqn)
@@ -118,6 +128,8 @@ def _nested_jaxprs(
 
 def registration_issues(
     jaxpr: Jaxpr,
+    *,
+    derivative_only: bool = False,
 ) -> tuple[SupportIssue, ...]:
     issues: list[SupportIssue] = []
     active_custom_jvp_callbacks: set[tuple[int, int]] = set()
@@ -152,7 +164,9 @@ def registration_issues(
             analysis = semantics.analysis
             if isinstance(analysis, HighPrimitiveAnalysisSemantics):
                 try:
-                    children = _nested_jaxprs(eqn, semantics)
+                    children = _nested_jaxprs(
+                        eqn, semantics, derivative_only=derivative_only
+                    )
                 except NotImplementedError as exc:
                     issues.append(
                         SupportIssue(
@@ -180,13 +194,17 @@ def registration_issues(
                     continue
                 active_custom_jvp_callbacks.add(callback_key)
                 try:
-                    for child in _nested_jaxprs(eqn, semantics):
+                    for child in _nested_jaxprs(
+                        eqn, semantics, derivative_only=derivative_only
+                    ):
                         visit(child, eqn_path)
                 finally:
                     active_custom_jvp_callbacks.remove(callback_key)
                 continue
 
-            for child in _nested_jaxprs(eqn, semantics):
+            for child in _nested_jaxprs(
+                eqn, semantics, derivative_only=derivative_only
+            ):
                 visit(child, eqn_path)
 
     visit(jaxpr, ())
@@ -196,8 +214,10 @@ def registration_issues(
 
 def require_registered_operations(
     jaxpr: Jaxpr,
+    *,
+    derivative_only: bool = False,
 ) -> None:
-    issues = registration_issues(jaxpr)
+    issues = registration_issues(jaxpr, derivative_only=derivative_only)
     if issues:
         raise SupportPreflightError(issues)
 

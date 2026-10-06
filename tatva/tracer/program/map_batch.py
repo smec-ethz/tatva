@@ -136,9 +136,13 @@ def build_batched_map_program(
 
     return BatchedMapProgram(
         analysis_closed_jaxpr=analysis_closed,
-        analysis_plan=analyze(analysis_jaxpr),
+        analysis_plan=analyze(
+            analysis_jaxpr, derivative_only=body_plan.derivative_only
+        ),
         execution_closed_jaxpr=execution_closed,
-        execution_plan=analyze(execution_jaxpr),
+        execution_plan=analyze(
+            execution_jaxpr, derivative_only=body_plan.derivative_only
+        ),
         num_outputs=num_outputs,
         exposed=exposed,
     )

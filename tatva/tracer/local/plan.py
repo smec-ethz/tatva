@@ -508,6 +508,8 @@ def _build_rank_local_jaxpr_plan(
     resolver: ConcreteResolver,
     trace: JaxprDemandTrace,
 ) -> LocalJaxprPlan:
+    if plan.derivative_only:
+        raise ValueError("sparsity-only plans cannot be localized for execution")
     if frame.plan is not plan:
         raise ValueError("localization plan does not match concrete frame")
 

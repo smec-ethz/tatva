@@ -11,9 +11,9 @@ from jax.extend.core import Primitive
 from tatva.tracer.api import analyze
 from tatva.tracer.core.nested import CustomJvpSpec
 from tatva.tracer.program.analysis import analyze as analyze_jaxpr
-from tatva.tracer.program.concrete_resolver import ConcreteResolver
+from tatva.tracer.program.concrete_resolver import ConcreteResolver, DynamicRoutingError
 from tatva.tracer.program.custom_root import extract_custom_root_parameters
-from tatva.tracer.program.derivatives import trace_form_derivatives
+from tatva.tracer.program.derivatives import tangent_pattern, trace_form_derivatives
 from tatva.tracer.program.forms import FormSpec
 from tatva.tracer.support import SupportPreflightError, registration_issues
 
@@ -21,6 +21,161 @@ pytestmark = pytest.mark.skipif(
     not hasattr(solves, "CustomRoot"),
     reason="requires the Hijax CustomRoot ABI",
 )
+
+
+def _while_root(p):
+    def solve(f, guess):
+        def step(state):
+            iteration, x = state
+            return iteration + 1, x - f(x) / (2 * x)
+
+        return jax.lax.while_loop(
+            lambda state: state[0] < 6,
+            step,
+            (0, guess),
+        )[1]
+
+    return jax.lax.custom_root(
+        lambda x: x * x - p,
+        jnp.ones_like(p),
+        solve,
+        lambda g, rhs: rhs / g(jnp.ones_like(rhs)),
+    )
+
+
+@pytest.mark.parametrize("wrapper", ["direct", "jit", "vmap", "map", "cond", "scan"])
+def test_sparsity_uses_implicit_derivatives_with_unsupported_primal_while(wrapper):
+    p = jnp.arange(4, dtype=jnp.float32) + 4
+
+    def objective(values):
+        if wrapper == "jit":
+            roots = jax.jit(_while_root)(values)
+        elif wrapper == "vmap":
+            roots = jax.vmap(_while_root)(values)
+        elif wrapper == "map":
+            roots = jax.lax.map(_while_root, values)
+        elif wrapper == "cond":
+            roots = jax.lax.cond(
+                True, _while_root, lambda x: _while_root(x * 2), values
+            )
+        elif wrapper == "scan":
+            roots, _ = jax.lax.scan(
+                lambda carry, _: (_while_root(carry), None),
+                values,
+                jnp.arange(2),
+            )
+        else:
+            roots = _while_root(values)
+        return jnp.sum(roots)
+
+    pattern = tangent_pattern(objective, (p,), {})
+    np.testing.assert_array_equal(pattern.toarray(), np.eye(4))
+    # The same function still requires full primal support for decomposition.
+    with pytest.raises(SupportPreflightError, match="while"):
+        analyze(objective, p)
+
+
+def test_sparsity_preflight_still_checks_root_derivative_program():
+    unsupported = Primitive("test_unsupported_sparse_root_derivative")
+    unsupported.def_impl(lambda x: x)
+    unsupported.def_abstract_eval(lambda x: x)
+
+    def objective(p):
+        root = jax.lax.custom_root(
+            lambda x: x - p,
+            jnp.ones_like(p),
+            lambda f, guess: jax.lax.while_loop(lambda x: False, lambda x: x, guess),
+            lambda g, rhs: unsupported.bind(rhs),
+        )
+        return jnp.sum(root)
+
+    with pytest.raises(SupportPreflightError, match=unsupported.name):
+        tangent_pattern(objective, (jnp.ones(3),), {})
+
+
+def test_sparsity_does_not_execute_root_solver(monkeypatch):
+    from jax._src.lax.control_flow.solves import CustomRoot
+
+    original = CustomRoot.expand
+
+    def traced_only(self, *args):
+        # Capturing the callback may trace it, but never execute it on values.
+        assert any(
+            isinstance(value, jax.core.Tracer) for value in jax.tree.leaves(args)
+        )
+        return original(self, *args)
+
+    monkeypatch.setattr(CustomRoot, "expand", traced_only)
+    pattern = tangent_pattern(lambda p: jnp.sum(_while_root(p)), (jnp.ones(3) * 4,), {})
+    np.testing.assert_array_equal(pattern.toarray(), np.eye(3))
+
+
+def test_opaque_primal_can_supply_coordinate_independent_concrete_routes():
+    def objective(values):
+        # Routing needs this constant root numerically, although its solver
+        # does not need structural while-loop support.
+        index = _while_root(jnp.asarray([4.0]))[0].astype(jnp.int32)
+        return values[index] ** 2
+
+    pattern = tangent_pattern(objective, (jnp.arange(5.0),), {})
+    expected = np.zeros((5, 5))
+    expected[2, 2] = 1
+    np.testing.assert_array_equal(pattern.toarray(), expected)
+
+
+def test_opaque_primal_does_not_supply_coordinate_dependent_routes():
+    def objective(values):
+        index = _while_root(values[:1])[0].astype(jnp.int32)
+        return values[index] ** 2
+
+    with pytest.raises(DynamicRoutingError, match="DOF input"):
+        tangent_pattern(objective, (jnp.arange(5.0) + 4,), {})
+
+
+def test_opaque_primal_constant_aux_route_ignores_unused_coordinate_operands():
+    def objective(values):
+        def solve(f, guess):
+            root = jax.lax.while_loop(lambda x: False, lambda x: x, guess)
+            return root, jnp.asarray(2, dtype=jnp.int32)
+
+        _, index = jax.lax.custom_root(
+            lambda x: x - values,
+            jnp.ones_like(values),
+            solve,
+            lambda g, rhs: rhs,
+            has_aux=True,
+        )
+        return values[index] ** 2
+
+    pattern = tangent_pattern(objective, (jnp.arange(5.0),), {})
+    expected = np.zeros((5, 5))
+    expected[2, 2] = 1
+    np.testing.assert_array_equal(pattern.toarray(), expected)
+
+
+def test_ordinary_while_is_still_unsupported_for_sparsity():
+    def objective(values):
+        return jnp.sum(jax.lax.while_loop(lambda x: False, lambda x: x, values))
+
+    with pytest.raises(SupportPreflightError, match="while"):
+        tangent_pattern(objective, (jnp.ones(3),), {})
+
+
+def test_sparsity_custom_jvp_primal_is_also_opaque():
+    @jax.custom_jvp
+    def value(x):
+        return jax.lax.while_loop(lambda y: False, lambda y: y, x)
+
+    @value.defjvp
+    def derivative(primals, tangents):
+        (x,), (dot,) = primals, tangents
+        return x, x * dot
+
+    objective = lambda x: jnp.sum(value(x))
+    pattern = tangent_pattern(objective, (jnp.ones(3),), {})
+    np.testing.assert_array_equal(pattern.toarray(), np.eye(3))
+    with pytest.raises(SupportPreflightError, match="while"):
+        analyze(objective, jnp.ones(3))
 
 
 def _root(p, *, mode="direct"):
