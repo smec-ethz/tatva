@@ -1,5 +1,5 @@
 import warnings
-from collections.abc import Callable, Iterable, Sized
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Self
@@ -1038,7 +1038,7 @@ class ConcreteResolver:
         self,
         plan: JaxprPlan,
         path: FramePath,
-        consts: Sized[object],
+        consts: Sequence[object],
         bindings: tuple[_ParentBinding | None, ...],
         *,
         values: dict[Var, ConcreteValue] | None = None,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sized
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import jax
@@ -62,7 +62,7 @@ def build_batched_map_program(
     *,
     num_consts: int,
     length: int,
-    outer_inputs: Sized[Atom],
+    outer_inputs: Sequence[Atom],
     expose: tuple[Var, ...] = (),
 ) -> BatchedMapProgram:
     body = body_plan.jaxpr
@@ -121,7 +121,7 @@ def build_batched_map_program(
     examples = tuple(
         jax.ShapeDtypeStruct(
             _shape_of(atom),
-            atom.aval.dtype,
+            atom.aval.dtype,  # ty: ignore[unresolved-attribute]
         )
         for atom in outer_inputs
     )
