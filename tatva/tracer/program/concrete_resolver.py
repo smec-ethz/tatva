@@ -29,11 +29,13 @@ from tatva.tracer.core.routes import Route, _compute_gather_route_rows
 from tatva.tracer.core.semantics import (
     DemandContext,
     FullConcrete,
+    OperationSemantics,
     PartialRouteContext,
     RegionalConcrete,
     RegionalConcreteContext,
     RouteRequirement,
     RoutingSemantics,
+    SparsityOnlySemantics,
     UnsupportedConcrete,
     no_route_fragment,
 )
@@ -411,7 +413,15 @@ class ConcreteResolver:
         demand: TensorDemand,
     ) -> ConcreteRegion:
         eqn = eqn_plan.eqn
-        semantics = SEMANTICS.get_ordinary(eqn.primitive)
+        semantics = SEMANTICS.get_for_derivatives(eqn.primitive)
+        if isinstance(semantics, SparsityOnlySemantics):
+            return self._escalate(
+                frame,
+                eqn_plan,
+                output_index,
+                demand,
+                f"{eqn.primitive.name} has no regional concrete evaluation semantics",
+            )
         ctx = RegionalConcreteContext(eqn, output_index, demand)
         decision = semantics.regional_concrete(ctx)
         if isinstance(decision, FullConcrete):
@@ -579,8 +589,8 @@ class ConcreteResolver:
     def _routing_semantics(
         self, frame: ConcreteFrame, eqn_plan: EqnPlan
     ) -> RoutingSemantics | None:
-        semantics = SEMANTICS.get_ordinary(eqn_plan.eqn.primitive)
-        return semantics.routing
+        semantics = SEMANTICS.get_for_derivatives(eqn_plan.eqn.primitive)
+        return semantics.routing if isinstance(semantics, OperationSemantics) else None
 
     def routed(
         self,

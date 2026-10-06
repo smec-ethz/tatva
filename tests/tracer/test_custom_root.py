@@ -153,12 +153,13 @@ def test_opaque_primal_constant_aux_route_ignores_unused_coordinate_operands():
     np.testing.assert_array_equal(pattern.toarray(), expected)
 
 
-def test_ordinary_while_is_still_unsupported_for_sparsity():
+def test_ordinary_while_reports_limited_sparsity_support():
     def objective(values):
-        return jnp.sum(jax.lax.while_loop(lambda x: False, lambda x: x, values))
+        return jnp.sum(jax.lax.while_loop(lambda x: False, lambda x: x + 1, values))
 
-    with pytest.raises(SupportPreflightError, match="while"):
-        tangent_pattern(objective, (jnp.ones(3),), {})
+    with pytest.warns(UserWarning, match="Limited while sparsity support"):
+        pattern = tangent_pattern(objective, (jnp.ones(3),), {})
+    np.testing.assert_array_equal(pattern.toarray(), np.zeros((3, 3)))
 
 
 def test_sparsity_custom_jvp_primal_is_also_opaque():

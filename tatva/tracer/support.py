@@ -15,6 +15,7 @@ from tatva.tracer.core.semantics import (
     LinearSolveAnalysisSemantics,
     NestedOperationSemantics,
     ScanAnalysisSemantics,
+    SparsityOnlySemantics,
 )
 from tatva.tracer.local.plan import (
     LocalJaxprPlan,
@@ -31,6 +32,7 @@ from tatva.tracer.program.custom_root import (
 class SupportCapability(Enum):
     REGISTRATION = "registration"
     ROUTE_LOCALIZATION = "route localization"
+    EXECUTION = "execution"
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +159,19 @@ def registration_issues(
                 # so we also do not know whether any JAXPR-valued
                 # params represent executable nested frames.
                 continue
+
+            if not derivative_only and isinstance(semantics, SparsityOnlySemantics):
+                try:
+                    SEMANTICS.get_for_execution(eqn.primitive)
+                except NotImplementedError as exc:
+                    issues.append(
+                        SupportIssue(
+                            SupportCapability.EXECUTION,
+                            eqn.primitive.name,
+                            _format_eqn_path(eqn_path),
+                            str(exc),
+                        )
+                    )
 
             if not isinstance(semantics, NestedOperationSemantics):
                 continue

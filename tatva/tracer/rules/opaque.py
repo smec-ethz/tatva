@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import scipy.sparse as sps
 
-from tatva.tracer.core.semantics import DerivativeRule, no_hessian
+from tatva.tracer.core.semantics import (
+    DerivativeRule,
+    SparsityOnlySemantics,
+    no_hessian,
+)
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.program.dependencies import DependencySet
 
@@ -25,6 +29,11 @@ def prepare_opaque(ctx: RuleContext) -> OpaqueData:
     warnings.warn(
         f"Using conservative opaque derivative rule for {ctx.eqn.primitive.name}"
     )
+    return prepare_dependency_union(ctx)
+
+
+def prepare_dependency_union(ctx: RuleContext) -> OpaqueData:
+    """Union input dependencies without assuming anything about the body."""
     nonempty = [dep.total_union().csr for dep in ctx.input_deps if dep.csr.nnz]
     if not nonempty:
         total_csr = sps.csr_matrix((1, ctx.n_dofs), dtype=bool)
@@ -85,4 +94,22 @@ DERIVATIVES_OPAQUE_LINEAR = DerivativeRule(
     prepare_opaque,
     opaque_dependencies,
     no_hessian,
+)
+
+
+def prepare_while(ctx: RuleContext) -> OpaqueData:
+    """Port the dependency-union rule without claiming full loop derivatives."""
+    warnings.warn(
+        "Limited while sparsity support: all input dependencies are unioned into "
+        "every output element without inspecting the condition or body. "
+        "Loop-local second-order couplings are not recorded, so the tangent/Hessian "
+        "pattern may omit entries introduced by a nonlinear loop body.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return prepare_dependency_union(ctx)
+
+
+WHILE = SparsityOnlySemantics(
+    derivatives=DerivativeRule(prepare_while, opaque_dependencies, no_hessian),
 )

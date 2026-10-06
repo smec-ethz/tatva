@@ -62,6 +62,7 @@ from tatva.tracer.core.semantics import (
     LinearSolveAnalysisSemantics,
     NestedAnalysisSemantics,
     NestedOperationSemantics,
+    OperationSemantics,
     RouteRequirement,
     ScanAnalysisSemantics,
 )
@@ -194,7 +195,11 @@ def analyze(
             concrete_outputs_by_eqn[index] = required_outputs
 
         # Nested primitive.
-        semantics = SEMANTICS.get(eqn.primitive)
+        semantics = (
+            SEMANTICS.get(eqn.primitive)
+            if derivative_only
+            else SEMANTICS.get_for_execution(eqn.primitive)
+        )
 
         if isinstance(semantics, NestedOperationSemantics):
             nested = _analyze_nested(
@@ -221,7 +226,9 @@ def analyze(
 
             continue
 
-        routing = semantics.routing
+        routing = (
+            semantics.routing if isinstance(semantics, OperationSemantics) else None
+        )
 
         if routing is not None and routing.requirement is RouteRequirement.REQUIRED:
             for input_index in routing.inputs(eqn):

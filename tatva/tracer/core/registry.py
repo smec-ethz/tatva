@@ -10,6 +10,7 @@ from tatva.tracer.core.semantics import (
     OperationSemantics,
     RegisteredOperationSemantics,
     ScanAnalysisSemantics,
+    SparsityOnlySemantics,
     conservative_demand,
     contribution_barrier,
     full_concrete_evaluation,
@@ -51,6 +52,29 @@ class PrimitiveRegistry:
             )
         return rule
 
+    def get_for_derivatives(
+        self,
+        primitive: Primitive,
+    ) -> OperationSemantics | SparsityOnlySemantics:
+        """Resolve a non-nested operation's structural derivative semantics."""
+        rule = self.get(primitive)
+        if not isinstance(rule, (OperationSemantics, SparsityOnlySemantics)):
+            raise TypeError(f"{primitive.name} requires nested derivative analysis")
+        return rule
+
+    def get_for_execution(
+        self,
+        primitive: Primitive,
+    ) -> OperationSemantics | NestedOperationSemantics:
+        """Reject registrations that cannot participate in executable planning."""
+        rule = self.get(primitive)
+        if isinstance(rule, SparsityOnlySemantics):
+            raise NotImplementedError(
+                f"{primitive.name} has sparsity-only semantics; "
+                "executable decomposition and distribute are unsupported"
+            )
+        return rule
+
     def get_nested(self, primitive: Primitive) -> NestedOperationSemantics:
         rule = self.get(primitive)
         if not isinstance(rule, NestedOperationSemantics):
@@ -64,6 +88,8 @@ class PrimitiveRegistry:
         errors: list[str] = []
 
         for primitive, rule in self._rules.items():
+            if isinstance(rule, SparsityOnlySemantics):
+                continue
             if isinstance(rule, NestedOperationSemantics):
                 if not isinstance(
                     rule.analysis,
@@ -103,6 +129,14 @@ class PrimitiveRegistry:
         primitive: Primitive,
     ) -> str:
         rule = self.get(primitive)
+        if isinstance(rule, SparsityOnlySemantics):
+            return "\n".join(
+                (
+                    f"{primitive.name}: sparsity-only",
+                    f"  derivatives: {_rule_name(rule.derivatives.prepare)}",
+                    "  execution: unsupported",
+                )
+            )
         if isinstance(rule, NestedOperationSemantics):
             return "\n".join(
                 (
@@ -156,6 +190,20 @@ class PrimitiveRegistry:
             self._rules.items(),
             key=lambda item: item[0].name,
         ):
+            if isinstance(rule, SparsityOnlySemantics):
+                rows.append(
+                    (
+                        primitive.name,
+                        "sparsity-only",
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "unsupported",
+                        "-",
+                    )
+                )
+                continue
             if isinstance(rule, NestedOperationSemantics):
                 rows.append(
                     (

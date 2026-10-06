@@ -84,7 +84,7 @@ from tatva.tracer.core.nested import (
 )
 from tatva.tracer.core.registry import SEMANTICS
 from tatva.tracer.core.route_fragments import RouteRequest
-from tatva.tracer.core.semantics import RuleContext
+from tatva.tracer.core.semantics import OperationSemantics, RuleContext
 from tatva.tracer.helpers import _shape_of
 from tatva.tracer.program.analysis import EqnPlan, JaxprPlan, analyze
 from tatva.tracer.program.concrete_resolver import ConcreteFrame, ConcreteResolver
@@ -187,6 +187,10 @@ def tangent_pattern(
     Custom-derivative primal solvers are opaque in this path. Only their
     derivative programs need structural support; executable decomposition has
     a separate preflight that also checks primal implementations.
+
+    Ordinary while loops use the limited legacy dependency-union rule and warn
+    that loop-local second-order couplings are omitted. This rule does not
+    provide complete Hessian support for nonlinear loop bodies.
     """
     captured = make_captured_jaxpr(functional, *args, **kwargs)
     if form is None:
@@ -506,9 +510,9 @@ def _trace_ordinary_eqn(
     n_symbols: int,
 ) -> tuple[DependencySet, ...]:
     eqn = eqn_plan.eqn
-    semantics = SEMANTICS.get_ordinary(eqn.primitive)
+    semantics = SEMANTICS.get_for_derivatives(eqn.primitive)
 
-    routing = semantics.routing
+    routing = semantics.routing if isinstance(semantics, OperationSemantics) else None
 
     if routing is None:
         route = None

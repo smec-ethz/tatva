@@ -610,6 +610,9 @@ def _register_dot_general(reg: PrimitiveRegistry) -> None:
 
 
 def _register_opaque_rules(reg: PrimitiveRegistry) -> None:
+    from jax._src.lax.control_flow.loops import while_p
+
+    reg.register(while_p, opaque.WHILE)
     reg.register(
         lax.cumprod_p,
         reductions.CUMPROD,

@@ -321,6 +321,13 @@ class OperationSemantics[T]:
     lowering: LoweringRule | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SparsityOnlySemantics[T]:
+    """Derivative propagation without executable planning or localization rules."""
+
+    derivatives: DerivativeRule[T]
+
+
 # Nested-operation semantics
 @dataclass(frozen=True, slots=True)
 class CallTarget:
@@ -401,4 +408,6 @@ class NestedOperationSemantics:
     analysis: NestedAnalysisSemantics
 
 
-type RegisteredOperationSemantics = OperationSemantics | NestedOperationSemantics
+type RegisteredOperationSemantics = (
+    OperationSemantics | NestedOperationSemantics | SparsityOnlySemantics
+)
