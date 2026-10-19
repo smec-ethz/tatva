@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import numpy as np
+import scipy.sparse as sps
+
+from tatva.tracer.core.semantics import (
+    DerivativeRule,
+    SparsityOnlySemantics,
+    no_hessian,
+)
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.program.dependencies import DependencySet
+
+if TYPE_CHECKING:
+    from tatva.tracer.core.semantics import RuleContext
+    from tatva.tracer.program.dependencies import InteractionGraph
+
+
+@dataclass(frozen=True)
+class OpaqueData:
+    total: DependencySet
+
+
+def prepare_opaque(ctx: RuleContext) -> OpaqueData:
+    warnings.warn(
+        f"Using conservative opaque derivative rule for {ctx.eqn.primitive.name}"
+    )
+    return prepare_dependency_union(ctx)
+
+
+def prepare_dependency_union(ctx: RuleContext) -> OpaqueData:
+    """Union input dependencies without assuming anything about the body."""
+    nonempty = [dep.total_union().csr for dep in ctx.input_deps if dep.csr.nnz]
+    if not nonempty:
+        total_csr = sps.csr_matrix((1, ctx.n_dofs), dtype=bool)
+    else:
+        total_csr = sps.vstack(nonempty, format="csr").max(axis=0)
+        total_csr = sps.csr_matrix(total_csr, dtype=bool)
+
+    return OpaqueData(DependencySet(total_csr, (1,)))
+
+
+def opaque_dependencies(
+    ctx: RuleContext,
+    prepared: OpaqueData,
+) -> tuple[DependencySet, ...]:
+    outputs: list[DependencySet] = []
+
+    for outvar in ctx.eqn.outvars:
+        shape = _shape_of(outvar)
+        n_rows = int(np.prod(shape))
+
+        if n_rows == 0:
+            csr = sps.csr_matrix(
+                (0, prepared.total.csr.shape[1]),
+                dtype=bool,
+            )
+        else:
+            selection = sps.csr_matrix(
+                (
+                    np.ones(n_rows, dtype=bool),
+                    (np.arange(n_rows), np.zeros(n_rows, dtype=np.int64)),
+                ),
+                shape=(n_rows, 1),
+                dtype=bool,
+            )
+            csr = (selection @ prepared.total.csr).tocsr()
+
+        outputs.append(DependencySet(csr, shape))
+
+    return tuple(outputs)
+
+
+def opaque_nonlinear_hessian(
+    ctx: RuleContext,
+    prepared: OpaqueData,
+    acc: InteractionGraph,
+) -> None:
+    acc.add_self(prepared.total)
+
+
+DERIVATIVES_OPAQUE_NONLINEAR = DerivativeRule(
+    prepare_opaque,
+    opaque_dependencies,
+    opaque_nonlinear_hessian,
+)
+
+
+DERIVATIVES_OPAQUE_LINEAR = DerivativeRule(
+    prepare_opaque,
+    opaque_dependencies,
+    no_hessian,
+)
+
+
+def prepare_while(ctx: RuleContext) -> OpaqueData:
+    """Port the dependency-union rule without claiming full loop derivatives."""
+    warnings.warn(
+        "Limited while sparsity support: all input dependencies are unioned into "
+        "every output element without inspecting the condition or body. "
+        "Loop-local second-order couplings are not recorded, so the tangent/Hessian "
+        "pattern may omit entries introduced by a nonlinear loop body.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return prepare_dependency_union(ctx)
+
+
+WHILE = SparsityOnlySemantics(
+    derivatives=DerivativeRule(prepare_while, opaque_dependencies, no_hessian),
+)

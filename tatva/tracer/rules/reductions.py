@@ -1,0 +1,321 @@
+from dataclasses import dataclass
+
+import numpy as np
+import scipy.sparse as sps
+from numpy.typing import NDArray
+
+from tatva.tracer.core.routes import Shape
+from tatva.tracer.core.semantics import (
+    DemandContext,
+    DerivativeRule,
+    OperationSemantics,
+    RuleContext,
+    no_hessian,
+)
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import (
+    AxisSubset,
+    Demand,
+    TensorDemand,
+    _FullAxis,
+    _RangeAxis,
+    axis_indices,
+)
+from tatva.tracer.program.dependencies import DependencySet, InteractionGraph
+from tatva.tracer.rules import tagged
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedReduction:
+    deps: DependencySet
+    input_to_output: NDArray[np.int64]
+    n_outputs: int
+    output_shape: Shape
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCumprod:
+    deps: DependencySet
+    axis: int
+    reverse: bool
+    output_shape: Shape
+
+
+def reduction_geometry(
+    shape: tuple[int, ...],
+    axes: tuple[int, ...],
+) -> tuple[NDArray[np.int64], int]:
+    ndim = len(shape)
+
+    axes = tuple(sorted(axis % ndim for axis in axes))
+
+    if len(set(axes)) != len(axes):
+        raise ValueError(f"Duplicate reduction axes: {axes}")
+
+    keep_axes = tuple(axis for axis in range(ndim) if axis not in axes)
+
+    n_inputs = int(np.prod(shape, dtype=np.int64))
+
+    if not keep_axes:
+        return np.zeros(n_inputs, dtype=np.int64), 1
+
+    keep_shape = tuple(shape[axis] for axis in keep_axes)
+    n_outputs = int(np.prod(keep_shape, dtype=np.int64))
+
+    if n_inputs == 0:
+        return np.empty(0, dtype=np.int64), n_outputs
+
+    input_rows = np.arange(n_inputs, dtype=np.int64)
+    coords = np.unravel_index(input_rows, shape)
+
+    input_to_output = np.ravel_multi_index(
+        tuple(coords[axis] for axis in keep_axes), keep_shape
+    ).astype(np.int64)
+
+    return input_to_output, n_outputs
+
+
+def prepare_reduction(ctx: RuleContext) -> PreparedReduction:
+    deps = ctx.input_deps[0]
+    axes = tuple(ctx.eqn.params["axes"])
+    input_to_output, n_outputs = reduction_geometry(deps.shape, axes)
+
+    return PreparedReduction(
+        deps=deps,
+        input_to_output=input_to_output,
+        n_outputs=n_outputs,
+        output_shape=_shape_of(ctx.eqn.outvars[0]),
+    )
+
+
+def reduction_dependencies(
+    ctx: RuleContext,
+    prepared: PreparedReduction,
+) -> tuple[DependencySet, ...]:
+    deps = prepared.deps
+
+    n_inputs = deps.csr.shape[0]
+
+    if n_inputs == 0:
+        reduced = sps.csr_matrix((prepared.n_outputs, ctx.n_dofs), dtype=bool)
+    else:
+        input_rows = np.arange(n_inputs, dtype=np.int64)
+
+        aggregation = sps.csr_matrix(
+            (np.ones(n_inputs, dtype=np.int32), (prepared.input_to_output, input_rows)),
+            shape=(prepared.n_outputs, n_inputs),
+        )
+
+        reduced = (aggregation @ deps.csr.astype(np.int32)).astype(bool).tocsr()
+
+    return (DependencySet(csr=reduced, shape=prepared.output_shape),)
+
+
+def zero_reduction_dependencies(
+    ctx: RuleContext,
+    prepared: PreparedReduction,
+) -> tuple[DependencySet, ...]:
+    return (DependencySet.empty(prepared.output_shape, ctx.n_dofs),)
+
+
+def reduce_prod_hessian(
+    ctx: RuleContext,
+    prepared: PreparedReduction,
+    acc: InteractionGraph,
+) -> None:
+    deps = prepared.deps
+    groups = prepared.input_to_output
+
+    if deps.csr.shape[0] <= 1:
+        return
+
+    order = np.argsort(groups, kind="stable")
+    sorted_groups = groups[order]
+
+    start = 0
+
+    while start < len(order):
+        group = sorted_groups[start]
+
+        stop = start + 1
+        while stop < len(order) and sorted_groups[stop] == group:
+            stop += 1
+
+        rows = order[start:stop]
+
+        # Product introduces interactions only between DISTINCT
+        # scalar operands in the same reduction bucket.
+        for i_pos in range(len(rows)):
+            lhs_row = rows[i_pos]
+
+            if deps.csr[lhs_row : lhs_row + 1].nnz == 0:
+                continue
+
+            rhs_rows = rows[i_pos + 1 :]
+            acc.add_paired_cross(
+                deps,
+                np.full(rhs_rows.size, lhs_row, dtype=np.int64),
+                deps,
+                rhs_rows,
+            )
+
+        start = stop
+
+
+def reduce_sum_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None,)
+
+    input_shape = _shape_of(ctx.eqn.invars[0])
+    reduced_axes = {int(axis) for axis in ctx.eqn.params["axes"]}
+    output_axes = iter(output.axes)
+    input_axes: list[AxisSubset] = []
+
+    for axis in range(len(input_shape)):
+        if axis in reduced_axes:
+            # Every entry of a reduced dimension contributes.
+            input_axes.append(_FullAxis())
+        else:
+            input_axes.append(next(output_axes))
+
+    return (
+        TensorDemand.from_axes(
+            input_shape,
+            tuple(input_axes),
+        ),
+    )
+
+
+def cumulative_demand(ctx: DemandContext) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return (None,)
+    input_shape = _shape_of(ctx.eqn.invars[0])
+    if input_shape != output.shape:
+        raise ValueError(
+            f"{ctx.eqn.primitive.name}: cumulative input/output shape mismatch"
+        )
+    axis = int(ctx.eqn.params["axis"])
+    if axis < 0:
+        axis += len(input_shape)
+    selected = axis_indices(output.axes[axis], extent=input_shape[axis])
+    reverse = bool(ctx.eqn.params.get("reverse", False))
+    start, stop = (
+        (int(selected.min()), input_shape[axis])
+        if reverse
+        else (0, int(selected.max()) + 1)
+    )
+    axes = list(output.axes)
+    axes[axis] = (
+        _FullAxis()
+        if start == 0 and stop == input_shape[axis]
+        else _RangeAxis(start, stop)
+    )
+    return (TensorDemand.from_axes(input_shape, tuple(axes)),)
+
+
+def prepare_cumprod(ctx: RuleContext) -> PreparedCumprod:
+    deps = ctx.input_deps[0]
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    if deps.shape != output_shape:
+        raise ValueError("cumprod input/output shapes must match")
+    axis = int(ctx.eqn.params["axis"])
+    if axis < 0:
+        axis += len(deps.shape)
+    if axis < 0 or axis >= len(deps.shape):
+        raise ValueError(f"invalid cumprod axis {axis} for shape {deps.shape}")
+    return PreparedCumprod(
+        deps=deps,
+        axis=axis,
+        reverse=bool(ctx.eqn.params.get("reverse", False)),
+        output_shape=output_shape,
+    )
+
+
+def _cumulative_fibers(shape: Shape, axis: int) -> NDArray[np.int64]:
+    rows = np.arange(int(np.prod(shape, dtype=np.int64)), dtype=np.int64)
+    fiber_count = int(np.prod(shape[:axis] + shape[axis + 1 :], dtype=np.int64))
+    if rows.size == 0:
+        return np.empty((fiber_count, shape[axis]), dtype=np.int64)
+    return np.moveaxis(rows.reshape(shape), axis, -1).reshape(fiber_count, shape[axis])
+
+
+def cumprod_dependencies(
+    ctx: RuleContext,
+    prepared: PreparedCumprod,
+) -> tuple[DependencySet, ...]:
+    deps = prepared.deps
+    n_rows = deps.csr.shape[0]
+    if n_rows == 0:
+        return (DependencySet.empty(prepared.output_shape, ctx.n_dofs),)
+    fibers = _cumulative_fibers(deps.shape, prepared.axis)
+    length = fibers.shape[1]
+    output_rows: list[NDArray[np.int64]] = []
+    input_rows: list[NDArray[np.int64]] = []
+    for position in range(length):
+        selected = (
+            fibers[:, position:] if prepared.reverse else fibers[:, : position + 1]
+        )
+        output_rows.append(np.repeat(fibers[:, position], selected.shape[1]))
+        input_rows.append(selected.ravel())
+    aggregation = sps.csr_matrix(
+        (
+            np.ones(sum(rows.size for rows in input_rows), dtype=np.int8),
+            (np.concatenate(output_rows), np.concatenate(input_rows)),
+        ),
+        shape=(n_rows, n_rows),
+    )
+    return (
+        DependencySet(
+            (aggregation @ deps.csr).astype(bool).tocsr(), prepared.output_shape
+        ),
+    )
+
+
+def cumprod_hessian(
+    ctx: RuleContext,
+    prepared: PreparedCumprod,
+    acc: InteractionGraph,
+) -> None:
+    fibers = _cumulative_fibers(prepared.deps.shape, prepared.axis)
+    if fibers.shape[1] < 2:
+        return
+    left, right = np.triu_indices(fibers.shape[1], k=1)
+    acc.add_paired_cross(
+        prepared.deps,
+        fibers[:, left].ravel(),
+        prepared.deps,
+        fibers[:, right].ravel(),
+    )
+
+
+REDUCE_BASIC = OperationSemantics(
+    DerivativeRule(
+        prepare=prepare_reduction,
+        dependencies=reduction_dependencies,
+        interactions=no_hessian,
+    ),
+    demand=reduce_sum_demand,
+    tagged_demand=tagged.reduction,
+)
+REDUCE_PROD = OperationSemantics(
+    DerivativeRule(
+        prepare=prepare_reduction,
+        dependencies=reduction_dependencies,
+        interactions=reduce_prod_hessian,
+    ),
+    tagged_demand=tagged.reduction,
+)
+ZERO_REDUCTION = OperationSemantics(
+    DerivativeRule(prepare_reduction, zero_reduction_dependencies, no_hessian),
+    demand=reduce_sum_demand,
+    tagged_demand=tagged.reduction,
+)
+CUMPROD = OperationSemantics(
+    DerivativeRule(prepare_cumprod, cumprod_dependencies, cumprod_hessian),
+    demand=cumulative_demand,
+    tagged_demand=tagged.cumulative,
+)

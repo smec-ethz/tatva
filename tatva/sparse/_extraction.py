@@ -25,11 +25,10 @@ import scipy.sparse as sps
 from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
-from tatva import Mesh
-
 if TYPE_CHECKING:
     from scipy.sparse import csr_matrix
 
+    from tatva import Mesh
     from tatva.compound import Compound
     from tatva.lifter import Lifter
 
