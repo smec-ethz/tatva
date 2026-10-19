@@ -558,7 +558,7 @@ class Hexahedron8(Element):
 
     def shape_function(self, xi: Array) -> Array:
         """Returns the shape functions evaluated at the local coordinates (xi, eta, zeta)."""
-        xi, eta, zeta = xi
+        xi, eta, zeta = xi[0], xi[1], xi[2]
         return (1 / 8) * jnp.array(
             [
                 (1 - xi) * (1 - eta) * (1 - zeta),
@@ -575,7 +575,7 @@ class Hexahedron8(Element):
     def shape_function_derivative(self, xi: Array) -> Array:
         """Returns the derivative of the shape functions."""
         # shape (3, 8) -> (dim, n_nodes)
-        xi, eta, zeta = xi
+        xi, eta, zeta = xi[0], xi[1], xi[2]
         return (1 / 8) * jnp.array(
             [
                 [
