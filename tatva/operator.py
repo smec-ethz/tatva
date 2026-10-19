@@ -37,10 +37,9 @@ from typing import (
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jax.errors import TracerBoolConversionError
-from jax_autovmap import autovmap
 
-from tatva.element import Element
+from tatva._interpolation import make_interpolator
+from tatva.element import Element, Tri3
 from tatva.mesh import Mesh, find_containing_polygons
 from tatva.utils import make_project_function
 
@@ -433,125 +432,75 @@ class Operator(Generic[ElementT]):
         return self._vmap_over_elements_and_quads(nodal_values, _hessian_quad)
 
     def make_interpolate(self, points: jax.Array) -> Callable[[jax.Array], jax.Array]:
-        """Returns a function that interpolates nodal values to a set of static points.
+        """Build a fixed interpolation stencil on the host.
 
-        Args:
-            points: The statically known points to interpolate to.
+        Supports Tri3, Quad4, Tetrahedron4, and Hexahedron8 in their full spatial
+        dimension. Mesh geometry and ``points`` (shape ``(n_points, n_dim)``)
+        must be concrete: call this method outside JAX transformations. Rebuild
+        the callable if the mesh geometry or points change.
 
-        Returns:
-            A function that takes nodal values (`arg`) and returns the interpolated values
-            at the statically known points.
+        The returned callable accepts nodal values shaped ``(n_mesh_nodes, ...)``
+        and returns values shaped ``(n_points, ...)``. It supports JIT, vmap,
+        and differentiation with respect to nodal values, and captures only
+        node indices and shape-function weights.
+
+        Containment uses a reference tolerance of ``max(1e-10, 32 * eps)``
+        and a physical tolerance scaled by element size and coordinate magnitude.
+        Shared boundaries select the lowest containing element index. Points
+        outside the mesh or with failed inverse mappings raise RuntimeError.
+
+        Example:
+            >>> interpolate = jax.jit(operator.make_interpolate(points))
+            >>> point_values = interpolate(nodal_values)
         """
-
-        @jax.jit
-        def compute_rhs(point: jax.Array, nodal_coords: jax.Array) -> jax.Array:
-            xi0 = self.element.quad_points[0]
-            x0, _, _ = self.element.get_local_values(xi0, nodal_coords, nodal_coords)
-            return x0 - point
-
-        @jax.jit
-        def compute_lhs(nodal_coords: jax.Array) -> jax.Array:
-            dfdxi = jax.jacrev(self.element.get_local_values)
-            return dfdxi(self.element.quad_points[0], nodal_coords, nodal_coords)[0]
-
-        @autovmap(point=1, nodal_coords=2)
-        def _map_physical_to_reference(
-            point: jax.Array, nodal_coords: jax.Array
-        ) -> jax.Array:
-            rhs = compute_rhs(point, nodal_coords)
-            lhs = compute_lhs(nodal_coords)
-            delta_xi = jnp.linalg.solve(lhs, -rhs)
-            return self.element.quad_points[0] + delta_xi
-
-        def map_physical_to_reference(
-            points: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            element_indices: Array = find_containing_polygons(
-                points, self.mesh.coords[self.mesh.elements]
-            )
-            valid_indices = element_indices != -1
-            safe_element_indices = jnp.where(valid_indices, element_indices, 0)
-            valid_elements = self.mesh.elements[safe_element_indices]
-            return (
-                _map_physical_to_reference(
-                    points,
-                    self.mesh.coords[valid_elements],
-                ),
-                valid_elements,
-                valid_indices,
-            )
-
-        xi_in_valid_element, valid_elements, valid_indices = map_physical_to_reference(
-            points
+        return make_interpolator(
+            self.element, self.mesh.coords, self.mesh.elements, points
         )
-
-        try:
-            if bool(jnp.any(~valid_indices)):
-                raise RuntimeError(
-                    "Some points are outside the mesh, revise the points"
-                )
-        except TracerBoolConversionError:
-            pass
-
-        def interpolate_fn(arg: jax.Array) -> jax.Array:
-            interpolated = self._interpolate_direct(
-                arg, xi_in_valid_element, valid_elements
-            )
-            mask = valid_indices.reshape(
-                (valid_indices.shape[0],) + (1,) * (interpolated.ndim - 1)
-            )
-            return jnp.where(mask, interpolated, jnp.nan)
-
-        return interpolate_fn
 
     def interpolate(self, arg: jax.Array, points: jax.Array) -> jax.Array:
-        """Interpolates nodal values to a set of points in the physical space.
+        """Interpolate a Tri3 field at live physical points using only JAX.
 
-        Args:
-            arg: The nodal values to interpolate.
-            points: The points to interpolate the function or nodal values to.
+        Supports dynamic points, geometry, and nodal values under JIT and vmap.
+        Values have shape ``(n_mesh_nodes, ...)``, points ``(n_points, 2)``, and
+        the result ``(n_points, ...)``. Points outside the mesh return NaN in
+        both eager and transformed execution. Derivatives are local to the
+        selected triangle; element selection is discrete.
 
-        Returns:
-            A `jax.Array` with the interpolated values at the given points.
+        For fixed points, or other supported element types, construct and reuse
+        a host-side stencil with ``make_interpolate(points)`` instead.
         """
-        return self.make_interpolate(points)(arg)
+        if type(self.element) is not Tri3:
+            raise NotImplementedError(
+                "Live interpolation supports only Tri3; use make_interpolate "
+                "for fixed points with other supported element types."
+            )
+        if self.mesh.coords.shape[1] != 2:
+            raise NotImplementedError(
+                "Live interpolation does not support embedded elements."
+            )
+        if self.mesh.elements.shape[1] != 3:
+            raise ValueError("Mesh connectivity width does not match Tri3.")
+        arg, points = jnp.asarray(arg), jnp.asarray(points)
+        if arg.ndim == 0 or arg.shape[0] != self.mesh.coords.shape[0]:
+            raise ValueError(
+                f"Nodal values must have shape ({self.mesh.coords.shape[0]}, ...)."
+            )
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("Interpolation points must have shape (n_points, 2).")
 
-    def _interpolate_direct(
-        self,
-        nodal_values: jax.Array,
-        xi_in_valid_element: jax.Array,
-        valid_elements: jax.Array,
-    ) -> jax.Array:
-        """Interpolates the given nodal values at the quad points.
-
-        Args:
-            nodal_values: The nodal values at the element's nodes (shape: (n_nodes, n_values))
-            xi_in_valid_element: The points in the reference element
-                (shape: (n_valid_points, n_dim))
-            valid_elements: The indices of the elements containing the quadrature points
-                (shape: (n_valid_points,))
-
-        Returns:
-            A `jax.Array` with the values of the nodal values at each quadrature point of
-            each element (shape: (n_valid_points, n_values)).
-        """
-
-        def _interpolate_at_xi(
-            xi: jax.Array, el_nodal_values: jax.Array, el_nodal_coords: jax.Array
-        ) -> jax.Array:
-            """Calls the function (interpolator) on arbitrary reference coord."""
-            return self.element.interpolate(
-                xi, el_nodal_values, el_nodal_coords
-            )  # nodal coords are needed for hermite elements, but not for lagrange elements, so we pass them in either way
-
-        return jax.vmap(
-            _interpolate_at_xi,
-            in_axes=(0, 0, 0),
-        )(
-            xi_in_valid_element,
-            nodal_values[valid_elements],
-            self.mesh.coords[valid_elements],
+        element_indices = find_containing_polygons(
+            points, self.mesh.coords[self.mesh.elements]
         )
+        valid = element_indices >= 0
+        node_indices = self.mesh.elements[jnp.where(valid, element_indices, 0)]
+        coords = self.mesh.coords[node_indices]
+        jacobian = jnp.swapaxes(coords[:, 1:] - coords[:, :1], -1, -2)
+        xi = jnp.linalg.solve(jacobian, (points - coords[:, 0])[..., None])[..., 0]
+        weights = jnp.concatenate([1 - jnp.sum(xi, axis=1, keepdims=True), xi], axis=1)
+        interpolated = jnp.einsum("pa,pa...->p...", weights, arg[node_indices])
+        valid = valid & jnp.all(jnp.isfinite(weights), axis=1)
+        mask = valid.reshape((points.shape[0],) + (1,) * (interpolated.ndim - 1))
+        return jnp.where(mask, interpolated, jnp.nan)
 
     def _replace(self, **changes: Any) -> Self:
         """Returns a new instance of the Operator with the specified changes. Same as
