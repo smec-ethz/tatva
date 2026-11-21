@@ -539,21 +539,39 @@ def test_element_kernels_avoid_lapack_and_cublas(element, dim):
 def test_operator_entry_points_avoid_the_gemm_path(kind, element):
     """The dot-free guarantee, asserted on the path tatva actually runs.
 
-    Every `Operator` entry point must compile to fused loops. A `dot` here means a
-    contraction slipped back to an einsum -- `Element.gradient`'s node contraction as
-    `jnp.einsum("dn,n...->...d", ...)` measured 54-90 ms against 4.7 ms, and
-    `_integrate_quad_array` as `jnp.einsum("eq...,eq->e...", ...)` cost 4x.
+    Every `Operator` entry point must avoid stray einsums and LAPACK/cuBLAS calls --
+    `Element.gradient`'s node contraction as `jnp.einsum("dn,n...->...d", ...)`
+    measured 54-90 ms against 4.7 ms, and `_integrate_quad_array` as
+    `jnp.einsum("eq...,eq->e...", ...)` cost 4x.
+
+    On GPU/non-CPU backends no `dot(` is allowed at all. On CPU, `_MATMUL`
+    intentionally dispatches to `@` via `jax.lax.platform_dependent` (tagged
+    `platform/dot_general` in HLO), which JAX 0.12+ may keep as an explicit `dot`
+    instruction instead of folding away; any other `dot(` is still rejected.
     """
     mesh = Mesh.unit_square(16, 16, type=kind)
     op = Operator(mesh, element, cache_weights=False)
     u = jnp.asarray(np.random.default_rng(5).random((mesh.coords.shape[0], 2)))
+    on_cpu = jax.default_backend() == "cpu"
 
     for hlo in (
         _compiled_hlo(lambda x: op.grad(x), u),
         _compiled_hlo(lambda x: op.integrate(x), u),
         _compiled_hlo(lambda: op.get_integration_weights()),
     ):
-        assert _gemm_ops(hlo) == dict(dot=0, cublas=0, getrf=0, triangular_solve=0)
+        ops = _gemm_ops(hlo)
+        assert ops["cublas"] == 0
+        assert ops["getrf"] == 0
+        assert ops["triangular_solve"] == 0
+        if on_cpu:
+            unexpected_dots = [
+                line
+                for line in hlo.splitlines()
+                if " dot(" in line and "platform/dot_general" not in line
+            ]
+            assert unexpected_dots == []
+        else:
+            assert ops["dot"] == 0
 
 
 # --------------------------------------------------------------------------------
