@@ -1390,17 +1390,17 @@ class Handlers:
         state.set(eqn.outvars[0], SparseDepSet(stacked_dep[stack_idx], oshp))
 
     @staticmethod
-    @TRACER_REGISTRY.register("split")
+    @TRACER_REGISTRY.register("split", "unstack")
     def split(
         eqn: JaxprEqn,
         state: TraceState,
         acc: "CouplingAccumulator",
         trial_test_split: int | None,
     ) -> None:
-        """``split`` (``jnp.split``) cuts one array into several along ``axis`` -- the exact
-        inverse of ``concatenate``, and just as structural: every output element *is* one
-        input element, so it inherits that element's dependency row verbatim (no union, no
-        couplings).
+        """``split`` (``jnp.split``) and ``unstack`` (array unpacking in JAX >= 0.12)
+        cut one array into several along ``axis`` -- the exact inverse of ``concatenate``,
+        and just as structural: every output element *is* one input element, so it inherits
+        that element's dependency row verbatim (no union, no couplings).
 
         Handled explicitly because it is a rare multi-output structural primitive:
         ``Handlers.fallback`` writes only ``outvars[0]``, which would leave every piece but
@@ -1409,11 +1409,12 @@ class Handlers:
         """
         d = state.get(eqn.invars[0])
         axis = eqn.params["axis"]
+        sizes = eqn.params.get("sizes", (1,) * len(eqn.outvars))
         # Row-major positions of the input's elements, laid out in its logical shape, so a
         # slice of this index array names exactly the dep rows that piece is built from.
         src_indices = np.arange(int(np.prod(d.shape))).reshape(d.shape)
         offset = 0
-        for outvar, size in zip(eqn.outvars, eqn.params["sizes"]):
+        for outvar, size in zip(eqn.outvars, sizes):
             size = int(size)
             oshp = _get_shape(outvar)
             piece = np.take(
