@@ -78,3 +78,34 @@ def test_sparse_matrix(op: Operator, coloring_func):
     np.testing.assert_allclose(
         primal, jax.grad(total_energy)(jnp.zeros(op.mesh.coords.shape[0] * 2))
     )
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+def test_sparse_jacfwd_preserves_input_dtype(op: Operator, dtype):
+    @jax.jit
+    def total_energy(u_flat):
+        u = u_flat.reshape(-1, 2)
+        u_grad = op.grad(u)
+        energy_density = strain_energy(u_grad, 1.0, 0.0)
+        return op.integrate(energy_density)
+
+    n_dofs = op.mesh.coords.shape[0] * 2
+    u0 = jnp.zeros(n_dofs, dtype=dtype)
+
+    sparsity_pattern_csr = sparse.pattern_from_mesh(op.mesh, n_dofs_per_node=2)
+    colored_matrix = sparse.ColoredMatrix.from_csr(sparsity_pattern_csr)
+
+    K_dense = jax.jacfwd(jax.jacrev(total_energy))(u0)
+    K_sparse = sparse.jacfwd(
+        jax.jacrev(total_energy), colored_matrix, color_batch_size=10
+    )(u0)
+    primal, K_linearized = sparse.linearized_jacfwd(
+        jax.jacrev(total_energy), colored_matrix, color_batch_size=10
+    )(u0)
+
+    assert K_sparse.data.dtype == dtype
+    assert K_linearized.data.dtype == dtype
+    assert primal.dtype == dtype
+    rtol = 1e-5 if dtype == jnp.float32 else 1e-7
+    np.testing.assert_allclose(K_dense, K_sparse.to_dense(), rtol=rtol, atol=rtol)
+    np.testing.assert_allclose(K_dense, K_linearized.to_dense(), rtol=rtol, atol=rtol)
