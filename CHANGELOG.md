@@ -5,6 +5,15 @@ from conventional commits.
 All notable changes to this project will be documented here, following
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.7](https://github.com/smec-ethz/tatva/compare/v0.11.6...v0.11.7) (2026-11-21)
+
+
+### Bug Fixes
+
+* remove the float32 dangling test ([0e1f62f](https://github.com/smec-ethz/tatva/commit/0e1f62f2cac6008c8b6608c378d80ae0767f7def))
+* **tracer:** add tracing of unstack as need for jax==0.12.1 ([0e1f62f](https://github.com/smec-ethz/tatva/commit/0e1f62f2cac6008c8b6608c378d80ae0767f7def))
+* update failing test for linalg for jax==0.12.1 ([c2181e3](https://github.com/smec-ethz/tatva/commit/c2181e36d4637af2df624b97fe5ba508815c9057))
+
 ## [0.11.6](https://github.com/smec-ethz/tatva/compare/v0.11.5...v0.11.6) (2026-09-02)
 
 
