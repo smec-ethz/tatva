@@ -502,6 +502,24 @@ def test_split_uses_handler_not_generic_fallback():
     assert nz_set(pat) == {(i, i) for i in range(4)}
 
 
+def test_unstack_preserves_support_and_no_warning():
+    """Array unpacking (emitting ``unstack`` in JAX >= 0.12) is structural: every unpacked
+    slice inherits its own dependency rows with no fallback warning and no dropped couplings
+    on later outputs."""
+
+    def energy(u):
+        ux, uy = u.reshape(-1, 2).T
+        return jnp.sum((ux * uy) ** 2)
+
+    n = 8
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pat = pattern_from_energy(energy, n)
+
+    assert nz_set(pat) == dense_hessian_pattern(energy, n)
+    assert pat.nnz < n * n
+
+
 def test_eigh_is_dense_nonlinear_no_false_negatives():
     """``jnp.linalg.eigh`` (→ ``eigh``) is a dense nonlinear op: every eigenvalue depends on
     the whole matrix, so consuming it — even linearly — must record the full block. Covers
