@@ -1,0 +1,331 @@
+import math
+
+import numpy as np
+import scipy.sparse as sps
+from numpy.typing import NDArray
+
+from tatva.tracer.core.route_fragments import (
+    DynamicSliceRouteFragment,
+    DynamicUpdateSliceRouteFragment,
+    SelectNRouteFragment,
+)
+from tatva.tracer.core.routes import (
+    DynamicSliceRoute,
+    DynamicUpdateSliceRoute,
+    SelectNRoute,
+)
+from tatva.tracer.core.semantics import (
+    DemandContext,
+    RouteLocalizationContext,
+    RuleContext,
+)
+from tatva.tracer.helpers import _shape_of
+from tatva.tracer.local.demand import Demand, TensorDemand
+from tatva.tracer.local.localize import (
+    LocalDynamicSliceRoute,
+    LocalSelectNRoute,
+    localize_dynamic_slice_route,
+    localize_select_n_route,
+)
+from tatva.tracer.program.dependencies import DependencySet
+from tatva.tracer.rules.elementwise import inverse_elementwise_broadcast
+
+
+def prepare_select_n(ctx: RuleContext) -> SelectNRoute | None:
+    """A missing route denotes a runtime (DOF-dependent) selector."""
+    if ctx.route is not None and not isinstance(ctx.route, SelectNRoute):
+        raise TypeError(f"invalid select_n route for equation {ctx.eqn}")
+    return ctx.route
+
+
+def select_n_dependencies(
+    ctx: RuleContext,
+    prepared: SelectNRoute | None,
+) -> tuple[DependencySet, ...]:
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    n_output = int(np.prod(output_shape))
+
+    cases = tuple(dep.broadcast_to(output_shape) for dep in ctx.input_deps[1:])
+
+    # lax.select_n is non-differentiable in its selector.  Without a static
+    # selector every case can contribute at runtime, so retain their union.
+    if prepared is None:
+        output = cases[0].csr.copy()
+        for case in cases[1:]:
+            output = output.maximum(case.csr)
+        return (DependencySet(output.tocsr(), output_shape),)
+
+    selected_rows: list[NDArray[np.int64]] = []
+    selected_blocks: list[sps.csr_matrix] = []
+
+    for case_index, dep in enumerate(cases):
+        rows = np.flatnonzero(prepared.case_indices == case_index).astype(np.int64)
+
+        if rows.size == 0:
+            continue
+
+        selected_rows.append(rows)
+        selected_blocks.append(dep.csr[rows])
+
+    if not selected_blocks:
+        output = sps.csr_matrix(
+            (n_output, ctx.n_dofs),
+            dtype=bool,
+        )
+    else:
+        rows = np.concatenate(selected_rows)
+        stacked = sps.vstack(
+            selected_blocks,
+            format="csr",
+        )
+        # `rows[i]` says which output position stacked row i belongs to.
+        permutation = np.argsort(rows)
+        output = stacked[permutation]
+
+    return (DependencySet(output, output_shape),)
+
+
+def prepare_dynamic_slice(ctx: RuleContext) -> DynamicSliceRoute:
+    if not isinstance(ctx.route, DynamicSliceRoute):
+        raise TypeError(f"dynamic_slice route was not resolved for equation {ctx.eqn}")
+
+    return ctx.route
+
+
+def dynamic_slice_dependencies(
+    ctx: RuleContext,
+    prepared: DynamicSliceRoute,
+) -> tuple[DependencySet, ...]:
+    source = ctx.input_deps[0]
+
+    return (
+        DependencySet(source.csr[prepared.source_rows], _shape_of(ctx.eqn.outvars[0])),
+    )
+
+
+def prepare_dynamic_update_slice(ctx: RuleContext) -> DynamicUpdateSliceRoute:
+    if not isinstance(ctx.route, DynamicUpdateSliceRoute):
+        raise TypeError(
+            f"dynamic_update_slice route was not resolved for equation {ctx.eqn}"
+        )
+
+    return ctx.route
+
+
+def dynamic_update_slice_dependencies(
+    ctx: RuleContext,
+    prepared: DynamicUpdateSliceRoute,
+) -> tuple[DependencySet, ...]:
+    if len(ctx.input_deps) < 2:
+        raise ValueError("dynamic_update_slice expects operand and update")
+
+    operand = ctx.input_deps[0]
+    update = ctx.input_deps[1]
+
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+
+    # Start from operand dependencies.
+    output = operand.csr.copy().tolil()
+
+    # Overwrite target rows with corresponding update dependencies.
+    output[prepared.target_rows] = update.csr
+
+    return (DependencySet(output.tocsr(), output_shape),)
+
+
+def select_n_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    route = ctx.route
+
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    demanded_rows = output.rows()
+    result: list[Demand] = [None] * len(ctx.eqn.invars)
+
+    if route is None:
+        # Keep the selector live as a runtime value, although its derivatives
+        # deliberately remain excluded above. Every case is runtime-live.
+        result[0] = inverse_elementwise_broadcast(
+            output, input_shape=_shape_of(ctx.eqn.invars[0]), output_shape=output_shape
+        )
+        for case_index, atom in enumerate(ctx.eqn.invars[1:]):
+            result[case_index + 1] = inverse_elementwise_broadcast(
+                output, input_shape=_shape_of(atom), output_shape=output_shape
+            )
+        return tuple(result)
+
+    # selector is compiled into route.case_indices.
+    result[0] = None
+
+    if isinstance(route, SelectNRouteFragment):
+        positions = np.searchsorted(route.output_rows, demanded_rows)
+        if np.any(positions >= route.output_rows.size) or np.any(
+            route.output_rows[positions] != demanded_rows
+        ):
+            raise ValueError("select_n fragment does not cover demanded rows")
+        selected_cases = route.case_indices[positions]
+
+    elif isinstance(route, SelectNRoute):
+        selected_cases = route.case_indices[demanded_rows]
+
+    else:
+        raise TypeError("select_n demand requires a select_n route")
+
+    for case_index, atom in enumerate(ctx.eqn.invars[1:]):
+        mask = selected_cases == case_index
+        rows = demanded_rows[mask]
+        if rows.size == 0:
+            continue
+
+        case_output_demand = TensorDemand.from_rows_hull(output_shape, rows)
+
+        result[case_index + 1] = inverse_elementwise_broadcast(
+            case_output_demand,
+            input_shape=_shape_of(atom),
+            output_shape=output_shape,
+        )
+
+    return tuple(result)
+
+
+def dynamic_slice_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    route = ctx.route
+
+    rows = output.rows()
+
+    if isinstance(route, DynamicSliceRouteFragment):
+        positions = np.searchsorted(route.output_rows, rows)
+        if np.any(positions >= route.output_rows.size) or np.any(
+            route.output_rows[positions] != rows
+        ):
+            raise ValueError("dynamic_slice fragment does not cover demanded rows")
+        source_rows = route.source_rows[positions]
+
+    elif isinstance(route, DynamicSliceRoute):
+        source_rows = route.source_rows[rows]
+
+    else:
+        raise TypeError("dynamic_slice demand requires a dynamic-slice route")
+
+    result: list[Demand] = [None] * len(ctx.eqn.invars)
+    result[0] = TensorDemand.from_rows_hull(
+        _shape_of(ctx.eqn.invars[0]),
+        source_rows,
+    )
+
+    # start indices compiled into route.
+    return tuple(result)
+
+
+def dynamic_update_slice_demand(
+    ctx: DemandContext,
+) -> tuple[Demand, ...]:
+    output = ctx.output_demands[0]
+    if output is None:
+        return tuple(None for _ in ctx.eqn.invars)
+
+    route = ctx.route
+
+    output_shape = _shape_of(ctx.eqn.outvars[0])
+    output_rows = output.rows()
+    n_output = int(math.prod(output_shape))
+
+    wanted = np.zeros(
+        n_output,
+        dtype=bool,
+    )
+    wanted[output_rows] = True
+
+    if isinstance(route, DynamicUpdateSliceRouteFragment):
+        target_rows = route.target_rows
+        relation_update_rows = route.update_rows
+
+    elif isinstance(route, DynamicUpdateSliceRoute):
+        target_rows = route.target_rows
+        relation_update_rows = np.arange(target_rows.size, dtype=np.int64)
+
+    else:
+        raise TypeError("dynamic_update_slice demand requires a dynamic route")
+
+    valid_update = (target_rows >= 0) & (target_rows < n_output)
+    relation_rows = np.flatnonzero(
+        valid_update & wanted[np.clip(target_rows, 0, max(n_output - 1, 0))]
+    )
+    update_rows = relation_update_rows[relation_rows]
+
+    overwritten = np.unique(target_rows[valid_update])
+    operand_rows = output_rows[~np.isin(output_rows, overwritten, assume_unique=False)]
+
+    result: list[Demand] = [None] * len(ctx.eqn.invars)
+    result[0] = TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[0]), operand_rows)
+    result[1] = TensorDemand.from_rows_hull(_shape_of(ctx.eqn.invars[1]), update_rows)
+
+    return tuple(result)
+
+
+def localize_select_n(
+    ctx: RouteLocalizationContext,
+) -> LocalSelectNRoute:
+    route = ctx.route
+
+    if not isinstance(route, (SelectNRoute, SelectNRouteFragment)):
+        raise TypeError(
+            f"{ctx.eqn.primitive.name} route localization requires SelectNRoute"
+        )
+
+    if len(ctx.output_layouts) != 1:
+        raise RuntimeError("select_n expected one output")
+
+    output_layout = ctx.output_layouts[0]
+    if output_layout is None:
+        raise RuntimeError("attempted to localize dead select_n")
+
+    # input 0 is the selector. Its concrete values have already
+    # been compiled into SelectNRoute.case_indices.
+    return localize_select_n_route(
+        route,
+        case_layouts=tuple(ctx.input_layouts[1:]),
+        output_layout=output_layout,
+    )
+
+
+def localize_dynamic_slice(
+    ctx: RouteLocalizationContext,
+) -> LocalDynamicSliceRoute:
+    route = ctx.route
+
+    if not isinstance(route, (DynamicSliceRoute, DynamicSliceRouteFragment)):
+        raise TypeError(
+            f"{ctx.eqn.primitive.name} route localization requires DynamicSliceRoute"
+        )
+
+    if not ctx.input_layouts:
+        raise RuntimeError("dynamic_slice has no operand")
+
+    operand_layout = ctx.input_layouts[0]
+
+    if operand_layout is None:
+        raise RuntimeError("live dynamic_slice output has no live operand")
+
+    if len(ctx.output_layouts) != 1:
+        raise RuntimeError("dynamic_slice expected one output")
+
+    output_layout = ctx.output_layouts[0]
+    if output_layout is None:
+        raise RuntimeError("attempted to localize dead dynamic_slice")
+
+    return localize_dynamic_slice_route(
+        route,
+        operand_layout=operand_layout,
+        output_layout=output_layout,
+    )
